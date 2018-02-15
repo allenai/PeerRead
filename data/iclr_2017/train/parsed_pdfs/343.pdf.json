@@ -1,0 +1,494 @@
+{
+  "name" : "343.pdf",
+  "metadata" : {
+    "source" : "CRF",
+    "title" : "PROGRAM SYNTHESIS FOR CHARACTER LEVEL LANGUAGE MODELING",
+    "authors" : [ "Pavol Bielik", "Veselin Raychev", "Martin Vechev" ],
+    "emails" : [ "pavol.bielik@inf.ethz.ch", "veselin.raychev@inf.ethz.ch", "martin.vechev@inf.ethz.ch" ],
+    "sections" : [ {
+      "heading" : "1 INTRODUCTION",
+      "text" : "Recent years have shown increased interest in learning from large datasets in order to make accurate predictions on important tasks. A significant catalyst for this movement has been the ground breaking precision improvements on a number of cognitive tasks achieved via deep neural networks. Deep neural networks have made substantial inroads in areas such as image recognition (Krizhevsky et al., 2012) and natural language processing (Józefowicz et al., 2016) thanks to large datasets, deeper networks (He et al., 2016) and substantial investments in computational power Oh & Jung (2004).\nWhile neural networks remain a practical choice for many applications, they have been less effective when used for more structured tasks such as those concerning predictions about programs (Allamanis et al., 2016; Raychev et al., 2014). Initially targeting the programming languages domain, a new method for synthesizing probabilistic models proposed by Bielik et al. (2016), without a neural network, has shown to be effective for modeling source code, and has gained traction.\nIn this work, we investigate the applicability of this new method to tasks which have so far been addressed with recurrent neural networks and n-gram language models. The probabilistic models we propose are defined by a program from a domain-specific language (DSL). A program in this DSL describes a probabilistic model such as n-gram language models or a variant of it - e.g. trained on subsets of the training data, queried only when certain conditions are met and specialized in making specific classes of predictions. These programs can also be combined to produce one large program that queries different specialized submodels depending on the context of the query.\nFor example, consider predicting the characters in an English text. Typically, the first character of a word is much more difficult to predict than other characters and thus we would like to predict it differently. Let f be a function that takes a prediction position t in a text x and returns a list of characters to make prediction on. For example, let f be defined as follows:\nf(t, x) = if xt−1 is whitespace then xs else xt−1xt−2\nwhere xs is the first character of the word preceding the predicted word at position t. Now, consider a model that predicts a character by estimating each character xt from a distribution P (xt|f(t, x)). For positions that do not follow a whitespace, this distribution uses the two characters preceding xt and thus it simply encodes a trigram language model (in this example, without backoff, but we\nconsider backoff separately). However, P (xt|f(t, x)) combines the trigram model with another interesting model for the samples in the beginning of the words where trigram models typically fail.\nMore generally, f is a function that describes a probabilistic model. By simply varying f , we can define trivial models such as n-gram models, or much deeper and interesting models and combinations. In this work, we draw f from a domain-specific language (DSL) that resembles a standard programming language: it includes if statements, limited use of variables and one iterator over the text, but overall that language can be further extended to handle specific tasks depending on the nature of the data. The learning process now includes finding f from the DSL such that the model P (xt|f(t, x)) performs best on a validation set and we show that we can effectively learn such functions using Markov chain Monte Carlo (MCMC) search techniques combined with decision tree learning.\nAdvantages An advantage of having a function f drawn from a DSL is that f becomes humanly readable, in contrast to neural networks that generally provide non-human readable matrices (Li et al., 2016). Further, the training procedure is two-fold: first, we synthesize f from the DSL, and then for a given f , we estimate probabilities for P (xt|f(t, x)) by counting in the training data. This gives us additional advantages such as the ability to synthesize f and learn the probability distribution P on different datasets: e.g., we can easily add and remove samples from the dataset used for computing the probability estimate P . Finally, because the final model is based on counting, estimating probabilities P (xt|f(t, x)) is efficient: applying f and looking up in a hashtable to determine how frequently in the training data, xt appears in the resulting context of f(t, x).\nBefore we continue, we note an important point about DSL-based models. In contrast to deep neural networks that can theoretically encode all continuous functions (Hornik, 1991), a DSL by definition targets a particular application domain, and thus comes with restricted expressiveness. Increasing the expressibility of the DSL (e.g., by adding new instructions) can in theory make the synthesis problem intractable or even undecidable. Overall, this means that a DSL should balance between expressibility and efficiency of synthesizing functions in it (Gulwani, 2010).\nContributions This work makes two main contributions:\n• We define a DSL which is useful in expressing (character level) language models. This DSL can express n-gram language models with backoff, with caching and can compose them using if statements in a decision-tree-like fashion. We also provide efficient synthesis procedures for functions in this DSL.\n• We experimentally compare our DSL-based probabilistic model with state-of-the-art neural network models on two popular datasets: the Linux Kernel dataset (Karpathy et al., 2015) and the Hutter Prize Wikipedia dataset (Hutter, 2012)."
+    }, {
+      "heading" : "2 A DSL FOR CHARACTER LEVEL LANGUAGE MODELING",
+      "text" : "We now provide a definition of our domain specific language (DSL) called TChar for learning character level language models. At a high level, executing a program p ∈ TChar at a position t ∈ N in the input sequence of characters x ∈ X returns an LMProgram that specifies language model to be used at position t. That is, p ∈ TChar : N×X → LMProgram. The best model to use at position t is selected depending on the current program state (updated after processing each character) and conditioning on the dynamically computed context for position t of the input text x. This allows us to train specialized models suited for various types of prediction such as for comments vs. source code, newlines, indentation, opening/closing brackets, first character of a word and many more. Despite of the fact that the approach uses many specialized models, we still obtain a valid probability distribution as all of these models operate on disjoint data and are valid probability distributions. Subsequently, the selected program f ∈ LMProgram determines the language model that estimates the probability of character xt by building a probability distribution P (xt|f(t, x)). That is, the probability distribution is conditioned on the context obtained by executing the program f .\nThe syntax of TChar is shown in Fig. 1 and is designed such that it contains general purpose instructions and statements that operate over a sequence of characters. One of the advantages of our approach is that this language can be further refined by adding more instructions that are specialized for a given domain at hand (e.g., in future versions, we can easily include set of instructions specific\nProgram State state ∈ N Accumulated Context v ∈ N∗ Backoff Threshold d ∈ 〈0, 1〉 TChar ::= SwitchProgram | StateProgram | return LMProgram\nStateProgram ::= StateUpdate; StateSwitch\nto modeling C/C++ source code). We now informally describe the general TChar language of this work. We provide a formal definition and semantics of the TChar language in the appendix."
+    }, {
+      "heading" : "2.1 SIMPLEPROGRAMS",
+      "text" : "The SimpleProgram is a basic building block of the TChar language. It describes a loop-free and branch-free program that accumulates context with values from the input by means of navigating within the input (using Move instructions) and writing the observed values (using Write instructions). The result of executing a SimpleProgram is the accumulated context which is used either to condition the prediction, to update the program state or to determine which program to execute next.\nMove Instructions We define four basic types of Move instructions – LEFT and RIGHT that move to the previous and next character respectively, PREV CHAR that moves to the most recent position in the input with the same value as the current character xt and PREV POS which works as PREV CHAR but only considers positions in the input that are partitioned into the same language model. Additionally, for each character c in the input vocabulary we generate instruction PREV CHAR(c) that navigates to the most recent position of character c. We note that all Move instructions are allowed to navigate only to the left of the character xt that is to be predicted.\nWrite Instructions We define three Write instructions – WRITE CHAR that writes the value of the character at current position, WRITE HASH that writes a hash of all the values seen between the current position and the position of last Write instruction, and WRITE DIST that writes a distance (i.e., number of characters) between current position and the position of last Write instruction. In our implementation we truncate WRITE HASH and WRITE DIST to a maximum size of 16.\nExample With Write and Move instructions, we can express various programs that extract useful context for a given position t in text x. For example, we can encode the context used in trigram language model with a program LEFT WRITE CHAR LEFT WRITE CHAR. We can also express programs such as LEFT PREV CHAR RIGHT WRITE CHAR that finds the previous occurrence of the character on the left of the current position and records the character following it in the context."
+    }, {
+      "heading" : "2.2 SWITCHPROGRAMS",
+      "text" : "A problem of using only one SimpleProgram is that the context it generates may not work well for the entire dataset, although combining several such programs can generate suitable contexts for the different types of predictions. To handle these cases, we introduce SwitchProgram with switch statements that can conditionally select appropriate subprograms to use depending on the context of the prediction. The checked conditions of switch are themselves program pguard ∈ SimpleProgram that accumulate values that are used to select the appropriate branch that should be executed next. During the learning the goal is then to synthesize best program pguard to be used as a guard, the values v1, · · · , vn used as branch conditions as well as the programs to be used in each branch. We note that we support disjunction of values within branch conditions. As a result, even if the same program is to be used for two different contexts v1 and v2, the synthesis procedure can decide whether a single model should be trained for both (by synthesizing a single branch with a disjunction of v1 and v2) or a separate models should be trained for each (by synthesizing two branches).\nExample We now briefly discuss some of the BranchProgram synthesized for the Linux Kernel dataset in our experiments described in Section 3. By inspecting the synthesized program we identified interesting SimplePrograms building blocks such as PREV CHAR( ) RIGHT WRITE CHAR that conditions on the first character of the current word, PREV CHAR(\\n) WRITE DIST that conditions on the distance from the beginning of the line or PREV CHAR( ) LEFT WRITE CHAR that checks the preceding character of a previous underscore (useful for predicting variable names). These are examples of more specialized programs that are typically found in the branches of nested switches of a large TChar program. The top level switch of the synthesized program used the character before the predicted position (i.e. switch LEFT WRITE CHAR) and handles separately cases such as newline, tabs, special characters (e.g., !#@.∗), upper-case characters and the rest."
+    }, {
+      "heading" : "2.3 STATEPROGRAMS",
+      "text" : "A common difficulty in building statistical language models is capturing long range dependencies in the given dataset. Our TChar language partially addresses this issue by using Move instructions that can jump to various positions in the data using PREV CHAR and PREV POS instructions. However, we can further improve by explicitly introducing a state to our programs using StateProgram. The StateProgram consists of two sequential operations – updating the current state and determining which program to execute next based on the value of the current state. For both we reuse the switch construct defined previously for SwitchProgram. In our work we consider integer valued state that can by either incremented, decremented or left unmodified after processing each input character. We note that other definitions of the state, such as stack based state, are possible.\nExample As an example of a StateProgram consider the question of detecting whether the current character is inside a comment or is a source code. These denote very different types of data that we might want to model separately if it leads to improvement in our cost metric. This can be achieved by using a simple state program with condition LEFT WRITE CHAR LEFT WRITE CHAR that increments the state on ’/*’, decrements on ’*/’ and leaves the state unchanged otherwise."
+    }, {
+      "heading" : "2.4 LMPROGRAMS",
+      "text" : "The LMProgram describes a probabilistic model trained and queried on a subset of the data as defined by the branches taken in the SwitchPrograms and StatePrograms. The LMProgram in TChar is instantiated with a language model described by a SimpleProgram plus backoff. That is, the prediction is conditioned on the sequence of values returned by executing the program, i.e. P (xt|f(t, x)). Recall that given a position t in text x, executing a SimpleProgram returns context f(t, x). For example, executing LEFT WRITE CHAR LEFT WRITE CHAR returns the two characters xt−1xt−2 preceding xt. In this example P (xt|f(t, x)) is a trigram model. To be effective in practice, however, such models should support smoothing or backoff to lower order models. We provide backoff in two ways. First, because the accumulated context by the SimpleProgram is a sequence we simply backoff to a model that uses a shorter sequences by using Witten-Bell backoff (Witten & Bell, 1991). Second, in the LMProgram we explicitly allow to backoff to other models specified by a TChar pro-\ngram if the probability of the most likely character from vocabulary V according to the P (xt|f(t, x)) model is less than a constant d. Additionally, for some of our experiments we also consider backoff to a cache model (Kuhn & De Mori, 1990).\nPredicting Out-of-Vocabulary Labels Finally, we incorporate a feature of the language models as proposed by Raychev et al. (2016a) that enables us not only to predict characters directly but instead to predict a character which is equal to some other character in the text. This is achieved by synthesising a pair of (SimpleProgram, SimpleProgram). The first program is called equality program and it navigates over the text to return characters that may be equal to the character that we are trying to predict. Then, the second program f describes P (xt|f(t, x)) as described before, except that a possible output is equality to one of the characters returned by the equality program.\n2.5 SYNTHESISING TChar PROGRAMS\nThe goal of the synthesizer is given a set of training and validation samples D, to find a program:\npbest = arg min p∈TChar cost(D, p)\nwhere cost(D, p) = −logprob(D, p) + λ · Ω(p). Here logprob(D, p) is the log-probability of the trained models on the dataset D and Ω(p) is a regularization that penalizes complex functions to avoid over-fitting to the data. In our implementation, Ω(p) returns the number of instructions in p.\nThe language TChar essentially consists of two fragments: branches and straight-line SimplePrograms. To synthesize branches, we essentially need a decision tree learning algorithm that we instantiate with the ID3+ algorithm as described in Raychev et al. (2016a). To synthesize SimplePrograms we use a combination of brute-force search for very short programs (up to 5 instructions), genetic programming-based search and Markov chain Monte Carlo-based search. These procedures are computationally feasible, because each SimpleProgram consists of only a small number of moves and writes. We provide more details about this procedure in Appendix B.1."
+    }, {
+      "heading" : "3 EXPERIMENTS",
+      "text" : "Datasets For our experiments we use two diverse datasets: a natural language one and a structured text (source code) one. Both were previously used to evaluate character-level language models – the Linux Kernel dataset Karpathy et al. (2015) and Hutter Prize Wikipedia dataset Hutter (2012). The Linux Kernel dataset contains header and source files in the C language shuffled randomly, and consists of 6, 206, 996 characters in total with vocabulary size 101. The Hutter Prize Wikipedia dataset contains the contents of Wikipedia articles annotated with meta-data using special mark-up (e.g., XML or hyperlinks) and consists of 100, 000, 000 characters and vocabulary size 205. For both datasets we use the first 80% for training, next 10% for validation and final 10% as a test set.\nEvaluation Metrics To evaluate the performance of various probabilistic language models we use two metrics. Firstly, we use the bits-per-character (BPC) metric which corresponds to the negative log likelihood of a given prediction E[− log2 p(xt | x<t)], where xt is character being predicted and x<t denotes characters preceding xt. Further, we use error rate which corresponds to the ratio of mistakes the model makes. This is a practical metric that directly quantifies how useful is the model in a concrete task (e.g., completion). As we will see, having two different evaluation metrics is beneficial as better (lower) BPC does not always correspond to better (lower) error rate."
+    }, {
+      "heading" : "3.1 LANGUAGE MODELS",
+      "text" : "We compare the performance of our trained DSL model, instantiated with the TChar language described in Section 2, against two widely used language models – n-gram model and recurrent neural networks. For all models we consider character level modeling of the dataset at hand. That is, the models are trained by feeding the input data character by character, without any knowledge of higher level word boundaries and dataset structure.\nN-gram We use the n-gram model as a baseline model as it has been traditionally the most widely used language model due to it simplicity, efficient training and fast sampling. We note that ngram can be trivially expressed in the TChar language as a program containing a sequence of LEFT and WRITE instructions. To deal with data sparseness we have experimented with various smoothing techniques including Witten-Bell interpolation smoothing Witten & Bell (1991) and modified Kneser-Ney smoothing Kneser & Ney (1995); Chen & Goodman (1998).\nRecurrent Neural Networks To evaluate the effectiveness of the DSL model we compare to a recurrent network language model shown to produce state-of-the-art performance in various natural language processing tasks. In particular, for the Linux Kernel dataset we compare against a variant of recurrent neural networks with Long Short-Term Memory (LSTM) proposed by Hochreiter & Schmidhuber (1997). To train our models we follow the experimental set-up and use the implementation of Karpathy et al. (2015). We initialize all parameters uniformly in range [−0.08, 0.08], use mini-batch stochastic gradient descent with batch size 50 and RMSProp Dauphin et al. (2015) perparameter adaptive update with base learning rate 2 × 10−3 and decay 0.95. Further, the network is unrolled 100 time steps and we do not use dropout. Finally, the network is trained for 50 epochs (with early stopping based on a validation set) and the learning rate is decayed after 10 epochs by multiplying it with a factor of 0.95 each additional epoch. For the Hutter Prize Wikipedia dataset we compared to various other, more sophisticated models as reported by Chung et al. (2017).\nDSL model To better understand various features of the TChar language we include experiments that disable some of the language features. Concretely, we evaluate the effect of including cache and backoff. In our experiments we backoff the learned program to a 7-gram and 3-gram models and we use cache size of 800 characters. The backoff thresholds d are selected by evaluating the model performance on the validation set. Finally, for the Linux Kernel dataset we manually include a StateProgram as a root that distinguishes between comments and code (illustrated in Section 2.3). The program learned for the Linux Kernel dataset contains ≈ 700 BranchPrograms and ≈ 2200 SimplePrograms and has over 8600 Move and Write instructions in total. We provide an interactive visualization of the program and it’s performance on the Linux Kernel dataset online at:\nwww.srl.inf.ethz.ch/charmodel.html"
+    }, {
+      "heading" : "3.2 MODEL PERFORMANCE",
+      "text" : "We compare the performance of the DSL model, n-gram and neural networks for the tasks of learning character level language models by discussing a number of relevant metrics shown in Table 1 and Table 2.\nPrecision In terms of model precision, we can see that as expected, the n-gram model performs worse in both BPC and error rate metrics. However, even though the best BPC is achieved for a 7-gram model, the error rate decreases up to 15-gram. This suggests that none of the smoothing techniques we tried can properly adjust to the data sparsity inherent in the higher order n-gram models. It is however possible that more advanced smoothing techniques such as one based on PitmanYor Processes (Teh, 2006) might address this issue. As the DSL model uses the same smoothing technique as n-grams, any improvement to smoothing is directly applicable to it.\nAs reported by Karpathy et al. (2015), the LSTM model trained on the Linux Kernel dataset improves BPC over the n-gram. However, in our experiments this improvement did not translate to lower error rate. In contrast, our model is superior to n-gram and LSTM in all configurations, beating the best other model significantly in both evaluation metrics – decreasing BPC by over 0.5 and improving error rate by more than 12%.\nFor the Hutter Prize Wikipedia dataset, even though the dataset consists of natural language text and is much less structured than the Linux Kernel, our model is competitive with several neural network models. Similar to the results achieved on Linux Kernel, we expect the error rate of the DSL model for Hutter Prize Wikipedia dataset, which is 30.5%, to be comparable to the error rate achieved by other models. However, this experiment shows that our model is less suitable to unstructured text such as the one found on Wikipedia.\nTraining Time Training time is dominated by the LSTM model that takes several days for the network with the highest number of parameters. On the other hand, training n-gram models is extremely fast since the model is trained simply by counting in a single pass over the training data. The DSL model sits between these two approaches and takes ≈ 8 hours to train. The majority of the DSL training time is spent in the synthesis of SwitchPrograms where one needs to consider a massive search space of possible programs from which the synthesis algorithm aims to find one that is approximately the best (e.g., for Linux Dataset the number of basic instructions is 108 which means that naive enumeration of programs up to size 3 already leads to 1083 different candidate programs). All of our experiments were performed on a machine with Intel(R) Xeon(R) CPU E52690 with 14 cores. All training times are reported for parallel training on CPU. Using GPUs for training of the neural networks might provide additional improvement in training time.\nQuery (Sampling) Time Sampling the n-gram is extremely fast, answering≈ 46, 000 queries per second, as each query corresponds to only a several hash look-ups. The query time for the DSL model is similarly fast, in fact can be even faster, by answering ≈ 62, 000 queries per second. This is because it consists of two steps: (i) executing the TChar program that selects a suitable language model (which is very fast once the program has been learned), and (ii) querying the language model. The reason why the model can be faster is that there are fewer hash lookups which are also faster due to the fact that the specialized language models are much smaller compared to the n-gram (e.g.,\n≈ 22% of the models simply compute unconditioned probabilities). Adding backoff and cache to the DSL model decreases sampling speed, which is partially because our implementation is currently not optimized for querying and fully evaluates all of the models even though that is not necessary.\nModel Size Finally, we include the size of all the trained models measured by the size in MB of the model parameters. The models have roughly the same size except for the n-gram models with high order for which the size increases significantly. We note that the reason why both the n-gram and DSL models are relatively small is that we use hash-based implementation for storing the prediction context. That is, in a 7-gram model the previous 6 characters are hashed into a single number. This decreases the model size significantly at the expense of some hash collisions."
+    }, {
+      "heading" : "4 RELATED WORK",
+      "text" : "Program Synthesis Program synthesis is a well studied research field in which the goal is to automatically discover a program that satisfies a given specification that can be expressed in various forms including input/output examples, logical formulas, set of constraints or even natural language description.In addition to the techniques that typically scale only for smaller programs and attempt to satisfy the specification completely (Alur et al., 2013; Solar-Lezama et al., 2006; Solar-Lezama, 2013; Jha et al., 2010) a recent line of work considers a different setting consisting of large (e.g., millions of examples) and noisy (i.e., no program can satisfy all examples perfectly) datasets. This is the setting that needs to be considered when synthesizing programs in our setting and in a language such as TChar. Here, the work of Raychev et al. (2016b) showed how to efficiently synthesize straight-line programs and how to handle noise, then Raychev et al. (2016a) showed how to synthesize branches, and thework of Heule et al. (2015) proposed a way to synthesize loops.\nIn our work we take advantage of these existing synthesis algorithms and use them to efficiently synthesize a program in TChar. We propose a simple extension that uses MCMC to sample from a large amount of instructions included in TChar (many more than prior work). Apart from this, no other modifications were required in order to use existing techniques for the setting of character level language modeling we consider here.\nRecurrent Neural Networks Recent years have seen an emerging interest in building a neural language models over words (Bengio et al., 2003), characters (Karpathy et al., 2015; Sutskever et al., 2011; Wu et al., 2016) as well as combination of both (Chung et al., 2017; Kim et al., 2015; Mikolov et al., 2012). Such models have been shown to achieve state-of-the-art performance in several domains and there is a significant research effort aimed at improving such models further.\nIn contrast, we take a very different approach, one that aims to explain the data by means of synthesizing a program from a domain specific language. Synthesising such programs efficiently while achieving competitive performance to the carefully tuned neural networks creates a valuable resource that be used as a standalone model, combined with existing neural language models or even used for their training. For example, the context on which the predictions are conditioned is similar to the attention mechanism (Sukhbaatar et al., 2015; Bahdanau et al., 2014) and might be incorporated into that training in the future."
+    }, {
+      "heading" : "5 CONCLUSION",
+      "text" : "In this paper we proposed and evaluated a new approach for building character level statistical language models based on a program that parameterizes the model. We design a language TChar for character level language modeling and synthesize a program in this language. We show that our model works especially well for structured data and is significantly more precise that prior work. We also demonstrate competitive results in the less structured task of modeling English text.\nExpressing the language model as a program results in several advantages including easier interpretability, debugging and extensibility with deep semantic domain knowledge by simply incorporating a new instruction in the DSL. We believe that this development is an interesting result in bridging synthesis and machine learning with much potential for future research."
+    } ],
+    "references" : [ {
+      "title" : "A convolutional attention network for extreme summarization of source code",
+      "author" : [ "Miltiadis Allamanis", "Hao Peng", "Charles A. Sutton" ],
+      "venue" : "In Proceedings of the 33nd International Conference on Machine Learning,",
+      "citeRegEx" : "Allamanis et al\\.,? \\Q2016\\E",
+      "shortCiteRegEx" : "Allamanis et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Syntaxguided synthesis",
+      "author" : [ "Rajeev Alur", "Rastislav Bodı́k", "Garvit Juniwal", "Milo M.K. Martin", "Mukund Raghothaman", "Sanjit A. Seshia", "Rishabh Singh", "Armando Solar-Lezama", "Emina Torlak", "Abhishek Udupa" ],
+      "venue" : "In Formal Methods in Computer-Aided Design,",
+      "citeRegEx" : "Alur et al\\.,? \\Q2013\\E",
+      "shortCiteRegEx" : "Alur et al\\.",
+      "year" : 2013
+    }, {
+      "title" : "Neural machine translation by jointly learning to align and translate",
+      "author" : [ "Dzmitry Bahdanau", "Kyunghyun Cho", "Yoshua Bengio" ],
+      "venue" : "CoRR, abs/1409.0473,",
+      "citeRegEx" : "Bahdanau et al\\.,? \\Q2014\\E",
+      "shortCiteRegEx" : "Bahdanau et al\\.",
+      "year" : 2014
+    }, {
+      "title" : "A neural probabilistic language model",
+      "author" : [ "Yoshua Bengio", "Réjean Ducharme", "Pascal Vincent", "Christian Janvin" ],
+      "venue" : "J. Mach. Learn. Res.,",
+      "citeRegEx" : "Bengio et al\\.,? \\Q2003\\E",
+      "shortCiteRegEx" : "Bengio et al\\.",
+      "year" : 2003
+    }, {
+      "title" : "PHOG: probabilistic model for code",
+      "author" : [ "Pavol Bielik", "Veselin Raychev", "Martin T. Vechev" ],
+      "venue" : "In Proceedings of the 33th International Conference on Machine Learning,",
+      "citeRegEx" : "Bielik et al\\.,? \\Q2016\\E",
+      "shortCiteRegEx" : "Bielik et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "An empirical study of smoothing techniques for language modeling",
+      "author" : [ "Stanley F. Chen", "Joshua Goodman" ],
+      "venue" : "Technical report, Harvard University,",
+      "citeRegEx" : "Chen and Goodman.,? \\Q1998\\E",
+      "shortCiteRegEx" : "Chen and Goodman.",
+      "year" : 1998
+    }, {
+      "title" : "Hierarchical multiscale recurrent neural networks",
+      "author" : [ "Junyoung Chung", "Sungjin Ahn", "Yoshua Bengio" ],
+      "venue" : null,
+      "citeRegEx" : "Chung et al\\.,? \\Q2017\\E",
+      "shortCiteRegEx" : "Chung et al\\.",
+      "year" : 2017
+    }, {
+      "title" : "Equilibrated adaptive learning rates for nonconvex optimization",
+      "author" : [ "Yann N. Dauphin", "Harm de Vries", "Yoshua Bengio" ],
+      "venue" : "In Proceedings of the 28th International Conference on Neural Information Processing Systems,",
+      "citeRegEx" : "Dauphin et al\\.,? \\Q2015\\E",
+      "shortCiteRegEx" : "Dauphin et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "Generating sequences with recurrent neural networks",
+      "author" : [ "Alex Graves" ],
+      "venue" : "CoRR, abs/1308.0850,",
+      "citeRegEx" : "Graves.,? \\Q2013\\E",
+      "shortCiteRegEx" : "Graves.",
+      "year" : 2013
+    }, {
+      "title" : "Dimensions in program synthesis",
+      "author" : [ "Sumit Gulwani" ],
+      "venue" : "Proceedings of the 12th International ACM SIGPLAN Symposium on Principles and Practice of Declarative Programming,",
+      "citeRegEx" : "Gulwani.,? \\Q2010\\E",
+      "shortCiteRegEx" : "Gulwani.",
+      "year" : 2010
+    }, {
+      "title" : "Deep residual learning for image recognition",
+      "author" : [ "Kaiming He", "Xiangyu Zhang", "Shaoqing Ren", "Jian Sun" ],
+      "venue" : "IEEE Conference on Computer Vision and Pattern Recognition (CVPR),",
+      "citeRegEx" : "He et al\\.,? \\Q2016\\E",
+      "shortCiteRegEx" : "He et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Mimic: Computing models for opaque code",
+      "author" : [ "Stefan Heule", "Manu Sridharan", "Satish Chandra" ],
+      "venue" : "In Proceedings of the 2015 10th Joint Meeting on Foundations of Software Engineering,",
+      "citeRegEx" : "Heule et al\\.,? \\Q2015\\E",
+      "shortCiteRegEx" : "Heule et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "Long short-term memory",
+      "author" : [ "Sepp Hochreiter", "Jürgen Schmidhuber" ],
+      "venue" : "Neural Comput.,",
+      "citeRegEx" : "Hochreiter and Schmidhuber.,? \\Q1997\\E",
+      "shortCiteRegEx" : "Hochreiter and Schmidhuber.",
+      "year" : 1997
+    }, {
+      "title" : "Approximation capabilities of multilayer feedforward networks",
+      "author" : [ "Kurt Hornik" ],
+      "venue" : "Neural Netw.,",
+      "citeRegEx" : "Hornik.,? \\Q1991\\E",
+      "shortCiteRegEx" : "Hornik.",
+      "year" : 1991
+    }, {
+      "title" : "The human knowledge compression contest",
+      "author" : [ "Marcus Hutter" ],
+      "venue" : "URL http://prize. hutter1.net/",
+      "citeRegEx" : "Hutter.,? \\Q2012\\E",
+      "shortCiteRegEx" : "Hutter.",
+      "year" : 2012
+    }, {
+      "title" : "Oracle-guided component-based program synthesis",
+      "author" : [ "Susmit Jha", "Sumit Gulwani", "Sanjit A. Seshia", "Ashish Tiwari" ],
+      "venue" : "In Proceedings of the 32nd ACM/IEEE International Conference on Software Engineering - Volume 1,",
+      "citeRegEx" : "Jha et al\\.,? \\Q2010\\E",
+      "shortCiteRegEx" : "Jha et al\\.",
+      "year" : 2010
+    }, {
+      "title" : "Exploring the limits of language modeling",
+      "author" : [ "Rafal Józefowicz", "Oriol Vinyals", "Mike Schuster", "Noam Shazeer", "Yonghui Wu" ],
+      "venue" : null,
+      "citeRegEx" : "Józefowicz et al\\.,? \\Q2016\\E",
+      "shortCiteRegEx" : "Józefowicz et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Visualizing and understanding recurrent networks",
+      "author" : [ "Andrej Karpathy", "Justin Johnson", "Fei-Fei Li" ],
+      "venue" : "CoRR, abs/1506.02078,",
+      "citeRegEx" : "Karpathy et al\\.,? \\Q2015\\E",
+      "shortCiteRegEx" : "Karpathy et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "Character-aware neural language models",
+      "author" : [ "Yoon Kim", "Yacine Jernite", "David Sontag", "Alexander M. Rush" ],
+      "venue" : "CoRR, abs/1508.06615,",
+      "citeRegEx" : "Kim et al\\.,? \\Q2015\\E",
+      "shortCiteRegEx" : "Kim et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "Improved backing-off for m-gram language modeling",
+      "author" : [ "Reinhard Kneser", "Hermann Ney" ],
+      "venue" : "Proceedings of the IEEE International Conference on Acoustics, Speech and Signal Processing,",
+      "citeRegEx" : "Kneser and Ney.,? \\Q1995\\E",
+      "shortCiteRegEx" : "Kneser and Ney.",
+      "year" : 1995
+    }, {
+      "title" : "Imagenet classification with deep convolutional neural networks",
+      "author" : [ "Alex Krizhevsky", "Ilya Sutskever", "Geoffrey E. Hinton" ],
+      "venue" : "Advances in Neural Information Processing Systems",
+      "citeRegEx" : "Krizhevsky et al\\.,? \\Q2012\\E",
+      "shortCiteRegEx" : "Krizhevsky et al\\.",
+      "year" : 2012
+    }, {
+      "title" : "A cache-based natural language model for speech recognition",
+      "author" : [ "R. Kuhn", "R. De Mori" ],
+      "venue" : "IEEE Trans. Pattern Anal. Mach. Intell.,",
+      "citeRegEx" : "Kuhn and Mori.,? \\Q1990\\E",
+      "shortCiteRegEx" : "Kuhn and Mori.",
+      "year" : 1990
+    }, {
+      "title" : "Visualizing and understanding neural models in NLP",
+      "author" : [ "Jiwei Li", "Xinlei Chen", "Eduard H. Hovy", "Dan Jurafsky" ],
+      "venue" : "In NAACL HLT",
+      "citeRegEx" : "Li et al\\.,? \\Q2016\\E",
+      "shortCiteRegEx" : "Li et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Subword language modeling with neural networks",
+      "author" : [ "Tomas Mikolov", "Ilya Sutskever", "Anoop Deoras", "Hai-Son Le", "Stefan Kombrink", "Jan Cernocky" ],
+      "venue" : "Technical report,",
+      "citeRegEx" : "Mikolov et al\\.,? \\Q2012\\E",
+      "shortCiteRegEx" : "Mikolov et al\\.",
+      "year" : 2012
+    }, {
+      "title" : "Code completion with statistical language models",
+      "author" : [ "Veselin Raychev", "Martin Vechev", "Eran Yahav" ],
+      "venue" : "In Proceedings of the 35th ACM SIGPLAN Conference on Programming Language Design and Implementation,",
+      "citeRegEx" : "Raychev et al\\.,? \\Q2014\\E",
+      "shortCiteRegEx" : "Raychev et al\\.",
+      "year" : 2014
+    }, {
+      "title" : "Probabilistic model for code with decision trees",
+      "author" : [ "Veselin Raychev", "Pavol Bielik", "Martin Vechev" ],
+      "venue" : "In Proceedings of the 2016 ACM SIGPLAN International Conference on Object-Oriented Programming,",
+      "citeRegEx" : "Raychev et al\\.,? \\Q2016\\E",
+      "shortCiteRegEx" : "Raychev et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Learning programs from noisy data",
+      "author" : [ "Veselin Raychev", "Pavol Bielik", "Martin Vechev", "Andreas Krause" ],
+      "venue" : "In Proceedings of the 43rd Annual ACM SIGPLAN-SIGACT Symposium on Principles of Programming Languages,",
+      "citeRegEx" : "Raychev et al\\.,? \\Q2016\\E",
+      "shortCiteRegEx" : "Raychev et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Combinatorial sketching for finite programs",
+      "author" : [ "Armando Solar-Lezama", "Liviu Tancau", "Rastislav Bodı́k", "Sanjit A. Seshia", "Vijay A. Saraswat" ],
+      "venue" : "In ASPLOS,",
+      "citeRegEx" : "Solar.Lezama et al\\.,? \\Q2006\\E",
+      "shortCiteRegEx" : "Solar.Lezama et al\\.",
+      "year" : 2006
+    }, {
+      "title" : "End-to-end memory networks",
+      "author" : [ "Sainbayar Sukhbaatar", "Arthur Szlam", "Jason Weston", "Rob Fergus" ],
+      "venue" : "In Advances in Neural Information Processing Systems",
+      "citeRegEx" : "Sukhbaatar et al\\.,? \\Q2015\\E",
+      "shortCiteRegEx" : "Sukhbaatar et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "Generating text with recurrent neural networks",
+      "author" : [ "Ilya Sutskever", "James Martens", "Geoffrey Hinton" ],
+      "venue" : "In Proceedings of the 28th International Conference on Machine Learning,",
+      "citeRegEx" : "Sutskever et al\\.,? \\Q2011\\E",
+      "shortCiteRegEx" : "Sutskever et al\\.",
+      "year" : 2011
+    }, {
+      "title" : "A hierarchical bayesian language model based on pitman-yor processes",
+      "author" : [ "Yee Whye Teh" ],
+      "venue" : "In Proceedings of the 21st International Conference on Computational Linguistics and the 44th Annual Meeting of the Association for Computational Linguistics,",
+      "citeRegEx" : "Teh.,? \\Q2006\\E",
+      "shortCiteRegEx" : "Teh.",
+      "year" : 2006
+    }, {
+      "title" : "The zero-frequency problem: Estimating the probabilities of novel events in adaptive text compression",
+      "author" : [ "Ian H. Witten", "Timothy C. Bell" ],
+      "venue" : "IEEE Transactions on Information Theory,",
+      "citeRegEx" : "Witten and Bell.,? \\Q1991\\E",
+      "shortCiteRegEx" : "Witten and Bell.",
+      "year" : 1991
+    }, {
+      "title" : "On multiplicative integration with recurrent neural networks",
+      "author" : [ "Yuhuai Wu", "Saizheng Zhang", "Ying Zhang", "Yoshua Bengio", "Ruslan Salakhutdinov" ],
+      "venue" : "Advances in Neural Information Processing Systems",
+      "citeRegEx" : "Wu et al\\.,? \\Q2016\\E",
+      "shortCiteRegEx" : "Wu et al\\.",
+      "year" : 2016
+    } ],
+    "referenceMentions" : [ {
+      "referenceID" : 20,
+      "context" : "Deep neural networks have made substantial inroads in areas such as image recognition (Krizhevsky et al., 2012) and natural language processing (Józefowicz et al.",
+      "startOffset" : 86,
+      "endOffset" : 111
+    }, {
+      "referenceID" : 16,
+      "context" : ", 2012) and natural language processing (Józefowicz et al., 2016) thanks to large datasets, deeper networks (He et al.",
+      "startOffset" : 40,
+      "endOffset" : 65
+    }, {
+      "referenceID" : 10,
+      "context" : ", 2016) thanks to large datasets, deeper networks (He et al., 2016) and substantial investments in computational power Oh & Jung (2004).",
+      "startOffset" : 50,
+      "endOffset" : 67
+    }, {
+      "referenceID" : 0,
+      "context" : "While neural networks remain a practical choice for many applications, they have been less effective when used for more structured tasks such as those concerning predictions about programs (Allamanis et al., 2016; Raychev et al., 2014).",
+      "startOffset" : 189,
+      "endOffset" : 235
+    }, {
+      "referenceID" : 24,
+      "context" : "While neural networks remain a practical choice for many applications, they have been less effective when used for more structured tasks such as those concerning predictions about programs (Allamanis et al., 2016; Raychev et al., 2014).",
+      "startOffset" : 189,
+      "endOffset" : 235
+    }, {
+      "referenceID" : 8,
+      "context" : ", 2016) thanks to large datasets, deeper networks (He et al., 2016) and substantial investments in computational power Oh & Jung (2004). While neural networks remain a practical choice for many applications, they have been less effective when used for more structured tasks such as those concerning predictions about programs (Allamanis et al.",
+      "startOffset" : 51,
+      "endOffset" : 136
+    }, {
+      "referenceID" : 0,
+      "context" : "While neural networks remain a practical choice for many applications, they have been less effective when used for more structured tasks such as those concerning predictions about programs (Allamanis et al., 2016; Raychev et al., 2014). Initially targeting the programming languages domain, a new method for synthesizing probabilistic models proposed by Bielik et al. (2016), without a neural network, has shown to be effective for modeling source code, and has gained traction.",
+      "startOffset" : 190,
+      "endOffset" : 375
+    }, {
+      "referenceID" : 22,
+      "context" : "Advantages An advantage of having a function f drawn from a DSL is that f becomes humanly readable, in contrast to neural networks that generally provide non-human readable matrices (Li et al., 2016).",
+      "startOffset" : 182,
+      "endOffset" : 199
+    }, {
+      "referenceID" : 13,
+      "context" : "In contrast to deep neural networks that can theoretically encode all continuous functions (Hornik, 1991), a DSL by definition targets a particular application domain, and thus comes with restricted expressiveness.",
+      "startOffset" : 91,
+      "endOffset" : 105
+    }, {
+      "referenceID" : 9,
+      "context" : "Overall, this means that a DSL should balance between expressibility and efficiency of synthesizing functions in it (Gulwani, 2010).",
+      "startOffset" : 116,
+      "endOffset" : 131
+    }, {
+      "referenceID" : 17,
+      "context" : "• We experimentally compare our DSL-based probabilistic model with state-of-the-art neural network models on two popular datasets: the Linux Kernel dataset (Karpathy et al., 2015) and the Hutter Prize Wikipedia dataset (Hutter, 2012).",
+      "startOffset" : 156,
+      "endOffset" : 179
+    }, {
+      "referenceID" : 14,
+      "context" : ", 2015) and the Hutter Prize Wikipedia dataset (Hutter, 2012).",
+      "startOffset" : 47,
+      "endOffset" : 61
+    }, {
+      "referenceID" : 24,
+      "context" : "Predicting Out-of-Vocabulary Labels Finally, we incorporate a feature of the language models as proposed by Raychev et al. (2016a) that enables us not only to predict characters directly but instead to predict a character which is equal to some other character in the text.",
+      "startOffset" : 108,
+      "endOffset" : 131
+    }, {
+      "referenceID" : 24,
+      "context" : "To synthesize branches, we essentially need a decision tree learning algorithm that we instantiate with the ID3+ algorithm as described in Raychev et al. (2016a). To synthesize SimplePrograms we use a combination of brute-force search for very short programs (up to 5 instructions), genetic programming-based search and Markov chain Monte Carlo-based search.",
+      "startOffset" : 139,
+      "endOffset" : 162
+    }, {
+      "referenceID" : 16,
+      "context" : "Both were previously used to evaluate character-level language models – the Linux Kernel dataset Karpathy et al. (2015) and Hutter Prize Wikipedia dataset Hutter (2012).",
+      "startOffset" : 97,
+      "endOffset" : 120
+    }, {
+      "referenceID" : 14,
+      "context" : "(2015) and Hutter Prize Wikipedia dataset Hutter (2012). The Linux Kernel dataset contains header and source files in the C language shuffled randomly, and consists of 6, 206, 996 characters in total with vocabulary size 101.",
+      "startOffset" : 11,
+      "endOffset" : 56
+    }, {
+      "referenceID" : 17,
+      "context" : "Linux Kernel Dataset (Karpathy et al., 2015)",
+      "startOffset" : 21,
+      "endOffset" : 44
+    }, {
+      "referenceID" : 14,
+      "context" : "To train our models we follow the experimental set-up and use the implementation of Karpathy et al. (2015). We initialize all parameters uniformly in range [−0.",
+      "startOffset" : 84,
+      "endOffset" : 107
+    }, {
+      "referenceID" : 6,
+      "context" : "08], use mini-batch stochastic gradient descent with batch size 50 and RMSProp Dauphin et al. (2015) perparameter adaptive update with base learning rate 2 × 10−3 and decay 0.",
+      "startOffset" : 79,
+      "endOffset" : 101
+    }, {
+      "referenceID" : 6,
+      "context" : "For the Hutter Prize Wikipedia dataset we compared to various other, more sophisticated models as reported by Chung et al. (2017).",
+      "startOffset" : 110,
+      "endOffset" : 130
+    }, {
+      "referenceID" : 14,
+      "context" : "Hutter Prize Wikipedia Dataset (Hutter, 2012) Metric n-gram DSL model Stacked LSTM MRNN MI-LSTM HM-LSTM†",
+      "startOffset" : 31,
+      "endOffset" : 45
+    }, {
+      "referenceID" : 7,
+      "context" : "n = 7 This Work Graves (2013) Sutskever et al.",
+      "startOffset" : 16,
+      "endOffset" : 30
+    }, {
+      "referenceID" : 7,
+      "context" : "n = 7 This Work Graves (2013) Sutskever et al. (2011) Wu et al.",
+      "startOffset" : 16,
+      "endOffset" : 54
+    }, {
+      "referenceID" : 7,
+      "context" : "n = 7 This Work Graves (2013) Sutskever et al. (2011) Wu et al. (2016) Chung et al.",
+      "startOffset" : 16,
+      "endOffset" : 71
+    }, {
+      "referenceID" : 6,
+      "context" : "(2016) Chung et al. (2017)",
+      "startOffset" : 7,
+      "endOffset" : 27
+    }, {
+      "referenceID" : 6,
+      "context" : "Table 2: Bits-per-character metric for various neural language models (as reported by Chung et al. (2017)) achieved on Hutter Prize Wikipedia dataset where the TChar model achieves competitive results.",
+      "startOffset" : 86,
+      "endOffset" : 106
+    }, {
+      "referenceID" : 30,
+      "context" : "It is however possible that more advanced smoothing techniques such as one based on PitmanYor Processes (Teh, 2006) might address this issue.",
+      "startOffset" : 104,
+      "endOffset" : 115
+    }, {
+      "referenceID" : 16,
+      "context" : "As reported by Karpathy et al. (2015), the LSTM model trained on the Linux Kernel dataset improves BPC over the n-gram.",
+      "startOffset" : 15,
+      "endOffset" : 38
+    }, {
+      "referenceID" : 1,
+      "context" : "In addition to the techniques that typically scale only for smaller programs and attempt to satisfy the specification completely (Alur et al., 2013; Solar-Lezama et al., 2006; Solar-Lezama, 2013; Jha et al., 2010) a recent line of work considers a different setting consisting of large (e.",
+      "startOffset" : 129,
+      "endOffset" : 213
+    }, {
+      "referenceID" : 27,
+      "context" : "In addition to the techniques that typically scale only for smaller programs and attempt to satisfy the specification completely (Alur et al., 2013; Solar-Lezama et al., 2006; Solar-Lezama, 2013; Jha et al., 2010) a recent line of work considers a different setting consisting of large (e.",
+      "startOffset" : 129,
+      "endOffset" : 213
+    }, {
+      "referenceID" : 15,
+      "context" : "In addition to the techniques that typically scale only for smaller programs and attempt to satisfy the specification completely (Alur et al., 2013; Solar-Lezama et al., 2006; Solar-Lezama, 2013; Jha et al., 2010) a recent line of work considers a different setting consisting of large (e.",
+      "startOffset" : 129,
+      "endOffset" : 213
+    }, {
+      "referenceID" : 1,
+      "context" : "In addition to the techniques that typically scale only for smaller programs and attempt to satisfy the specification completely (Alur et al., 2013; Solar-Lezama et al., 2006; Solar-Lezama, 2013; Jha et al., 2010) a recent line of work considers a different setting consisting of large (e.g., millions of examples) and noisy (i.e., no program can satisfy all examples perfectly) datasets. This is the setting that needs to be considered when synthesizing programs in our setting and in a language such as TChar. Here, the work of Raychev et al. (2016b) showed how to efficiently synthesize straight-line programs and how to handle noise, then Raychev et al.",
+      "startOffset" : 130,
+      "endOffset" : 553
+    }, {
+      "referenceID" : 1,
+      "context" : "In addition to the techniques that typically scale only for smaller programs and attempt to satisfy the specification completely (Alur et al., 2013; Solar-Lezama et al., 2006; Solar-Lezama, 2013; Jha et al., 2010) a recent line of work considers a different setting consisting of large (e.g., millions of examples) and noisy (i.e., no program can satisfy all examples perfectly) datasets. This is the setting that needs to be considered when synthesizing programs in our setting and in a language such as TChar. Here, the work of Raychev et al. (2016b) showed how to efficiently synthesize straight-line programs and how to handle noise, then Raychev et al. (2016a) showed how to synthesize branches, and thework of Heule et al.",
+      "startOffset" : 130,
+      "endOffset" : 666
+    }, {
+      "referenceID" : 1,
+      "context" : "In addition to the techniques that typically scale only for smaller programs and attempt to satisfy the specification completely (Alur et al., 2013; Solar-Lezama et al., 2006; Solar-Lezama, 2013; Jha et al., 2010) a recent line of work considers a different setting consisting of large (e.g., millions of examples) and noisy (i.e., no program can satisfy all examples perfectly) datasets. This is the setting that needs to be considered when synthesizing programs in our setting and in a language such as TChar. Here, the work of Raychev et al. (2016b) showed how to efficiently synthesize straight-line programs and how to handle noise, then Raychev et al. (2016a) showed how to synthesize branches, and thework of Heule et al. (2015) proposed a way to synthesize loops.",
+      "startOffset" : 130,
+      "endOffset" : 736
+    }, {
+      "referenceID" : 3,
+      "context" : "Recurrent Neural Networks Recent years have seen an emerging interest in building a neural language models over words (Bengio et al., 2003), characters (Karpathy et al.",
+      "startOffset" : 118,
+      "endOffset" : 139
+    }, {
+      "referenceID" : 17,
+      "context" : ", 2003), characters (Karpathy et al., 2015; Sutskever et al., 2011; Wu et al., 2016) as well as combination of both (Chung et al.",
+      "startOffset" : 20,
+      "endOffset" : 84
+    }, {
+      "referenceID" : 29,
+      "context" : ", 2003), characters (Karpathy et al., 2015; Sutskever et al., 2011; Wu et al., 2016) as well as combination of both (Chung et al.",
+      "startOffset" : 20,
+      "endOffset" : 84
+    }, {
+      "referenceID" : 32,
+      "context" : ", 2003), characters (Karpathy et al., 2015; Sutskever et al., 2011; Wu et al., 2016) as well as combination of both (Chung et al.",
+      "startOffset" : 20,
+      "endOffset" : 84
+    }, {
+      "referenceID" : 6,
+      "context" : ", 2016) as well as combination of both (Chung et al., 2017; Kim et al., 2015; Mikolov et al., 2012).",
+      "startOffset" : 39,
+      "endOffset" : 99
+    }, {
+      "referenceID" : 18,
+      "context" : ", 2016) as well as combination of both (Chung et al., 2017; Kim et al., 2015; Mikolov et al., 2012).",
+      "startOffset" : 39,
+      "endOffset" : 99
+    }, {
+      "referenceID" : 23,
+      "context" : ", 2016) as well as combination of both (Chung et al., 2017; Kim et al., 2015; Mikolov et al., 2012).",
+      "startOffset" : 39,
+      "endOffset" : 99
+    }, {
+      "referenceID" : 28,
+      "context" : "For example, the context on which the predictions are conditioned is similar to the attention mechanism (Sukhbaatar et al., 2015; Bahdanau et al., 2014) and might be incorporated into that training in the future.",
+      "startOffset" : 104,
+      "endOffset" : 152
+    }, {
+      "referenceID" : 2,
+      "context" : "For example, the context on which the predictions are conditioned is similar to the attention mechanism (Sukhbaatar et al., 2015; Bahdanau et al., 2014) and might be incorporated into that training in the future.",
+      "startOffset" : 104,
+      "endOffset" : 152
+    } ],
+    "year" : 2017,
+    "abstractText" : "We propose a statistical model applicable to character level language modeling and show that it is a good fit for both, program source code and English text. The model is parameterized by a program from a domain-specific language (DSL) that allows expressing non-trivial data dependencies. Learning is done in two phases: (i) we synthesize a program from the DSL, essentially learning a good representation for the data, and (ii) we learn parameters from the training data – the process is done via counting, as in simple language models such as n-gram. Our experiments show that the precision of our model is comparable to that of neural networks while sharing a number of advantages with n-gram models such as fast query time and the capability to quickly add and remove training data samples. Further, the model is parameterized by a program that can be manually inspected, understood and updated, addressing a major problem of neural networks.",
+    "creator" : "LaTeX with hyperref package"
+  }
+}

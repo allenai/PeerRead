@@ -1,0 +1,343 @@
+{
+  "name" : "780.pdf",
+  "metadata" : {
+    "source" : "CRF",
+    "title" : null,
+    "authors" : [ "Linnan Wang", "Wei Wu", "Zenglin Xu" ],
+    "emails" : [ "linnan.wang@gatech.edu", "bosilca}@icl.utk.edu", "richie@cc.gatech.edu", "zlxu@uestc.edu.cn" ],
+    "sections" : [ {
+      "heading" : "1 INTRODUCTION",
+      "text" : "Scaling up neural networks with respect to parameter sizes, training sets, or both has drastically improved the state-of-the-art performance in several domains ranging from scene understanding, speech recognition, even to playing Go against professional players. Although training a large network saturated with nonlinearities is extremely time-consuming, the benefits brought forth by large-scale models has sparked a surge of interest in parallelizing training on multi-GPUs. The parallelization of SGD demands synchronizations to exchange gradients and parameters per iteration, and this introduces significant communication overhead. Previous studies have focused on trading the SGD convergence rate for fast gradient updates, such as stale or asynchronous SGD, 1-bit compressed gradient, etc. However, these methods are rarely adopted by Deep Learning frameworks as they depend on the balance between the enhanced iteration throughput and the decelerated convergence rate. Since BSP retains the convergence properties of SGD, its optimization should be of interest.\nThe gradient aggregations and parameter exchanges in BSP SGD are typical operations of communication collectives (Chan et al., 2007). Messages in the large-scale neural networks training are dense, long, and fixed-length, while the performance of collective algorithms is drastically sensitive to these attributes. Besides, the processing speed is several orders of magnitude faster than the network unidirectional transmission rate. These prioritize the utilization of network bandwidth in the collective design. However, we have seen sub-optimal collective algorithms, e.g. MST and BE, widely adopted by the deep learning community (Agarwal et al., 2014) (Jia et al., 2014) (Duchi et al., 2011). MST is only suitable for the latency dominant case such as frequent short message exchanges, while the bandwidth term of BE can be further improved (Thakur et al., 2005).\nIn this paper, we introduce new Linear Pipeline based collectives for multiGPU training. The collectives demonstrate O(log(P )) speedups over MST collectives and up to 2x speedups over BE based ones; the bounds only hold in training large neural networks. In particular, the theoretical analysis and the implementation yield an interesting insight that the cost of our design is invariant to GPU numbers, i.e., the cost of collective operations on 2 GPUs is similar to 20 GPUs. The design explores message granularity to maximize simultaneous bidirectional data exchanges. In specific, it divides a message into fine-grained blocks as the basic communication element. A GPU sends a block (via DMA 1) while receiving (via DMA 2) a new block from a neighbor. The copies are asynchronously launched on two GPU streams, and numerical operations further overlap data copies. As a result, our method yields a highly efficient pipeline over which messages for neural network training may be exchanged.\nThe proposed collective design achieves 2.3x to 360.55x speedups over Open MPI alternatives on 6 GPUs. In training GoogLeNet, we set up the same BSP SGD implementation with different underlying collectives. Our design demonstrates up to 1.7x convergence speedup over MST based Caffe."
+    }, {
+      "heading" : "2 RELATED WORK",
+      "text" : "The communication overhead has been widely identified as the major bottleneck in the data-parallel SGD (Shamir (2014), Li et al. (2014)). The data parallelism linearly adds the processing power by concurrent gradient computations with multiple GPUs. But it also requires synchronizations to collect partial gradients or to broadcast parameters. In practice, the communication rate is several orders of magnitude slower than the computation (Coates et al., 2013). Various approaches have been proposed to reduce the overhead.\nThe first group of approaches relaxes synchronous models of SGD to increase the iteration throughput (Dean et al. (2012), Zinkevich et al. (2010)). In this case, the relaxed SGD enables computations on a GPU to partially overlap with communications on others as demonstrated in Fig.1c and Fig.1d. Recht et al. (2011) proposed a lock free Asynchronous SGD (ASGD) that entirely gets rid of the synchronization requirement by allowing free concurrent parameter updates. But the relaxation only works well on sparse learning problems. In response, Ho et al. (2013) introduced the concept of staleness by bounding the fastest and the slowest machine within a few iterations of each other to ensure correctness. These relaxations claim to be effective as the enhanced iteration throughput offsets the disadvantages of degraded convergence rate. However, recent advances in deep learning frameworks (Cui et al. (2016)) have reestablished the advantages of BSP over relaxed ones in training neural networks. This reiterates the importance of studying BSP SGD.\nThe second group of approaches tries to reduce the overall communication volume. Seide et al. (2014) quantized gradients from 32 bits to 1 bit to reduce the message length, but the lost gradient information decelerates the convergence rate. Another approach is to accelerate the convergence with a large batch. Dekel et al. (2012) shows the convergence rate of mini-batch SGD isO(1/ √ Tb+1/T ) with b being the batch size. This result indicates a large batch needs fewer iterations to find a solution, and thereby fewer overall synchronizations. However, unwieldy increasing the batch size is also unfavorable under limited computing resources demonstrated by Wang et al. (2016b). Please note these methods still need synchronizations, and our work will further improve their performance.\nThe third group of approaches conducts system optimizations to minimize the communication cost (Wang et al., 2016a). Agarwal & Duchi (2011) and Agarwal et al. (2014) presented partial gradients aggregations guided with a MST that takes log(P ) steps to fully synchronize the model. Deep learning frameworks such as Caffe (Jia et al., 2014) also adopt this approach. Unfortunately, MST is only suitable for latency dominant scenarios (i.e. high frequent short messages). Although collective algorithms have been thoroughly discussed in the HPC community (Almási et al. (2005), Gabriel et al. (2004), Shipman et al. (2006)), few have studied their performances for the deep learning. The performance of collectives varies significantly with different message lengths and network topologies, while messages in deep network training are dense, long and fixed-length. Therefore, it is imperative to address such peculiarities in the collectives. Worringen (2003) proposed a pipeline collective model in shared memory environment for CPU data, but communications of different MPI processes sharing the same CPU memory bus within the same CPU socket. This causes bandwidth competition among different processes, thereby poor performance for the collective communication in shared memory environment for CPU data. In contrast, PCI-E is bi-directional. The latest GPUs also feature two independent DMA engines for simultaneous independent in/out communications. The hardware updates pave the way for LP based GPU communications."
+    }, {
+      "heading" : "3 LINEAR PIPELINE BASED COLLECTIVE DESIGN DEDICATED FOR NEURAL NETWORK TRAINING ON MULTI-GPUS",
+      "text" : "This section presents a new LP based MultiGPU collective design ensued by the concrete proof of its performance in training neural networks. The general idea of LP is as follows: a) we dissect a long message into fine-grained blocks. b) a GPU receives a block from the prior GPU via DMA1 while sending a block to the next one via DMA2. Please note each block exchange utilizes an independent physical link, and the entire network is fully utilized once the pipeline is filled.\nBroadcast tackles the synchronizations of parameters among multiple GPUs. It copies the source vector to every GPU. Fig.2a illustrates the data flow of the broadcast collective on 3 GPUs. GPU0 is the source, and the rest are destinations. Broadcast starts with filling the pipe by copying block a on GPU0 to GPU1 at step 1. Let’s focus on GPU1. At each step, GPU1 receives a block from GPU0 via DMA1, while GPU1 is also sending a block to GPU2 via DMA2. The data exchange in either way utilizes an independent link and DMA engine to achieve the maximal unidirectional rate. Hence, the bandwidth is fully exploited.\nReduce aggregates the partial gradients to reconstruct the global one. It combines the elements provided in the vector of each GPU, and returns the combined value in the receive vector to a specific GPU. It supports basic arithmetic operations such as summations and multiplications. Fig.2b illustrates the data flow of the reduce collective. GPU2 is the root that aggregates the vectors across all GPUs. Reduce starts with filling the pipe by writing block a0 to a buffer on GPU1. Then, GPU1 reduces the received block a0 with a1 to yield a′ (within the rectangle of Fig.2b). Please note the computation is much faster than the communication, we assume no latency on it. In practice, computations are further overlapped with communications. In the next step, GPU1 retrieves b0 from GPU0 to reduce to b′ via DMA 1, while GPU1 is also sending a′ to GPU2 to reduce to a′′ via DMA 2. b′′, c′′, d′′ are reduced at steps 3, 4, 5 in a similar fashion.\nAllReduce enables us to collect partial gradients and broadcast the latest parameters with only one synchronization point per SGD iteration. It combines vectors from all GPUs and distributes the\nresult back to them. Mathematically, it is equivalent to a reduce followed by a broadcast. However, allreduce is more efficient than two separate calls as it only needs to fill the pipeline once. For example, it takes 9 timesteps to allreduce 4 message blocks, while broadcast + reduce will cost 10. Fig.2c illustrates the data flow of the allreduce collective. It starts with reducing a′′, after which a′′ is broadcast to GPU1 and GPU2 at step 5, 6 respectively. Please note d0 utilizes the outbound DMA at step 4, therefore a′′ has to wait until step 5. b′′, c′′, d′′ are processed in a similar fashion.\nOur collective is also specifically designed to accommodate GPU features such as asynchronous kernel launches and multi-stream processing. In the rectangle of Fig.2a, it demonstrates the data transfers are asynchronously launched on two separate streams. The copies happening in the red steps are scheduled on one stream while copies in the black steps are scheduled on another stream. This overlaps the overhead of GPU kernel launches, further improving the pipeline. We illustrate the data flow of the collectives on 3 GPUs. If there are k GPUs, GPU n, 0 < n < k − 1, duplicates the same communication pattern on GPU 1."
+    }, {
+      "heading" : "3.1 ARCHITECTURE ANALYSIS",
+      "text" : "LP is the optimal collective algorithm to fully exploit the network bandwidth of a MultiGPU system. Even though PCI-E supports full-duplex communication between any two endpoints, each PCI-E endpoint device only has one input and output port. This results in bandwidth competition if a GPU is receiving from multiple GPUs. Similarly, each PCI-E switch only contains one input and output port used for inter-switch communication, and inter-switch communications of the same direction also compete for the PCI-E bus. It is known that any delay in data movement between two GPUs interrupts the pipelining in the collectives. In such architecture, the communication from parents to children in MST based collective algorithms will compete for the same PCI-E bus, therefore breaking pipelining. The data exchange of BE also suffers from the inter-switch communication congestion in one direction. In contrast, LP connects all GPUs into a chain, and data always flow in one direction. Hence, data movements between two GPUs exclusively occupy the entire PCI-E bus, ensuring uninterrupted pipelining."
+    }, {
+      "heading" : "3.2 THEORETICAL ANALYSIS",
+      "text" : "We adopt a cost model widely used by the MPI community to analyze collective operations (Thakur et al. (2005), Thakur & Gropp (2003)). The model assumes the time taken to send a message between two nodes follows:\nT = α+ βn+ γn (1)\nwhere α is the latency or startup time of sending a message, β and γ is the transmission rate and reduce rate measured by time per byte, and n is the message size in bytes. We also denote p as the node count, and b as the block size (in bytes) in the pipeline.\nProposition 1 If the network latency α→ 0, Linear Pipeline collectives provide anO(log p) speedup over Minimal Spanning Tree collectives and up to a 2 times speedup over Bidirectional Exchange collectives as the message size n→∞.\nProof. First, we derive the costs of the three Linear Pipeline collectives. According to Fig.2, the length of pipeline is p− 1 + nb blocks assuming each block to be b bytes. A block exchange takes α+ βb+ γb (with reduce) or α+ βb (without reduce). Consequently, broadcast essentially costs (α+βb)(p−1+ nb ) = (p−1+ n b )α+(b(p−1)+n)β, and reduce costs (α+βb+γb)(p−1+ n b ) = (p − 1 + nb )α + (b(p − 1) + n)(β + γ). allreduce is approximately equivalent with a reduce\nfollowed by a broadcast. Therefore, the allreduce’s cost is broadcast’s cost plus reduce’s cost, i.e. 2(p− 1 + nb )α+ (bp− b+ n)(2β + γ). Secondly, we derive the costs of the three Minimal Spanning Tree collectives. MPI adopts MST to broadcast or reduce short messages (Thakur et al. (2005)), the length of which is less than 12 KB. The core concept of MST is to organize p GPUs into a balanced tree of height dlogpe. Then, it takes dlog pe steps to traverse all GPUs in the tree. Each step carries the message of length n, resulting in the cost of broadcast to be the tree height times the cost per step, i.e. log p(α+ nβ) (we omit the ceiling for simplicity). Similarly, MST reduce is log p(α+ nβ + nγ), and MST allreduce is also a combination of broadcast and reduce. Please note the latency term, log pα, is the smallest among algorithms in Table.1, and the bandwidth term, log pnβ, is the slowest as log pnβ nβ. Therefore, MST is widely used for high frequent exchanges of short message.\nFinally, we present the costs of the three Bidirectional Exchange collectives. MPI broadcast handles long messages with a MST scatter followed by a BE allgather. Please refer to Chan et al. (2007) for the analysis of BE collectives. Basically, scatter costs ∑dlogpe k=1 (α+2\n−knβ) = log pα+ p−1p nβ, while allgather costs (p − 1)α + p−1p nβ. The cost of broadcast is the sum of these two. The MPI long message reduce consists of a reducescatter plus a gather, while allreduce consists of a reducescatter and a allgather. The cost for reducescatter is log pα + p−1p nβ + p−1 p nγ, and both the costs of gather and allgather are log pα + p−1p nβ (also in Chan et al. (2007)). Table 1 summarizes the costs of broadcast, reduce and allreduce for the three different underlying algorithms.\nThe proposition holds under the assumptions of α → 0 and n → ∞, and these assumptions are legitimate for the training of large scale neural networks on multiGPUs. Nowadays, the PCI Express x16 effectively reduces the latency α down to 10−7s. The current two sockets shared memory machine supports up to 8 GPUs indicating limited p in practice. Let’s take an appropriate block size b to ensure p nb and α n b ∼ 0. This enables us to safely ignore the latency term, e.g. log pα in MST broadcast. On the other hand, current deep convolutional neural network uses a tremendous number of parameters. For example, AlexNet uses 50 MB parameters. The transmission rate1 β ∼ 109Byte/Seconds. Compared to the trivial latency term, the bandwidth term dominates the entire cost T . This result leads us to simplify the costs of BE, MST, and LP based broadcast (Table. 2) to be 2p−1p nβ, nβ log p and (b(p− 1) + n)β, obtaining the following equations:\nTbroadcast BE Tbroadcast LP\n≈ 2(1− 1p )\n1 + bn (p− 1) < 2 (2)\nTbroadcast MST Tbroadcast LP ≈ log p b(p−1) n + 1 < log p (3)\nCompared with broadcast, reduce has the additional γ term. Please note the processing speed of GPUs exceeds TFLOPs implying the term γ ∗ n→ 0. Therefore, it is also legitimate to ignore the γ term, and it yields the same result Treduce BE/Treduce LP < 2 and Treduce MST /Treduce LP < log p. This completes our proof of the proposition 1.\nAnother interesting point is the cost of Linear Pipeline is invariant to GPU count p regardless of message length n. This implies broadcasting a vector to 8 GPUs should cost the same as broadcasting to 2 GPUs. In practice, we set the block size b around 64 KB, and p is within 101. This suggests the bandwidth term, e.g. the cost of LP broadcast (bp − p + n)β ∼ nβ. Hence, the cost of LP collectives are less likely to be affected by GPU counts p."
+    }, {
+      "heading" : "3.3 DEEP LEARNING WITH EFFICIENT BSP SGD",
+      "text" : "We formulate the neural network training as the following optimization problem. Let ψ be a loss function with weight vector w as function parameters that takes randomly sampled images dt as the\n1https://en.wikipedia.org/wiki/InfiniBand\nAlgorithm 1: BSP SGD with communications/computations overlapping. 1 while not converge do 2 broadcast(w0t ) 3 for i ∈ [0, 1, ...,max layers] do 4 nonblocking broadcast(wi+1t ) 5 Forward(i) 6 sync broadcast()\n7 Backward(max layers) 8 for i ∈ [max layers− 1, ..., 1, 0] do 9 nonblocking reduce(∇ψi+1sub)\n10 Backward(i) 11 sync reduce()\n12 wt+1 = GradientUpdate()\nAlgorithm 2: BSP SGD uses broadcast + reduce. 1 while not converge do 2 ∇ψsub = ForwardBackward(dt) 3 ∇ψ = reduce(∇ψsub) 4 if root then 5 wt+1 = GradientUpdate()\n6 broadcast(wt+1) 7 barrier /* sync new w */\nAlgorithm 3: BSP SGD uses allreduce. 1 while not converge do 2 ∇ψsub = ForwardBackward(dt) 3 ∇ψ = allreduce(∇ψsub) 4 barrier /* collect ∇ψsub */ 5 wt+1 = GradientUpdate() 6 if iter%5 = 0 then 7 broadcast(wt+1)\ninput. The objective of training is to find an approximate solution to the following problem:\nmin w\nE{ψw(dt)} = ∫\nΩ\nψw(dt)dP (4)\nA typical neural network training iteration consists of a forward and backward pass. The forward pass yields a loss that measures the discrepancy between the current predictions and the target; The backward pass calculates the gradient, the negative of which points to the steepest descent direction. The gradient descent updates the parameters, w, as follows:\nwt = wt−1 − ηt∇ψw(dt) (5)\nGuided with Data Parallelism, BSP SGD evenly divides dt into p slices d1t ,d 2 t , ...,d p t so that every GPU computes a partial gradient from dit in parallel. The global gradient is equivalent to the average of partial gradients. After finishing the gradient update, wt is synchronized to all GPUs. We integrate the proposed collectives into this process to harness parallel processing capabilities of multiGPU system. In this paper, we discuss two approaches to BSP SGD implementations.\n•fork and join: This approach forks the gradient computations, and joins partial gradients with communications. In this case, communications do not overlap with computations. Alg.2 and Alg.3 demonstrate two collective based implementations using 2 and 1 synchronization points, respectively.\nIn Alg.2, synchronizations rely on broadcast and reduce. Each GPU calculates a partial gradient referred to as ∇ψsub. The master GPU reconstructs ∇ψ by reducing all ∇ψsub. Then, the GPUs synchronize the latest weight, w, by broadcasting.\nIn Alg.3, synchronizations only rely on allreduce. The differences between this and Alg.2 are that 1) there is only 1 synchronization point; 2) every GPU computes the gradient update. However, the parameters are not consistent after several iterations due to the precision issues of float multiplications inGradientUpdate. We synchronize w every 5 iterations to enforce consistency while still retaining the benefit of efficient pipelining in allreduce (line 7-8 Alg.3).\n•overlapping communications with computations: Another approach is to overlap communications and computations for each network layer. In the forward pass, GPUs broadcast network parameters of layer t+1 during forward computations at layer t. In the backward pass, GPUs reduce\n•pros and cons of both approaches: The cost of Alg.2 or Alg.3 is comm+ compt, while the cost of Alg.1 is max(comm, compt). If the network has over a few hundred MB of parameters, the overlapping will be significantly better than the fork and join approach. However, Alg.2 and Alg.3 are relatively easy to implement, and the performance on networks < 100 MB is similar to that of Alg.1."
+    }, {
+      "heading" : "4 EXPERIMENT",
+      "text" : ""
+    }, {
+      "heading" : "4.1 COLLECTIVES EVALUATION",
+      "text" : "The MST and BE implementations used in benchmarks are Caffe 2 and OpenMPI. Caffe optimizes the GPU placement in an MST to fully utilize inter-GPU peer to peer (P2P) access. OpenMPI and our implementation, similar to Caffe, also take advantages of P2P. We set up AlexNet and GoogLeNet training using the three BSP SGD algorithms proposed in section 3.3.\nFig.3 presents the performance of LP, MST, and BE based collectives at different message sizes on 4 K40m. The LP broadcast demonstrates an average of 29.2x and 2.3x speedup over BE and MST based alternatives in Caffe and OpenMPI; the LP reduce demonstrates an average of 360.55x and 8.7x speedup over BE and MST reduce, and the LP allreduce demonstrates an average of 109.2x and 7.9x speedup over BE and MST allreduce. In theory, LP is approximately 2x faster than both the MST (p = 4 → logp = 2) and BE approaches. An extraordinary speedup against Open MPI is observable due to inefficient data movement in Open MPI, which moves data to host RAM to perform reduce operations on the CPU before being copied to the target GPU. Instead, we perform reduce on the GPUs, and data blocks directly flow to the target GPU via P2P access. The overlapped reduce computations with communications enables our reduce and allreduce to be 8x faster than that of MST. At each step of MST, GPUs reduce the incoming data only after all the data is available. In contrast, our fine-grained block design enables communications and computations to overlap by reducing a block while receiving a new one in the pipeline. broadcast only involves data copies, and both we and Caffe use P2P to transmit the data. Therefore, the speedup of MST broadcast (2.3x), conforms to the 2.0x theoretical prediction.\nThe theoretical analysis indicates both the cost of LP and BE collectives are invariant to the GPU count p, while the cost of MST increases with p by a factor of logp. This is also noticeable in the\n2Caffe implements an MST based broadcast and reduce for the multiGPU training.\nscalability experiment demonstrated in Fig.4. Please note there is a cost jump between 4 and 5 GPUs. Communications have to go through QPI after 4 GPUs incurring the additional cost of copying through the host RAM. The cost of the Linear Pipeline method robustly stays the same if GPU counts =[2,3,4] or [5,6], and QPI explains the inconsistency. The communication steps of MST for 2,3,4,5,6 GPUs are 1,2,2,3,3, respectively. The MST experiments verify the logp cost increase w.r.t GPU counts by evident cost jumps at 3 and 5 GPUs. The data flow of OpenMPI between two GPUs follows GPU RAM→host RAM→GPU RAM. The inefficient data flow inside Open MPI contributes to the near linear cost increase with GPU counts p."
+    }, {
+      "heading" : "4.2 IMPACT ON THE NEURAL NETWORK TRAINING",
+      "text" : "Fig.5 demonstrates LP collectives effectively reduce the total training time without affecting SGD’s convergence properties in training large scale neural networks. We use inspurCaffe, Caffe and cuhk’s Caffe branch to benchmark the performance of BE-Alg.1, MST-Alg.1 and BE-Overlap-Alg.3. We also implement Alg.1,2,3, integrated with LP collectives, in Caffe to ensure consistency. Please note the model size affects the communication time, while the batch size affects the computation time. We carefully set these parameters to cover as many cases as possible. Please refer to the captions of Table.2 and Fig.5 for experiment details. We assume these algorithms have similar convergence speeds in iterations as losses of AlexNet are approximately 1 after 30000 iterations and losses of GoogLeNet are approximately 2 after 67000 iterations. However, the time taken to reach the target loss varies dramatically. For example, the speedups of LP-Overlap-Alg.3 over BE-Alg.1 in training AlexNet and GoogLeNet are 2.12x and 2.19x, respectively.\nUnder Alg.1, but using different underlying collective algorithms, LP-Alg.1 presents 1.91x and 1.74x speedup over BE-Alg.1 and MST-Alg.1 in AlexNet, and 1.6x and 1.1x speedup over BE-Alg.1 and MST-Alg.1 in GoogLeNet. The iteration profiles of these 3 algorithms in Table.2 indicate the communication cost of LP-Alg.1 is only 10% of BE-Alg.1, and 11% of MST-Alg.1 in AlexNet; and 6% of BE-Alg.1, and 43% of MST-Alg.1 in GoogLetNet.\nThe experiments demonstrate that the speed of the three proposed BSP SGD algorithms is Alg.3 > Alg.2 > Alg.1. The result conforms to our expectations as the cost of Alg.3 is max(comm, compt), while the cost of Alg.1 and Alg.2 is comm+ compt. However, the performance gain is quite limited from Alg.2 to Alg.3 as there is little room left for reducing communications from LP Alg.2 to Alg.3 as demonstrated in Table.2. If the model parameters keep increasing, we expect Alg.3 to be more efficient than Alg.2."
+    } ],
+    "references" : [ {
+      "title" : "Distributed delayed stochastic optimization",
+      "author" : [ "Alekh Agarwal", "John C Duchi" ],
+      "venue" : "In Advances in Neural Information Processing Systems,",
+      "citeRegEx" : "Agarwal and Duchi.,? \\Q2011\\E",
+      "shortCiteRegEx" : "Agarwal and Duchi.",
+      "year" : 2011
+    }, {
+      "title" : "A reliable effective terascale linear learning system",
+      "author" : [ "Alekh Agarwal", "Olivier Chapelle", "Miroslav Dudı́k", "John Langford" ],
+      "venue" : "Journal of Machine Learning Research,",
+      "citeRegEx" : "Agarwal et al\\.,? \\Q2014\\E",
+      "shortCiteRegEx" : "Agarwal et al\\.",
+      "year" : 2014
+    }, {
+      "title" : "Optimization of mpi collective communication on bluegene/l systems",
+      "author" : [ "George Almási", "Philip Heidelberger", "Charles J Archer", "Xavier Martorell", "C Chris Erway", "José E Moreira", "B Steinmacher-Burow", "Yili Zheng" ],
+      "venue" : "In Proceedings of the 19th annual international conference on Supercomputing,",
+      "citeRegEx" : "Almási et al\\.,? \\Q2005\\E",
+      "shortCiteRegEx" : "Almási et al\\.",
+      "year" : 2005
+    }, {
+      "title" : "Collective communication: theory, practice, and experience",
+      "author" : [ "Ernie Chan", "Marcel Heimlich", "Avi Purkayastha", "Robert Van De Geijn" ],
+      "venue" : "Concurrency and Computation: Practice and Experience,",
+      "citeRegEx" : "Chan et al\\.,? \\Q2007\\E",
+      "shortCiteRegEx" : "Chan et al\\.",
+      "year" : 2007
+    }, {
+      "title" : "Deep learning with cots hpc systems",
+      "author" : [ "Adam Coates", "Brody Huval", "Tao Wang", "David Wu", "Bryan Catanzaro", "Ng Andrew" ],
+      "venue" : "In Proceedings of the 30th international conference on machine learning,",
+      "citeRegEx" : "Coates et al\\.,? \\Q2013\\E",
+      "shortCiteRegEx" : "Coates et al\\.",
+      "year" : 2013
+    }, {
+      "title" : "Geeps: Scalable deep learning on distributed gpus with a gpu-specialized parameter server",
+      "author" : [ "Henggang Cui", "Hao Zhang", "Gregory R Ganger", "Phillip B Gibbons", "Eric P Xing" ],
+      "venue" : "In Proceedings of the Eleventh European Conference on Computer Systems,",
+      "citeRegEx" : "Cui et al\\.,? \\Q2016\\E",
+      "shortCiteRegEx" : "Cui et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Large scale distributed deep networks",
+      "author" : [ "Jeffrey Dean", "Greg Corrado", "Rajat Monga", "Kai Chen", "Matthieu Devin", "Mark Mao", "Andrew Senior", "Paul Tucker", "Ke Yang", "Quoc V Le" ],
+      "venue" : "In Advances in Neural Information Processing Systems,",
+      "citeRegEx" : "Dean et al\\.,? \\Q2012\\E",
+      "shortCiteRegEx" : "Dean et al\\.",
+      "year" : 2012
+    }, {
+      "title" : "Optimal distributed online prediction using mini-batches",
+      "author" : [ "Ofer Dekel", "Ran Gilad-Bachrach", "Ohad Shamir", "Lin Xiao" ],
+      "venue" : "The Journal of Machine Learning Research,",
+      "citeRegEx" : "Dekel et al\\.,? \\Q2012\\E",
+      "shortCiteRegEx" : "Dekel et al\\.",
+      "year" : 2012
+    }, {
+      "title" : "Adaptive subgradient methods for online learning and stochastic optimization",
+      "author" : [ "John Duchi", "Elad Hazan", "Yoram Singer" ],
+      "venue" : "The Journal of Machine Learning Research,",
+      "citeRegEx" : "Duchi et al\\.,? \\Q2011\\E",
+      "shortCiteRegEx" : "Duchi et al\\.",
+      "year" : 2011
+    }, {
+      "title" : "Open mpi: Goals, concept, and design of a next generation mpi implementation",
+      "author" : [ "Edgar Gabriel", "Graham E Fagg", "George Bosilca", "Thara Angskun", "Jack J Dongarra", "Jeffrey M Squyres", "Vishal Sahay", "Prabhanjan Kambadur", "Brian Barrett", "Andrew Lumsdaine" ],
+      "venue" : "In European Parallel Virtual Machine/Message Passing Interface Users’ Group Meeting,",
+      "citeRegEx" : "Gabriel et al\\.,? \\Q2004\\E",
+      "shortCiteRegEx" : "Gabriel et al\\.",
+      "year" : 2004
+    }, {
+      "title" : "More effective distributed ml via a stale synchronous parallel parameter server",
+      "author" : [ "Qirong Ho", "James Cipar", "Henggang Cui", "Seunghak Lee", "Jin Kyu Kim", "Phillip B Gibbons", "Garth A Gibson", "Greg Ganger", "Eric P Xing" ],
+      "venue" : "In Advances in neural information processing systems,",
+      "citeRegEx" : "Ho et al\\.,? \\Q2013\\E",
+      "shortCiteRegEx" : "Ho et al\\.",
+      "year" : 2013
+    }, {
+      "title" : "Caffe: Convolutional architecture for fast feature embedding",
+      "author" : [ "Yangqing Jia", "Evan Shelhamer", "Jeff Donahue", "Sergey Karayev", "Jonathan Long", "Ross Girshick", "Sergio Guadarrama", "Trevor Darrell" ],
+      "venue" : "In Proceedings of the 22nd ACM international conference on Multimedia,",
+      "citeRegEx" : "Jia et al\\.,? \\Q2014\\E",
+      "shortCiteRegEx" : "Jia et al\\.",
+      "year" : 2014
+    }, {
+      "title" : "Communication efficient distributed machine learning with the parameter server",
+      "author" : [ "Mu Li", "David G Andersen", "Alex J Smola", "Kai Yu" ],
+      "venue" : "In Advances in Neural Information Processing Systems,",
+      "citeRegEx" : "Li et al\\.,? \\Q2014\\E",
+      "shortCiteRegEx" : "Li et al\\.",
+      "year" : 2014
+    }, {
+      "title" : "Hogwild: A lock-free approach to parallelizing stochastic gradient descent",
+      "author" : [ "Benjamin Recht", "Christopher Re", "Stephen Wright", "Feng Niu" ],
+      "venue" : "In Advances in Neural Information Processing Systems,",
+      "citeRegEx" : "Recht et al\\.,? \\Q2011\\E",
+      "shortCiteRegEx" : "Recht et al\\.",
+      "year" : 2011
+    }, {
+      "title" : "1-bit stochastic gradient descent and its application to data-parallel distributed training of speech dnns",
+      "author" : [ "Frank Seide", "Hao Fu", "Jasha Droppo", "Gang Li", "Dong Yu" ],
+      "venue" : "In INTERSPEECH,",
+      "citeRegEx" : "Seide et al\\.,? \\Q2014\\E",
+      "shortCiteRegEx" : "Seide et al\\.",
+      "year" : 2014
+    }, {
+      "title" : "Fundamental limits of online and distributed algorithms for statistical learning and estimation",
+      "author" : [ "Ohad Shamir" ],
+      "venue" : "In Advances in Neural Information Processing Systems,",
+      "citeRegEx" : "Shamir.,? \\Q2014\\E",
+      "shortCiteRegEx" : "Shamir.",
+      "year" : 2014
+    }, {
+      "title" : "Infiniband scalability in open mpi",
+      "author" : [ "Galen M Shipman", "Timothy S Woodall", "Richard L Graham", "Arthur B Maccabe", "Patrick G Bridges" ],
+      "venue" : "In Proceedings 20th IEEE International Parallel & Distributed Processing Symposium, pp. 10–pp. IEEE,",
+      "citeRegEx" : "Shipman et al\\.,? \\Q2006\\E",
+      "shortCiteRegEx" : "Shipman et al\\.",
+      "year" : 2006
+    }, {
+      "title" : "Improving the performance of collective operations in mpich",
+      "author" : [ "Rajeev Thakur", "William D Gropp" ],
+      "venue" : "Recent Advances in Parallel Virtual Machine and Message Passing Interface,",
+      "citeRegEx" : "Thakur and Gropp.,? \\Q2003\\E",
+      "shortCiteRegEx" : "Thakur and Gropp.",
+      "year" : 2003
+    }, {
+      "title" : "Optimization of collective communication operations in mpich",
+      "author" : [ "Rajeev Thakur", "Rolf Rabenseifner", "William Gropp" ],
+      "venue" : "International Journal of High Performance Computing Applications,",
+      "citeRegEx" : "Thakur et al\\.,? \\Q2005\\E",
+      "shortCiteRegEx" : "Thakur et al\\.",
+      "year" : 2005
+    }, {
+      "title" : "Blasx: A high performance level-3 blas library for heterogeneous multi-gpu computing",
+      "author" : [ "Linnan Wang", "Wu Wei", "Zenglin Xu", "Jianxiong Xiao", "Yi Yang" ],
+      "venue" : "In ICS ’16: Proceedings of the 30th ACM on International Conference on Supercomputing,",
+      "citeRegEx" : "Wang et al\\.,? \\Q2016\\E",
+      "shortCiteRegEx" : "Wang et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Accelerating deep neural network training with inconsistent stochastic gradient descent",
+      "author" : [ "Linnan Wang", "Yi Yang", "Martin Renqiang Min", "Srimat Chakradhar" ],
+      "venue" : "arXiv preprint arXiv:1603.05544,",
+      "citeRegEx" : "Wang et al\\.,? \\Q2016\\E",
+      "shortCiteRegEx" : "Wang et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Pipelining and overlapping for mpi collective operations",
+      "author" : [ "Joachim Worringen" ],
+      "venue" : "In Local Computer Networks,",
+      "citeRegEx" : "Worringen.,? \\Q2003\\E",
+      "shortCiteRegEx" : "Worringen.",
+      "year" : 2003
+    }, {
+      "title" : "Parallelized stochastic gradient descent",
+      "author" : [ "Martin Zinkevich", "Markus Weimer", "Lihong Li", "Alex J Smola" ],
+      "venue" : "In Advances in neural information processing systems,",
+      "citeRegEx" : "Zinkevich et al\\.,? \\Q2010\\E",
+      "shortCiteRegEx" : "Zinkevich et al\\.",
+      "year" : 2010
+    } ],
+    "referenceMentions" : [ {
+      "referenceID" : 3,
+      "context" : "The gradient aggregations and parameter exchanges in BSP SGD are typical operations of communication collectives (Chan et al., 2007).",
+      "startOffset" : 113,
+      "endOffset" : 132
+    }, {
+      "referenceID" : 1,
+      "context" : "MST and BE, widely adopted by the deep learning community (Agarwal et al., 2014) (Jia et al.",
+      "startOffset" : 58,
+      "endOffset" : 80
+    }, {
+      "referenceID" : 11,
+      "context" : ", 2014) (Jia et al., 2014) (Duchi et al.",
+      "startOffset" : 8,
+      "endOffset" : 26
+    }, {
+      "referenceID" : 8,
+      "context" : ", 2014) (Duchi et al., 2011).",
+      "startOffset" : 8,
+      "endOffset" : 28
+    }, {
+      "referenceID" : 18,
+      "context" : "MST is only suitable for the latency dominant case such as frequent short message exchanges, while the bandwidth term of BE can be further improved (Thakur et al., 2005).",
+      "startOffset" : 148,
+      "endOffset" : 169
+    }, {
+      "referenceID" : 4,
+      "context" : "In practice, the communication rate is several orders of magnitude slower than the computation (Coates et al., 2013).",
+      "startOffset" : 95,
+      "endOffset" : 116
+    }, {
+      "referenceID" : 7,
+      "context" : "The communication overhead has been widely identified as the major bottleneck in the data-parallel SGD (Shamir (2014), Li et al.",
+      "startOffset" : 104,
+      "endOffset" : 118
+    }, {
+      "referenceID" : 7,
+      "context" : "The communication overhead has been widely identified as the major bottleneck in the data-parallel SGD (Shamir (2014), Li et al. (2014)).",
+      "startOffset" : 119,
+      "endOffset" : 136
+    }, {
+      "referenceID" : 4,
+      "context" : "In practice, the communication rate is several orders of magnitude slower than the computation (Coates et al., 2013). Various approaches have been proposed to reduce the overhead. The first group of approaches relaxes synchronous models of SGD to increase the iteration throughput (Dean et al. (2012), Zinkevich et al.",
+      "startOffset" : 96,
+      "endOffset" : 301
+    }, {
+      "referenceID" : 4,
+      "context" : "In practice, the communication rate is several orders of magnitude slower than the computation (Coates et al., 2013). Various approaches have been proposed to reduce the overhead. The first group of approaches relaxes synchronous models of SGD to increase the iteration throughput (Dean et al. (2012), Zinkevich et al. (2010)).",
+      "startOffset" : 96,
+      "endOffset" : 326
+    }, {
+      "referenceID" : 4,
+      "context" : "In practice, the communication rate is several orders of magnitude slower than the computation (Coates et al., 2013). Various approaches have been proposed to reduce the overhead. The first group of approaches relaxes synchronous models of SGD to increase the iteration throughput (Dean et al. (2012), Zinkevich et al. (2010)). In this case, the relaxed SGD enables computations on a GPU to partially overlap with communications on others as demonstrated in Fig.1c and Fig.1d. Recht et al. (2011) proposed a lock free Asynchronous SGD (ASGD) that entirely gets rid of the synchronization requirement by allowing free concurrent parameter updates.",
+      "startOffset" : 96,
+      "endOffset" : 497
+    }, {
+      "referenceID" : 4,
+      "context" : "In practice, the communication rate is several orders of magnitude slower than the computation (Coates et al., 2013). Various approaches have been proposed to reduce the overhead. The first group of approaches relaxes synchronous models of SGD to increase the iteration throughput (Dean et al. (2012), Zinkevich et al. (2010)). In this case, the relaxed SGD enables computations on a GPU to partially overlap with communications on others as demonstrated in Fig.1c and Fig.1d. Recht et al. (2011) proposed a lock free Asynchronous SGD (ASGD) that entirely gets rid of the synchronization requirement by allowing free concurrent parameter updates. But the relaxation only works well on sparse learning problems. In response, Ho et al. (2013) introduced the concept of staleness by bounding the fastest and the slowest machine within a few iterations of each other to ensure correctness.",
+      "startOffset" : 96,
+      "endOffset" : 741
+    }, {
+      "referenceID" : 4,
+      "context" : "In practice, the communication rate is several orders of magnitude slower than the computation (Coates et al., 2013). Various approaches have been proposed to reduce the overhead. The first group of approaches relaxes synchronous models of SGD to increase the iteration throughput (Dean et al. (2012), Zinkevich et al. (2010)). In this case, the relaxed SGD enables computations on a GPU to partially overlap with communications on others as demonstrated in Fig.1c and Fig.1d. Recht et al. (2011) proposed a lock free Asynchronous SGD (ASGD) that entirely gets rid of the synchronization requirement by allowing free concurrent parameter updates. But the relaxation only works well on sparse learning problems. In response, Ho et al. (2013) introduced the concept of staleness by bounding the fastest and the slowest machine within a few iterations of each other to ensure correctness. These relaxations claim to be effective as the enhanced iteration throughput offsets the disadvantages of degraded convergence rate. However, recent advances in deep learning frameworks (Cui et al. (2016)) have reestablished the advantages of BSP over relaxed ones in training neural networks.",
+      "startOffset" : 96,
+      "endOffset" : 1091
+    }, {
+      "referenceID" : 4,
+      "context" : "In practice, the communication rate is several orders of magnitude slower than the computation (Coates et al., 2013). Various approaches have been proposed to reduce the overhead. The first group of approaches relaxes synchronous models of SGD to increase the iteration throughput (Dean et al. (2012), Zinkevich et al. (2010)). In this case, the relaxed SGD enables computations on a GPU to partially overlap with communications on others as demonstrated in Fig.1c and Fig.1d. Recht et al. (2011) proposed a lock free Asynchronous SGD (ASGD) that entirely gets rid of the synchronization requirement by allowing free concurrent parameter updates. But the relaxation only works well on sparse learning problems. In response, Ho et al. (2013) introduced the concept of staleness by bounding the fastest and the slowest machine within a few iterations of each other to ensure correctness. These relaxations claim to be effective as the enhanced iteration throughput offsets the disadvantages of degraded convergence rate. However, recent advances in deep learning frameworks (Cui et al. (2016)) have reestablished the advantages of BSP over relaxed ones in training neural networks. This reiterates the importance of studying BSP SGD. The second group of approaches tries to reduce the overall communication volume. Seide et al. (2014) quantized gradients from 32 bits to 1 bit to reduce the message length, but the lost gradient information decelerates the convergence rate.",
+      "startOffset" : 96,
+      "endOffset" : 1333
+    }, {
+      "referenceID" : 4,
+      "context" : "In practice, the communication rate is several orders of magnitude slower than the computation (Coates et al., 2013). Various approaches have been proposed to reduce the overhead. The first group of approaches relaxes synchronous models of SGD to increase the iteration throughput (Dean et al. (2012), Zinkevich et al. (2010)). In this case, the relaxed SGD enables computations on a GPU to partially overlap with communications on others as demonstrated in Fig.1c and Fig.1d. Recht et al. (2011) proposed a lock free Asynchronous SGD (ASGD) that entirely gets rid of the synchronization requirement by allowing free concurrent parameter updates. But the relaxation only works well on sparse learning problems. In response, Ho et al. (2013) introduced the concept of staleness by bounding the fastest and the slowest machine within a few iterations of each other to ensure correctness. These relaxations claim to be effective as the enhanced iteration throughput offsets the disadvantages of degraded convergence rate. However, recent advances in deep learning frameworks (Cui et al. (2016)) have reestablished the advantages of BSP over relaxed ones in training neural networks. This reiterates the importance of studying BSP SGD. The second group of approaches tries to reduce the overall communication volume. Seide et al. (2014) quantized gradients from 32 bits to 1 bit to reduce the message length, but the lost gradient information decelerates the convergence rate. Another approach is to accelerate the convergence with a large batch. Dekel et al. (2012) shows the convergence rate of mini-batch SGD isO(1/ √ Tb+1/T ) with b being the batch size.",
+      "startOffset" : 96,
+      "endOffset" : 1563
+    }, {
+      "referenceID" : 4,
+      "context" : "In practice, the communication rate is several orders of magnitude slower than the computation (Coates et al., 2013). Various approaches have been proposed to reduce the overhead. The first group of approaches relaxes synchronous models of SGD to increase the iteration throughput (Dean et al. (2012), Zinkevich et al. (2010)). In this case, the relaxed SGD enables computations on a GPU to partially overlap with communications on others as demonstrated in Fig.1c and Fig.1d. Recht et al. (2011) proposed a lock free Asynchronous SGD (ASGD) that entirely gets rid of the synchronization requirement by allowing free concurrent parameter updates. But the relaxation only works well on sparse learning problems. In response, Ho et al. (2013) introduced the concept of staleness by bounding the fastest and the slowest machine within a few iterations of each other to ensure correctness. These relaxations claim to be effective as the enhanced iteration throughput offsets the disadvantages of degraded convergence rate. However, recent advances in deep learning frameworks (Cui et al. (2016)) have reestablished the advantages of BSP over relaxed ones in training neural networks. This reiterates the importance of studying BSP SGD. The second group of approaches tries to reduce the overall communication volume. Seide et al. (2014) quantized gradients from 32 bits to 1 bit to reduce the message length, but the lost gradient information decelerates the convergence rate. Another approach is to accelerate the convergence with a large batch. Dekel et al. (2012) shows the convergence rate of mini-batch SGD isO(1/ √ Tb+1/T ) with b being the batch size. This result indicates a large batch needs fewer iterations to find a solution, and thereby fewer overall synchronizations. However, unwieldy increasing the batch size is also unfavorable under limited computing resources demonstrated by Wang et al. (2016b). Please note these methods still need synchronizations, and our work will further improve their performance.",
+      "startOffset" : 96,
+      "endOffset" : 1912
+    }, {
+      "referenceID" : 11,
+      "context" : "Deep learning frameworks such as Caffe (Jia et al., 2014) also adopt this approach.",
+      "startOffset" : 39,
+      "endOffset" : 57
+    }, {
+      "referenceID" : 14,
+      "context" : "The third group of approaches conducts system optimizations to minimize the communication cost (Wang et al., 2016a). Agarwal & Duchi (2011) and Agarwal et al.",
+      "startOffset" : 96,
+      "endOffset" : 140
+    }, {
+      "referenceID" : 1,
+      "context" : "Agarwal & Duchi (2011) and Agarwal et al. (2014) presented partial gradients aggregations guided with a MST that takes log(P ) steps to fully synchronize the model.",
+      "startOffset" : 27,
+      "endOffset" : 49
+    }, {
+      "referenceID" : 1,
+      "context" : "Agarwal & Duchi (2011) and Agarwal et al. (2014) presented partial gradients aggregations guided with a MST that takes log(P ) steps to fully synchronize the model. Deep learning frameworks such as Caffe (Jia et al., 2014) also adopt this approach. Unfortunately, MST is only suitable for latency dominant scenarios (i.e. high frequent short messages). Although collective algorithms have been thoroughly discussed in the HPC community (Almási et al. (2005), Gabriel et al.",
+      "startOffset" : 27,
+      "endOffset" : 458
+    }, {
+      "referenceID" : 1,
+      "context" : "Agarwal & Duchi (2011) and Agarwal et al. (2014) presented partial gradients aggregations guided with a MST that takes log(P ) steps to fully synchronize the model. Deep learning frameworks such as Caffe (Jia et al., 2014) also adopt this approach. Unfortunately, MST is only suitable for latency dominant scenarios (i.e. high frequent short messages). Although collective algorithms have been thoroughly discussed in the HPC community (Almási et al. (2005), Gabriel et al. (2004), Shipman et al.",
+      "startOffset" : 27,
+      "endOffset" : 481
+    }, {
+      "referenceID" : 1,
+      "context" : "Agarwal & Duchi (2011) and Agarwal et al. (2014) presented partial gradients aggregations guided with a MST that takes log(P ) steps to fully synchronize the model. Deep learning frameworks such as Caffe (Jia et al., 2014) also adopt this approach. Unfortunately, MST is only suitable for latency dominant scenarios (i.e. high frequent short messages). Although collective algorithms have been thoroughly discussed in the HPC community (Almási et al. (2005), Gabriel et al. (2004), Shipman et al. (2006)), few have studied their performances for the deep learning.",
+      "startOffset" : 27,
+      "endOffset" : 504
+    }, {
+      "referenceID" : 1,
+      "context" : "Agarwal & Duchi (2011) and Agarwal et al. (2014) presented partial gradients aggregations guided with a MST that takes log(P ) steps to fully synchronize the model. Deep learning frameworks such as Caffe (Jia et al., 2014) also adopt this approach. Unfortunately, MST is only suitable for latency dominant scenarios (i.e. high frequent short messages). Although collective algorithms have been thoroughly discussed in the HPC community (Almási et al. (2005), Gabriel et al. (2004), Shipman et al. (2006)), few have studied their performances for the deep learning. The performance of collectives varies significantly with different message lengths and network topologies, while messages in deep network training are dense, long and fixed-length. Therefore, it is imperative to address such peculiarities in the collectives. Worringen (2003) proposed a pipeline collective model in shared memory environment for CPU data, but communications of different MPI processes sharing the same CPU memory bus within the same CPU socket.",
+      "startOffset" : 27,
+      "endOffset" : 841
+    }, {
+      "referenceID" : 18,
+      "context" : "2 THEORETICAL ANALYSIS We adopt a cost model widely used by the MPI community to analyze collective operations (Thakur et al. (2005), Thakur & Gropp (2003)).",
+      "startOffset" : 112,
+      "endOffset" : 133
+    }, {
+      "referenceID" : 18,
+      "context" : "2 THEORETICAL ANALYSIS We adopt a cost model widely used by the MPI community to analyze collective operations (Thakur et al. (2005), Thakur & Gropp (2003)).",
+      "startOffset" : 112,
+      "endOffset" : 156
+    }, {
+      "referenceID" : 17,
+      "context" : "MPI adopts MST to broadcast or reduce short messages (Thakur et al. (2005)), the length of which is less than 12 KB.",
+      "startOffset" : 54,
+      "endOffset" : 75
+    }, {
+      "referenceID" : 3,
+      "context" : "Please refer to Chan et al. (2007) for the analysis of BE collectives.",
+      "startOffset" : 16,
+      "endOffset" : 35
+    }, {
+      "referenceID" : 3,
+      "context" : "Please refer to Chan et al. (2007) for the analysis of BE collectives. Basically, scatter costs ∑dlogpe k=1 (α+2 −knβ) = log pα+ p−1 p nβ, while allgather costs (p − 1)α + p−1 p nβ. The cost of broadcast is the sum of these two. The MPI long message reduce consists of a reducescatter plus a gather, while allreduce consists of a reducescatter and a allgather. The cost for reducescatter is log pα + p−1 p nβ + p−1 p nγ, and both the costs of gather and allgather are log pα + p−1 p nβ (also in Chan et al. (2007)).",
+      "startOffset" : 16,
+      "endOffset" : 514
+    } ],
+    "year" : 2016,
+    "abstractText" : "We consider the problem of how to reduce the cost of communication that is required for the parallel training of a neural network. The state-of-the-art method, Bulk Synchronous Parallel Stochastic Gradient Descent (BSP-SGD), requires many collective communication operations, like broadcasts of parameters or reductions for partial gradient aggregations, which for large messages quickly dominates overall execution time and limits parallel scalability. To address this problem, we develop a new technique for collective operations, referred to as Linear Pipelining (LP). It is tuned to the message sizes that arise in BSP-SGD, and works effectively on multi-GPU systems. Theoretically, the cost of LP is invariant to P , where P is the number of GPUs, while the cost of the more conventional Minimum Spanning Tree (MST) scales like O(logP ). LP also demonstrates up to 2x higher bandwidth than Bidirectional Exchange (BE) techniques that are widely adopted by current MPI implementations. We apply these collectives to BSP-SGD, showing that the proposed implementations reduce communication bottlenecks in practice while preserving the attractive convergence properties of BSP-SGD.",
+    "creator" : "LaTeX with hyperref package"
+  }
+}

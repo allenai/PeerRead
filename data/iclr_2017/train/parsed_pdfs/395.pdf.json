@@ -1,0 +1,879 @@
+{
+  "name" : "395.pdf",
+  "metadata" : {
+    "source" : "CRF",
+    "title" : "DEEP PROBABILISTIC PROGRAMMING",
+    "authors" : [ "Dustin Tran", "Matthew D. Hoffman" ],
+    "emails" : [ ],
+    "sections" : [ {
+      "heading" : "1 INTRODUCTION",
+      "text" : "The nature of deep neural networks is compositional. Users can connect layers in creative ways, without having to worry about how to perform testing (forward propagation) or inference (gradientbased optimization, with back propagation and automatic differentiation).\nIn this paper, we design compositional representations for probabilistic programming. Probabilistic programming lets users specify generative probabilistic models as programs and then “compile” those models down into inference procedures. Probabilistic models are also compositional in nature, and much work has enabled rich probabilistic programs via compositions of random variables (Goodman et al., 2012; Ghahramani, 2015; Lake et al., 2016).\nLess work, however, has considered an analogous compositionality for inference. Rather, many existing probabilistic programming languages treat the inference engine as a black box, abstracted away from the model. These cannot capture probabilistic inferences that reuse the model’s representation—a key idea in recent advances in variational inference (Kingma & Welling, 2014; Rezende & Mohamed, 2015; Tran et al., 2016b), generative adversarial networks (Goodfellow et al., 2014), and also in more classic inferences (Dayan et al., 1995; Gutmann & Hyvärinen, 2010).\nWe propose Edward1, a Turing-complete probabilistic programming language which builds on two compositional representations—one for random variables and one for inference. By treating inference as a first class citizen, on a par with modeling, we show that probabilistic programming can be as flexible and computationally efficient as traditional deep learning. For flexibility, we show how Edward makes it easy to fit the same model using a variety of composable inference methods, ranging from point estimation to variational inference to MCMC. For efficiency, we show how to integrate Edward into existing computational graph frameworks such as TensorFlow (Abadi et al., 2016). Frameworks like TensorFlow provide computational benefits like distributed training, parallelism, vectorization, and GPU support “for free.” For example, we show on a benchmark task that Edward’s Hamiltonian Monte Carlo is many times faster than existing software. Further, Edward incurs no runtime overhead: it is as fast as handwritten TensorFlow.\n1See Tran et al. (2016a) for details of the API. A companion webpage for this paper is available at http: //edwardlib.org/iclr2017. It contains more complete examples with runnable code."
+    }, {
+      "heading" : "2 RELATED WORK",
+      "text" : "Probabilistic programming languages (PPLs) typically trade off the expressiveness of the language with the computational efficiency of inference. On one side, there are languages which emphasize expressiveness (Pfeffer, 2001; Milch et al., 2005; Pfeffer, 2009; Goodman et al., 2012), representing a rich class beyond graphical models. Each employs a generic inference engine, but scales poorly with respect to model and data size. On the other side, there are languages which emphasize efficiency (Spiegelhalter et al., 1995; Murphy, 2001; Plummer, 2003; Salvatier et al., 2015; Carpenter et al., 2016). The PPL is restricted to a specific class of models, and inference algorithms are optimized to be efficient for this class. For example, Infer.NET enables fast message passing for graphical models (Minka et al., 2014), and Augur enables data parallelism with GPUs for Gibbs sampling in Bayesian networks (Tristan et al., 2014). Edward bridges this gap. It is Turing complete—it supports any computable probability distribution—and it supports efficient algorithms, such as those that leverage model structure and those that scale to massive data.\nThere has been some prior research on efficient algorithms in Turing-complete languages. Venture and Anglican design inference as a collection of local inference problems, defined over program fragments (Mansinghka et al., 2014; Wood et al., 2014). This produces fast program-specific inference code, which we build on. Neither system supports inference methods such as programmable posterior approximations, inference models, or data subsampling. Concurrent with our work, WebPPL features amortized inference (Ritchie et al., 2016). Unlike Edward, WebPPL does not reuse the model’s representation; rather, it annotates the original program and leverages helper functions, which is a less flexible strategy. Finally, inference is designed as program transformations in Kiselyov & Shan (2009); Ścibior et al. (2015); Zinkov & Shan (2016). This enables the flexibility of composing inference inside other probabilistic programs. Edward builds on this idea to compose not only inference within modeling but also modeling within inference (e.g., variational models)."
+    }, {
+      "heading" : "3 COMPOSITIONAL REPRESENTATIONS FOR PROBABILISTIC MODELS",
+      "text" : "We first develop compositional representations for probabilistic models. We desire two criteria: (a) integration with computational graphs, an efficient framework where nodes represent operations on data and edges represent data communicated between them (Culler, 1986); and (b) invariance of the representation under the graph, that is, the representation can be reused during inference.\nEdward defines random variables as the key compositional representation. They are class objects with methods, for example, to compute the log density and to sample. Further, each random variable x is associated to a tensor (multi-dimensional array) x∗, which represents a single sample x∗ ∼ p(x). This association embeds the random variable onto a computational graph on tensors.\nThe design’s simplicity makes it easy to develop probabilistic programs in a computational graph framework. Importantly, all computation is represented on the graph. This enables one to compose random variables with complex deterministic structure such as deep neural networks, a diverse set of math operations, and third party libraries that build on the same framework. The design also enables compositions of random variables to capture complex stochastic structure.\nAs an illustration, we use a Beta-Bernoulli model, p(x, θ) = Beta(θ | 1, 1) ∏50\nn=1 Bernoulli(xn | θ), where θ is a latent probability shared across the 50 data points x ∈ {0, 1}50. The random variable x is 50-dimensional, parameterized by the random tensor θ∗. Fetching the object x runs the graph: it simulates from the generative process and outputs a binary vector of 50 elements.\nAll computation is registered symbolically on random variables and not over their execution. Symbolic representations do not require reifying the full model, which leads to unreasonable memory\nconsumption for large models (Tristan et al., 2014). Moreover, it enables us to simplify both deterministic and stochastic operations in the graph, before executing any code (Ścibior et al., 2015; Zinkov & Shan, 2016).\nWith computational graphs, it is also natural to build mutable states within the probabilistic program. As a typical use of computational graphs, such states can define model parameters; in TensorFlow, this is given by a tf.Variable. Another use case is for building discriminative models p(y |x), where x are features that are input as training or test data. The program can be written independent of the data, using a mutable state (tf.placeholder) for x in its graph. During training and testing, we feed the placeholder the appropriate values.\nIn Appendix A, we provide examples of a Bayesian neural network for classification (A.1), latent Dirichlet allocation (A.2), and Gaussian matrix factorization (A.3). We present others below."
+    }, {
+      "heading" : "3.1 EXAMPLE: VARIATIONAL AUTO-ENCODER",
+      "text" : "Figure 2 implements a variational auto-encoder (VAE) (Kingma & Welling, 2014; Rezende et al., 2014) in Edward. It comprises a probabilistic model over data and a variational model designed to approximate the former’s posterior. Here we use random variables to construct both the probabilistic model and the variational model; they are fit during inference (more details in Section 4).\nThere are N data points xn ∈ {0, 1}28·28 each with d latent variables, zn ∈ Rd. The program uses Keras (Chollet, 2015) to define neural networks. The probabilistic model is parameterized by a 2-layer neural network, with 256 hidden units (and ReLU activation), and generates 28× 28 pixel images. The variational model is parameterized by a 2-layer inference network, with 256 hidden units and outputs parameters of a normal posterior approximation.\nThe probabilistic program is concise. Core elements of the VAE—such as its distributional assumptions and neural net architectures—are all extensible. With model compositionality, we can embed it into more complicated models (Gregor et al., 2015; Rezende et al., 2016) and for other learning tasks (Kingma et al., 2014). With inference compositionality (which we discuss in Section 4), we can embed it into more complicated algorithms, such as with expressive variational approximations (Rezende & Mohamed, 2015; Tran et al., 2016b; Kingma et al., 2016) and alternative objectives (Ranganath et al., 2016a; Li & Turner, 2016; Dieng et al., 2016)."
+    }, {
+      "heading" : "3.2 EXAMPLE: BAYESIAN RECURRENT NEURAL NETWORK WITH VARIABLE LENGTH",
+      "text" : "Random variables can also be composed with control flow operations. As an example, Figure 3 implements a Bayesian recurrent neural network (RNN) with variable length. The data is a sequence of inputs {x1, . . . ,xT } and outputs {y1, . . . , yT } of length T with xt ∈ RD and yt ∈ R per time step. For t = 1, . . . , T , a RNN applies the update\nht = tanh(Whht−1 +Wxxt + bh),\nwhere the previous hidden state is ht−1 ∈ RH . We feed each hidden state into the output’s likelihood, yt ∼ Normal(Wyht + by, 1), and we place a standard normal prior over all parameters {Wh ∈ RH×H ,Wx ∈ RD×H ,Wy ∈ RH×1,bh ∈ RH ,by ∈ R}. Our implementation is dynamic: it differs from a RNN with fixed length, which pads and unrolls the computation.\n3.3 STOCHASTIC CONTROL FLOW AND MODEL PARALLELISM\nRandom variables can also be placed in the control flow itself, enabling probabilistic programs with stochastic control flow. Stochastic control flow defines dynamic conditional dependencies, known in the literature as contingent or existential dependencies (Mansinghka et al., 2014; Wu et al., 2016). See Figure 4, where x may or may not depend on a for a given execution. In Appendix A.4, we use stochastic control flow to implement a Dirichlet process mixture model. Tensors with stochastic shape are also possible: for example, tf.zeros(Poisson(lam=5.0)) defines a vector of zeros with length given by a Poisson draw with rate 5.0.\nStochastic control flow produces difficulties for algorithms that use the graph structure because the relationship of conditional dependencies changes across execution traces. The computational graph, however, provides an elegant way of teasing out static conditional dependence structure (p) from dynamic dependence structure (a). We can perform model parallelism (parallel computation across components of the model) over the static structure with GPUs and batch training. We can use more generic computations to handle the dynamic structure."
+    }, {
+      "heading" : "4 COMPOSITIONAL REPRESENTATIONS FOR INFERENCE",
+      "text" : "We described random variables as a representation for building rich probabilistic programs over computational graphs. We now describe a compositional representation for inference. We desire two criteria: (a) support for many classes of inference, where the form of the inferred posterior depends on the algorithm; and (b) invariance of inference under the computational graph, that is, the posterior can be further composed as part of another model.\nTo explain our approach, we will use a simple hierarchical model as a running example. Figure 5 displays a joint distribution p(x, z, β) of data x, local variables z, and global variables β. The ideas here extend to more expressive programs."
+    }, {
+      "heading" : "4.1 INFERENCE AS STOCHASTIC GRAPH OPTIMIZATION",
+      "text" : "The goal of inference is to calculate the posterior distribution p(z, β | xtrain;θ) given data xtrain, where θ are any model parameters that we will compute point estimates for.2 We formalize this as\n2For example, we could replace x’s sigma argument with tf.exp(tf.Variable(0.0))*tf.ones([N, D]). This defines a model parameter initialized at 0 and positive-constrained.\nthe following optimization problem:\nmin λ,θ L(p(z, β | xtrain;θ), q(z, β;λ)), (1)\nwhere q(z, β;λ) is an approximation to the posterior p(z, β |xtrain;θ), and L is a loss function with respect to p and q.\nThe choice of approximation q, loss L, and rules to update parameters {θ,λ} are specified by an inference algorithm. (Note q can be nonparametric, such as a point or a collection of samples.)\nIn Edward, we write this problem as follows: 1 inference = ed.Inference({beta: qbeta, z: qz}, data={x: x_train})\nInference is an abstract class which takes two inputs. The first is a collection of latent random variables beta and z, associated to their “posterior variables” qbeta and qz respectively. The second is a collection of observed random variables x, which is associated to their realizations x_train.\nThe idea is that Inference defines and solves the optimization in Equation 1. It adjusts parameters of the distribution of qbeta and qz (and any model parameters) to be close to the posterior.\nClass methods are available to finely control the inference. Calling inference.initialize() builds a computational graph to update {θ,λ}. Calling inference.update() runs this computation once to update {θ,λ}; we call the method in a loop until convergence. Importantly, no efficiency is lost in Edward’s language: the computational graph is the same as if it were handwritten for a specific model. This means the runtime is the same; also see our experiments in Section 5.2.\nA key concept in Edward is that there is no distinct “model” or “inference” block. A model is simply a collection of random variables, and inference is a way of modifying parameters in that collection subject to another. This reductionism offers significant flexibility. For example, we can infer only parts of a model (e.g., layer-wise training (Hinton et al., 2006)), infer parts used in multiple models (e.g., multi-task learning), or plug in a posterior into a new model (e.g., Bayesian updating)."
+    }, {
+      "heading" : "4.2 CLASSES OF INFERENCE",
+      "text" : "The design of Inference is very general. We describe subclasses to represent many algorithms below: variational inference, Monte Carlo, and generative adversarial networks.\nVariational inference posits a family of approximating distributions and finds the closest member in the family to the posterior (Jordan et al., 1999). In Edward, we build the variational family in the graph; see Figure 6 (left). For our running example, the family has mutable variables as parameters λ = {π, µ, σ}, where q(β;µ, σ) = Normal(β;µ, σ) and q(z;π) = Categorical(z;π). Specific variational algorithms inherit from the VariationalInference class. Each defines its own methods, such as a loss function and gradient. For example, we represent maximum a posteriori (MAP) estimation with an approximating family (qbeta and qz) of PointMass random variables, i.e., with all probability mass concentrated at a point. MAP inherits from VariationalInference and defines the negative log joint density as the loss function; it uses existing optimizers inside TensorFlow. In Section 5.1, we experiment with multiple gradient estimators for black box variational inference (Ranganath et al., 2014). Each estimator implements the same loss (an objective proportional to the divergence KL(q ‖ p)) and a different update rule (stochastic gradient).\nMonte Carlo approximates the posterior using samples (Robert & Casella, 1999). Monte Carlo is an inference where the approximating family is an empirical distribution, q(β; {β(t)}) = 1 T ∑T t=1 δ(β, β (t)) and q(z; {z(t)}) = 1T ∑T t=1 δ(z, z (t)). The parameters are λ = {β(t), z(t)}. See Figure 6 (right). Monte Carlo algorithms proceed by updating one sample β(t), z(t) at a time in the empirical approximation. Specific MC samplers determine the update rules: they can use gradients such as in Hamiltonian Monte Carlo (Neal, 2011) and graph structure such as in sequential Monte Carlo (Doucet et al., 2001).\nEdward also supports non-Bayesian methods such as generative adversarial networks (GANs) (Goodfellow et al., 2014). See Figure 7. The model posits random noise eps over N data points, each with d dimensions; this random noise feeds into a generative_network function, a neural network that outputs real-valued data x. In addition, there is a discriminative_network which takes data as input and outputs the probability that the data is real (in logit parameterization). We build GANInference; running it optimizes parameters inside the two neural network functions. This approach extends to many advances in GANs (e.g., Denton et al. (2015); Li et al. (2015)).\nFinally, one can design algorithms that would otherwise require tedious algebraic manipulation. With symbolic algebra on nodes of the computational graph, we can uncover conjugacy relationships between random variables. Users can then integrate out variables to automatically derive classical Gibbs (Gelfand & Smith, 1990), mean-field updates (Bishop, 2006), and exact inference. These algorithms are being currently developed in Edward."
+    }, {
+      "heading" : "4.3 COMPOSING INFERENCES",
+      "text" : "Core to Edward’s design is that inference can be written as a collection of separate inference programs. Below we demonstrate variational EM, with an (approximate) E-step over local variables and an M-step over global variables. We instantiate two algorithms, each of which conditions on inferences from the other, and we alternate with one update of each (Neal & Hinton, 1993),\n1 qbeta = PointMass(params=tf.Variable(tf.zeros([K, D]))) 2 qz = Categorical(logits=tf.Variable(tf.zeros([N, K]))) 3 4 inference_e = ed.VariationalInference({z: qz}, data={x: x_train, beta: qbeta}) 5 inference_m = ed.MAP({beta: qbeta}, data={x: x_train, z: qz}) 6 ...\n7 for _ in range(10000): 8 inference_e.update() 9 inference_m.update()\nThis extends to many other cases such as exact EM for exponential families, contrastive divergence (Hinton, 2002), pseudo-marginal methods (Andrieu & Roberts, 2009), and Gibbs sampling within variational inference (Wang & Blei, 2012; Hoffman & Blei, 2015). We can also write message passing algorithms, which solve a collection of local inference problems (Koller & Friedman, 2009). For example, classical message passing uses exact local inference and expectation propagation locally minimizes the Kullback-Leibler divergence, KL(p ‖ q) (Minka, 2001)."
+    }, {
+      "heading" : "4.4 DATA SUBSAMPLING",
+      "text" : "Stochastic optimization (Bottou, 2010) scales inference to massive data and is key to algorithms such as stochastic gradient Langevin dynamics (Welling & Teh, 2011) and stochastic variational inference (Hoffman et al., 2013). The idea is to cheaply estimate the model’s log joint density in an unbiased way. At each step, one subsamples a data set {xm} of size M and then scales densities with respect to local variables,\nlog p(x, z, β) = log p(β) + N∑ n=1 [ log p(xn | zn, β) + log p(zn |β) ] ≈ log p(β) + N\nM M∑ m=1 [ log p(xm | zm, β) + log p(zm |β) ] .\nTo support stochastic optimization, we represent only a subgraph of the full model. This prevents reifying the full model, which can lead to unreasonable memory consumption (Tristan et al., 2014). During initialization, we pass in a dictionary to properly scale the arguments. See Figure 8.\nConceptually, the scale argument represents scaling for each random variable’s plate, as if we had seen that random variable N/M as many times. As an example, Appendix B shows how to implement stochastic variational inference in Edward. The approach extends naturally to streaming data (Doucet et al., 2000; Broderick et al., 2013; McInerney et al., 2015), dynamic batch sizes, and data structures in which working on a subgraph does not immediately apply (Binder et al., 1997; Johnson & Willsky, 2014; Foti et al., 2014)."
+    }, {
+      "heading" : "5 EXPERIMENTS",
+      "text" : "In this section, we illustrate two main benefits of Edward: flexibility and efficiency. For the former, we show how it is easy to compare different inference algorithms on the same model. For the latter, we show how it is easy to get significant speedups by exploiting computational graphs."
+    }, {
+      "heading" : "5.1 RECENT METHODS IN VARIATIONAL INFERENCE",
+      "text" : "We demonstrate Edward’s flexibility for experimenting with complex inference algorithms. We consider the VAE setup from Figure 2 and the binarized MNIST data set (Salakhutdinov & Murray,\n2008). We use d = 50 latent variables per data point and optimize using ADAM. We study different components of the VAE setup using different methods; Appendix C.1 is a complete script. After training we evaluate held-out log likelihoods, which are lower bounds on the true value.\nTable 1 shows the results. The first method uses the VAE from Figure 2. The next three methods use the same VAE but apply different gradient estimators: reparameterization gradient without an analytic KL; reparameterization gradient with an analytic entropy; and the score function gradient (Paisley et al., 2012; Ranganath et al., 2014). This typically leads to the same optima but at different convergence rates. The score function gradient was slowest. Gradients with an analytic entropy produced difficulties around convergence: we switched to stochastic estimates of the entropy as it approached an optima. We also use hierarchical variational models (HVMs) (Ranganath et al., 2016b) with a normalizing flow prior; it produced similar results as a normalizing flow on the latent variable space (Rezende & Mohamed, 2015), and better than importance-weighted auto-encoders (IWAEs) (Burda et al., 2016).\nWe also study novel combinations, such as HVMs with the IWAE objective, GAN-based optimization on the decoder (with pixel intensity-valued data), and Rényi divergence on the decoder. GAN-based optimization does not enable calculation of the log-likelihood; Rényi divergence does not directly optimize for log-likelihood so it does not perform well. The key point is that Edward is a convenient research platform: they are all easy modifications of a given script.\n5.2 GPU-ACCELERATED HAMILTONIAN MONTE CARLO\nWe benchmark runtimes for a fixed number of Hamiltonian Monte Carlo (HMC; Neal, 2011) iterations on modern hardware: a 12-core Intel i7-5930K CPU at 3.50GHz and an NVIDIA Titan X (Maxwell) GPU. We apply logistic regression on the Covertype dataset (N = 581012, D = 54; responses were binarized) using Edward, Stan (with PyStan) (Carpenter et al., 2016), and PyMC3 (Salvatier et al., 2015). We ran 100 HMC iterations, with 10 leapfrog updates per iteration, a step size of 0.5/N , and single precision. Figure 9 illustrates the program in Edward.\nTable 2 displays the runtimes.3 Edward (GPU) features a dramatic 35x speedup over Stan (1 CPU) and 6x speedup over PyMC3 (12 CPU). This showcases the value of building a PPL on top of com-\n3In a previous version of this paper, we reported PyMC3 took 361s. This was caused by a bug preventing PyMC3 from correctly handling single-precision floating point. (PyMC3 with double precision is roughly 14x\nputational graphs. The speedup stems from fast matrix multiplication when calculating the model’s log-likelihood; GPUs can efficiently parallelize this computation. We expect similar speedups for models whose bottleneck is also matrix multiplication, such as deep neural networks.\nThere are various reasons for the speedup. Stan only used 1 CPU as it leverages multiple cores by running HMC chains in parallel. Stan also used double-precision floating point as it does not allow single-precision. For PyMC3, we note Edward’s speedup is not a result of PyMC3’s Theano backend compared to Edward’s TensorFlow. Rather, PyMC3 does not use Theano for all its computation, so it experiences communication overhead with NumPy. (PyMC3 was actually slower when using the GPU.) We predict that porting Edward’s design to Theano would feature similar speedups.\nIn addition to these speedups, we highlight that Edward has no runtime overhead: it is as fast as handwritten TensorFlow. Following Section 4.1, this is because the computational graphs for inference are in fact the same for Edward and the handwritten code."
+    }, {
+      "heading" : "5.3 PROBABILITY ZOO",
+      "text" : "In addition to Edward, we also release the Probability Zoo, a community repository for pre-trained probability models and their posteriors.4 It is inspired by the model zoo in Caffe (Jia et al., 2014), which provides many pre-trained discriminative neural networks, and which has been key to making large-scale deep learning more transparent and accessible. It is also inspired by Forest (Stuhlmüller, 2012), which provides examples of probabilistic programs."
+    }, {
+      "heading" : "6 DISCUSSION: CHALLENGES & EXTENSIONS",
+      "text" : "We described Edward, a Turing-complete PPL with compositional representations for probabilistic models and inference. Edward expands the scope of probabilistic programming to be as flexible and computationally efficient as traditional deep learning. For flexibility, we showed how Edward can use a variety of composable inference methods, capture recent advances in variational inference and generative adversarial networks, and finely control the inference algorithms. For efficiency, we showed how Edward leverages computational graphs to achieve fast, parallelizable computation, scales to massive data, and incurs no runtime overhead over handwritten code.\nIn present work, we are applying Edward as a research platform for developing new probabilistic models (Rudolph et al., 2016; Tran et al., 2017) and new inference algorithms (Dieng et al., 2016). As with any language design, Edward makes tradeoffs in pursuit of its flexibility and speed for research. For example, an open challenge in Edward is to better facilitate programs with complex control flow and recursion. While possible to represent, it is unknown how to enable their flexible inference strategies. In addition, it is open how to expand Edward’s design to dynamic computational graph frameworks—which provide more flexibility in their programming paradigm—but may sacrifice performance. A crucial next step for probabilistic programming is to leverage dynamic computational graphs while maintaining the flexibility and efficiency that Edward offers.\nslower than Edward (GPU).) This has been fixed after discussion with Thomas Wiecki. The reported numbers also exclude compilation time, which is significant for Stan.\n4The Probability Zoo is available at http://edwardlib.org/zoo. It includes model parameters and inferred posterior factors, such as local and global variables during training and any inference networks."
+    }, {
+      "heading" : "ACKNOWLEDGEMENTS",
+      "text" : "We thank the probabilistic programming community—for sharing our enthusiasm and motivating further work—including developers of Church, Venture, Gamalon, Hakaru, and WebPPL. We also thank Stan developers for providing extensive feedback as we developed the language, as well as Thomas Wiecki for experimental details. We thank the Google BayesFlow team—Joshua Dillon, Ian Langmore, Ryan Sepassi, and Srinivas Vasudevan—as well as Amr Ahmed, Matthew Johnson, Hung Bui, Rajesh Ranganath, Maja Rudolph, and Francisco Ruiz for their helpful feedback. This work is supported by NSF IIS-1247664, ONR N00014-11-1-0651, DARPA FA8750-14-2-0009, DARPA N66001-15-C-4032, Adobe, Google, NSERC PGS-D, and the Sloan Foundation."
+    }, {
+      "heading" : "A MODEL EXAMPLES",
+      "text" : "There are many examples available at http://edwardlib.org, including models, inference methods, and complete scripts. Below we describe several model examples; Appendix B describes an inference example (stochastic variational inference); Appendix C describes complete scripts. All examples in this paper are comprehensive, only leaving out import statements and fixed values. See the companion webpage for this paper (http://edwardlib.org/iclr2017) for examples in a machine-readable format with runnable code.\nA.1 BAYESIAN NEURAL NETWORK FOR CLASSIFICATION\nA Bayesian neural network is a neural network with a prior distribution on its weights.\nDefine the likelihood of an observation (xn, yn) with binary label yn ∈ {0, 1} as\np(yn |W0,b0,W1,b1 ; xn) = Bernoulli(yn |NN(xn ; W0,b0,W1,b1)),\nwhere NN is a 2-layer neural network whose weights and biases form the latent variables W0,b0,W1,b1. Define the prior on the weights and biases to be the standard normal. See Figure 10. There are N data points, D features, and H hidden units.\nA.2 LATENT DIRICHLET ALLOCATION\nSee Figure 11. Note that the program is written for illustration. We recommend vectorization in practice: instead of storing scalar random variables in lists of lists, one should prefer to represent few random variables, each which have many dimensions.\nA.3 GAUSSIAN MATRIX FACTORIZATIONN\nSee Figure 12.\n1 N = 10 2 M = 10 3 K = 5 # latent dimension 4 5 U = Normal(mu=tf.zeros([M, K]), sigma=tf.ones([M, K])) 6 V = Normal(mu=tf.zeros([N, K]), sigma=tf.ones([N, K])) 7 Y = Normal(mu=tf.matmul(U, V, transpose_b=True), sigma=tf.ones([N, M]))\nA.4 DIRICHLET PROCESS MIXTURE MODEL\nSee Figure 13.\nA Dirichlet process mixture model is written as follows: 1 mu = DirichletProcess(alpha=0.1, base_cls=Normal, mu=tf.zeros(D), sigma=tf.ones(D), sample_n=N) 2 x = Normal(mu=mu, sigma=tf.ones([N, D]))\nwhere mu has shape (N, D). The DirichletProcess random variable returns sample_n=N draws, each with shape given by the base distribution Normal(mu, sigma). The essential component defining the DirichletProcess random variable is a stochastic while loop. We define it below. See Edward’s code base for a more involved version with a base distribution.\nB INFERENCE EXAMPLE: STOCHASTIC VARIATIONAL INFERENCE\nIn the subgraph setting, we do data subsampling while working with a subgraph of the full model. This setting is necessary when the data and model do not fit in memory. It is scalable in that both the algorithm’s computational complexity (per iteration) and memory complexity are independent of the data set size.\nFor the code, we use the running example, a mixture model described in Figure 5.\n1 N = 10000000 # data set size 2 D = 2 # data dimension 3 K = 5 # number of clusters\nThe model is\np(x, z, β) = p(β) N∏ n=1 p(zn | β)p(xn | zn, β).\nTo avoid memory issues, we work on only a subgraph of the model,\np(x, z, β) = p(β) M∏ m=1 p(zm | β)p(xm | zm, β)\n1 M = 128 # mini-batch size 2 3 beta = Normal(mu=tf.zeros([K, D]), sigma=tf.ones([K, D])) 4 z = Categorical(logits=tf.zeros([M, K])) 5 x = Normal(mu=tf.gather(beta, z), sigma=tf.ones([M, D]))\nAssume the variational model is\nq(z, β) = q(β;λ) N∏ n=1 q(zn | β; γn),\nparameterized by {λ, {γn}}. Again, we work on only a subgraph of the model,\nq(z, β) = q(β;λ) M∏ m=1 q(zm | β; γm).\nparameterized by {λ, {γm}}. Importantly, onlyM parameters are stored in memory for {γm} rather than N .\n1 qbeta = Normal(mu=tf.Variable(tf.zeros([K, D])), 2 sigma=tf.nn.softplus(tf.Variable(tf.zeros[K, D]))) 3 qz_variables = tf.Variable(tf.zeros([M, K])) 4 qz = Categorical(logits=qz_variables)\nWe use KLqp, a variational method that minimizes the divergence measure KL(q ‖ p) (Jordan et al., 1999). We instantiate two algorithms: a global inference over β given the subset of z and a local inference over the subset of z given β. We also pass in a TensorFlow placeholder x_ph for the data, so we can change the data at each step.\n1 x_ph = tf.placeholder(tf.float32, [M]) 2 inference_global = ed.KLqp({beta: qbeta}, data={x: x_ph, z: qz}) 3 inference_local = ed.KLqp({z: qz}, data={x: x_ph, beta: qbeta})\nWe initialize the algorithms with the scale argument, so that computation on z and x will be scaled appropriately. This enables unbiased estimates for stochastic gradients.\n1 inference_global.initialize(scale={x: float(N) / M, z: float(N) / M}) 2 inference_local.initialize(scale={x: float(N) / M, z: float(N) / M})\nWe now run the algorithm, assuming there is a next_batch function which provides the next batch of data.\n1 qz_init = tf.initialize_variables([qz_variables]) 2 for _ in range(1000): 3 x_batch = next_batch(size=M) 4 for _ in range(10): # make local inferences 5 inference_local.update(feed_dict={x_ph: x_batch}) 6 7 # update global parameters 8 inference_global.update(feed_dict={x_ph: x_batch}) 9 # reinitialize the local factors\n10 qz_init.run()\nAfter each iteration, we also reinitialize the parameters for q(z | β); this is because we do inference on a new set of local variational factors for each batch. This demo readily applies to other inference algorithms such as SGLD (stochastic gradient Langevin dynamics): simply replace qbeta and qz with Empirical random variables; then call ed.SGLD instead of ed.KLqp.\nNote that if the data and model fit in memory but you’d still like to perform data subsampling for fast inference, we recommend not defining subgraphs. You can reify the full model, and simply index the local variables with a placeholder. The placeholder is fed at runtime to determine which of the local variables to update at a time. (For more details, see the website’s API.)"
+    }, {
+      "heading" : "C COMPLETE EXAMPLES",
+      "text" : "C.1 VARIATIONAL AUTO-ENCODER\nSee Figure 14.\nC.2 PROBABILISTIC MODEL FOR WORD EMBEDDINGS\nSee Figure 15. This example uses data subsampling (Section 4.4). The priors and conditional likelihoods are defined only for a minibatch of data. Similarly the variational model only models the embeddings used in a given minibatch. TensorFlow variables contain the embedding vectors for the entire vocabulary. TensorFlow placeholders ensure that the correct embedding vectors are used as variational parameters for a given minibatch.\nThe Bernoulli variables y_pos and y_neg are fixed to be 1’s and 0’s respectively. They model whether a word is indeed the target word for a given context window or has been drawn as a negative sample. Without regularization (via priors), the objective we optimize is identical to negative sampling."
+    } ],
+    "references" : [ {
+      "title" : "TensorFlow: A system for largescale machine learning",
+      "author" : [ "Martín Abadi", "Paul Barham", "Jianmin Chen", "Zhifeng Chen", "Andy Davis", "Jeffrey Dean", "Matthieu Devin", "Sanjay Ghemawat", "Geoffrey Irving", "Michael Isard", "Manjunath Kudlur", "Josh Levenberg", "Rajat Monga", "Sherry Moore", "Derek G Murray", "Benoit Steiner", "Paul Tucker", "Vijay Vasudevan", "Pete Warden", "Martin Wicke", "Yuan Yu", "Xiaoqiang Zhang" ],
+      "venue" : "arXiv preprint arXiv:1605.08695,",
+      "citeRegEx" : "Abadi et al\\.,? \\Q2016\\E",
+      "shortCiteRegEx" : "Abadi et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "The pseudo-marginal approach for efficient Monte Carlo computations",
+      "author" : [ "Christophe Andrieu", "Gareth O Roberts" ],
+      "venue" : "The Annals of Statistics,",
+      "citeRegEx" : "Andrieu and Roberts.,? \\Q2009\\E",
+      "shortCiteRegEx" : "Andrieu and Roberts.",
+      "year" : 2009
+    }, {
+      "title" : "Space-efficient inference in dynamic probabilistic networks",
+      "author" : [ "John Binder", "Kevin Murphy", "Stuart Russell" ],
+      "venue" : "In International Joint Conference on Artificial Intelligence,",
+      "citeRegEx" : "Binder et al\\.,? \\Q1997\\E",
+      "shortCiteRegEx" : "Binder et al\\.",
+      "year" : 1997
+    }, {
+      "title" : "Pattern Recognition and Machine Learning",
+      "author" : [ "Christopher M. Bishop" ],
+      "venue" : null,
+      "citeRegEx" : "Bishop.,? \\Q2006\\E",
+      "shortCiteRegEx" : "Bishop.",
+      "year" : 2006
+    }, {
+      "title" : "Latent Dirichlet Allocation",
+      "author" : [ "David M Blei", "Andrew Y Ng", "Michael I Jordan" ],
+      "venue" : "Journal of Machine Learning Research,",
+      "citeRegEx" : "Blei et al\\.,? \\Q2003\\E",
+      "shortCiteRegEx" : "Blei et al\\.",
+      "year" : 2003
+    }, {
+      "title" : "Large-scale machine learning with stochastic gradient descent",
+      "author" : [ "Léon Bottou" ],
+      "venue" : "In Proceedings of COMPSTAT’2010,",
+      "citeRegEx" : "Bottou.,? \\Q2010\\E",
+      "shortCiteRegEx" : "Bottou.",
+      "year" : 2010
+    }, {
+      "title" : "Streaming Variational Bayes",
+      "author" : [ "Tamara Broderick", "Nicholas Boyd", "Andre Wibisono", "Ashia C Wilson", "Michael I Jordan" ],
+      "venue" : "In Neural Information Processing Systems,",
+      "citeRegEx" : "Broderick et al\\.,? \\Q2013\\E",
+      "shortCiteRegEx" : "Broderick et al\\.",
+      "year" : 2013
+    }, {
+      "title" : "Importance weighted autoencoders",
+      "author" : [ "Yuri Burda", "Roger Grosse", "Ruslan Salakhutdinov" ],
+      "venue" : "In International Conference on Learning Representations,",
+      "citeRegEx" : "Burda et al\\.,? \\Q2016\\E",
+      "shortCiteRegEx" : "Burda et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Stan: A probabilistic programming language",
+      "author" : [ "Bob Carpenter", "Andrew Gelman", "Matthew D Hoffman", "Daniel Lee", "Ben Goodrich", "Michael Betancourt", "Marcus Brubaker", "Jiqiang Guo", "Peter Li", "Allen Riddell" ],
+      "venue" : "Journal of Statistical Software,",
+      "citeRegEx" : "Carpenter et al\\.,? \\Q2016\\E",
+      "shortCiteRegEx" : "Carpenter et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Dataflow architectures",
+      "author" : [ "David E Culler" ],
+      "venue" : "Technical report, DTIC Document,",
+      "citeRegEx" : "Culler.,? \\Q1986\\E",
+      "shortCiteRegEx" : "Culler.",
+      "year" : 1986
+    }, {
+      "title" : "The Helmholtz machine",
+      "author" : [ "Peter Dayan", "Geoffrey E Hinton", "Radford M Neal", "Richard S Zemel" ],
+      "venue" : "Neural computation,",
+      "citeRegEx" : "Dayan et al\\.,? \\Q1995\\E",
+      "shortCiteRegEx" : "Dayan et al\\.",
+      "year" : 1995
+    }, {
+      "title" : "Deep generative image models using a Laplacian pyramid of adversarial networks",
+      "author" : [ "Emily L Denton", "Soumith Chintala", "Rob Fergus" ],
+      "venue" : "In Neural Information Processing Systems,",
+      "citeRegEx" : "Denton et al\\.,? \\Q2015\\E",
+      "shortCiteRegEx" : "Denton et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "χ-divergence for approximate inference",
+      "author" : [ "Adji B. Dieng", "Dustin Tran", "Rajesh Ranganath", "John Paisley", "David M. Blei" ],
+      "venue" : "In arXiv preprint arXiv:1611.00328,",
+      "citeRegEx" : "Dieng et al\\.,? \\Q2016\\E",
+      "shortCiteRegEx" : "Dieng et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "On sequential Monte Carlo sampling methods for Bayesian filtering",
+      "author" : [ "Arnaud Doucet", "Simon Godsill", "Christophe Andrieu" ],
+      "venue" : "Statistics and Computing,",
+      "citeRegEx" : "Doucet et al\\.,? \\Q2000\\E",
+      "shortCiteRegEx" : "Doucet et al\\.",
+      "year" : 2000
+    }, {
+      "title" : "An introduction to sequential monte carlo methods",
+      "author" : [ "Arnaud Doucet", "Nando De Freitas", "Neil Gordon" ],
+      "venue" : "In Sequential Monte Carlo methods in practice,",
+      "citeRegEx" : "Doucet et al\\.,? \\Q2001\\E",
+      "shortCiteRegEx" : "Doucet et al\\.",
+      "year" : 2001
+    }, {
+      "title" : "Stochastic variational inference for hidden Markov models",
+      "author" : [ "Nicholas Foti", "Jason Xu", "Dillon Laird", "Emily Fox" ],
+      "venue" : "In Neural Information Processing Systems,",
+      "citeRegEx" : "Foti et al\\.,? \\Q2014\\E",
+      "shortCiteRegEx" : "Foti et al\\.",
+      "year" : 2014
+    }, {
+      "title" : "Sampling-based approaches to calculating marginal densities",
+      "author" : [ "Alan E Gelfand", "Adrian FM Smith" ],
+      "venue" : "Journal of the American statistical association,",
+      "citeRegEx" : "Gelfand and Smith.,? \\Q1990\\E",
+      "shortCiteRegEx" : "Gelfand and Smith.",
+      "year" : 1990
+    }, {
+      "title" : "Probabilistic machine learning and artificial intelligence",
+      "author" : [ "Zoubin Ghahramani" ],
+      "venue" : "Nature, 521(7553):",
+      "citeRegEx" : "Ghahramani.,? \\Q2015\\E",
+      "shortCiteRegEx" : "Ghahramani.",
+      "year" : 2015
+    }, {
+      "title" : "Generative adversarial nets",
+      "author" : [ "Ian Goodfellow", "Jean Pouget-Abadie", "M Mirza", "Bing Xu", "David Warde-Farley", "Sherjil Ozair", "Aaron Courville", "Yoshua Bengio" ],
+      "venue" : "In Neural Information Processing Systems,",
+      "citeRegEx" : "Goodfellow et al\\.,? \\Q2014\\E",
+      "shortCiteRegEx" : "Goodfellow et al\\.",
+      "year" : 2014
+    }, {
+      "title" : "Church: A language for generative models",
+      "author" : [ "Noah Goodman", "Vikash Mansinghka", "Daniel M Roy", "Keith Bonawitz", "Joshua B Tenenbaum" ],
+      "venue" : "In Uncertainty in Artificial Intelligence,",
+      "citeRegEx" : "Goodman et al\\.,? \\Q2012\\E",
+      "shortCiteRegEx" : "Goodman et al\\.",
+      "year" : 2012
+    }, {
+      "title" : "DRAW: A recurrent neural network for image generation",
+      "author" : [ "Karol Gregor", "Ivo Danihelka", "Alex Graves", "Danilo J Rezende", "Daan Wierstra" ],
+      "venue" : "In International Conference on Machine Learning,",
+      "citeRegEx" : "Gregor et al\\.,? \\Q2015\\E",
+      "shortCiteRegEx" : "Gregor et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "Noise-contrastive estimation: A new estimation principle for unnormalized statistical models",
+      "author" : [ "M Gutmann", "A Hyvärinen" ],
+      "venue" : "Artificial Intelligence and Statistics,",
+      "citeRegEx" : "Gutmann and Hyvärinen.,? \\Q2010\\E",
+      "shortCiteRegEx" : "Gutmann and Hyvärinen.",
+      "year" : 2010
+    }, {
+      "title" : "Training products of experts by minimizing contrastive divergence",
+      "author" : [ "Geoffrey E Hinton" ],
+      "venue" : "Neural computation,",
+      "citeRegEx" : "Hinton.,? \\Q2002\\E",
+      "shortCiteRegEx" : "Hinton.",
+      "year" : 2002
+    }, {
+      "title" : "A fast learning algorithm for deep belief nets",
+      "author" : [ "Geoffrey E Hinton", "Simon Osindero", "Yee-Whye Teh" ],
+      "venue" : "Neural computation,",
+      "citeRegEx" : "Hinton et al\\.,? \\Q2006\\E",
+      "shortCiteRegEx" : "Hinton et al\\.",
+      "year" : 2006
+    }, {
+      "title" : "Structured stochastic variational inference",
+      "author" : [ "Matthew Hoffman", "David M. Blei" ],
+      "venue" : "In Artificial Intelligence and Statistics,",
+      "citeRegEx" : "Hoffman and Blei.,? \\Q2015\\E",
+      "shortCiteRegEx" : "Hoffman and Blei.",
+      "year" : 2015
+    }, {
+      "title" : "Stochastic variational inference",
+      "author" : [ "Matthew D Hoffman", "David M Blei", "Chong Wang", "John Paisley" ],
+      "venue" : "The Journal of Machine Learning Research,",
+      "citeRegEx" : "Hoffman et al\\.,? \\Q2013\\E",
+      "shortCiteRegEx" : "Hoffman et al\\.",
+      "year" : 2013
+    }, {
+      "title" : "Caffe: Convolutional architecture for fast feature embedding",
+      "author" : [ "Yangqing Jia", "Evan Shelhamer", "Jeff Donahue", "Sergey Karayev", "Jonathan Long", "Ross Girshick", "Sergio Guadarrama", "Trevor Darrell" ],
+      "venue" : "arXiv preprint arXiv:1408.5093,",
+      "citeRegEx" : "Jia et al\\.,? \\Q2014\\E",
+      "shortCiteRegEx" : "Jia et al\\.",
+      "year" : 2014
+    }, {
+      "title" : "Stochastic variational inference for Bayesian time series models",
+      "author" : [ "Matthew Johnson", "Alan S Willsky" ],
+      "venue" : "In International Conference on Machine Learning,",
+      "citeRegEx" : "Johnson and Willsky.,? \\Q2014\\E",
+      "shortCiteRegEx" : "Johnson and Willsky.",
+      "year" : 2014
+    }, {
+      "title" : "An introduction to variational methods for graphical models",
+      "author" : [ "M.I. Jordan", "Z. Ghahramani", "T.S. Jaakkola", "L.K. Saul" ],
+      "venue" : "Machine Learning,",
+      "citeRegEx" : "Jordan et al\\.,? \\Q1999\\E",
+      "shortCiteRegEx" : "Jordan et al\\.",
+      "year" : 1999
+    }, {
+      "title" : "Auto-encoding variational Bayes",
+      "author" : [ "Diederik P Kingma", "Max Welling" ],
+      "venue" : "In International Conference on Learning Representations,",
+      "citeRegEx" : "Kingma and Welling.,? \\Q2014\\E",
+      "shortCiteRegEx" : "Kingma and Welling.",
+      "year" : 2014
+    }, {
+      "title" : "Semi-supervised learning with deep generative models",
+      "author" : [ "Diederik P Kingma", "Shakir Mohamed", "Danilo Jimenez Rezende", "Max Welling" ],
+      "venue" : "In Neural Information Processing Systems,",
+      "citeRegEx" : "Kingma et al\\.,? \\Q2014\\E",
+      "shortCiteRegEx" : "Kingma et al\\.",
+      "year" : 2014
+    }, {
+      "title" : "Improving variational inference with inverse autoregressive flow",
+      "author" : [ "Diederik P Kingma", "Tim Salimans", "Max Welling" ],
+      "venue" : "In Neural Information Processing Systems,",
+      "citeRegEx" : "Kingma et al\\.,? \\Q2016\\E",
+      "shortCiteRegEx" : "Kingma et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Embedded probabilistic programming",
+      "author" : [ "Oleg Kiselyov", "Chung-Chieh Shan" ],
+      "venue" : "In Domain-Specific Languages,",
+      "citeRegEx" : "Kiselyov and Shan.,? \\Q2009\\E",
+      "shortCiteRegEx" : "Kiselyov and Shan.",
+      "year" : 2009
+    }, {
+      "title" : "Probabilistic Graphical Models: Principles and Techniques",
+      "author" : [ "Daphne Koller", "Nir Friedman" ],
+      "venue" : "MIT press,",
+      "citeRegEx" : "Koller and Friedman.,? \\Q2009\\E",
+      "shortCiteRegEx" : "Koller and Friedman.",
+      "year" : 2009
+    }, {
+      "title" : "Building machines that learn and think like people",
+      "author" : [ "Brenden M Lake", "Tomer D Ullman", "Joshua B Tenenbaum", "Samuel J Gershman" ],
+      "venue" : "arXiv preprint arXiv:1604.00289,",
+      "citeRegEx" : "Lake et al\\.,? \\Q2016\\E",
+      "shortCiteRegEx" : "Lake et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Variational inference with Rényi divergence",
+      "author" : [ "Yingzhen Li", "Richard E Turner" ],
+      "venue" : "In Neural Information Processing Systems,",
+      "citeRegEx" : "Li and Turner.,? \\Q2016\\E",
+      "shortCiteRegEx" : "Li and Turner.",
+      "year" : 2016
+    }, {
+      "title" : "Generative moment matching networks",
+      "author" : [ "Yujia Li", "Kevin Swersky", "Richard Zemel" ],
+      "venue" : "In International Conference on Machine Learning,",
+      "citeRegEx" : "Li et al\\.,? \\Q2015\\E",
+      "shortCiteRegEx" : "Li et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "Venture: A higher-order probabilistic programming platform with programmable inference",
+      "author" : [ "V Mansinghka", "D Selsam", "Y Perov" ],
+      "venue" : null,
+      "citeRegEx" : "Mansinghka et al\\.,? \\Q2014\\E",
+      "shortCiteRegEx" : "Mansinghka et al\\.",
+      "year" : 2014
+    }, {
+      "title" : "The Population Posterior and Bayesian Inference on Streams",
+      "author" : [ "James McInerney", "Rajesh Ranganath", "David M Blei" ],
+      "venue" : "In Neural Information Processing Systems,",
+      "citeRegEx" : "McInerney et al\\.,? \\Q2015\\E",
+      "shortCiteRegEx" : "McInerney et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "Expectation propagation for approximate Bayesian inference",
+      "author" : [ "Thomas P Minka" ],
+      "venue" : "In Uncertainty in Artificial Intelligence,",
+      "citeRegEx" : "Minka.,? \\Q2001\\E",
+      "shortCiteRegEx" : "Minka.",
+      "year" : 2001
+    }, {
+      "title" : "The Bayes net toolbox for Matlab",
+      "author" : [ "Kevin Murphy" ],
+      "venue" : "Computing Science and Statistics,",
+      "citeRegEx" : "Murphy.,? \\Q2001\\E",
+      "shortCiteRegEx" : "Murphy.",
+      "year" : 2001
+    }, {
+      "title" : "MCMC using Hamiltonian dynamics",
+      "author" : [ "Radford M Neal" ],
+      "venue" : "Handbook of Markov Chain Monte Carlo,",
+      "citeRegEx" : "Neal.,? \\Q2011\\E",
+      "shortCiteRegEx" : "Neal.",
+      "year" : 2011
+    }, {
+      "title" : "A new view of the EM algorithm that justifies incremental and other variants",
+      "author" : [ "Radford M. Neal", "Geoffrey E. Hinton" ],
+      "venue" : "In Learning in Graphical Models,",
+      "citeRegEx" : "Neal and Hinton.,? \\Q1993\\E",
+      "shortCiteRegEx" : "Neal and Hinton.",
+      "year" : 1993
+    }, {
+      "title" : "Variational Bayesian inference with stochastic search",
+      "author" : [ "John Paisley", "David M. Blei", "Michael Jordan" ],
+      "venue" : "In International Conference on Machine Learning,",
+      "citeRegEx" : "Paisley et al\\.,? \\Q2012\\E",
+      "shortCiteRegEx" : "Paisley et al\\.",
+      "year" : 2012
+    }, {
+      "title" : "IBAL: A probabilistic rational programming language",
+      "author" : [ "Avi Pfeffer" ],
+      "venue" : "In International Joint Conference on Artificial Intelligence,",
+      "citeRegEx" : "Pfeffer.,? \\Q2001\\E",
+      "shortCiteRegEx" : "Pfeffer.",
+      "year" : 2001
+    }, {
+      "title" : "Figaro: An object-oriented probabilistic programming language. Charles River Analytics",
+      "author" : [ "Avi Pfeffer" ],
+      "venue" : "Technical Report,",
+      "citeRegEx" : "Pfeffer.,? \\Q2009\\E",
+      "shortCiteRegEx" : "Pfeffer.",
+      "year" : 2009
+    }, {
+      "title" : "JAGS: A program for analysis of Bayesian graphical models using Gibbs sampling",
+      "author" : [ "Martyn Plummer" ],
+      "venue" : "In International Workshop on Distributed Statistical Computing,",
+      "citeRegEx" : "Plummer.,? \\Q2003\\E",
+      "shortCiteRegEx" : "Plummer.",
+      "year" : 2003
+    }, {
+      "title" : "Black box variational inference",
+      "author" : [ "Rajesh Ranganath", "Sean Gerrish", "David M. Blei" ],
+      "venue" : "In Artificial Intelligence and Statistics,",
+      "citeRegEx" : "Ranganath et al\\.,? \\Q2014\\E",
+      "shortCiteRegEx" : "Ranganath et al\\.",
+      "year" : 2014
+    }, {
+      "title" : "Operator variational inference",
+      "author" : [ "Rajesh Ranganath", "Jaan Altosaar", "Dustin Tran", "David M. Blei" ],
+      "venue" : "In Neural Information Processing Systems,",
+      "citeRegEx" : "Ranganath et al\\.,? \\Q2016\\E",
+      "shortCiteRegEx" : "Ranganath et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Hierarchical variational models",
+      "author" : [ "Rajesh Ranganath", "Dustin Tran", "David M Blei" ],
+      "venue" : "In International Conference on Machine Learning,",
+      "citeRegEx" : "Ranganath et al\\.,? \\Q2016\\E",
+      "shortCiteRegEx" : "Ranganath et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Variational inference with normalizing flows",
+      "author" : [ "Danilo J Rezende", "Shakir Mohamed" ],
+      "venue" : "In International Conference on Machine Learning,",
+      "citeRegEx" : "Rezende and Mohamed.,? \\Q2015\\E",
+      "shortCiteRegEx" : "Rezende and Mohamed.",
+      "year" : 2015
+    }, {
+      "title" : "Stochastic backpropagation and approximate inference in deep generative models",
+      "author" : [ "Danilo J Rezende", "Shakir Mohamed", "Daan Wierstra" ],
+      "venue" : "In International Conference on Machine Learning,",
+      "citeRegEx" : "Rezende et al\\.,? \\Q2014\\E",
+      "shortCiteRegEx" : "Rezende et al\\.",
+      "year" : 2014
+    }, {
+      "title" : "Oneshot generalization in deep generative models",
+      "author" : [ "Danilo Jimenez Rezende", "Shakir Mohamed", "Ivo Danihelka", "Karol Gregor", "Daan Wierstra" ],
+      "venue" : "In International Conference on Machine Learning,",
+      "citeRegEx" : "Rezende et al\\.,? \\Q2016\\E",
+      "shortCiteRegEx" : "Rezende et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Deep amortized inference for probabilistic programs",
+      "author" : [ "Daniel Ritchie", "Paul Horsfall", "Noah D Goodman" ],
+      "venue" : "arXiv preprint arXiv:1610.05735,",
+      "citeRegEx" : "Ritchie et al\\.,? \\Q2016\\E",
+      "shortCiteRegEx" : "Ritchie et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Exponential family embeddings",
+      "author" : [ "Maja R Rudolph", "Francisco J R Ruiz", "Stephan Mandt", "David M Blei" ],
+      "venue" : "In Neural Information Processing Systems,",
+      "citeRegEx" : "Rudolph et al\\.,? \\Q2016\\E",
+      "shortCiteRegEx" : "Rudolph et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "On the quantitative analysis of deep belief networks",
+      "author" : [ "Ruslan Salakhutdinov", "Iain Murray" ],
+      "venue" : "In International Conference on Machine Learning,",
+      "citeRegEx" : "Salakhutdinov and Murray.,? \\Q2008\\E",
+      "shortCiteRegEx" : "Salakhutdinov and Murray.",
+      "year" : 2008
+    }, {
+      "title" : "Probabilistic Programming in Python using PyMC",
+      "author" : [ "John Salvatier", "Thomas Wiecki", "Christopher Fonnesbeck" ],
+      "venue" : "arXiv preprint arXiv:1507.08050,",
+      "citeRegEx" : "Salvatier et al\\.,? \\Q2015\\E",
+      "shortCiteRegEx" : "Salvatier et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "Practical probabilistic programming with monads",
+      "author" : [ "Adam Ścibior", "Zoubin Ghahramani", "Andrew D Gordon" ],
+      "venue" : "In the 8th ACM SIGPLAN Symposium,",
+      "citeRegEx" : "Ścibior et al\\.,? \\Q2015\\E",
+      "shortCiteRegEx" : "Ścibior et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "BUGS: Bayesian inference using Gibbs sampling, version 0.50",
+      "author" : [ "David J Spiegelhalter", "Andrew Thomas", "Nicky G Best", "Wally R Gilks" ],
+      "venue" : "MRC Biostatistics Unit,",
+      "citeRegEx" : "Spiegelhalter et al\\.,? \\Q1995\\E",
+      "shortCiteRegEx" : "Spiegelhalter et al\\.",
+      "year" : 1995
+    }, {
+      "title" : "Forest: A repository for generative models, 2012. URL http:// forestdb.org",
+      "author" : [ "Andreas Stuhlmüller" ],
+      "venue" : null,
+      "citeRegEx" : "Stuhlmüller.,? \\Q2012\\E",
+      "shortCiteRegEx" : "Stuhlmüller.",
+      "year" : 2012
+    }, {
+      "title" : "Edward: A library for probabilistic modeling, inference, and criticism",
+      "author" : [ "Dustin Tran", "Alp Kucukelbir", "Adji B. Dieng", "Maja Rudolph", "Dawen Liang", "David M. Blei" ],
+      "venue" : "arXiv preprint arXiv:1610.09787,",
+      "citeRegEx" : "Tran et al\\.,? \\Q2016\\E",
+      "shortCiteRegEx" : "Tran et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "The variational Gaussian process",
+      "author" : [ "Dustin Tran", "Rajesh Ranganath", "David M. Blei" ],
+      "venue" : "In International Conference on Learning Representations,",
+      "citeRegEx" : "Tran et al\\.,? \\Q2016\\E",
+      "shortCiteRegEx" : "Tran et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Deep and hierarchical implicit models",
+      "author" : [ "Dustin Tran", "Rajesh Ranganath", "David M Blei" ],
+      "venue" : "arXiv preprint arXiv:1702.08896,",
+      "citeRegEx" : "Tran et al\\.,? \\Q2017\\E",
+      "shortCiteRegEx" : "Tran et al\\.",
+      "year" : 2017
+    }, {
+      "title" : "Augur: Data-parallel probabilistic modeling",
+      "author" : [ "Jean-Baptiste Tristan", "Daniel Huang", "Joseph Tassarotti", "Adam C Pocock", "Stephen Green", "Guy L Steele" ],
+      "venue" : "In Neural Information Processing Systems,",
+      "citeRegEx" : "Tristan et al\\.,? \\Q2014\\E",
+      "shortCiteRegEx" : "Tristan et al\\.",
+      "year" : 2014
+    }, {
+      "title" : "Truncation-free online variational inference for Bayesian nonparametric models",
+      "author" : [ "Chong Wang", "David M Blei" ],
+      "venue" : "In Neural Information Processing Systems,",
+      "citeRegEx" : "Wang and Blei.,? \\Q2012\\E",
+      "shortCiteRegEx" : "Wang and Blei.",
+      "year" : 2012
+    }, {
+      "title" : "Bayesian learning via stochastic gradient Langevin dynamics",
+      "author" : [ "Max Welling", "Yee Whye Teh" ],
+      "venue" : "In International Conference on Machine Learning,",
+      "citeRegEx" : "Welling and Teh.,? \\Q2011\\E",
+      "shortCiteRegEx" : "Welling and Teh.",
+      "year" : 2011
+    }, {
+      "title" : "A new approach to probabilistic programming inference",
+      "author" : [ "Frank Wood", "Jan Willem van de Meent", "Vikash Mansinghka" ],
+      "venue" : "In Artificial Intelligence and Statistics,",
+      "citeRegEx" : "Wood et al\\.,? \\Q2014\\E",
+      "shortCiteRegEx" : "Wood et al\\.",
+      "year" : 2014
+    }, {
+      "title" : "Swift: Compiled inference for probabilistic programming languages",
+      "author" : [ "Yi Wu", "Lei Li", "Stuart Russell", "Rastislav Bodik" ],
+      "venue" : "arXiv preprint arXiv:1606.09242,",
+      "citeRegEx" : "Wu et al\\.,? \\Q2016\\E",
+      "shortCiteRegEx" : "Wu et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Composing inference algorithms as program transformations",
+      "author" : [ "Robert Zinkov", "Chung-chieh Shan" ],
+      "venue" : "arXiv preprint arXiv:1603.01882,",
+      "citeRegEx" : "Zinkov and Shan.,? \\Q2016\\E",
+      "shortCiteRegEx" : "Zinkov and Shan.",
+      "year" : 2016
+    } ],
+    "referenceMentions" : [ {
+      "referenceID" : 19,
+      "context" : "Probabilistic models are also compositional in nature, and much work has enabled rich probabilistic programs via compositions of random variables (Goodman et al., 2012; Ghahramani, 2015; Lake et al., 2016).",
+      "startOffset" : 146,
+      "endOffset" : 205
+    }, {
+      "referenceID" : 17,
+      "context" : "Probabilistic models are also compositional in nature, and much work has enabled rich probabilistic programs via compositions of random variables (Goodman et al., 2012; Ghahramani, 2015; Lake et al., 2016).",
+      "startOffset" : 146,
+      "endOffset" : 205
+    }, {
+      "referenceID" : 34,
+      "context" : "Probabilistic models are also compositional in nature, and much work has enabled rich probabilistic programs via compositions of random variables (Goodman et al., 2012; Ghahramani, 2015; Lake et al., 2016).",
+      "startOffset" : 146,
+      "endOffset" : 205
+    }, {
+      "referenceID" : 18,
+      "context" : ", 2016b), generative adversarial networks (Goodfellow et al., 2014), and also in more classic inferences (Dayan et al.",
+      "startOffset" : 42,
+      "endOffset" : 67
+    }, {
+      "referenceID" : 10,
+      "context" : ", 2014), and also in more classic inferences (Dayan et al., 1995; Gutmann & Hyvärinen, 2010).",
+      "startOffset" : 45,
+      "endOffset" : 92
+    }, {
+      "referenceID" : 0,
+      "context" : "For efficiency, we show how to integrate Edward into existing computational graph frameworks such as TensorFlow (Abadi et al., 2016).",
+      "startOffset" : 112,
+      "endOffset" : 132
+    }, {
+      "referenceID" : 0,
+      "context" : "For efficiency, we show how to integrate Edward into existing computational graph frameworks such as TensorFlow (Abadi et al., 2016). Frameworks like TensorFlow provide computational benefits like distributed training, parallelism, vectorization, and GPU support “for free.” For example, we show on a benchmark task that Edward’s Hamiltonian Monte Carlo is many times faster than existing software. Further, Edward incurs no runtime overhead: it is as fast as handwritten TensorFlow. See Tran et al. (2016a) for details of the API.",
+      "startOffset" : 113,
+      "endOffset" : 508
+    }, {
+      "referenceID" : 44,
+      "context" : "On one side, there are languages which emphasize expressiveness (Pfeffer, 2001; Milch et al., 2005; Pfeffer, 2009; Goodman et al., 2012), representing a rich class beyond graphical models.",
+      "startOffset" : 64,
+      "endOffset" : 136
+    }, {
+      "referenceID" : 45,
+      "context" : "On one side, there are languages which emphasize expressiveness (Pfeffer, 2001; Milch et al., 2005; Pfeffer, 2009; Goodman et al., 2012), representing a rich class beyond graphical models.",
+      "startOffset" : 64,
+      "endOffset" : 136
+    }, {
+      "referenceID" : 19,
+      "context" : "On one side, there are languages which emphasize expressiveness (Pfeffer, 2001; Milch et al., 2005; Pfeffer, 2009; Goodman et al., 2012), representing a rich class beyond graphical models.",
+      "startOffset" : 64,
+      "endOffset" : 136
+    }, {
+      "referenceID" : 58,
+      "context" : "On the other side, there are languages which emphasize efficiency (Spiegelhalter et al., 1995; Murphy, 2001; Plummer, 2003; Salvatier et al., 2015; Carpenter et al., 2016).",
+      "startOffset" : 66,
+      "endOffset" : 171
+    }, {
+      "referenceID" : 40,
+      "context" : "On the other side, there are languages which emphasize efficiency (Spiegelhalter et al., 1995; Murphy, 2001; Plummer, 2003; Salvatier et al., 2015; Carpenter et al., 2016).",
+      "startOffset" : 66,
+      "endOffset" : 171
+    }, {
+      "referenceID" : 46,
+      "context" : "On the other side, there are languages which emphasize efficiency (Spiegelhalter et al., 1995; Murphy, 2001; Plummer, 2003; Salvatier et al., 2015; Carpenter et al., 2016).",
+      "startOffset" : 66,
+      "endOffset" : 171
+    }, {
+      "referenceID" : 56,
+      "context" : "On the other side, there are languages which emphasize efficiency (Spiegelhalter et al., 1995; Murphy, 2001; Plummer, 2003; Salvatier et al., 2015; Carpenter et al., 2016).",
+      "startOffset" : 66,
+      "endOffset" : 171
+    }, {
+      "referenceID" : 8,
+      "context" : "On the other side, there are languages which emphasize efficiency (Spiegelhalter et al., 1995; Murphy, 2001; Plummer, 2003; Salvatier et al., 2015; Carpenter et al., 2016).",
+      "startOffset" : 66,
+      "endOffset" : 171
+    }, {
+      "referenceID" : 63,
+      "context" : ", 2014), and Augur enables data parallelism with GPUs for Gibbs sampling in Bayesian networks (Tristan et al., 2014).",
+      "startOffset" : 94,
+      "endOffset" : 116
+    }, {
+      "referenceID" : 37,
+      "context" : "Venture and Anglican design inference as a collection of local inference problems, defined over program fragments (Mansinghka et al., 2014; Wood et al., 2014).",
+      "startOffset" : 114,
+      "endOffset" : 158
+    }, {
+      "referenceID" : 66,
+      "context" : "Venture and Anglican design inference as a collection of local inference problems, defined over program fragments (Mansinghka et al., 2014; Wood et al., 2014).",
+      "startOffset" : 114,
+      "endOffset" : 158
+    }, {
+      "referenceID" : 53,
+      "context" : "Concurrent with our work, WebPPL features amortized inference (Ritchie et al., 2016).",
+      "startOffset" : 62,
+      "endOffset" : 84
+    }, {
+      "referenceID" : 8,
+      "context" : ", 2015; Carpenter et al., 2016). The PPL is restricted to a specific class of models, and inference algorithms are optimized to be efficient for this class. For example, Infer.NET enables fast message passing for graphical models (Minka et al., 2014), and Augur enables data parallelism with GPUs for Gibbs sampling in Bayesian networks (Tristan et al., 2014). Edward bridges this gap. It is Turing complete—it supports any computable probability distribution—and it supports efficient algorithms, such as those that leverage model structure and those that scale to massive data. There has been some prior research on efficient algorithms in Turing-complete languages. Venture and Anglican design inference as a collection of local inference problems, defined over program fragments (Mansinghka et al., 2014; Wood et al., 2014). This produces fast program-specific inference code, which we build on. Neither system supports inference methods such as programmable posterior approximations, inference models, or data subsampling. Concurrent with our work, WebPPL features amortized inference (Ritchie et al., 2016). Unlike Edward, WebPPL does not reuse the model’s representation; rather, it annotates the original program and leverages helper functions, which is a less flexible strategy. Finally, inference is designed as program transformations in Kiselyov & Shan (2009); Ścibior et al.",
+      "startOffset" : 8,
+      "endOffset" : 1372
+    }, {
+      "referenceID" : 8,
+      "context" : ", 2015; Carpenter et al., 2016). The PPL is restricted to a specific class of models, and inference algorithms are optimized to be efficient for this class. For example, Infer.NET enables fast message passing for graphical models (Minka et al., 2014), and Augur enables data parallelism with GPUs for Gibbs sampling in Bayesian networks (Tristan et al., 2014). Edward bridges this gap. It is Turing complete—it supports any computable probability distribution—and it supports efficient algorithms, such as those that leverage model structure and those that scale to massive data. There has been some prior research on efficient algorithms in Turing-complete languages. Venture and Anglican design inference as a collection of local inference problems, defined over program fragments (Mansinghka et al., 2014; Wood et al., 2014). This produces fast program-specific inference code, which we build on. Neither system supports inference methods such as programmable posterior approximations, inference models, or data subsampling. Concurrent with our work, WebPPL features amortized inference (Ritchie et al., 2016). Unlike Edward, WebPPL does not reuse the model’s representation; rather, it annotates the original program and leverages helper functions, which is a less flexible strategy. Finally, inference is designed as program transformations in Kiselyov & Shan (2009); Ścibior et al. (2015); Zinkov & Shan (2016).",
+      "startOffset" : 8,
+      "endOffset" : 1395
+    }, {
+      "referenceID" : 8,
+      "context" : ", 2015; Carpenter et al., 2016). The PPL is restricted to a specific class of models, and inference algorithms are optimized to be efficient for this class. For example, Infer.NET enables fast message passing for graphical models (Minka et al., 2014), and Augur enables data parallelism with GPUs for Gibbs sampling in Bayesian networks (Tristan et al., 2014). Edward bridges this gap. It is Turing complete—it supports any computable probability distribution—and it supports efficient algorithms, such as those that leverage model structure and those that scale to massive data. There has been some prior research on efficient algorithms in Turing-complete languages. Venture and Anglican design inference as a collection of local inference problems, defined over program fragments (Mansinghka et al., 2014; Wood et al., 2014). This produces fast program-specific inference code, which we build on. Neither system supports inference methods such as programmable posterior approximations, inference models, or data subsampling. Concurrent with our work, WebPPL features amortized inference (Ritchie et al., 2016). Unlike Edward, WebPPL does not reuse the model’s representation; rather, it annotates the original program and leverages helper functions, which is a less flexible strategy. Finally, inference is designed as program transformations in Kiselyov & Shan (2009); Ścibior et al. (2015); Zinkov & Shan (2016). This enables the flexibility of composing inference inside other probabilistic programs.",
+      "startOffset" : 8,
+      "endOffset" : 1417
+    }, {
+      "referenceID" : 9,
+      "context" : "We desire two criteria: (a) integration with computational graphs, an efficient framework where nodes represent operations on data and edges represent data communicated between them (Culler, 1986); and (b) invariance of the representation under the graph, that is, the representation can be reused during inference.",
+      "startOffset" : 182,
+      "endOffset" : 196
+    }, {
+      "referenceID" : 63,
+      "context" : "consumption for large models (Tristan et al., 2014).",
+      "startOffset" : 29,
+      "endOffset" : 51
+    }, {
+      "referenceID" : 57,
+      "context" : "Moreover, it enables us to simplify both deterministic and stochastic operations in the graph, before executing any code (Ścibior et al., 2015; Zinkov & Shan, 2016).",
+      "startOffset" : 121,
+      "endOffset" : 164
+    }, {
+      "referenceID" : 51,
+      "context" : "Figure 2 implements a variational auto-encoder (VAE) (Kingma & Welling, 2014; Rezende et al., 2014) in Edward.",
+      "startOffset" : 53,
+      "endOffset" : 99
+    }, {
+      "referenceID" : 20,
+      "context" : "With model compositionality, we can embed it into more complicated models (Gregor et al., 2015; Rezende et al., 2016) and for other learning tasks (Kingma et al.",
+      "startOffset" : 74,
+      "endOffset" : 117
+    }, {
+      "referenceID" : 52,
+      "context" : "With model compositionality, we can embed it into more complicated models (Gregor et al., 2015; Rezende et al., 2016) and for other learning tasks (Kingma et al.",
+      "startOffset" : 74,
+      "endOffset" : 117
+    }, {
+      "referenceID" : 30,
+      "context" : ", 2016) and for other learning tasks (Kingma et al., 2014).",
+      "startOffset" : 37,
+      "endOffset" : 58
+    }, {
+      "referenceID" : 31,
+      "context" : "With inference compositionality (which we discuss in Section 4), we can embed it into more complicated algorithms, such as with expressive variational approximations (Rezende & Mohamed, 2015; Tran et al., 2016b; Kingma et al., 2016) and alternative objectives (Ranganath et al.",
+      "startOffset" : 166,
+      "endOffset" : 232
+    }, {
+      "referenceID" : 12,
+      "context" : ", 2016) and alternative objectives (Ranganath et al., 2016a; Li & Turner, 2016; Dieng et al., 2016).",
+      "startOffset" : 35,
+      "endOffset" : 99
+    }, {
+      "referenceID" : 37,
+      "context" : "Stochastic control flow defines dynamic conditional dependencies, known in the literature as contingent or existential dependencies (Mansinghka et al., 2014; Wu et al., 2016).",
+      "startOffset" : 132,
+      "endOffset" : 174
+    }, {
+      "referenceID" : 67,
+      "context" : "Stochastic control flow defines dynamic conditional dependencies, known in the literature as contingent or existential dependencies (Mansinghka et al., 2014; Wu et al., 2016).",
+      "startOffset" : 132,
+      "endOffset" : 174
+    }, {
+      "referenceID" : 23,
+      "context" : ", layer-wise training (Hinton et al., 2006)), infer parts used in multiple models (e.",
+      "startOffset" : 22,
+      "endOffset" : 43
+    }, {
+      "referenceID" : 28,
+      "context" : "Variational inference posits a family of approximating distributions and finds the closest member in the family to the posterior (Jordan et al., 1999).",
+      "startOffset" : 129,
+      "endOffset" : 150
+    }, {
+      "referenceID" : 47,
+      "context" : "1, we experiment with multiple gradient estimators for black box variational inference (Ranganath et al., 2014).",
+      "startOffset" : 87,
+      "endOffset" : 111
+    }, {
+      "referenceID" : 41,
+      "context" : "Specific MC samplers determine the update rules: they can use gradients such as in Hamiltonian Monte Carlo (Neal, 2011) and graph structure such as in sequential Monte Carlo (Doucet et al.",
+      "startOffset" : 107,
+      "endOffset" : 119
+    }, {
+      "referenceID" : 14,
+      "context" : "Specific MC samplers determine the update rules: they can use gradients such as in Hamiltonian Monte Carlo (Neal, 2011) and graph structure such as in sequential Monte Carlo (Doucet et al., 2001).",
+      "startOffset" : 174,
+      "endOffset" : 195
+    }, {
+      "referenceID" : 18,
+      "context" : "Edward also supports non-Bayesian methods such as generative adversarial networks (GANs) (Goodfellow et al., 2014).",
+      "startOffset" : 89,
+      "endOffset" : 114
+    }, {
+      "referenceID" : 3,
+      "context" : "Users can then integrate out variables to automatically derive classical Gibbs (Gelfand & Smith, 1990), mean-field updates (Bishop, 2006), and exact inference.",
+      "startOffset" : 123,
+      "endOffset" : 137
+    }, {
+      "referenceID" : 10,
+      "context" : ", Denton et al. (2015); Li et al.",
+      "startOffset" : 2,
+      "endOffset" : 23
+    }, {
+      "referenceID" : 10,
+      "context" : ", Denton et al. (2015); Li et al. (2015)).",
+      "startOffset" : 2,
+      "endOffset" : 41
+    }, {
+      "referenceID" : 22,
+      "context" : "This extends to many other cases such as exact EM for exponential families, contrastive divergence (Hinton, 2002), pseudo-marginal methods (Andrieu & Roberts, 2009), and Gibbs sampling within variational inference (Wang & Blei, 2012; Hoffman & Blei, 2015).",
+      "startOffset" : 99,
+      "endOffset" : 113
+    }, {
+      "referenceID" : 39,
+      "context" : "For example, classical message passing uses exact local inference and expectation propagation locally minimizes the Kullback-Leibler divergence, KL(p ‖ q) (Minka, 2001).",
+      "startOffset" : 155,
+      "endOffset" : 168
+    }, {
+      "referenceID" : 5,
+      "context" : "Stochastic optimization (Bottou, 2010) scales inference to massive data and is key to algorithms such as stochastic gradient Langevin dynamics (Welling & Teh, 2011) and stochastic variational inference (Hoffman et al.",
+      "startOffset" : 24,
+      "endOffset" : 38
+    }, {
+      "referenceID" : 25,
+      "context" : "Stochastic optimization (Bottou, 2010) scales inference to massive data and is key to algorithms such as stochastic gradient Langevin dynamics (Welling & Teh, 2011) and stochastic variational inference (Hoffman et al., 2013).",
+      "startOffset" : 202,
+      "endOffset" : 224
+    }, {
+      "referenceID" : 63,
+      "context" : "This prevents reifying the full model, which can lead to unreasonable memory consumption (Tristan et al., 2014).",
+      "startOffset" : 89,
+      "endOffset" : 111
+    }, {
+      "referenceID" : 13,
+      "context" : "The approach extends naturally to streaming data (Doucet et al., 2000; Broderick et al., 2013; McInerney et al., 2015), dynamic batch sizes, and data structures in which working on a subgraph does not immediately apply (Binder et al.",
+      "startOffset" : 49,
+      "endOffset" : 118
+    }, {
+      "referenceID" : 6,
+      "context" : "The approach extends naturally to streaming data (Doucet et al., 2000; Broderick et al., 2013; McInerney et al., 2015), dynamic batch sizes, and data structures in which working on a subgraph does not immediately apply (Binder et al.",
+      "startOffset" : 49,
+      "endOffset" : 118
+    }, {
+      "referenceID" : 38,
+      "context" : "The approach extends naturally to streaming data (Doucet et al., 2000; Broderick et al., 2013; McInerney et al., 2015), dynamic batch sizes, and data structures in which working on a subgraph does not immediately apply (Binder et al.",
+      "startOffset" : 49,
+      "endOffset" : 118
+    }, {
+      "referenceID" : 2,
+      "context" : ", 2015), dynamic batch sizes, and data structures in which working on a subgraph does not immediately apply (Binder et al., 1997; Johnson & Willsky, 2014; Foti et al., 2014).",
+      "startOffset" : 108,
+      "endOffset" : 173
+    }, {
+      "referenceID" : 15,
+      "context" : ", 2015), dynamic batch sizes, and data structures in which working on a subgraph does not immediately apply (Binder et al., 1997; Johnson & Willsky, 2014; Foti et al., 2014).",
+      "startOffset" : 108,
+      "endOffset" : 173
+    }, {
+      "referenceID" : 7,
+      "context" : "4 Importance-weighted auto-encoders (K = 50) (Burda et al., 2016) ≤ 86.",
+      "startOffset" : 45,
+      "endOffset" : 65
+    }, {
+      "referenceID" : 43,
+      "context" : "The next three methods use the same VAE but apply different gradient estimators: reparameterization gradient without an analytic KL; reparameterization gradient with an analytic entropy; and the score function gradient (Paisley et al., 2012; Ranganath et al., 2014).",
+      "startOffset" : 219,
+      "endOffset" : 265
+    }, {
+      "referenceID" : 47,
+      "context" : "The next three methods use the same VAE but apply different gradient estimators: reparameterization gradient without an analytic KL; reparameterization gradient with an analytic entropy; and the score function gradient (Paisley et al., 2012; Ranganath et al., 2014).",
+      "startOffset" : 219,
+      "endOffset" : 265
+    }, {
+      "referenceID" : 7,
+      "context" : ", 2016b) with a normalizing flow prior; it produced similar results as a normalizing flow on the latent variable space (Rezende & Mohamed, 2015), and better than importance-weighted auto-encoders (IWAEs) (Burda et al., 2016).",
+      "startOffset" : 204,
+      "endOffset" : 224
+    }, {
+      "referenceID" : 41,
+      "context" : "We benchmark runtimes for a fixed number of Hamiltonian Monte Carlo (HMC; Neal, 2011) iterations on modern hardware: a 12-core Intel i7-5930K CPU at 3.",
+      "startOffset" : 68,
+      "endOffset" : 85
+    }, {
+      "referenceID" : 8,
+      "context" : "We apply logistic regression on the Covertype dataset (N = 581012, D = 54; responses were binarized) using Edward, Stan (with PyStan) (Carpenter et al., 2016), and PyMC3 (Salvatier et al.",
+      "startOffset" : 134,
+      "endOffset" : 158
+    }, {
+      "referenceID" : 56,
+      "context" : ", 2016), and PyMC3 (Salvatier et al., 2015).",
+      "startOffset" : 19,
+      "endOffset" : 43
+    }, {
+      "referenceID" : 8,
+      "context" : "Probabilistic programming system Runtime (s) Handwritten NumPy (1 CPU) 534 Stan (1 CPU) (Carpenter et al., 2016) 171 PyMC3 (12 CPU) (Salvatier et al.",
+      "startOffset" : 88,
+      "endOffset" : 112
+    }, {
+      "referenceID" : 56,
+      "context" : ", 2016) 171 PyMC3 (12 CPU) (Salvatier et al., 2015) 30.",
+      "startOffset" : 27,
+      "endOffset" : 51
+    }, {
+      "referenceID" : 26,
+      "context" : "4 It is inspired by the model zoo in Caffe (Jia et al., 2014), which provides many pre-trained discriminative neural networks, and which has been key to making large-scale deep learning more transparent and accessible.",
+      "startOffset" : 43,
+      "endOffset" : 61
+    }, {
+      "referenceID" : 59,
+      "context" : "It is also inspired by Forest (Stuhlmüller, 2012), which provides examples of probabilistic programs.",
+      "startOffset" : 30,
+      "endOffset" : 49
+    }, {
+      "referenceID" : 54,
+      "context" : "In present work, we are applying Edward as a research platform for developing new probabilistic models (Rudolph et al., 2016; Tran et al., 2017) and new inference algorithms (Dieng et al.",
+      "startOffset" : 103,
+      "endOffset" : 144
+    }, {
+      "referenceID" : 62,
+      "context" : "In present work, we are applying Edward as a research platform for developing new probabilistic models (Rudolph et al., 2016; Tran et al., 2017) and new inference algorithms (Dieng et al.",
+      "startOffset" : 103,
+      "endOffset" : 144
+    }, {
+      "referenceID" : 12,
+      "context" : ", 2017) and new inference algorithms (Dieng et al., 2016).",
+      "startOffset" : 37,
+      "endOffset" : 57
+    } ],
+    "year" : 2017,
+    "abstractText" : "We propose Edward, a Turing-complete probabilistic programming language. Edward defines two compositional representations—random variables and inference. By treating inference as a first class citizen, on a par with modeling, we show that probabilistic programming can be as flexible and computationally efficient as traditional deep learning. For flexibility, Edward makes it easy to fit the same model using a variety of composable inference methods, ranging from point estimation to variational inference to MCMC. In addition, Edward can reuse the modeling representation as part of inference, facilitating the design of rich variational models and generative adversarial networks. For efficiency, Edward is integrated into TensorFlow, providing significant speedups over existing probabilistic systems. For example, we show on a benchmark logistic regression task that Edward is at least 35x faster than Stan and 6x faster than PyMC3. Further, Edward incurs no runtime overhead: it is as fast as handwritten TensorFlow.",
+    "creator" : "LaTeX with hyperref package"
+  }
+}

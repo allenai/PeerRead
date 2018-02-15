@@ -1,0 +1,654 @@
+{
+  "name" : "765.pdf",
+  "metadata" : {
+    "source" : "CRF",
+    "title" : null,
+    "authors" : [ "ATARI GAMES", "Felix Leibfried" ],
+    "emails" : [ "felix.leibfried@gmail.com", "nkushman@microsoft.com", "katja.hofmann@microsoft.com" ],
+    "sections" : [ {
+      "heading" : "1 INTRODUCTION",
+      "text" : "When humans or animals receive reward for taking a particular action in a given situation, the probability is increased that they will act similarly in similar situations in the future. This is described by principles such as the law of effect (Thorndike, 1898), operant conditioning (Skinner, 1938) and trial-and-error learning (Thorpe, 1979) in behaviorist psychology, and has inspired a discipline of artificial intelligence called reinforcement learning (RL, Sutton & Barto (1998)). RL is concerned with finding optimal behavior policies in order to maximize agents’ cumulative future reward.\nApproaches to RL can be divided into model-free and model-based approaches. In model-free approaches, agents learn by trial and error but do not aim to explicitly capture the dynamics of the environment or the structure of the reward function underlying the environment. State-of-the-art modelfree approaches, such as DQN (Mnih et al., 2015), effectively approximate so-called Q-values, i.e., the value of taking specific actions in a given state, using deep neural networks. The impressive effectiveness of these approaches comes from their ability to learn complex policies directly from high-dimensional input (e.g., video frames). Despite their effectiveness, model-free approaches require large amounts of training data that have to be collected through direct interactions with the environment, which makes them expensive to apply in settings where interactions are costly (such as most real-world applications). Additionally, model-free RL requires access to reward observations during training, which is problematic in environments with sparse reward structure—unless coupled with an explicit exploration mechanism.\nRL approaches that explicitly learn statistics about the environment or the reward are generally referred to as model-based—in a more narrow definition these statistics comprise environment dynamics and the reward function. In recent work, model-based techniques were successfully used to learn statistics about cumulative future reward (Veness et al., 2015) and to improve exploration by favoring actions that are likely to lead to novel states (Bellemare et al., 2016; Oh et al., 2015),\n∗Research conducted while interning at Microsoft.\nresulting in substantially more data efficient learning compared to model-free approaches. When an accurate model of the true environment dynamics and the true reward function is available, modelbased approaches, such as planning via Monte-Carlo tree search (Browne et al., 2012) outperform model-free state-of-the-art approaches (Guo et al., 2014).\nA key open question is whether effective model-based RL is possible in complex settings where the environment dynamics and the reward function are initially unknown, and the agent has to acquire such knowledge through experience. In this paper, we take a step towards addressing this question by extending recent work on video frame prediction (Oh et al., 2015), which has been demonstrated to effectively learn system dynamics, to enable joint prediction of future states and rewards using a single latent representation. We propose a network architecture and training procedure for joint state and reward prediction, and evaluate our approach in the Arcade Learning Environment (ALE, Bellemare et al. (2013)).\nOur empirical results on five Atari games demonstrate that our approach can successfully predict cumulative reward up to roughly 200 frames. We complement our quantitative results with a detailed error analysis by visualizing example predictions. Our results are the first to demonstrate the feasibility of using a learned dynamics and reward model for accurate planning. We see this as a significant step towards data efficient RL in high-dimensional environments without prior knowledge."
+    }, {
+      "heading" : "2 RELATED WORK AND MOTIVATION",
+      "text" : "Two lines of research are related to the work presented in this paper: model-based RL and optimal control theory. Model-based RL utilizes a given or learned model of some aspect of a task to, e.g., reduce data or exploration requirements (Bellemare et al., 2016; Oh et al., 2015; Veness et al., 2015). Optimal control theory describes mathematical principles for deriving control policies in continuous action spaces that maximize cumulative future reward in scenarios with known system dynamics and known reward structure (Bertsekas, 2007; 2005).\nThere has been recent interest in combining principles from optimal control theory and model-based learning in settings where no information on system dynamics is available a priori and instead has to be acquired from visual data (Finn et al., 2016; Wahlström et al., 2015; Watter et al., 2015). The general idea behind these approaches is to learn a compressed latent representation of the visual state space from raw images through autoencoder networks (Bengio, 2009) and to utilize the acquired latent representation to infer system dynamics. System dynamics are then used to specify a planning problem which can be solved by optimization techniques to derive optimal policies. Watter et al. (2015) introduce an approach for learning system dynamics from raw visual data by jointly training a variational autoencoder (Kingma & Welling, 2014; Rezende et al., 2014) and a state prediction model that operates in the autoencoder’s compressed latent state representation. A similar approach for jointly learning a compressed state representation and a predictive model is pursued by Wahlström et al. (2015).Finn et al. (2016) devise a sequential approach that first learns a latent state representation from visual data and that subsequently exploits this latent representation to augment a robot’s initial state space describing joint angles and end-effector positions. The augmented state space is then used to improve estimates of local system dynamics for planning.\nThe approaches presented above assume knowledge of the functional form of the true reward signal and are hence not directly applicable in settings like ALE (and many real-world settings) where the reward function is initially unknown. Planning in such settings therefore necessitates learning both system dynamics and reward function in order to infer optimal behavioral policies. Recent work by Oh et al. (2015) introduced an approach for learning environment dynamics from pixel images and demonstrated that this enabled successful video frame prediction over up to 400 frames. In our current paper, we extend this recent work to enable reward prediction as well by modifying the network’s architecture and training objective accordingly. The modification of the training objective bears a positive side effect: since our network must optimize a compound loss consisting of the video frame reconstruction loss and the reward loss, reward-relevant aspects in the video frames to which the reconstruction loss alone might be insensitive are explicitly captured by the optimization objective. In the subsequent section, we elucidate the approach from Oh et al. (2015) as well as our extensions for reward prediction in more detail."
+    }, {
+      "heading" : "3 NETWORK ARCHITECTURE AND TRAINING",
+      "text" : "The deep network proposed by Oh et al. (2015) for video frame prediction in Atari games aims at learning a function that predicts the video frame st+1 at the next time step t + 1, given the current history of frames st−h+1:t with time horizon h and the current action at taken by the agent—see Section 3.1. Here, we extend this work to enable joint video frame and reward prediction such that the network anticipates the current reward rt as well—see Sections 3.2 and 3.3."
+    }, {
+      "heading" : "3.1 VIDEO FRAME PREDICTION",
+      "text" : "The video-frame-predictive architecture from Oh et al. (2015) comprises three informationprocessing stages: an encoding stage that maps input frames to some compressed latent representation, a transformation stage that integrates the current action into the compressed latent representation, and a decoding stage that maps the compressed latent representation to the predicted next frame—see Figure 1. The initial encoding stage is a sequence of convolutional and forward operations that map the current frame history st−h+1:t—a three-dimensional tensor—to a compressed feature vector henct . The transformation stage converts this compressed feature vector h enc t into an action-conditional representation hdect in vectorized form by integrating the current action at. The current action at is represented as a one-hot vector with length varying from game to game since there are at least 3 and at most 18 actions in ALE. The integration of the current action into the compressed feature vector includes an element-wise vector multiplication—depicted as ’×’ in Figure 1—with the particularity that the two neuron layers involved in this element-wise multiplication are the only layers in the entire network without bias parameters, see Section 3.2 in Oh et al. (2015). Finally, the decoding stage performs a series of forward and deconvolutional operations (Dosovitskiy et al., 2015; Zeiler et al., 2010) by mapping the action-conditional representation hdect of the current frame history st−h+1:t and the current action at to the predicted video frame st+1 of the next time step t+1. Note that this necessitates a reshape operation at the beginning of the decoding cascade in order to transform the vectorized hidden representation into a three-dimensional tensor. The whole network uses linear and rectified linear units (Glorot et al., 2011) only. In all our experiments, following DQN (Mnih et al., 2015), the video frames processed by the network are 84 × 84 grey-scale images down-sampled from the full-resolution 210× 160 Atari RGB images from ALE. Following Mnih et al. (2015) and Oh et al. (2015), the history frame time horizon h is set to 4."
+    }, {
+      "heading" : "3.2 REWARD PREDICTION",
+      "text" : "In this section we detail our proposed network architecture for joint state and reward prediction. Our model assumes ternary rewards which result from reward clipping in line with Mnih et al. (2015). Original game scores in ALE are integers that can vary significantly between different Atari games and the corresponding original rewards are clipped to assume one of three values: −1 for negative rewards, 0 for no reward and 1 for positive rewards. Because of reward clipping, rewards can be represented as vectors rt in one-hot encoding of size 3.\nIn Figure 1, our extension of the video-frame-predictive architecture from Oh et al. (2015) to enable reward prediction is highlighted in red. We add an additional softmax layer to predict the current reward rt with information contained in the action-conditional encoding hdect . The motivation behind this extension is twofold. First, our extension makes it possible to jointly train the network with a compound objective that emphasizes both video frame reconstruction and reward prediction, and thus encourages the network to not abstract away reward-relevant features to which the reconstruction loss alone might be insensitive. Second, this formulation facilitates the future use of the model for reward prediction through virtual roll-outs in the compressed latent space, without the computational expensive necessity of reconstructing video frames explicitly—note that this requires another ”shortcut” predictive model to map from hdect to h enc t+1.\nFollowing previous work (Oh et al., 2015; Mnih et al., 2015), actions are chosen by the agent on every fourth frame and are repeated on frames that were skipped. Skipped frames and repeated actions are hence not part of the data sets used to train and test the predictive network on, and original reward values are accumulated over four frames before clipping."
+    }, {
+      "heading" : "3.3 TRAINING",
+      "text" : "Training the model for joint video frame and reward prediction requires trajectory samples{( s (i) n ,a (i) n , r (i) n )N n=1 }I i=1 collected by some agent playing the Atari game, where i is an index over trajectories and n is a time index over samples within one trajectory i. The parameter I denotes the number of trajectories in the training set or the minibatch respectively and the parameter N denotes the length of an individual trajectory. In our case, we use agents trained according to Mnih et al. (2015) in order to collect trajectory samples.\nThe original training objective in Oh et al. (2015) consists of a video frame reconstruction loss in terms of a squared loss function aimed at minimizing the quadratic l2-norm of the difference vector between the ground truth image and its action-conditional reconstruction. We extend this training objective to enable joint reward prediction. This results in a compound training loss consisting of the original video frame reconstruction loss and a reward prediction loss given by the cross entropy (Simard et al., 2003) between the ground truth reward and the corresponding prediction:\nLK(θ) = 1\n2 · I · T ·K I∑ i=1 T−1∑ t=0 K∑ k=1  ∣∣∣∣∣∣s(i)t+k − ŝ(i)t+k∣∣∣∣∣∣2\n2︸ ︷︷ ︸ video frame reconstruction loss\n+λ · (−1) 3∑\nl=1\nr (i) t+k[l] · lnp (i) t+k[l]︸ ︷︷ ︸\nreward prediction loss  , where ŝ(i)t+k denotes the k-step look ahead frame prediction with target video frame s (i) t+k and p (i) t+k denotes the k-step look ahead probability values of the reward-predicting softmax layer—depicted in red in Figure1—with target reward vector r(i)t+k. The parameter λ > 0 controls the trade-off between video frame reconstruction and reward loss. The parameter T is a time horizon parameter that determines how often a single trajectory sample i is unrolled into the future, and K determines the look ahead prediction horizon dictating how far the network predicts into the future by using its own video frame predicted output as input for the next time step. Following Oh et al. (2015) and Michalski et al. (2014), we apply a curriculum learning (Bengio et al., 2009) scheme by successively increasing K in the course of training such that the network initially learns to predict over a short time horizon and becomes fine-tuned on longer-term predictions as training advances (see Section A.1 for details). The network parameters θ are updated by stochastic gradient descent, derivatives of the training objective w.r.t. θ are computed with backpropagation through time (Werbos, 1988)."
+    }, {
+      "heading" : "4 RESULTS",
+      "text" : "In our evaluations, we investigate cumulative reward predictions quantitatively and qualitatively on five different Atari games (Q*bert, Seaquest, Freeway, Ms Pacman and Space Invaders). The quantitative analysis comprises evaluating the cumulative reward prediction error—see Section 4.1. The qualitative analysis comprises visualizations of example predictions in Seaquest—see Section 4.2."
+    }, {
+      "heading" : "4.1 QUANTITATIVE REWARD PREDICTION ANALYSIS: CUMULATIVE REWARD ERROR",
+      "text" : "Our quantitative evaluation examines whether our joint model of system dynamics and reward function results in a shared latent representation that enables accurate cumulative reward prediction. We assess cumulative reward prediction on test sets consisting of approximately 50,000 video frames per game, including actions and rewards. Each network is evaluated on 1,000 trajectories—suitable to analyze up to 100-step ahead prediction—drawn randomly from the test set. Look ahead prediction is measured in terms of the cumulative reward error which is the difference between ground truth cumulative reward and predicted cumulative reward. For each game, this results in 100 empirical distributions over the cumulative reward error—one distribution for each look ahead step—consisting of 1,000 samples each (one for each trajectory). We compare our model predictions to a baseline model that samples rewards from the marginal reward distribution observed on the test set for each game. Note that negative reward values are absent in the games investigated for this study.\nFigure 2 illustrates 20 of the 100 empirical cumulative reward error distributions in all games for our network model in blue and for the baseline model in red (histograms, bottom), together with the median and the 5 to 95 percentiles of the cumulative reward error over look ahead steps (top). Across all games, we observe that our joint state and reward prediction model accurately predicts future cumulative rewards at least 20 look ahead steps, and that it predicts future rewards substantially more accurately than the baseline model. This is evidenced by cumulative reward error distributions that maintain a unimodal form with mode zero and do not flatten out as quickly as the distributions for the random-prediction baseline model. Best results are achieved in Freeway and Q*bert where the probability of zero cumulative reward error at 51 look ahead steps is still around 80% and 60% respectively—see Figure 2. Note that 51 look ahead steps correspond to 204 frames because the underlying DQN agent, collecting trajectory samples for training and testing our model, skipped every fourth frame when choosing an action—see Section 3.2. Lowest performance is obtained in Seaquest where the probability of zero cumulative reward error at 26 steps (104 frames) is around 40% and begins to flatten out soon thereafter—see Figure 2. Running the ALE emulator at a frequency of 60fps, 26 steps correspond to more than 1 second real-time game play because of frame skipping. Since our model is capable of predicting 26 steps ahead in less than 1 second, our model enables real-time planning and could be therefore utilized in an online fashion.\nWe now turn our attention to error analysis. While the look ahead step at which errors become prominent differs substantially from game to game, we find that overall our model underestimates cumulative reward. This can be seen in the asymmetry towards positive cumulative reward error values when inspecting the 5 to 95 percentile intervals in the first plot per each game in Figure 2. We identify a likely cause in (pseudo-)stochastic transitions inherent in these games. Considering Seaquest as our running example, objects such as divers and submarines can enter the scene randomly from the right and from the left and at the same time have an essential impact on which rewards the agent can potentially collect. In the ground truth trajectories, the agent’s actions are reactions to these objects. If the predicted future trajectory deviates from the ground truth, targeted actions such as shooting will miss their target, leading to underestimating true reward. We analyze this effect in more detail in Section 4.2.\nAll our experiments were conducted in triplicate with different initial random seeds. Different initial random seeds did not have a significant impact on cumulative reward prediction in all games except Freeway—see Section A.5 for a detailed analysis. So far, we discussed results concerning reward prediction only. In the appendix, we also evaluate the joint performance of reward and video frame prediction on the test set in terms of the optimization objective as in Oh et al. (2015), where the authors report successful video frame reconstruction up to approximately 100 steps (400 frames), and observe similar results—see Section A.6."
+    }, {
+      "heading" : "4.2 QUALITATIVE REWARD PREDICTION ANALYSIS: EXAMPLE PREDICTIONS IN SEAQUEST",
+      "text" : "In the previous section, we identified stochasticity in state transitions as a likely cause for relatively low performance in long-term cumulative reward prediction in games such as Seaquest. In Seaquest objects may randomly enter a scene in a non-deterministic fashion. Errors in predicting these events result in predicted possible futures that do not match actually observed future states, resulting in inaccurate reward predictions. Here, we support this hypothesis by visualizations in Seaquest illustrating joint video frame and reward prediction for a single network over 20 steps (80 frames)—see Figure 3 where ground truth video frames are compared to predicted video frames in terms of error maps. Error maps emphasize the difference between ground truth and predicted frames through squared error values between pixels in black or white depending on whether objects are absent or present by mistake in the network’s prediction. Actions, ground truth rewards and model-predicted rewards are shown between state transitions. Peculiarities in the prediction process are shown in red.\nIn step 2, the model predicts reward by mistake because the agent barely misses its target. Steps 4 to 6 report how the model predicts reward correctly but is off by one time step. Steps 7 to 14 depict problems caused by objects randomly entering the scene from the right which the model cannot predict. Steps 26 to 30 show how the model has problems to predict rewards at steps 26 and 28 as these rewards are attached to objects the model failed to notice entering the scene earlier."
+    }, {
+      "heading" : "5 CONCLUSION AND FUTURE WORK",
+      "text" : "In this paper, we extended recent work on video frame prediction (Oh et al., 2015) in Atari games to enable reward prediction. Our approach can be used to jointly predict video frames and cumulative rewards up to a horizon of approximately 200 frames in five different games (Q*bert, Seaquest, Freeway, Ms Pacman and Space Invaders). We achieved best results in Freeway and Q*bert where the probability of zero cumulative reward error after 200 frames is still around 80% and 60% respectively, and worst results in Seaquest where the probability of zero cumulative reward error after 100 frames is around 40%. Our study fits into the general line of research using autoencoder networks to learn a latent representation from visual data (Finn et al., 2016; Goroshin et al., 2015; Gregor et al., 2015; Kulkarni et al., 2015; Srivastava et al., 2015; Wahlström et al., 2015; Watter et al., 2015; Kingma & Welling, 2014; Rezende et al., 2014; Lange et al., 2012; Hinton et al., 2011; Ranzato et al., 2007), and extends this line of research by showing that autoencoder networks are capable of learning a combined representation for system dynamics and the reward function in reinforcement learning settings with high-dimensional visual state spaces—a first step towards applying modelbased techniques for planning in environments where the reward function is not initially known.\nOur positive results open up intriguing directions for future work. Our long-term goal is the integration of model-based and model-free approaches for effective interactive learning and planning in complex environments. Directions for achieving this long-standing challenge include the Dyna method (Sutton, 1990), which uses a predictive model to artificially augment expensive training data, and has been shown to lead to substantial reductions in data requirements in tabular RL approaches. Alternatively, the model could be could be utilized for planning via Monte-Carlo tree search (Guo et al., 2014; Browne et al., 2012). We hypothesize that such an approach would be particularly beneficial in multi-task or life-long learning scenarios where the reward function changes but the environment dynamics are stationary. Testing this hypothesis requires a flexible learning framework where the reward function and the artificial environment can be changed by the experimenter in an arbitrary fashion, which is not possible in ALE where the environment and the reward function are fixed per game. A learning environment providing such a flexibility is the recently released Malmö platform for Minecraft (Johnson et al., 2016) where researchers can create user-defined environments and tasks in order to evaluate the performance of artificial agents. In the shorter-term, we envision improving the prediction performance of our network by regularization methods such as dropout and max norm regularization (Srivastava et al., 2014)—a state-of-the-art regularizer in supervised learning—and by modifying the optimization objective to enforce similarity between hidden encodings in multi-step ahead prediction and one-step ahead prediction—see Watter et al. (2015). Finally, extensions of our model to non-deterministic state transitions through dropout and variational autoencoder schemes (Kingma & Welling, 2014; Rezende et al., 2014) is a promising direction to alleviate the limitations highlighted in Section 4.2—paving the way for models that adequately predict and reason over alternative possible future trajectories.\nSteps\nError mapPredictionGround truth\nSteps Error mapPredictionGround truth"
+    }, {
+      "heading" : "A APPENDIX",
+      "text" : ""
+    }, {
+      "heading" : "A.1 TRAINING DETAILS",
+      "text" : "We performed all our experiments in Python with Chainer and adhered to the instructions in Oh et al. (2015) as close as possible. Trajectory samples for learning the network parameters were obtained from a previously trained DQN agent according to Mnih et al. (2015). The dataset for training comprised around 500, 000 video frames per game in addition to actions chosen by the DQN agent and rewards collected during game play. Video frames used as network input were 84×84 grey-scale images with pixel values between 0 and 255 down-sampled from the full-resolution 210× 160 ALE RGB images. We applied a further preprocessing step by dividing each pixel by 255 and subtracting mean pixel values from each image leading to final pixel values ∈ [−1; 1]. A detailed network architecture is shown in Figure 1 in the main paper. All weights in the network were initialized according to Glorot & Bengio (2010) except for those two layers that participate in the element-wise multiplication in Figure 1: the weights of the action-processing layer were initialized uniformly in the range [−0.1; 0.1] and the weights of the layer receiving the latent encoding of the input video frames were initialized uniformly in the range [−1; 1]. Training was performed for 1, 500, 000 minibatch iterations with a curriculum learning scheme increasing the look ahead parameter K every 500, 000 iterations from 1 to 3 to 5. When increasing the look ahead parameter K for the first time after 500, 000 iterations, the minibatch size I was also altered from 32 to 8 as was the learning rate for parameter updates from 10−4 to 10−5. Throughout the entire curriculum scheme, the time horizon parameter determining the number of times a single trajectory is unrolled into the future was T = 4. The optimizer for updating weights was Adam (Kingma & Ba, 2015) with gradient momentum 0.9, squared gradient momentum 0.95 and epsilon parameter 10−8. In evaluation mode, network outputs were clipped to [−1; 1] so that strong activations could not accumulate over roll-out time in the network.\nIn our experiments, we modified the reward prediction loss slightly in order to prevent exploding gradient values by replacing the term − ln p with a first-order Taylor approximation for p-values smaller than e−10—a similar technique is used in DQN (Mnih et al., 2015) to improve the stability of the optimization algorithm. To identify optimal values for the reward weight λ, we performed initial experiments on Ms Pacman without applying the aforementioned curriculum learning scheme instead using a fixed look ahead parameter K = 1. We evaluated the effect of different λ-values ∈ {0.1, 1, 10, 100} on the training objective and identified λ = 1 for conducting further experiments—see Section A.2. After identifying an optimal reward weight, we conducted additional initial experiments without curriculum learning with fixed look ahead parameterK = 1 on all of the five different Atari games used in this paper. We observed periodic oscillations in the reward prediction loss of the training objective in Seaquest, which was fixed by adding gradient clipping (Pascanu et al., 2013) with threshold parameter 1 to our optimization procedure—experiments investigating the effect of gradient clipping in Seaquest are reported in Section A.3. The fine-tuning effect of curriculum learning on the training objective in our final experiments is shown in Section A.4 for all of the five analysed Atari games."
+    }, {
+      "heading" : "A.2 EFFECT OF REWARD WEIGHT IN MS PACMAN",
+      "text" : "To identify optimal values for the reward weight λ, we conducted initial experiments in Ms Pacman without curriculum learning and a fixed look ahead horizon K = 1. We tested four different λvalues ∈ {0.1, 1, 10, 100} and investigated how the frame reconstruction loss and the reward loss of the training objective evolve over minibatch iterations—see Figure 4. Best results were obtained for λ = 1 and for λ = 10, whereas values of λ = 0.1 and λ = 100 lead to significantly slower convergence and worse overall training performance respectively."
+    }, {
+      "heading" : "A.3 EFFECT OF GRADIENT CLIPPING IN SEAQUEST",
+      "text" : "After identifying an optimal value for the reward weight, see Section A.2, we observed oscillations in the reward loss of the training objective in Seaquest—see first column in Figure 5—which was solved by adding gradient clipping to our optimization procedure—see second and third column in Figure 5. We tested two different values for the gradient clipping threshold (5 and 1) both of which worked, but for a value of 1 the oscillation vanished completely."
+    }, {
+      "heading" : "A.4 EFFECT OF CURRICULUM LEARNING",
+      "text" : "In our final experiments with curriculum learning, the networks were trained for 1, 500, 000 minibatch iterations in total but the look ahead parameter K was gradually increased every 500, 000 iterations from 1 to 3 to 5. The networks were hence initially trained on one-step ahead prediction only and later on fine-tuned on further-step ahead prediction. Figure 6 shows how the training objective evolves over iterations. The characteristic ”bumps” in the training objective every 500, 000 iterations as training evolves demonstrate improvements in long-term predictions in all games except Freeway where the training objective assumed already very low values within the first 500, 000 iterations and might have been therefore insensitive to further fine-tuning by curriculum learning."
+    }, {
+      "heading" : "A.5 EFFECT OF RANDOM SEEDS",
+      "text" : "We conducted three different experiments per game with different initial random seeds. The effect of different initial random seeds on the cumulative reward error is summarized in Figure 7 which reports how the median and the 5 to 95 percentiles of the cumulative reward error evolve over look ahead steps in the different experiments per game. Note that the results of the first column in Figure 7 are shown in Figure 2 from the main paper together with a more detailed analysis depicting empirical cumulative reward error distributions for some look ahead steps. The random initial seed does not seem to have a significant impact on the cumulative reward prediction except for Freeway where the network in the third experiment starts to considerably overestimate cumulative rewards at around 30 to 40 look ahead steps.\nIn order to investigate this reward overestimation in Freeway further, we analyse visualizations of joint video frame and reward prediction for this particular seed (similar in style to Figure 3 from Section 4.2 in the main paper). The results are shown in Figure 8 where a peculiar situation occurs after 31 predicted look ahead steps. In Freeway, the agent’s job is to cross a busy road from the bottom to the top without bumping into a car in order to receive reward. If the agent bumps into a car, the agent is propelled downwards further away from the reward-yielding top. This propelled downwards movement happens even when the agent tries to move upwards. Exactly that kind of situation is depicted at the beginning of Figure 8 and occurs for this particular prediction after 31 steps. Our predictive model is however not able to correctly predict the aforementioned downwards movement caused by the agent hitting the car, which is highlighted in red throughout steps 31 to 35 documenting an increasing gap between ground truth and predicted agent position as the propelled downwards movement of the ground truth agent continues. In the course of further prediction, the network model assumes the agent to reach the reward-yielding top side of the road way too early which results in a sequence of erroneous positive reward predictions throughout steps 41 to 50, and as a side effect seemingly that the predictive model loses track of other objects in the scene. Concluding, this finding may serve as a possible explanation for cumulative reward overestimation for that particular experiment in Freeway.\nSteps\nSteps\nGround truth Prediction Error map Ground truth Prediction Error map"
+    }, {
+      "heading" : "A.6 LOSS ON TEST SET",
+      "text" : "In the main paper, our analysis focuses on evaluating how well our model serves the purpose of cumulative reward prediction. Here, we evaluate network performance in terms of both the video frame reconstruction loss as well as the reward prediction loss on the test set following the analysis conducted in Oh et al. (2015). For each game, we sample 300 minibatches of size I = 50 from the underlying test set and compute the test loss over K = 100 look ahead steps with the formula presented in the main paper in Section 3.3 used for learning network parameters, but without averaging over look ahead steps because we aim to illustrate the test loss as a function of look ahead steps—statistics of this analysis are plotted in Figure 9.\nBest overall test loss is achieved in Freeway and for initial look ahead steps (up to roughly between 40 and 60 steps) in Q*bert, which is in accordance with results for cumulative reward prediction from the main paper. Also in line with results from the main paper is the finding that the reward loss on the test set is worse in Seaquest, Ms Pacman and Space Invaders when compared to Q*bert (up to approximately 40 steps) and Freeway. Worst video frame reconstruction loss is observed for Space Invaders in compliance with Oh et al. (2015) where the authors report that there are objects in the scene moving at a period of 9 time steps which is hard to predict by a network only taking the last 4 frames from the last 4 steps as input for future predictions. At first sight, it might seem a bit surprising that the reward prediction loss in Space Invaders is significantly lower than in Seaquest and Ms Pacman for long-term ahead prediction despite the higher frame reconstruction loss in Space Invaders. A possible explanation for this paradox might be the frequency at which rewards are collected—this frequency is significantly higher in Seaquest and Ms Pacman than in Space Invaders. A reward prediction model with bias towards zero rewards—as indicated by the main results in the paper—might therefore err less often in absolute terms when rewards are collected at a lower frequency and may hence achieve lower overall reward reconstruction loss.\nCompound loss Reconstruction loss Reward loss"
+    } ],
+    "references" : [ {
+      "title" : "The Arcade Learning Environment: an evaluation platform for general agents",
+      "author" : [ "M G Bellemare", "Y Naddaf", "J Veness", "M Bowling" ],
+      "venue" : "Journal of Artificial Intelligence Research,",
+      "citeRegEx" : "Bellemare et al\\.,? \\Q2013\\E",
+      "shortCiteRegEx" : "Bellemare et al\\.",
+      "year" : 2013
+    }, {
+      "title" : "Unifying count-based exploration and intrinsic motivation",
+      "author" : [ "M G Bellemare", "S Srinivasan", "G Ostrovski", "T Schaul", "D Saxton", "R Munos" ],
+      "venue" : "arXiv preprint arXiv:1606.01868,",
+      "citeRegEx" : "Bellemare et al\\.,? \\Q2016\\E",
+      "shortCiteRegEx" : "Bellemare et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Learning deep architectures for AI",
+      "author" : [ "Y Bengio" ],
+      "venue" : "Foundations and Trends in Machine Learning,",
+      "citeRegEx" : "Bengio.,? \\Q2009\\E",
+      "shortCiteRegEx" : "Bengio.",
+      "year" : 2009
+    }, {
+      "title" : "Curriculum learning",
+      "author" : [ "Y Bengio", "J Louradour", "R Collobert", "J Weston" ],
+      "venue" : "In Proceedings of the International Conference on Machine Learning,",
+      "citeRegEx" : "Bengio et al\\.,? \\Q2009\\E",
+      "shortCiteRegEx" : "Bengio et al\\.",
+      "year" : 2009
+    }, {
+      "title" : "Dynamic programming & optimal control, volume 1",
+      "author" : [ "D P Bertsekas" ],
+      "venue" : "Athena Scientific,",
+      "citeRegEx" : "Bertsekas.,? \\Q2005\\E",
+      "shortCiteRegEx" : "Bertsekas.",
+      "year" : 2005
+    }, {
+      "title" : "Dynamic programming & optimal control, volume 2",
+      "author" : [ "D P Bertsekas" ],
+      "venue" : "Athena Scientific,",
+      "citeRegEx" : "Bertsekas.,? \\Q2007\\E",
+      "shortCiteRegEx" : "Bertsekas.",
+      "year" : 2007
+    }, {
+      "title" : "A survey of monte carlo tree search methods",
+      "author" : [ "C Browne", "E Powley", "D Whitehouse", "S Lucas", "P I Cowling", "P Rohlfshagen", "S Tavener", "D Perez", "S Samothrakis", "S Colton" ],
+      "venue" : "IEEE Transactions on Computational Intelligence and AI in Games,",
+      "citeRegEx" : "Browne et al\\.,? \\Q2012\\E",
+      "shortCiteRegEx" : "Browne et al\\.",
+      "year" : 2012
+    }, {
+      "title" : "Learning to generate chairs with convolutional neural networks",
+      "author" : [ "A Dosovitskiy", "J T Springenberg", "T Brox" ],
+      "venue" : "In Proceedings of the IEEE Conference on Computer Vision and Pattern Recognition,",
+      "citeRegEx" : "Dosovitskiy et al\\.,? \\Q2015\\E",
+      "shortCiteRegEx" : "Dosovitskiy et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "Deep spatial autoencoders for visuomotor learning",
+      "author" : [ "C Finn", "X Y Tan", "Y Duan", "T Darrell", "S Levine", "P Abbeel" ],
+      "venue" : "In Proceedings of the IEEE International Conference on Robotics and Automation,",
+      "citeRegEx" : "Finn et al\\.,? \\Q2016\\E",
+      "shortCiteRegEx" : "Finn et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Understanding the difficulty of training deep feedforward neural networks",
+      "author" : [ "X Glorot", "Y Bengio" ],
+      "venue" : "In Proceedings of the International Conference on Artificial Intelligence and Statistics,",
+      "citeRegEx" : "Glorot and Bengio.,? \\Q2010\\E",
+      "shortCiteRegEx" : "Glorot and Bengio.",
+      "year" : 2010
+    }, {
+      "title" : "Deep sparse rectifier neural networks",
+      "author" : [ "X Glorot", "A Bordes", "Y Bengio" ],
+      "venue" : "In Proceedings of the International Conference on Artificial Intelligence and Statistics,",
+      "citeRegEx" : "Glorot et al\\.,? \\Q2011\\E",
+      "shortCiteRegEx" : "Glorot et al\\.",
+      "year" : 2011
+    }, {
+      "title" : "Learning to linearize under uncertainty",
+      "author" : [ "R Goroshin", "M Mathieu", "Y LeCun" ],
+      "venue" : "Advances in Neural Information Processing Systems,",
+      "citeRegEx" : "Goroshin et al\\.,? \\Q2015\\E",
+      "shortCiteRegEx" : "Goroshin et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "DRAW: a recurrent neural network for image generation",
+      "author" : [ "K Gregor", "I Danihelka", "A Graves", "D J Rezende", "D Wierstra" ],
+      "venue" : "In Proceedings of the International Conference on Machine Learning,",
+      "citeRegEx" : "Gregor et al\\.,? \\Q2015\\E",
+      "shortCiteRegEx" : "Gregor et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "Deep learning for real-time Atari game play using offline Monte-Carlo tree search planning",
+      "author" : [ "X Guo", "S Singh", "H Lee", "R Lewis", "X Wang" ],
+      "venue" : "In Advances in Neural Information Processing Systems,",
+      "citeRegEx" : "Guo et al\\.,? \\Q2014\\E",
+      "shortCiteRegEx" : "Guo et al\\.",
+      "year" : 2014
+    }, {
+      "title" : "Transforming auto-encoders",
+      "author" : [ "G E Hinton", "A Krizhevsky", "S D Wang" ],
+      "venue" : "In Proceedings of the International Conference on Artificial Neural Networks,",
+      "citeRegEx" : "Hinton et al\\.,? \\Q2011\\E",
+      "shortCiteRegEx" : "Hinton et al\\.",
+      "year" : 2011
+    }, {
+      "title" : "The Malmo platform for artificial intelligence experimentation",
+      "author" : [ "M Johnson", "K Hofmann", "T Hutton", "D Bignell" ],
+      "venue" : "In Proceedings of the International Joint Conference on Artificial Intelligence,",
+      "citeRegEx" : "Johnson et al\\.,? \\Q2016\\E",
+      "shortCiteRegEx" : "Johnson et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Adam: a method for stochastic optimization",
+      "author" : [ "D P Kingma", "J Ba" ],
+      "venue" : "In Proceedings of the International Conference on Learning Representations,",
+      "citeRegEx" : "Kingma and Ba.,? \\Q2015\\E",
+      "shortCiteRegEx" : "Kingma and Ba.",
+      "year" : 2015
+    }, {
+      "title" : "Auto-encoding variational Bayes",
+      "author" : [ "D P Kingma", "M Welling" ],
+      "venue" : "In Proceedings of the International Conference on Learning Representations,",
+      "citeRegEx" : "Kingma and Welling.,? \\Q2014\\E",
+      "shortCiteRegEx" : "Kingma and Welling.",
+      "year" : 2014
+    }, {
+      "title" : "Deep convolutional inverse graphics network",
+      "author" : [ "T D Kulkarni", "W F Whitney", "P Kohli", "J B Tenenbaum" ],
+      "venue" : "In Advances in Neural Information Processing Systems,",
+      "citeRegEx" : "Kulkarni et al\\.,? \\Q2015\\E",
+      "shortCiteRegEx" : "Kulkarni et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "Autonomous reinforcement learning on raw visual input data in a real world application",
+      "author" : [ "S Lange", "M Riedmiller", "A Voigtländer" ],
+      "venue" : "In Proceedings of the International Joint Conference on Neural Networks,",
+      "citeRegEx" : "Lange et al\\.,? \\Q2012\\E",
+      "shortCiteRegEx" : "Lange et al\\.",
+      "year" : 2012
+    }, {
+      "title" : "Modeling deep temporal dependencies with recurrent grammar cells",
+      "author" : [ "V Michalski", "R Memisevic", "K Konda" ],
+      "venue" : "In Advances in Neural Information Processing Systems,",
+      "citeRegEx" : "Michalski et al\\.,? \\Q2014\\E",
+      "shortCiteRegEx" : "Michalski et al\\.",
+      "year" : 2014
+    }, {
+      "title" : "Human-level control through deep reinforcement learning",
+      "author" : [ "V Mnih", "K Kavukcuoglu", "D Silver", "A A Rusu", "J Veness", "M G Bellemare", "A Graves", "M Riedmiller", "A K Fidjeland", "G Ostrovski", "S Petersen", "C Beattie", "A Sadik", "I Antonoglou", "H King", "D Kumaran", "D Wierstra", "S Legg", "D Hassabis" ],
+      "venue" : "Nature, 518(7540):529–533,",
+      "citeRegEx" : "Mnih et al\\.,? \\Q2015\\E",
+      "shortCiteRegEx" : "Mnih et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "Action-conditional video prediction using deep networks in Atari games",
+      "author" : [ "J Oh", "X Guo", "H Lee", "R Lewis", "S Singh" ],
+      "venue" : "In Advances in Neural Information Processing Systems,",
+      "citeRegEx" : "Oh et al\\.,? \\Q2015\\E",
+      "shortCiteRegEx" : "Oh et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "On the difficulty of training recurrent neural networks",
+      "author" : [ "R Pascanu", "T Mikolov", "Y Bengio" ],
+      "venue" : "In Proceedings of the International Conference on Machine Learning,",
+      "citeRegEx" : "Pascanu et al\\.,? \\Q2013\\E",
+      "shortCiteRegEx" : "Pascanu et al\\.",
+      "year" : 2013
+    }, {
+      "title" : "Unsupervised learning of invariant feature hierarchies with applications to object recognition",
+      "author" : [ "M Ranzato", "F J Huang", "Y-L Boureau", "Y LeCun" ],
+      "venue" : "In Proceedings of the IEEE Conference on Computer Vision and Pattern Recognition,",
+      "citeRegEx" : "Ranzato et al\\.,? \\Q2007\\E",
+      "shortCiteRegEx" : "Ranzato et al\\.",
+      "year" : 2007
+    }, {
+      "title" : "Stochastic backpropagation and approximate inference in deep generative models",
+      "author" : [ "D J Rezende", "S Mohamed", "D Wierstra" ],
+      "venue" : "In Proceedings of the International Conference on Machine Learning,",
+      "citeRegEx" : "Rezende et al\\.,? \\Q2014\\E",
+      "shortCiteRegEx" : "Rezende et al\\.",
+      "year" : 2014
+    }, {
+      "title" : "Best practices for convolutional neural networks applied to visual document analysis",
+      "author" : [ "P Y Simard", "D Steinkraus", "J C Platt" ],
+      "venue" : "In Proceedings of the International Conference on Document Analysis and Recognition,",
+      "citeRegEx" : "Simard et al\\.,? \\Q2003\\E",
+      "shortCiteRegEx" : "Simard et al\\.",
+      "year" : 2003
+    }, {
+      "title" : "The behavior of organisms: an experimental analysis",
+      "author" : [ "B F Skinner" ],
+      "venue" : "Appleton-Century-Crofts,",
+      "citeRegEx" : "Skinner.,? \\Q1938\\E",
+      "shortCiteRegEx" : "Skinner.",
+      "year" : 1938
+    }, {
+      "title" : "Dropout : a simple way to prevent neural networks from overfitting",
+      "author" : [ "N Srivastava", "G E Hinton", "A Krizhevsky", "I Sutskever", "R Salakhutdinov" ],
+      "venue" : "Journal of Machine Learning Research,",
+      "citeRegEx" : "Srivastava et al\\.,? \\Q1929\\E",
+      "shortCiteRegEx" : "Srivastava et al\\.",
+      "year" : 1929
+    }, {
+      "title" : "Unsupervised learning of video representations using LSTMs",
+      "author" : [ "N Srivastava", "E Mansimov", "R Salakhutdinov" ],
+      "venue" : "In Proceedings of the International Conference on Machine Learning,",
+      "citeRegEx" : "Srivastava et al\\.,? \\Q2015\\E",
+      "shortCiteRegEx" : "Srivastava et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "Integrated architectures for learning, planning, and reacting based on approximating dynamic programming",
+      "author" : [ "R S Sutton" ],
+      "venue" : "In Proceedings of the International Conference on Machine Learning,",
+      "citeRegEx" : "Sutton.,? \\Q1990\\E",
+      "shortCiteRegEx" : "Sutton.",
+      "year" : 1990
+    }, {
+      "title" : "Reinforcement learning: an introduction",
+      "author" : [ "R S Sutton", "A G Barto" ],
+      "venue" : null,
+      "citeRegEx" : "Sutton and Barto.,? \\Q1998\\E",
+      "shortCiteRegEx" : "Sutton and Barto.",
+      "year" : 1998
+    }, {
+      "title" : "The origins and rise of ethology",
+      "author" : [ "W H Thorpe" ],
+      "venue" : "Heinemann Educational Books,",
+      "citeRegEx" : "Thorpe.,? \\Q1979\\E",
+      "shortCiteRegEx" : "Thorpe.",
+      "year" : 1979
+    }, {
+      "title" : "Compress and control",
+      "author" : [ "J Veness", "M G Bellemare", "M Hutter", "A Chua", "G Desjardins" ],
+      "venue" : "In Proceedings of the AAAI Conference on Artificial Intelligence,",
+      "citeRegEx" : "Veness et al\\.,? \\Q2015\\E",
+      "shortCiteRegEx" : "Veness et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "From pixels to torques: policy learning with deep dynamical models",
+      "author" : [ "N Wahlström", "T B Schön", "M P Deisenroth" ],
+      "venue" : "arXiv preprint arXiv:1502.02251,",
+      "citeRegEx" : "Wahlström et al\\.,? \\Q2015\\E",
+      "shortCiteRegEx" : "Wahlström et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "Embed to control: a locally linear latent dynamics model for control from raw images",
+      "author" : [ "M Watter", "J T Springenberg", "J Boedecker", "M Riedmiller" ],
+      "venue" : "In Advances in Neural Information Processing Systems,",
+      "citeRegEx" : "Watter et al\\.,? \\Q2015\\E",
+      "shortCiteRegEx" : "Watter et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "Generalization of backpropagation with application to a recurrent gas market model",
+      "author" : [ "P J Werbos" ],
+      "venue" : "Neural Networks,",
+      "citeRegEx" : "Werbos.,? \\Q1988\\E",
+      "shortCiteRegEx" : "Werbos.",
+      "year" : 1988
+    }, {
+      "title" : "The dataset for training comprised around 500, 000 video frames per game in addition to actions chosen by the DQN agent and rewards collected during game play. Video frames used as network input were 84×84 grey-scale images with pixel values between 0 and 255 down-sampled from the full-resolution",
+      "author" : [ "Mnih" ],
+      "venue" : null,
+      "citeRegEx" : "Mnih,? \\Q2015\\E",
+      "shortCiteRegEx" : "Mnih",
+      "year" : 2015
+    }, {
+      "title" : "For each game, we sample 300 minibatches of size I = 50 from the underlying test set and compute the test loss over K = 100 look ahead steps with the formula presented in the main paper in Section 3.3 used for learning network parameters, but without averaging over look ahead steps because we aim to illustrate the test loss as a function of look ahead steps—statistics of this analysis",
+      "author" : [ "Oh" ],
+      "venue" : null,
+      "citeRegEx" : "Oh,? \\Q2015\\E",
+      "shortCiteRegEx" : "Oh",
+      "year" : 2015
+    } ],
+    "referenceMentions" : [ {
+      "referenceID" : 27,
+      "context" : "This is described by principles such as the law of effect (Thorndike, 1898), operant conditioning (Skinner, 1938) and trial-and-error learning (Thorpe, 1979) in behaviorist psychology, and has inspired a discipline of artificial intelligence called reinforcement learning (RL, Sutton & Barto (1998)).",
+      "startOffset" : 98,
+      "endOffset" : 113
+    }, {
+      "referenceID" : 32,
+      "context" : "This is described by principles such as the law of effect (Thorndike, 1898), operant conditioning (Skinner, 1938) and trial-and-error learning (Thorpe, 1979) in behaviorist psychology, and has inspired a discipline of artificial intelligence called reinforcement learning (RL, Sutton & Barto (1998)).",
+      "startOffset" : 143,
+      "endOffset" : 157
+    }, {
+      "referenceID" : 21,
+      "context" : "State-of-the-art modelfree approaches, such as DQN (Mnih et al., 2015), effectively approximate so-called Q-values, i.",
+      "startOffset" : 51,
+      "endOffset" : 70
+    }, {
+      "referenceID" : 33,
+      "context" : "In recent work, model-based techniques were successfully used to learn statistics about cumulative future reward (Veness et al., 2015) and to improve exploration by favoring actions that are likely to lead to novel states (Bellemare et al.",
+      "startOffset" : 113,
+      "endOffset" : 134
+    }, {
+      "referenceID" : 1,
+      "context" : ", 2015) and to improve exploration by favoring actions that are likely to lead to novel states (Bellemare et al., 2016; Oh et al., 2015), ∗Research conducted while interning at Microsoft.",
+      "startOffset" : 95,
+      "endOffset" : 136
+    }, {
+      "referenceID" : 22,
+      "context" : ", 2015) and to improve exploration by favoring actions that are likely to lead to novel states (Bellemare et al., 2016; Oh et al., 2015), ∗Research conducted while interning at Microsoft.",
+      "startOffset" : 95,
+      "endOffset" : 136
+    }, {
+      "referenceID" : 23,
+      "context" : "This is described by principles such as the law of effect (Thorndike, 1898), operant conditioning (Skinner, 1938) and trial-and-error learning (Thorpe, 1979) in behaviorist psychology, and has inspired a discipline of artificial intelligence called reinforcement learning (RL, Sutton & Barto (1998)).",
+      "startOffset" : 99,
+      "endOffset" : 299
+    }, {
+      "referenceID" : 6,
+      "context" : "When an accurate model of the true environment dynamics and the true reward function is available, modelbased approaches, such as planning via Monte-Carlo tree search (Browne et al., 2012) outperform model-free state-of-the-art approaches (Guo et al.",
+      "startOffset" : 167,
+      "endOffset" : 188
+    }, {
+      "referenceID" : 13,
+      "context" : ", 2012) outperform model-free state-of-the-art approaches (Guo et al., 2014).",
+      "startOffset" : 58,
+      "endOffset" : 76
+    }, {
+      "referenceID" : 22,
+      "context" : "In this paper, we take a step towards addressing this question by extending recent work on video frame prediction (Oh et al., 2015), which has been demonstrated to effectively learn system dynamics, to enable joint prediction of future states and rewards using a single latent representation.",
+      "startOffset" : 114,
+      "endOffset" : 131
+    }, {
+      "referenceID" : 1,
+      "context" : ", reduce data or exploration requirements (Bellemare et al., 2016; Oh et al., 2015; Veness et al., 2015).",
+      "startOffset" : 42,
+      "endOffset" : 104
+    }, {
+      "referenceID" : 22,
+      "context" : ", reduce data or exploration requirements (Bellemare et al., 2016; Oh et al., 2015; Veness et al., 2015).",
+      "startOffset" : 42,
+      "endOffset" : 104
+    }, {
+      "referenceID" : 33,
+      "context" : ", reduce data or exploration requirements (Bellemare et al., 2016; Oh et al., 2015; Veness et al., 2015).",
+      "startOffset" : 42,
+      "endOffset" : 104
+    }, {
+      "referenceID" : 5,
+      "context" : "Optimal control theory describes mathematical principles for deriving control policies in continuous action spaces that maximize cumulative future reward in scenarios with known system dynamics and known reward structure (Bertsekas, 2007; 2005).",
+      "startOffset" : 221,
+      "endOffset" : 244
+    }, {
+      "referenceID" : 8,
+      "context" : "There has been recent interest in combining principles from optimal control theory and model-based learning in settings where no information on system dynamics is available a priori and instead has to be acquired from visual data (Finn et al., 2016; Wahlström et al., 2015; Watter et al., 2015).",
+      "startOffset" : 230,
+      "endOffset" : 294
+    }, {
+      "referenceID" : 34,
+      "context" : "There has been recent interest in combining principles from optimal control theory and model-based learning in settings where no information on system dynamics is available a priori and instead has to be acquired from visual data (Finn et al., 2016; Wahlström et al., 2015; Watter et al., 2015).",
+      "startOffset" : 230,
+      "endOffset" : 294
+    }, {
+      "referenceID" : 35,
+      "context" : "There has been recent interest in combining principles from optimal control theory and model-based learning in settings where no information on system dynamics is available a priori and instead has to be acquired from visual data (Finn et al., 2016; Wahlström et al., 2015; Watter et al., 2015).",
+      "startOffset" : 230,
+      "endOffset" : 294
+    }, {
+      "referenceID" : 2,
+      "context" : "The general idea behind these approaches is to learn a compressed latent representation of the visual state space from raw images through autoencoder networks (Bengio, 2009) and to utilize the acquired latent representation to infer system dynamics.",
+      "startOffset" : 159,
+      "endOffset" : 173
+    }, {
+      "referenceID" : 25,
+      "context" : "(2015) introduce an approach for learning system dynamics from raw visual data by jointly training a variational autoencoder (Kingma & Welling, 2014; Rezende et al., 2014) and a state prediction model that operates in the autoencoder’s compressed latent state representation.",
+      "startOffset" : 125,
+      "endOffset" : 171
+    }, {
+      "referenceID" : 0,
+      "context" : "We propose a network architecture and training procedure for joint state and reward prediction, and evaluate our approach in the Arcade Learning Environment (ALE, Bellemare et al. (2013)).",
+      "startOffset" : 163,
+      "endOffset" : 187
+    }, {
+      "referenceID" : 0,
+      "context" : "We propose a network architecture and training procedure for joint state and reward prediction, and evaluate our approach in the Arcade Learning Environment (ALE, Bellemare et al. (2013)). Our empirical results on five Atari games demonstrate that our approach can successfully predict cumulative reward up to roughly 200 frames. We complement our quantitative results with a detailed error analysis by visualizing example predictions. Our results are the first to demonstrate the feasibility of using a learned dynamics and reward model for accurate planning. We see this as a significant step towards data efficient RL in high-dimensional environments without prior knowledge. 2 RELATED WORK AND MOTIVATION Two lines of research are related to the work presented in this paper: model-based RL and optimal control theory. Model-based RL utilizes a given or learned model of some aspect of a task to, e.g., reduce data or exploration requirements (Bellemare et al., 2016; Oh et al., 2015; Veness et al., 2015). Optimal control theory describes mathematical principles for deriving control policies in continuous action spaces that maximize cumulative future reward in scenarios with known system dynamics and known reward structure (Bertsekas, 2007; 2005). There has been recent interest in combining principles from optimal control theory and model-based learning in settings where no information on system dynamics is available a priori and instead has to be acquired from visual data (Finn et al., 2016; Wahlström et al., 2015; Watter et al., 2015). The general idea behind these approaches is to learn a compressed latent representation of the visual state space from raw images through autoencoder networks (Bengio, 2009) and to utilize the acquired latent representation to infer system dynamics. System dynamics are then used to specify a planning problem which can be solved by optimization techniques to derive optimal policies. Watter et al. (2015) introduce an approach for learning system dynamics from raw visual data by jointly training a variational autoencoder (Kingma & Welling, 2014; Rezende et al.",
+      "startOffset" : 163,
+      "endOffset" : 1959
+    }, {
+      "referenceID" : 0,
+      "context" : "We propose a network architecture and training procedure for joint state and reward prediction, and evaluate our approach in the Arcade Learning Environment (ALE, Bellemare et al. (2013)). Our empirical results on five Atari games demonstrate that our approach can successfully predict cumulative reward up to roughly 200 frames. We complement our quantitative results with a detailed error analysis by visualizing example predictions. Our results are the first to demonstrate the feasibility of using a learned dynamics and reward model for accurate planning. We see this as a significant step towards data efficient RL in high-dimensional environments without prior knowledge. 2 RELATED WORK AND MOTIVATION Two lines of research are related to the work presented in this paper: model-based RL and optimal control theory. Model-based RL utilizes a given or learned model of some aspect of a task to, e.g., reduce data or exploration requirements (Bellemare et al., 2016; Oh et al., 2015; Veness et al., 2015). Optimal control theory describes mathematical principles for deriving control policies in continuous action spaces that maximize cumulative future reward in scenarios with known system dynamics and known reward structure (Bertsekas, 2007; 2005). There has been recent interest in combining principles from optimal control theory and model-based learning in settings where no information on system dynamics is available a priori and instead has to be acquired from visual data (Finn et al., 2016; Wahlström et al., 2015; Watter et al., 2015). The general idea behind these approaches is to learn a compressed latent representation of the visual state space from raw images through autoencoder networks (Bengio, 2009) and to utilize the acquired latent representation to infer system dynamics. System dynamics are then used to specify a planning problem which can be solved by optimization techniques to derive optimal policies. Watter et al. (2015) introduce an approach for learning system dynamics from raw visual data by jointly training a variational autoencoder (Kingma & Welling, 2014; Rezende et al., 2014) and a state prediction model that operates in the autoencoder’s compressed latent state representation. A similar approach for jointly learning a compressed state representation and a predictive model is pursued by Wahlström et al. (2015).Finn et al.",
+      "startOffset" : 163,
+      "endOffset" : 2363
+    }, {
+      "referenceID" : 0,
+      "context" : "We propose a network architecture and training procedure for joint state and reward prediction, and evaluate our approach in the Arcade Learning Environment (ALE, Bellemare et al. (2013)). Our empirical results on five Atari games demonstrate that our approach can successfully predict cumulative reward up to roughly 200 frames. We complement our quantitative results with a detailed error analysis by visualizing example predictions. Our results are the first to demonstrate the feasibility of using a learned dynamics and reward model for accurate planning. We see this as a significant step towards data efficient RL in high-dimensional environments without prior knowledge. 2 RELATED WORK AND MOTIVATION Two lines of research are related to the work presented in this paper: model-based RL and optimal control theory. Model-based RL utilizes a given or learned model of some aspect of a task to, e.g., reduce data or exploration requirements (Bellemare et al., 2016; Oh et al., 2015; Veness et al., 2015). Optimal control theory describes mathematical principles for deriving control policies in continuous action spaces that maximize cumulative future reward in scenarios with known system dynamics and known reward structure (Bertsekas, 2007; 2005). There has been recent interest in combining principles from optimal control theory and model-based learning in settings where no information on system dynamics is available a priori and instead has to be acquired from visual data (Finn et al., 2016; Wahlström et al., 2015; Watter et al., 2015). The general idea behind these approaches is to learn a compressed latent representation of the visual state space from raw images through autoencoder networks (Bengio, 2009) and to utilize the acquired latent representation to infer system dynamics. System dynamics are then used to specify a planning problem which can be solved by optimization techniques to derive optimal policies. Watter et al. (2015) introduce an approach for learning system dynamics from raw visual data by jointly training a variational autoencoder (Kingma & Welling, 2014; Rezende et al., 2014) and a state prediction model that operates in the autoencoder’s compressed latent state representation. A similar approach for jointly learning a compressed state representation and a predictive model is pursued by Wahlström et al. (2015).Finn et al. (2016) devise a sequential approach that first learns a latent state representation from visual data and that subsequently exploits this latent representation to augment a robot’s initial state space describing joint angles and end-effector positions.",
+      "startOffset" : 163,
+      "endOffset" : 2382
+    }, {
+      "referenceID" : 0,
+      "context" : "We propose a network architecture and training procedure for joint state and reward prediction, and evaluate our approach in the Arcade Learning Environment (ALE, Bellemare et al. (2013)). Our empirical results on five Atari games demonstrate that our approach can successfully predict cumulative reward up to roughly 200 frames. We complement our quantitative results with a detailed error analysis by visualizing example predictions. Our results are the first to demonstrate the feasibility of using a learned dynamics and reward model for accurate planning. We see this as a significant step towards data efficient RL in high-dimensional environments without prior knowledge. 2 RELATED WORK AND MOTIVATION Two lines of research are related to the work presented in this paper: model-based RL and optimal control theory. Model-based RL utilizes a given or learned model of some aspect of a task to, e.g., reduce data or exploration requirements (Bellemare et al., 2016; Oh et al., 2015; Veness et al., 2015). Optimal control theory describes mathematical principles for deriving control policies in continuous action spaces that maximize cumulative future reward in scenarios with known system dynamics and known reward structure (Bertsekas, 2007; 2005). There has been recent interest in combining principles from optimal control theory and model-based learning in settings where no information on system dynamics is available a priori and instead has to be acquired from visual data (Finn et al., 2016; Wahlström et al., 2015; Watter et al., 2015). The general idea behind these approaches is to learn a compressed latent representation of the visual state space from raw images through autoencoder networks (Bengio, 2009) and to utilize the acquired latent representation to infer system dynamics. System dynamics are then used to specify a planning problem which can be solved by optimization techniques to derive optimal policies. Watter et al. (2015) introduce an approach for learning system dynamics from raw visual data by jointly training a variational autoencoder (Kingma & Welling, 2014; Rezende et al., 2014) and a state prediction model that operates in the autoencoder’s compressed latent state representation. A similar approach for jointly learning a compressed state representation and a predictive model is pursued by Wahlström et al. (2015).Finn et al. (2016) devise a sequential approach that first learns a latent state representation from visual data and that subsequently exploits this latent representation to augment a robot’s initial state space describing joint angles and end-effector positions. The augmented state space is then used to improve estimates of local system dynamics for planning. The approaches presented above assume knowledge of the functional form of the true reward signal and are hence not directly applicable in settings like ALE (and many real-world settings) where the reward function is initially unknown. Planning in such settings therefore necessitates learning both system dynamics and reward function in order to infer optimal behavioral policies. Recent work by Oh et al. (2015) introduced an approach for learning environment dynamics from pixel images and demonstrated that this enabled successful video frame prediction over up to 400 frames.",
+      "startOffset" : 163,
+      "endOffset" : 3139
+    }, {
+      "referenceID" : 0,
+      "context" : "We propose a network architecture and training procedure for joint state and reward prediction, and evaluate our approach in the Arcade Learning Environment (ALE, Bellemare et al. (2013)). Our empirical results on five Atari games demonstrate that our approach can successfully predict cumulative reward up to roughly 200 frames. We complement our quantitative results with a detailed error analysis by visualizing example predictions. Our results are the first to demonstrate the feasibility of using a learned dynamics and reward model for accurate planning. We see this as a significant step towards data efficient RL in high-dimensional environments without prior knowledge. 2 RELATED WORK AND MOTIVATION Two lines of research are related to the work presented in this paper: model-based RL and optimal control theory. Model-based RL utilizes a given or learned model of some aspect of a task to, e.g., reduce data or exploration requirements (Bellemare et al., 2016; Oh et al., 2015; Veness et al., 2015). Optimal control theory describes mathematical principles for deriving control policies in continuous action spaces that maximize cumulative future reward in scenarios with known system dynamics and known reward structure (Bertsekas, 2007; 2005). There has been recent interest in combining principles from optimal control theory and model-based learning in settings where no information on system dynamics is available a priori and instead has to be acquired from visual data (Finn et al., 2016; Wahlström et al., 2015; Watter et al., 2015). The general idea behind these approaches is to learn a compressed latent representation of the visual state space from raw images through autoencoder networks (Bengio, 2009) and to utilize the acquired latent representation to infer system dynamics. System dynamics are then used to specify a planning problem which can be solved by optimization techniques to derive optimal policies. Watter et al. (2015) introduce an approach for learning system dynamics from raw visual data by jointly training a variational autoencoder (Kingma & Welling, 2014; Rezende et al., 2014) and a state prediction model that operates in the autoencoder’s compressed latent state representation. A similar approach for jointly learning a compressed state representation and a predictive model is pursued by Wahlström et al. (2015).Finn et al. (2016) devise a sequential approach that first learns a latent state representation from visual data and that subsequently exploits this latent representation to augment a robot’s initial state space describing joint angles and end-effector positions. The augmented state space is then used to improve estimates of local system dynamics for planning. The approaches presented above assume knowledge of the functional form of the true reward signal and are hence not directly applicable in settings like ALE (and many real-world settings) where the reward function is initially unknown. Planning in such settings therefore necessitates learning both system dynamics and reward function in order to infer optimal behavioral policies. Recent work by Oh et al. (2015) introduced an approach for learning environment dynamics from pixel images and demonstrated that this enabled successful video frame prediction over up to 400 frames. In our current paper, we extend this recent work to enable reward prediction as well by modifying the network’s architecture and training objective accordingly. The modification of the training objective bears a positive side effect: since our network must optimize a compound loss consisting of the video frame reconstruction loss and the reward loss, reward-relevant aspects in the video frames to which the reconstruction loss alone might be insensitive are explicitly captured by the optimization objective. In the subsequent section, we elucidate the approach from Oh et al. (2015) as well as our extensions for reward prediction in more detail.",
+      "startOffset" : 163,
+      "endOffset" : 3893
+    }, {
+      "referenceID" : 7,
+      "context" : "Finally, the decoding stage performs a series of forward and deconvolutional operations (Dosovitskiy et al., 2015; Zeiler et al., 2010) by mapping the action-conditional representation hdec t of the current frame history st−h+1:t and the current action at to the predicted video frame st+1 of the next time step t+1.",
+      "startOffset" : 88,
+      "endOffset" : 135
+    }, {
+      "referenceID" : 10,
+      "context" : "The whole network uses linear and rectified linear units (Glorot et al., 2011) only.",
+      "startOffset" : 57,
+      "endOffset" : 78
+    }, {
+      "referenceID" : 21,
+      "context" : "In all our experiments, following DQN (Mnih et al., 2015), the video frames processed by the network are 84 × 84 grey-scale images down-sampled from the full-resolution 210× 160 Atari RGB images from ALE.",
+      "startOffset" : 38,
+      "endOffset" : 57
+    }, {
+      "referenceID" : 19,
+      "context" : "3 NETWORK ARCHITECTURE AND TRAINING The deep network proposed by Oh et al. (2015) for video frame prediction in Atari games aims at learning a function that predicts the video frame st+1 at the next time step t + 1, given the current history of frames st−h+1:t with time horizon h and the current action at taken by the agent—see Section 3.",
+      "startOffset" : 65,
+      "endOffset" : 82
+    }, {
+      "referenceID" : 19,
+      "context" : "3 NETWORK ARCHITECTURE AND TRAINING The deep network proposed by Oh et al. (2015) for video frame prediction in Atari games aims at learning a function that predicts the video frame st+1 at the next time step t + 1, given the current history of frames st−h+1:t with time horizon h and the current action at taken by the agent—see Section 3.1. Here, we extend this work to enable joint video frame and reward prediction such that the network anticipates the current reward rt as well—see Sections 3.2 and 3.3. 3.1 VIDEO FRAME PREDICTION The video-frame-predictive architecture from Oh et al. (2015) comprises three informationprocessing stages: an encoding stage that maps input frames to some compressed latent representation, a transformation stage that integrates the current action into the compressed latent representation, and a decoding stage that maps the compressed latent representation to the predicted next frame—see Figure 1.",
+      "startOffset" : 65,
+      "endOffset" : 598
+    }, {
+      "referenceID" : 19,
+      "context" : "3 NETWORK ARCHITECTURE AND TRAINING The deep network proposed by Oh et al. (2015) for video frame prediction in Atari games aims at learning a function that predicts the video frame st+1 at the next time step t + 1, given the current history of frames st−h+1:t with time horizon h and the current action at taken by the agent—see Section 3.1. Here, we extend this work to enable joint video frame and reward prediction such that the network anticipates the current reward rt as well—see Sections 3.2 and 3.3. 3.1 VIDEO FRAME PREDICTION The video-frame-predictive architecture from Oh et al. (2015) comprises three informationprocessing stages: an encoding stage that maps input frames to some compressed latent representation, a transformation stage that integrates the current action into the compressed latent representation, and a decoding stage that maps the compressed latent representation to the predicted next frame—see Figure 1. The initial encoding stage is a sequence of convolutional and forward operations that map the current frame history st−h+1:t—a three-dimensional tensor—to a compressed feature vector henc t . The transformation stage converts this compressed feature vector h enc t into an action-conditional representation hdec t in vectorized form by integrating the current action at. The current action at is represented as a one-hot vector with length varying from game to game since there are at least 3 and at most 18 actions in ALE. The integration of the current action into the compressed feature vector includes an element-wise vector multiplication—depicted as ’×’ in Figure 1—with the particularity that the two neuron layers involved in this element-wise multiplication are the only layers in the entire network without bias parameters, see Section 3.2 in Oh et al. (2015). Finally, the decoding stage performs a series of forward and deconvolutional operations (Dosovitskiy et al.",
+      "startOffset" : 65,
+      "endOffset" : 1808
+    }, {
+      "referenceID" : 7,
+      "context" : "Finally, the decoding stage performs a series of forward and deconvolutional operations (Dosovitskiy et al., 2015; Zeiler et al., 2010) by mapping the action-conditional representation hdec t of the current frame history st−h+1:t and the current action at to the predicted video frame st+1 of the next time step t+1. Note that this necessitates a reshape operation at the beginning of the decoding cascade in order to transform the vectorized hidden representation into a three-dimensional tensor. The whole network uses linear and rectified linear units (Glorot et al., 2011) only. In all our experiments, following DQN (Mnih et al., 2015), the video frames processed by the network are 84 × 84 grey-scale images down-sampled from the full-resolution 210× 160 Atari RGB images from ALE. Following Mnih et al. (2015) and Oh et al.",
+      "startOffset" : 89,
+      "endOffset" : 817
+    }, {
+      "referenceID" : 7,
+      "context" : "Finally, the decoding stage performs a series of forward and deconvolutional operations (Dosovitskiy et al., 2015; Zeiler et al., 2010) by mapping the action-conditional representation hdec t of the current frame history st−h+1:t and the current action at to the predicted video frame st+1 of the next time step t+1. Note that this necessitates a reshape operation at the beginning of the decoding cascade in order to transform the vectorized hidden representation into a three-dimensional tensor. The whole network uses linear and rectified linear units (Glorot et al., 2011) only. In all our experiments, following DQN (Mnih et al., 2015), the video frames processed by the network are 84 × 84 grey-scale images down-sampled from the full-resolution 210× 160 Atari RGB images from ALE. Following Mnih et al. (2015) and Oh et al. (2015), the history frame time horizon h is set to 4.",
+      "startOffset" : 89,
+      "endOffset" : 838
+    }, {
+      "referenceID" : 22,
+      "context" : "Following previous work (Oh et al., 2015; Mnih et al., 2015), actions are chosen by the agent on every fourth frame and are repeated on frames that were skipped.",
+      "startOffset" : 24,
+      "endOffset" : 60
+    }, {
+      "referenceID" : 21,
+      "context" : "Following previous work (Oh et al., 2015; Mnih et al., 2015), actions are chosen by the agent on every fourth frame and are repeated on frames that were skipped.",
+      "startOffset" : 24,
+      "endOffset" : 60
+    }, {
+      "referenceID" : 26,
+      "context" : "This results in a compound training loss consisting of the original video frame reconstruction loss and a reward prediction loss given by the cross entropy (Simard et al., 2003) between the ground truth reward and the corresponding prediction: LK(θ) = 1 2 · I · T ·K I ∑ i=1 T−1 ∑ t=0 K ∑ k=1  ∣∣∣∣∣∣s(i) t+k − ŝ t+k∣∣∣∣∣∣2 2 } {{ } video frame reconstruction loss +λ · (−1) 3 ∑ l=1 r (i) t+k[l] · lnp (i) t+k[l] } {{ } reward prediction loss  , where ŝ t+k denotes the k-step look ahead frame prediction with target video frame s (i) t+k and p (i) t+k denotes the k-step look ahead probability values of the reward-predicting softmax layer—depicted in red in Figure1—with target reward vector r t+k.",
+      "startOffset" : 156,
+      "endOffset" : 177
+    }, {
+      "referenceID" : 3,
+      "context" : "(2014), we apply a curriculum learning (Bengio et al., 2009) scheme by successively increasing K in the course of training such that the network initially learns to predict over a short time horizon and becomes fine-tuned on longer-term predictions as training advances (see Section A.",
+      "startOffset" : 39,
+      "endOffset" : 60
+    }, {
+      "referenceID" : 36,
+      "context" : "θ are computed with backpropagation through time (Werbos, 1988).",
+      "startOffset" : 49,
+      "endOffset" : 63
+    }, {
+      "referenceID" : 18,
+      "context" : "Our model assumes ternary rewards which result from reward clipping in line with Mnih et al. (2015). Original game scores in ALE are integers that can vary significantly between different Atari games and the corresponding original rewards are clipped to assume one of three values: −1 for negative rewards, 0 for no reward and 1 for positive rewards.",
+      "startOffset" : 81,
+      "endOffset" : 100
+    }, {
+      "referenceID" : 18,
+      "context" : "Our model assumes ternary rewards which result from reward clipping in line with Mnih et al. (2015). Original game scores in ALE are integers that can vary significantly between different Atari games and the corresponding original rewards are clipped to assume one of three values: −1 for negative rewards, 0 for no reward and 1 for positive rewards. Because of reward clipping, rewards can be represented as vectors rt in one-hot encoding of size 3. In Figure 1, our extension of the video-frame-predictive architecture from Oh et al. (2015) to enable reward prediction is highlighted in red.",
+      "startOffset" : 81,
+      "endOffset" : 543
+    }, {
+      "referenceID" : 18,
+      "context" : "Our model assumes ternary rewards which result from reward clipping in line with Mnih et al. (2015). Original game scores in ALE are integers that can vary significantly between different Atari games and the corresponding original rewards are clipped to assume one of three values: −1 for negative rewards, 0 for no reward and 1 for positive rewards. Because of reward clipping, rewards can be represented as vectors rt in one-hot encoding of size 3. In Figure 1, our extension of the video-frame-predictive architecture from Oh et al. (2015) to enable reward prediction is highlighted in red. We add an additional softmax layer to predict the current reward rt with information contained in the action-conditional encoding hdec t . The motivation behind this extension is twofold. First, our extension makes it possible to jointly train the network with a compound objective that emphasizes both video frame reconstruction and reward prediction, and thus encourages the network to not abstract away reward-relevant features to which the reconstruction loss alone might be insensitive. Second, this formulation facilitates the future use of the model for reward prediction through virtual roll-outs in the compressed latent space, without the computational expensive necessity of reconstructing video frames explicitly—note that this requires another ”shortcut” predictive model to map from hdec t to h enc t+1. Following previous work (Oh et al., 2015; Mnih et al., 2015), actions are chosen by the agent on every fourth frame and are repeated on frames that were skipped. Skipped frames and repeated actions are hence not part of the data sets used to train and test the predictive network on, and original reward values are accumulated over four frames before clipping. 3.3 TRAINING Training the model for joint video frame and reward prediction requires trajectory samples {( s (i) n ,a (i) n , r (i) n )N n=1 }I i=1 collected by some agent playing the Atari game, where i is an index over trajectories and n is a time index over samples within one trajectory i. The parameter I denotes the number of trajectories in the training set or the minibatch respectively and the parameter N denotes the length of an individual trajectory. In our case, we use agents trained according to Mnih et al. (2015) in order to collect trajectory samples.",
+      "startOffset" : 81,
+      "endOffset" : 2303
+    }, {
+      "referenceID" : 18,
+      "context" : "Our model assumes ternary rewards which result from reward clipping in line with Mnih et al. (2015). Original game scores in ALE are integers that can vary significantly between different Atari games and the corresponding original rewards are clipped to assume one of three values: −1 for negative rewards, 0 for no reward and 1 for positive rewards. Because of reward clipping, rewards can be represented as vectors rt in one-hot encoding of size 3. In Figure 1, our extension of the video-frame-predictive architecture from Oh et al. (2015) to enable reward prediction is highlighted in red. We add an additional softmax layer to predict the current reward rt with information contained in the action-conditional encoding hdec t . The motivation behind this extension is twofold. First, our extension makes it possible to jointly train the network with a compound objective that emphasizes both video frame reconstruction and reward prediction, and thus encourages the network to not abstract away reward-relevant features to which the reconstruction loss alone might be insensitive. Second, this formulation facilitates the future use of the model for reward prediction through virtual roll-outs in the compressed latent space, without the computational expensive necessity of reconstructing video frames explicitly—note that this requires another ”shortcut” predictive model to map from hdec t to h enc t+1. Following previous work (Oh et al., 2015; Mnih et al., 2015), actions are chosen by the agent on every fourth frame and are repeated on frames that were skipped. Skipped frames and repeated actions are hence not part of the data sets used to train and test the predictive network on, and original reward values are accumulated over four frames before clipping. 3.3 TRAINING Training the model for joint video frame and reward prediction requires trajectory samples {( s (i) n ,a (i) n , r (i) n )N n=1 }I i=1 collected by some agent playing the Atari game, where i is an index over trajectories and n is a time index over samples within one trajectory i. The parameter I denotes the number of trajectories in the training set or the minibatch respectively and the parameter N denotes the length of an individual trajectory. In our case, we use agents trained according to Mnih et al. (2015) in order to collect trajectory samples. The original training objective in Oh et al. (2015) consists of a video frame reconstruction loss in terms of a squared loss function aimed at minimizing the quadratic l-norm of the difference vector between the ground truth image and its action-conditional reconstruction.",
+      "startOffset" : 81,
+      "endOffset" : 2395
+    }, {
+      "referenceID" : 18,
+      "context" : "Our model assumes ternary rewards which result from reward clipping in line with Mnih et al. (2015). Original game scores in ALE are integers that can vary significantly between different Atari games and the corresponding original rewards are clipped to assume one of three values: −1 for negative rewards, 0 for no reward and 1 for positive rewards. Because of reward clipping, rewards can be represented as vectors rt in one-hot encoding of size 3. In Figure 1, our extension of the video-frame-predictive architecture from Oh et al. (2015) to enable reward prediction is highlighted in red. We add an additional softmax layer to predict the current reward rt with information contained in the action-conditional encoding hdec t . The motivation behind this extension is twofold. First, our extension makes it possible to jointly train the network with a compound objective that emphasizes both video frame reconstruction and reward prediction, and thus encourages the network to not abstract away reward-relevant features to which the reconstruction loss alone might be insensitive. Second, this formulation facilitates the future use of the model for reward prediction through virtual roll-outs in the compressed latent space, without the computational expensive necessity of reconstructing video frames explicitly—note that this requires another ”shortcut” predictive model to map from hdec t to h enc t+1. Following previous work (Oh et al., 2015; Mnih et al., 2015), actions are chosen by the agent on every fourth frame and are repeated on frames that were skipped. Skipped frames and repeated actions are hence not part of the data sets used to train and test the predictive network on, and original reward values are accumulated over four frames before clipping. 3.3 TRAINING Training the model for joint video frame and reward prediction requires trajectory samples {( s (i) n ,a (i) n , r (i) n )N n=1 }I i=1 collected by some agent playing the Atari game, where i is an index over trajectories and n is a time index over samples within one trajectory i. The parameter I denotes the number of trajectories in the training set or the minibatch respectively and the parameter N denotes the length of an individual trajectory. In our case, we use agents trained according to Mnih et al. (2015) in order to collect trajectory samples. The original training objective in Oh et al. (2015) consists of a video frame reconstruction loss in terms of a squared loss function aimed at minimizing the quadratic l-norm of the difference vector between the ground truth image and its action-conditional reconstruction. We extend this training objective to enable joint reward prediction. This results in a compound training loss consisting of the original video frame reconstruction loss and a reward prediction loss given by the cross entropy (Simard et al., 2003) between the ground truth reward and the corresponding prediction: LK(θ) = 1 2 · I · T ·K I ∑ i=1 T−1 ∑ t=0 K ∑ k=1  ∣∣∣∣∣∣s(i) t+k − ŝ t+k∣∣∣∣∣∣2 2 } {{ } video frame reconstruction loss +λ · (−1) 3 ∑ l=1 r (i) t+k[l] · lnp (i) t+k[l] } {{ } reward prediction loss  , where ŝ t+k denotes the k-step look ahead frame prediction with target video frame s (i) t+k and p (i) t+k denotes the k-step look ahead probability values of the reward-predicting softmax layer—depicted in red in Figure1—with target reward vector r t+k. The parameter λ > 0 controls the trade-off between video frame reconstruction and reward loss. The parameter T is a time horizon parameter that determines how often a single trajectory sample i is unrolled into the future, and K determines the look ahead prediction horizon dictating how far the network predicts into the future by using its own video frame predicted output as input for the next time step. Following Oh et al. (2015) and Michalski et al.",
+      "startOffset" : 81,
+      "endOffset" : 3834
+    }, {
+      "referenceID" : 18,
+      "context" : "(2015) and Michalski et al. (2014), we apply a curriculum learning (Bengio et al.",
+      "startOffset" : 11,
+      "endOffset" : 35
+    }, {
+      "referenceID" : 22,
+      "context" : "In the appendix, we also evaluate the joint performance of reward and video frame prediction on the test set in terms of the optimization objective as in Oh et al. (2015), where the authors report successful video frame reconstruction up to approximately 100 steps (400 frames), and observe similar results—see Section A.",
+      "startOffset" : 154,
+      "endOffset" : 171
+    }, {
+      "referenceID" : 22,
+      "context" : "5 CONCLUSION AND FUTURE WORK In this paper, we extended recent work on video frame prediction (Oh et al., 2015) in Atari games to enable reward prediction.",
+      "startOffset" : 94,
+      "endOffset" : 111
+    }, {
+      "referenceID" : 8,
+      "context" : "Our study fits into the general line of research using autoencoder networks to learn a latent representation from visual data (Finn et al., 2016; Goroshin et al., 2015; Gregor et al., 2015; Kulkarni et al., 2015; Srivastava et al., 2015; Wahlström et al., 2015; Watter et al., 2015; Kingma & Welling, 2014; Rezende et al., 2014; Lange et al., 2012; Hinton et al., 2011; Ranzato et al., 2007), and extends this line of research by showing that autoencoder networks are capable of learning a combined representation for system dynamics and the reward function in reinforcement learning settings with high-dimensional visual state spaces—a first step towards applying modelbased techniques for planning in environments where the reward function is not initially known.",
+      "startOffset" : 126,
+      "endOffset" : 391
+    }, {
+      "referenceID" : 11,
+      "context" : "Our study fits into the general line of research using autoencoder networks to learn a latent representation from visual data (Finn et al., 2016; Goroshin et al., 2015; Gregor et al., 2015; Kulkarni et al., 2015; Srivastava et al., 2015; Wahlström et al., 2015; Watter et al., 2015; Kingma & Welling, 2014; Rezende et al., 2014; Lange et al., 2012; Hinton et al., 2011; Ranzato et al., 2007), and extends this line of research by showing that autoencoder networks are capable of learning a combined representation for system dynamics and the reward function in reinforcement learning settings with high-dimensional visual state spaces—a first step towards applying modelbased techniques for planning in environments where the reward function is not initially known.",
+      "startOffset" : 126,
+      "endOffset" : 391
+    }, {
+      "referenceID" : 12,
+      "context" : "Our study fits into the general line of research using autoencoder networks to learn a latent representation from visual data (Finn et al., 2016; Goroshin et al., 2015; Gregor et al., 2015; Kulkarni et al., 2015; Srivastava et al., 2015; Wahlström et al., 2015; Watter et al., 2015; Kingma & Welling, 2014; Rezende et al., 2014; Lange et al., 2012; Hinton et al., 2011; Ranzato et al., 2007), and extends this line of research by showing that autoencoder networks are capable of learning a combined representation for system dynamics and the reward function in reinforcement learning settings with high-dimensional visual state spaces—a first step towards applying modelbased techniques for planning in environments where the reward function is not initially known.",
+      "startOffset" : 126,
+      "endOffset" : 391
+    }, {
+      "referenceID" : 18,
+      "context" : "Our study fits into the general line of research using autoencoder networks to learn a latent representation from visual data (Finn et al., 2016; Goroshin et al., 2015; Gregor et al., 2015; Kulkarni et al., 2015; Srivastava et al., 2015; Wahlström et al., 2015; Watter et al., 2015; Kingma & Welling, 2014; Rezende et al., 2014; Lange et al., 2012; Hinton et al., 2011; Ranzato et al., 2007), and extends this line of research by showing that autoencoder networks are capable of learning a combined representation for system dynamics and the reward function in reinforcement learning settings with high-dimensional visual state spaces—a first step towards applying modelbased techniques for planning in environments where the reward function is not initially known.",
+      "startOffset" : 126,
+      "endOffset" : 391
+    }, {
+      "referenceID" : 29,
+      "context" : "Our study fits into the general line of research using autoencoder networks to learn a latent representation from visual data (Finn et al., 2016; Goroshin et al., 2015; Gregor et al., 2015; Kulkarni et al., 2015; Srivastava et al., 2015; Wahlström et al., 2015; Watter et al., 2015; Kingma & Welling, 2014; Rezende et al., 2014; Lange et al., 2012; Hinton et al., 2011; Ranzato et al., 2007), and extends this line of research by showing that autoencoder networks are capable of learning a combined representation for system dynamics and the reward function in reinforcement learning settings with high-dimensional visual state spaces—a first step towards applying modelbased techniques for planning in environments where the reward function is not initially known.",
+      "startOffset" : 126,
+      "endOffset" : 391
+    }, {
+      "referenceID" : 34,
+      "context" : "Our study fits into the general line of research using autoencoder networks to learn a latent representation from visual data (Finn et al., 2016; Goroshin et al., 2015; Gregor et al., 2015; Kulkarni et al., 2015; Srivastava et al., 2015; Wahlström et al., 2015; Watter et al., 2015; Kingma & Welling, 2014; Rezende et al., 2014; Lange et al., 2012; Hinton et al., 2011; Ranzato et al., 2007), and extends this line of research by showing that autoencoder networks are capable of learning a combined representation for system dynamics and the reward function in reinforcement learning settings with high-dimensional visual state spaces—a first step towards applying modelbased techniques for planning in environments where the reward function is not initially known.",
+      "startOffset" : 126,
+      "endOffset" : 391
+    }, {
+      "referenceID" : 35,
+      "context" : "Our study fits into the general line of research using autoencoder networks to learn a latent representation from visual data (Finn et al., 2016; Goroshin et al., 2015; Gregor et al., 2015; Kulkarni et al., 2015; Srivastava et al., 2015; Wahlström et al., 2015; Watter et al., 2015; Kingma & Welling, 2014; Rezende et al., 2014; Lange et al., 2012; Hinton et al., 2011; Ranzato et al., 2007), and extends this line of research by showing that autoencoder networks are capable of learning a combined representation for system dynamics and the reward function in reinforcement learning settings with high-dimensional visual state spaces—a first step towards applying modelbased techniques for planning in environments where the reward function is not initially known.",
+      "startOffset" : 126,
+      "endOffset" : 391
+    }, {
+      "referenceID" : 25,
+      "context" : "Our study fits into the general line of research using autoencoder networks to learn a latent representation from visual data (Finn et al., 2016; Goroshin et al., 2015; Gregor et al., 2015; Kulkarni et al., 2015; Srivastava et al., 2015; Wahlström et al., 2015; Watter et al., 2015; Kingma & Welling, 2014; Rezende et al., 2014; Lange et al., 2012; Hinton et al., 2011; Ranzato et al., 2007), and extends this line of research by showing that autoencoder networks are capable of learning a combined representation for system dynamics and the reward function in reinforcement learning settings with high-dimensional visual state spaces—a first step towards applying modelbased techniques for planning in environments where the reward function is not initially known.",
+      "startOffset" : 126,
+      "endOffset" : 391
+    }, {
+      "referenceID" : 19,
+      "context" : "Our study fits into the general line of research using autoencoder networks to learn a latent representation from visual data (Finn et al., 2016; Goroshin et al., 2015; Gregor et al., 2015; Kulkarni et al., 2015; Srivastava et al., 2015; Wahlström et al., 2015; Watter et al., 2015; Kingma & Welling, 2014; Rezende et al., 2014; Lange et al., 2012; Hinton et al., 2011; Ranzato et al., 2007), and extends this line of research by showing that autoencoder networks are capable of learning a combined representation for system dynamics and the reward function in reinforcement learning settings with high-dimensional visual state spaces—a first step towards applying modelbased techniques for planning in environments where the reward function is not initially known.",
+      "startOffset" : 126,
+      "endOffset" : 391
+    }, {
+      "referenceID" : 14,
+      "context" : "Our study fits into the general line of research using autoencoder networks to learn a latent representation from visual data (Finn et al., 2016; Goroshin et al., 2015; Gregor et al., 2015; Kulkarni et al., 2015; Srivastava et al., 2015; Wahlström et al., 2015; Watter et al., 2015; Kingma & Welling, 2014; Rezende et al., 2014; Lange et al., 2012; Hinton et al., 2011; Ranzato et al., 2007), and extends this line of research by showing that autoencoder networks are capable of learning a combined representation for system dynamics and the reward function in reinforcement learning settings with high-dimensional visual state spaces—a first step towards applying modelbased techniques for planning in environments where the reward function is not initially known.",
+      "startOffset" : 126,
+      "endOffset" : 391
+    }, {
+      "referenceID" : 24,
+      "context" : "Our study fits into the general line of research using autoencoder networks to learn a latent representation from visual data (Finn et al., 2016; Goroshin et al., 2015; Gregor et al., 2015; Kulkarni et al., 2015; Srivastava et al., 2015; Wahlström et al., 2015; Watter et al., 2015; Kingma & Welling, 2014; Rezende et al., 2014; Lange et al., 2012; Hinton et al., 2011; Ranzato et al., 2007), and extends this line of research by showing that autoencoder networks are capable of learning a combined representation for system dynamics and the reward function in reinforcement learning settings with high-dimensional visual state spaces—a first step towards applying modelbased techniques for planning in environments where the reward function is not initially known.",
+      "startOffset" : 126,
+      "endOffset" : 391
+    }, {
+      "referenceID" : 30,
+      "context" : "Directions for achieving this long-standing challenge include the Dyna method (Sutton, 1990), which uses a predictive model to artificially augment expensive training data, and has been shown to lead to substantial reductions in data requirements in tabular RL approaches.",
+      "startOffset" : 78,
+      "endOffset" : 92
+    }, {
+      "referenceID" : 13,
+      "context" : "Alternatively, the model could be could be utilized for planning via Monte-Carlo tree search (Guo et al., 2014; Browne et al., 2012).",
+      "startOffset" : 93,
+      "endOffset" : 132
+    }, {
+      "referenceID" : 6,
+      "context" : "Alternatively, the model could be could be utilized for planning via Monte-Carlo tree search (Guo et al., 2014; Browne et al., 2012).",
+      "startOffset" : 93,
+      "endOffset" : 132
+    }, {
+      "referenceID" : 15,
+      "context" : "A learning environment providing such a flexibility is the recently released Malmö platform for Minecraft (Johnson et al., 2016) where researchers can create user-defined environments and tasks in order to evaluate the performance of artificial agents.",
+      "startOffset" : 106,
+      "endOffset" : 128
+    }, {
+      "referenceID" : 25,
+      "context" : "Finally, extensions of our model to non-deterministic state transitions through dropout and variational autoencoder schemes (Kingma & Welling, 2014; Rezende et al., 2014) is a promising direction to alleviate the limitations highlighted in Section 4.",
+      "startOffset" : 124,
+      "endOffset" : 170
+    }, {
+      "referenceID" : 6,
+      "context" : ", 2014; Browne et al., 2012). We hypothesize that such an approach would be particularly beneficial in multi-task or life-long learning scenarios where the reward function changes but the environment dynamics are stationary. Testing this hypothesis requires a flexible learning framework where the reward function and the artificial environment can be changed by the experimenter in an arbitrary fashion, which is not possible in ALE where the environment and the reward function are fixed per game. A learning environment providing such a flexibility is the recently released Malmö platform for Minecraft (Johnson et al., 2016) where researchers can create user-defined environments and tasks in order to evaluate the performance of artificial agents. In the shorter-term, we envision improving the prediction performance of our network by regularization methods such as dropout and max norm regularization (Srivastava et al., 2014)—a state-of-the-art regularizer in supervised learning—and by modifying the optimization objective to enforce similarity between hidden encodings in multi-step ahead prediction and one-step ahead prediction—see Watter et al. (2015). Finally, extensions of our model to non-deterministic state transitions through dropout and variational autoencoder schemes (Kingma & Welling, 2014; Rezende et al.",
+      "startOffset" : 8,
+      "endOffset" : 1165
+    } ],
+    "year" : 2016,
+    "abstractText" : "Reinforcement learning is concerned with learning to interact with environments that are initially unknown. State-of-the-art reinforcement learning approaches, such as DQN, are model-free and learn to act effectively across a wide range of environments such as Atari games, but require huge amounts of data. Modelbased techniques are more data-efficient, but need to acquire explicit knowledge about the environment dynamics or the reward structure. In this paper we take a step towards using model-based techniques in environments with high-dimensional visual state space when system dynamics and the reward structure are both unknown and need to be learned, by demonstrating that it is possible to learn both jointly. Empirical evaluation on five Atari games demonstrate accurate cumulative reward prediction of up to 200 frames. We consider these positive results as opening up important directions for model-based RL in complex, initially unknown environments.",
+    "creator" : "LaTeX with hyperref package"
+  }
+}

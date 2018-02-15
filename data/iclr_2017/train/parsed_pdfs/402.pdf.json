@@ -1,0 +1,415 @@
+{
+  "name" : "402.pdf",
+  "metadata" : {
+    "source" : "CRF",
+    "title" : "HYPERBAND: BANDIT-BASED CONFIGURATION EVAL-",
+    "authors" : [ "UATION FOR", "HYPERPARAMETER OPTIMIZATION", "Lisha Li", "Kevin Jamieson", "Giulia DeSalvo", "Afshin Rostamizadeh", "Ameet Talwalkar" ],
+    "emails" : [ "lishal@cs.ucla.edu,", "ameet@cs.ucla.edu,", "kjamieson@berkeley.edu", "desalvo@cims.nyu.edu,", "rostami@google.com" ],
+    "sections" : [ {
+      "heading" : "1 INTRODUCTION",
+      "text" : "The task of hyperparameter optimization is becoming increasingly important as modern data analysis pipelines grow in complexity. The quality of a predictive model critically depends on its hyperparameter configuration, but it is poorly understood how these hyperparameters interact with each other to affect the quality of the resulting model. Consequently, practitioners often default to either hand-tuning or automated brute-force methods like random search and grid search.\nIn an effort to develop more efficient search methods, the problem of hyperparameter optimization has recently been dominated by Bayesian optimization methods (Snoek et al., 2012; Hutter et al., 2011; Bergstra et al., 2011) that focus on optimizing hyperparameter configuration selection. These methods aim to identify good configurations more quickly than standard baselines like random search by selecting configurations in an adaptive manner; see Figure 1(a). Existing empirical evidence suggests that these methods outperform random search (Thornton et al., 2013; Eggensperger et al., 2013; Snoek et al., 2015). However, these methods tackle a fundamentally challenging problem of simultaneously fitting and optimizing a high-dimensional, non-convex function with unknown smoothness, and possibly noisy evaluations. To overcome these difficulties, some Bayesian optimization methods resort to heuristics, at the expense of consistency guarantees, to model the objective function or speed up resource intensive subroutines.1 Moreover, these adaptive configuration selection methods are intrinsically sequential and thus difficult to parallelize.\nAn orthogonal approach to hyperparameter optimization focuses on speeding up configuration evaluation; see Figure 1(b). These methods are adaptive in computation, allocating more resources to promising hyperparameter configurations while quickly eliminating poor ones. Resources can take various forms, including size of training set, number of features, or number of iterations for iterative algorithms. By adaptively allocating these resources, these methods aim to examine orders of magnitude more hyperparameter configurations than methods that uniformly train all configurations to completion, thereby quickly identifying good hyperparameters. While there are methods that combine Bayesian optimization with adaptive resource allocation (Swersky et al., 2013; 2014; Domhan et al., 2015), we focus on speeding up random search as it offers a simple, parallelizable, and theoretically principled launching point and is shown to outperform grid search (Bergstra & Bengio, 2012).\n1Consistency can be restored by allocating a fraction of resources to performing random search.\nOur novel configuration evaluation method, HYPERBAND, relies on a principled early-stopping strategy to allocate resources, allowing it to evaluate orders of magnitude more configurations than uniform allocation strategies. HYPERBAND is a general-purpose technique that makes minimal assumptions, unlike prior configuration evaluation approaches (Swersky et al., 2013; Domhan et al., 2015; Swersky et al., 2014; György & Kocsis, 2011; Agarwal et al., 2011). In this work, we describe HYPERBAND, provide intuition for the algorithm through a detailed example, and present a wide range of empirical results comparing HYPERBAND with well established competitors. We also briefly describe the theoretical underpinnings of HYPERBAND, however a thorough theoretical treatment is beyond the scope of this paper and is deferred to Li et al. (2016)."
+    }, {
+      "heading" : "2 RELATED WORK",
+      "text" : "Bayesian optimization techniques model the conditional probability p(f |λ) of a configuration’s performance on a metric f given a set of hyperparameters λ. For instance, SMAC uses random forests to model p(f |λ) as a Gaussian distribution (Hutter et al., 2011). TPE is a non-standard Bayesian optimization algorithm based on tree-structured Parzen density estimators (Bergstra et al., 2011). A third popular method, Spearmint, uses Gaussian processes (GP) to model p(f |λ) and performs slice sampling over the GP’s hyperparameters (Snoek et al., 2012).\nAdaptive configuration evaluation is not a new idea. Maron & Moore (1993) considered a setting where training time is negligible (e.g., k-nearest-neighbor classification) and evaluation on a large validation set is accelerated by evaluating on an increasing subset of the validation set, stopping early configurations that are performing poorly. Since subsets of the validation set provide unbiased estimates of its expected performance, this is an instance of the stochastic best-arm identification problem for multi-armed bandits (see Jamieson & Nowak (2014) for a brief survey).\nIn contrast, this paper assumes that evaluation time is negligible and the goal is to early-stop longrunning training procedures by evaluating partially trained models on the validation set. Previous approaches either require strong assumptions or use heuristics to perform adaptive resource allocation. Several works propose methods that make strong assumptions on the convergence behavior of training algorithms, providing theoretical performance guarantees under these assumptions (György & Kocsis, 2011; Agarwal et al., 2011; Swersky et al., 2013; 2014; Domhan et al., 2015; Sabharwal et al., 2016). Unfortunately, these assumptions are often hard to verify, and empirical performance can drastically suffer when they are violated. One recent work of particular interest proposes a heuristic based on sequential analysis to determine stopping times for training configurations on increasing subsets of the data (Krueger et al., 2015). However, it has a few shortcomings: (1) it is designed to speedup multi-fold cross-validation and is not significantly faster than standard holdout, (2) it is not an anytime algorithm and requires the set of configurations to be evaluated as an input, and (3) the theoretical correctness and empirical performance of this method are highly dependent on\na user-defined “safety-zone.”2 Lastly, in an effort avoid heuristics and strong assumptions, Sparks et al. (2015) proposed a halving style algorithm that did not require explicit convergence behavior, and Jamieson & Talwalkar (2015) analyzed a similar algorithm, providing theoretical guarantees and encouraging empirical results. Unfortunately, these halving style algorithms suffer from the n vs B/n issue which we will discuss in Section 3.\nFinally, Klein et al. (2016) recently introduced Fabolas, a Bayesian optimization method that combines adaptive selection and evaluation. Similar to Swersky et al. (2013; 2014), it models the conditional validation error as a Gaussian process using a kernel that captures the covariance with downsampling rate to allow for adaptive evaluation. While we intended to compare HYPERBAND with Fabolas, we encountered some technical difficulties when using the package3 and are working with the authors of Klein et al. (2016) to resolve the issues."
+    }, {
+      "heading" : "3 HYPERBAND ALGORITHM",
+      "text" : "HYPERBAND extends the SUCCESSIVEHALVING algorithm proposed for hyperparameter optimization in Jamieson & Talwalkar (2015) and calls it as a subroutine. The idea behind SUCCESSIVEHALVING follows directly from its name: uniformly allocate a budget to a set of hyperparameter configurations, evaluate the performance of all configurations, throw out the worst half, and repeat until one configurations remains. The algorithm allocates exponentially more resources to more promising configurations. Unfortunately, SUCCESSIVEHALVING requires the number of configurations n as an input to the algorithm. Given some finite time budget B (e.g. an hour of training time to choose a hyperparameter configuration), B/n resources are allocated on average across the configurations. However, for a fixed B, it is not clear a priori whether we should (a) consider many configurations (large n) with a small average training time; or (b) consider a small number of configurations (small n) with longer average training times.\nWe use a simple example to better understand this tradeoff. Figure 1(c) shows the validation loss as a function of total resources allocated for two configurations with terminal validation losses ν1 and ν2. The shaded areas bound the maximum deviation from the terminal validation loss and will be referred to as “envelope” functions. It is possible to differentiate between the two configurations when the envelopes diverge. Simple arithmetic shows that this happens when the width of the envelopes is less than ν2 − ν1, i.e. when the intermediate losses are guaranteed to be less than ν2−ν12 away from the terminal losses. There are two takeaways from this observation: more resources are needed to differentiate between the two configurations when either (1) the envelope functions are wider or (2) the terminal losses are closer together.\nHowever, in practice, the optimal allocation strategy is unknown because we do not have knowledge of the envelope functions nor the distribution of terminal losses. Hence, if more resources are required before configurations can differentiate themselves in terms of quality (e.g., if an iterative training method converges very slowly for a given dataset or if randomly selected hyperparameter configurations perform similarly well) then it would be reasonable to work with a small number of configurations. In contrast, if the quality of a configuration is typically revealed using minimal resources (e.g., if iterative training methods converge very quickly for a given dataset or if randomly selected hyperparameter configurations are of low-quality with high probability) then n is the bottleneck and we should choose n to be large."
+    }, {
+      "heading" : "3.1 HYPERBAND",
+      "text" : "HYPERBAND, shown in Algorithm 1, addresses this “n versus B/n” problem by considering several possible values of n for a fixed B, in essence performing a grid search over feasible value of n. Associated with each value of n is a minimum resource r that is allocated to all configurations before some are discarded; a larger value of n corresponds to a smaller r and hence more aggressive early stopping. There are two components to HYPERBAND; (1) the inner loop invokes SUCCESSIVEHALVING for fixed values of n and r (lines 3-9) and (2) the outer loop which iterates over different values\n2The first two drawbacks prevent a full comparison to HYPERBAND on our selected empirical tasks, however, for completeness, we provide a comparison in Appendix A to Krueger et al. (2015) on some experimental tasks replicated from their paper.\n3The package provided by Klein et al. (2016) is available at https://github.com/automl/RoBO.\nof n and r (lines 1-2). We will refer to each such run of SUCCESSIVEHALVING within HYPERBAND as a “bracket.” Each bracket is designed to use about B total resources and corresponds to a different tradeoff between n and B/n. A single execution of HYPERBAND takes a finite number of iterations, and in practice can be repeated indefinitely.\nHYPERBAND requires two inputs (1) R, the maximum amount of resource that can be allocated to a single configuration, and (2) η, an input that controls the proportion of configurations discarded in each round of SUCCESSIVEHALVING. The two inputs dictate how many different brackets are considered; specifically, smax + 1 different values for n are considered with smax = blogη(R)c. HYPERBAND begins with the most aggressive bracket s = smax, which sets n to maximize exploration, subject to the constraint that at least one configuration is allocated R resources. Each subsequent bracket reduces n by a factor of approximately η until the final bracket, s = 0, in which every configuration is allocated R resources (this bracket simply performs classical random search). Hence, HYPERBAND performs a geometric search in the average budget per configuration to address the “n versus B/n” problem, at the cost of approximately smax+1 times more work than running SUCCESSIVEHALVING for a fixed n. By doing so, HYPERBAND is able to exploit situations in which adaptive allocation works well, while protecting itself in situations where more conservative allocations are required.\nAlgorithm 1: HYPERBAND algorithm for hyperparameter optimization. input :R, η (default η = 3) initialization :smax = blogη(R)c, B = (smax + 1)R 1 for s ∈ {smax, smax − 1, . . . , 0} do 2 n = dBR ηs (s+1)e, r = Rη −s // begin SUCCESSIVEHALVING with (n, r) inner loop 3 T =get hyperparameter configuration(n) 4 for i ∈ {0, . . . , s} do 5 ni = bnη−ic 6 ri = rη i 7 L = {run then return val loss(t, ri) : t ∈ T} 8 T =top k(T, L, bni/ηc) 9 end\n10 end 11 return Configuration with the smallest intermediate loss seen so far.\nR represents the maximum amount of resources that can be allocated to any given configuration. In most cases, there is a natural upper bound on the maximum budget per configuration that is often dictated by the resource type (e.g., training set size for dataset downsampling; limitations based on memory constraint for feature downsampling; rule of thumb regarding number of epochs when iteratively training neural networks). R is also the number of configurations evaluated in the bracket that performs the most exploration, i.e s = smax. In practice one may want n ≤ nmax to limit overhead associated with training many configurations on a small budget, i.e. costs associated with initialization, loading a model, and validation. In this case, set smax = blogη(nmax)c. The value of η can be viewed as a knob that can be tuned based on practical user constraints. Larger values of η correspond to a more aggressive elimination schedule and thus fewer rounds of elimination; specifically, each round retains 1/η configurations for a total of blogη(n)c+ 1 rounds of elimination with n configurations. If one wishes to receive a result faster at the cost of a sub-optimal asymptotic constant, one can increase η to reduce the budget per bracket B = (blogη(R)c + 1)R. We stress that results are not very sensitive to the choice of η. In practice we suggest taking η to be equal to 3 or 4.\nHYPERBAND requires the following methods to be defined for any given learning problem: get hyperparameter configuration(n) returns a set of n i.i.d. samples from some distribution defined over the hyperparameter configuration space; run then return val loss(t, r) takes a hyperparameter configuration (t) and resource allocation (r) and returns the validation loss after training for the allocated resources; and top k(configs, losses, k) takes a set of configurations as well as their associated losses and returns the top k performing configurations."
+    }, {
+      "heading" : "3.2 EXAMPLE APPLICATION WITH ITERATIONS AS A RESOURCE: LENET",
+      "text" : "We next present a simple example to provide intuition. We work with the MNIST dataset and optimize hyperparameters for the LeNet convolutional neural network trained using mini-batch SGD. Our search space includes learning rate, batch size, and number of kernels for the two layers of the network as hyperparameters (details are shown in Table 3 in Appendix A).\nWe further define the number of iterations as the resource to allocate, with one unit of resource corresponding to one epoch or a full pass over the dataset. We set R to 81 and use the default value of η = 3, resulting in smax = 4 and thus 5 brackets of SUCCESSIVEHALVING with different tradeoffs between n and B/n. The resources allocated within each bracket are displayed in Table 1."
+    }, {
+      "heading" : "3.3 OVERVIEW OF THEORETICAL RESULTS",
+      "text" : "Although a detailed theoretical analysis is beyond the scope of this paper, we provide an intuitive, high-level description of theoretical properties of HYPERBAND. Suppose there are n configurations, each with a given terminal validation error νi for i = 1, . . . , n. Without loss of generality, index the configurations by performance so that ν1 corresponds to the best performing configuration, ν2 to the second best, and so on. Now consider the task of identifying the best configuration. The optimal strategy would allocate to each configuration i the minimum resource required to distinguish it from ν1, i.e., enough so that the envelope functions depicted in Figure 1(c) bound the intermediate loss to be less than νi−ν12 away from the terminal value. As shown in Jamieson & Talwalkar (2015) and Li et al. (2016), the budget required by SUCCESSIVEHALVING is in fact only a small factor away from this optimal approach because it capitalizes on configurations that are easy to distinguish from ν1. In contrast, the naive uniform allocation strategy, which allocates B/n to each configuration, has to allocate to every configuration the resource required to distinguish ν2 from ν1.\nThe relative size of the budget required for uniform allocation and SUCCESSIVEHALVING depends on the envelope functions bounding deviation from terminal losses as well as the distribution from which νi’s are drawn. The budget required for SUCCESSIVEHALVING is smaller when the optimal n versus B/n tradeoff requires fewer resources per configuration. Hence, if the envelope functions tighten quickly as a function of resource allocated, or the average distances between terminal losses is large, then SUCCESSIVEHALVING can be substantially faster than uniform allocation. Of course we do not have knowledge of either function in practice, so we will hedge our aggressiveness with HYPERBAND. Remarkably, despite having no knowledge of the envelope functions or the distribution of νi’s, HYPERBAND requires a budget that is only log factors larger than the optimal for SUCCESSIVEHALVING. See Li et al. (2016) for details."
+    }, {
+      "heading" : "4 HYPERPARAMETER OPTIMIZATION EXPERIMENTS",
+      "text" : "In this section, we evaluate the empirical behavior of HYPERBAND with iterations, data subsamples, and features as resources. For all experiments, we compare HYPERBAND with three well known Bayesian optimization algorithms — SMAC, TPE, and Spearmint. Additionally, we show results for SUCCESSIVEHALVING corresponding to repeating the most exploration bracket of HYPERBAND. Finally for all experiments, we benchmark against standard random search and random 2×, which is a variant of random search with twice the budget of other methods."
+    }, {
+      "heading" : "4.1 EARLY STOPPING ITERATIVE ALGORITHMS FOR NEURAL NETWORKS",
+      "text" : "We study a convolutional neural network with the same architecture as that used in Snoek et al. (2012) and Domhan et al. (2015) from cuda-convnet. The search spaces used in the two previous works differ, and we used a search space similar to that of Snoek et al. (2012) with 6 hyperparameters for stochastic gradient decent and 2 hyperparameters for the response normalization layers. In line with the two previous works, we used a batch size of 100 for all experiments. For these experiments, we also compare against a variant of SMAC named SMAC early that uses the early termination criterion proposed in Domhan et al. (2015) for neural networks. We view SMAC with early stopping to be a combination of adaptive configuration selection and configuration evaluation. See Appendix A for more details about the experimental setup.\nDatasets: We considered three image classification datasets: CIFAR-10 (Krizhevsky, 2009), rotated MNIST with background images (MRBI) (Larochelle et al., 2007), and Street View House Numbers (SVHN) (Netzer et al., 2011). CIFAR-10 and SVHN contain 32 × 32 RGB images while MRBI contains 28× 28 grayscale images. The splits used for each dataset are as follows: (1) CIFAR-10 has 40k, 10k, and 10k instances; (2) MRBI has 10k, 2k, and 50k instances; and (3) SVHN has close to 600k, 6k, and 26k instances for training, validation, and test respectively. For all datasets, the only preprocessing performed on the raw images was demeaning.\nHYPERBAND Configuration: For these experiments, one unit of resource corresponds to 100 minibatch iterations. For CIFAR-10 and MRBI, R is set to 300 (or 30k total iterations). For SVHN, R is set to 600 (or 60k total iterations) to accommodate the larger training set. η was set to 4 for all experiments, resulting in 5 SUCCESSIVEHALVING brackets for HYPERBAND.\nResults: Ten independent trials were performed for each searcher. For CIFAR-10, the results in Figure 3(a) show that HYPERBAND is more than an order of magnitude faster than its competitors. In Figure 6 of Appendix A, we extend the x-axis for CIFAR-10 out to 100R. The results show that Bayesian optimization methods ultimately converge to similar errors as HYPERBAND. For MRBI, HYPERBAND is more than an order of magnitude faster than standard configuration selection approaches and 5× faster than SMAC with early stopping. For SVHN, while HYPERBAND finds a good configuration faster, Bayesian optimization methods are competitive and SMAC with early stopping outperforms HYPERBAND. This result demonstrates that there is merit to incorporating early stopping with configuration selection approaches.\nAcross the three datasets, HYPERBAND and SMAC early are the only two methods that consistently outperform random 2×. On these datasets, HYPERBAND is over 20× faster than random search while SMAC early is ≤ 7× faster than random search within the evaluation window. In fact, the first result returned by HYPERBAND after using a budget of 5R is often competitive with results returned by other searchers after using 50R. Additionally, HYPERBAND is less variable than other searchers across trials, which is highly desirable in practice (see Appendix A for plots with error bars).\nFor computationally expensive problems in high dimensional search spaces, it may make sense to just repeat the most exploratory brackets. Similarly, if meta-data is available about a problem or it is known that the quality of a configuration is evident after allocating a small amount of resource, then one should just repeat the most exploration bracket. Indeed, for these experiments, repeating the most exploratory bracket of HYPERBAND outperforms cycling through all the brackets. In fact, bracket s = 4 vastly outperforms all other methods on CIFAR-10 and MRBI and is nearly tied with SMAC early for first on SVHN.\nFinally, CIFAR-10 is a very popular dataset and state-of-the-art models achieve much better accuracy than what is shown in Figure 3. The difference in performance is mainly attributable to higher model complexities and data manipulation (i.e. using reflection or random cropping to artificially increase the dataset size). If we limit the comparison to published results that use the same architecture and exclude data manipulation, the best human expert result for the dataset is 18% error and hyperparameter optimized result is 15.0% for Snoek et al. (2012)4 and 17.2% for Domhan et al. (2015). These results are better than our results on CIFAR-10 because they use 25% more data by including the validation set and also train for more epochs. The best model found by HYPERBAND achieved a test error of 17.0% when trained on the combined training and validation data for 300 epochs."
+    }, {
+      "heading" : "4.2 DATA DOWNSAMPLING KERNEL REGULARIZED LEAST SQUARES CLASSIFICATION",
+      "text" : "In this experiment, we use HYPERBAND with data samples as the resource to optimize the hyperparameters of a kernel-based classification task on CIFAR-10. We use the multi-class regularized least squares classification model which is known to have comparable performance to SVMs (Rifkin & Klautau, 2004; Agarwal et al., 2014) but can be trained significantly faster. The hyperparameters considered in the search space include preprocessing method, regularization, kernel type, kernel length scale, and other kernel specific hyperparameters (see Appendix A for more details). HYPERBAND is run with η = 4 and R = 400, with each unit of resource representing 100 datapoints. Similar to previous experiments, these inputs result in a total of 5 brackets. Each hyperparameter optimization algorithm is run for ten trials on Amazon EC2 m4.2xlarge instances; for a given trial, HYPERBAND is allowed to run for two outer loops, bracket s = 4 is repeated 10 times, and all other searchers are run for 12 hours.\nFigure 4 shows that HYPERBAND returns a good configuration after just the first SUCCESSIVEHALVING bracket in approximately 20 minutes; other searchers fail to reach this error rate on average even after the entire 12 hours. Notably, HYPERBAND was able to evaluate over 250 configurations in this first bracket of SUCCESSIVEHALVING, while competitors were able to evaluate only three configurations in the same amount of time. Consequently, HYPERBAND is over 30× faster than Bayesian optimization methods and 70× faster than random search. Bracket s = 4 sightly outperforms HYPERBAND but the terminal performance for the two algorithms are the same. Random 2× is competitive with SMAC and TPE."
+    }, {
+      "heading" : "4.3 FEATURE SUBSAMPLING TO SPEED UP APPROXIMATE KERNEL CLASSIFICATION",
+      "text" : "We next demonstrate the performance of HYPERBAND when using features as a resource, focusing on random feature approximations for kernel methods. Features are randomly generated using the method described in Rahimi & Recht (2007) to approximate the RBF kernel, and these random features are then used as inputs to a ridge regression classifier. We consider hyperparameters of a random feature kernel approximation classifier trained on CIFAR-10, including preprocessing method, kernel length scale, and l2 penalty. We impose an upper bound of 100k random features for the kernel approximation so that the data will comfortably fit into a machine with 60GB of\n4We were unable to reproduce this result even after receiving the optimal hyperparameters from the authors through a personal communication.\nmemory. Additionally, we set one unit of resource to be 100 features for an R = 1000, which gives 5 different brackets with η = 4. Each searcher is run for 10 trials, with each trial lasting 12 hours on a n1-standard-16 machine from Google Cloud Compute. The results in Figure 5 show that HYPERBAND is around 6x faster than Bayesian methods and random search. HYPERBAND performs similarly to bracket s = 4. Random 2× outperforms Bayesian optimization algorithms."
+    }, {
+      "heading" : "4.4 EXPERIMENTAL DISCUSSION",
+      "text" : "For a given R, the most exploratory SUCCESSIVEHALVING round performed by HYPERBAND evaluates ηblogη(R)c configurations using a budget of (blogη(R)c+1)R, which gives an upper bound on the potential speedup over random search. If training time scales linearly with the resource, the maximum speedup offered by HYPERBAND compared to random search is η blogη(R)c\n(blogη(R)c+1) . For\nthe values of η and R used in our experiments, the maximum speedup over random search is approximately 50× given linear training time. However, we observe a range of speedups from 6× to 70× faster than random search. The differences in realized speedup can be explained by two factors: (1) the scaling properties of total evaluation time as a function of the allocated resource and (2) the difficulty of finding a good configuration.\nIf training time is superlinear as a function of the resource, then HYPERBAND can offer higher speedups. More generally, if training scales like a polynomial of degree p > 1, the maximum speedup of HYPERBAND over random search is approximately η\np−1−1 ηp−1 η blogη(R)c. Hence, higher speedups were observed for the the kernel least square classifier experiment discussed in Section 4.2 because the training time scaled quadratically as a function of the resource.\nIf 10 randomly sampled configurations is sufficient to find a good hyperparameter setting, then the benefit of evaluating orders of magnitude more configurations is muted. Generally the difficulty of the problem scales with the dimension of the search space since coverage diminishes with dimensionality. For low dimensional problems, the number of configurations evaluated by random search and Bayesian methods is exponential in the number of dimensions so good coverage can be achieved; i.e. if d = 3 as in the features subsampling experiment, then n = O(2d = 8). Hence, HYPERBAND is only 6× faster than random search on the feature subsampling experiment. For the neural network experiments however, we hypothesize that faster speedups are observed for HYPERBAND because the dimension of the search space is higher."
+    }, {
+      "heading" : "5 FUTURE WORK",
+      "text" : "We have introduced a novel bandit-based method for adaptive configuration evaluation with demonstrated competitive empirical performance. Future work involves exploring (i) embedding HYPERBAND into parallel and distributed computing environments; (ii) adjusting for training methods with different convergence rates; and (iii) combining HYPERBAND with non-random sampling methods."
+    }, {
+      "heading" : "A ADDITIONAL EXPERIMENTAL RESULTS",
+      "text" : "In this section, we present a comparison of HYPERBAND with the CVST algorithm from Krueger et al. (2015) and provide additional details for experiments presented in Section 3 and 4.\nA.1 COMPARISON WITH CVST\nThe CVST algorithm from Krueger et al. (2015) focuses on speeding up standard k-fold crossvalidation. We did not include it as one of the competitors in Section 4 because the experiments we selected were too computational expensive for multi-fold cross-validation and CVST is not an any time algorithm. Nonetheless, the CVST algorithm is an interesting approach and was shown to have promising empirical performance in Krueger et al. (2015). Hence, we performed a small scale comparison modeled after their empirical studies between CVST and HYPERBAND.\nWe replicated the classification experiments in Krueger et al. (2015) that train a support vector machine on the datasets from the IDA benchmark (Rätsch et al., 2001). All experiments were performed on Google Cloud Compute’s n1-standard-1 instances. Following Krueger et al. (2015), we evaluated HYPERBAND and CVST on the same 2d grid of 610 hyperparameters and recorded the best test error and duration for 50 trials . The only modification we made to their original experimental setup was the data splits; instead of half for test and half for training, we used 1/11th for test and 10/11th for training. HYPERBAND performed holdout evaluation using 1/10th of the training data as the validation set. We set η = 3, and R was set for each dataset so that a minimum resource of 50 datapoints is allocated to each configuration. Table 2 shows that CVST and HYPERBAND achieve comparable test errors (the differences are well within the error bars), while HYPERBAND is significantly faster than CVST on all datasets. More granularly, while CVST on average has slightly lower mean error, HYPERBAND is within 0.2% of CVST on 5 of the 7 datasets. Additionally, for each of the 7 datasets, HYPERBAND does as well as or better than CVST in over half of the trials.\nA.2 LENET EXPERIMENT\nWe trained the LeNet convolutional neural network on MNIST using mini-batch SGD. Code is available for the network at http://deeplearning.net/tutorial/lenet.html. The search space for the LeNet example discussed in Section 3.2 is shown in Table 3.\nA.3 EXPERIMENTS USING ALEX KRIZHEVSKY’S CNN ARCHITECTURE\nFor the experiments discussed in Section 4.1, the exact architecture used is the 18% model provided on cuda-convnet for CIFAR-10.5\nSearch Space: The search space used for the experiments is shown in Table 4. The learning rate reductions hyperparameter indicates how many times the learning rate was reduced by a factor of 10 over the maximum iteration window. For example, on CIFAR-10, which has a maximum iteration of 30,000, a learning rate reduction of 2 corresponds to reducing the learning every 10,000 iterations, for a total of 2 reductions over the 30,000 iteration window. All hyperparameters with the exception of the learning rate decay reduction overlap with those in Snoek et al. (2012). Two hyperparameters in Snoek et al. (2012) were excluded from our experiments: (1) the width of the response normalization layer was excluded due to limitations of the Caffe framework and (2) the number of epochs was excluded because it is incompatible with dynamic resource allocation.\nDatasets: CIFAR-10 and SVHN contain 32×32 RGB images while MRBI contains 28×28 grayscale images. For all datasets, the only preprocessing performed on the raw images was demeaning. For CIFAR-10, the training (40,000 instances) and validation (10,000 instances) sets were sampled from data batches 1-5 with balanced classes. The original test set (10,000 instances) is used for testing. For MRBI, the training (10,000 instances) and validation (2,000 instances) sets were sampled from the original training set with balanced classes. The original test set (50,000 instances) is used for testing. Lastly, for SVHN, the train, validation, and test splits were created using the same procedure as that in Sermanet et al. (2012).\nComputational Considerations: The experiments took the equivalent of over 1 year of GPU hours on NVIDIA GRID K520 cards available on Amazon EC2 g2.8xlarge instances. We set a total budget constraint in terms of iterations instead of compute time to make comparisons hardware independent.6 Comparing progress by iterations instead of time ignores overhead costs not associated with training like cost of configuration selection for Bayesian methods and model initialization and validation costs for HYPERBAND. While overhead is hardware dependent, the overhead for HYPERBAND is below 5% on EC2 g2.8xlarge machines, so comparing progress by time passed would not impact results significantly.\nDue to the high computational cost of these experiments, we were not able to run all searchers out to convergence. However, we did double the budget for each trial of CIFAR-10 to allow for a comparison of the searchers as they near convergence. Figure 6 shows while Bayesian optimization methods achieve similar performance as HYPERBAND and SUCCESSIVEHALVING, it takes them much longer to achieve a comparable error rate.\nComparison with Early Stopping: Adaptive allocation for hyperparameter optimization can be thought of as a form of early stopping where less promising configurations are halted before completion. Domhan et al. (2015) propose an early stopping method for neural networks and combine it\n5The model specification is available at http://code.google.com/p/cuda-convnet/. 6Most trials were run on Amazon EC2 g2.8xlarge instances but a few trials were run on different machines\ndue to the large computational demand of these experiments.\nwith SMAC to speed up hyperparameter optimization. Their method stops training a configuration if the probability of the configuration beating the current best is below a specified threshold. This probability is estimated by extrapolating learning curves fit to the intermediate validation error losses of a configuration. If a configuration is terminated early, the predicted terminal value from the estimated learning curves is used as the validation error passed to the hyperparameter optimization algorithm. Hence, if the learning curve fit is poor, it could impact the performance of the configuration selection algorithm. While this approach is heuristic in nature, it does demonstrate promising empirical performance so we included SMAC with early termination as a competitor. We used the conservative termination criterion with default parameters and recorded the validation loss every 400 iterations and evaluated the termination criterion 3 times within the training period (every 8k iterations for CIFAR-10 and MRBI and every 16k iterations for SVHN).7 Comparing performance by the total multiple of R used is conservative because it does not account for the time spent fitting the learning curve in order to check the termination criterion.\nA.4 KERNEL CLASSIFICATION EXPERIMENTS\nWe trained the regularized least-squares classification model using a block coordinate descent solver. Our models take less than 10 minutes to train on CIFAR-10 using an 8 core machine, while the default SVM method in Scikit-learn is single core and takes hours. Table 5 shows the hyperparameters and associated ranges considered in the kernel least squares classification experiment discussed in\n7We used the code provided at https://github.com/automl/pylearningcurvepredictor.\nSection 4.2. The cost term C is divided by the number of samples so that the tradeoff between the squared error and the l2 penalty would remain constant as the resource increased (squared error is summed across observations and not averaged). The regularization term λ is equal to the inverse of the scaled cost term C. Additionally, the average test error with associated minimum and maximum ranges across 10 trials are show in Figure 7.\nTable 6 shows the hyperparameters and associated ranges considered in the random features kernel approximation classification experiment discussed in Section 4.3. The regularization term λ is divided by the number of features so that the tradeoff between the squared error and the l2 penalty would remain constant as the resource increased. Additionally, the average test error with associated minimum and maximum ranges across 10 trials are show in Figure 8."
+    } ],
+    "references" : [ {
+      "title" : "Oracle inequalities for computationally budgeted model selection",
+      "author" : [ "A. Agarwal", "J. Duchi", "P.L. Bartlett", "C. Levrard" ],
+      "venue" : "In COLT,",
+      "citeRegEx" : "Agarwal et al\\.,? \\Q2011\\E",
+      "shortCiteRegEx" : "Agarwal et al\\.",
+      "year" : 2011
+    }, {
+      "title" : "Least squares revisited: Scalable approaches for multi-class prediction",
+      "author" : [ "A. Agarwal", "S. Kakade", "N. Karampatziakis", "L. Song", "G. Valiant" ],
+      "venue" : "In ICML,",
+      "citeRegEx" : "Agarwal et al\\.,? \\Q2014\\E",
+      "shortCiteRegEx" : "Agarwal et al\\.",
+      "year" : 2014
+    }, {
+      "title" : "Random search for hyper-parameter optimization",
+      "author" : [ "J. Bergstra", "Y. Bengio" ],
+      "venue" : "In JMLR,",
+      "citeRegEx" : "Bergstra and Bengio.,? \\Q2012\\E",
+      "shortCiteRegEx" : "Bergstra and Bengio.",
+      "year" : 2012
+    }, {
+      "title" : "Algorithms for hyper-parameter optimization",
+      "author" : [ "J. Bergstra" ],
+      "venue" : "In NIPS,",
+      "citeRegEx" : "Bergstra,? \\Q2011\\E",
+      "shortCiteRegEx" : "Bergstra",
+      "year" : 2011
+    }, {
+      "title" : "Speeding up automatic hyperparameter optimization of deep neural networks by extrapolation of learning curves",
+      "author" : [ "T. Domhan", "J.T. Springenberg", "F. Hutter" ],
+      "venue" : "In IJCAI,",
+      "citeRegEx" : "Domhan et al\\.,? \\Q2015\\E",
+      "shortCiteRegEx" : "Domhan et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "Towards an empirical foundation for assessing bayesian optimization of hyperparameters",
+      "author" : [ "K. Eggensperger" ],
+      "venue" : "In NIPS Bayesian Optimization Workshop,",
+      "citeRegEx" : "Eggensperger,? \\Q2013\\E",
+      "shortCiteRegEx" : "Eggensperger",
+      "year" : 2013
+    }, {
+      "title" : "Efficient multi-start strategies for local search",
+      "author" : [ "A. György", "L. Kocsis" ],
+      "venue" : "algorithms. JAIR,",
+      "citeRegEx" : "György and Kocsis.,? \\Q2011\\E",
+      "shortCiteRegEx" : "György and Kocsis.",
+      "year" : 2011
+    }, {
+      "title" : "Sequential model-based optimization for general algorithm configuration",
+      "author" : [ "F. Hutter", "H. Hoos", "K. Leyton-Brown" ],
+      "venue" : "In Proc. of LION-5,",
+      "citeRegEx" : "Hutter et al\\.,? \\Q2011\\E",
+      "shortCiteRegEx" : "Hutter et al\\.",
+      "year" : 2011
+    }, {
+      "title" : "Best-arm identification algorithms for multi-armed bandits in the fixed confidence setting",
+      "author" : [ "K. Jamieson", "R. Nowak" ],
+      "venue" : "In Information Sciences and Systems (CISS),",
+      "citeRegEx" : "Jamieson and Nowak.,? \\Q2014\\E",
+      "shortCiteRegEx" : "Jamieson and Nowak.",
+      "year" : 2014
+    }, {
+      "title" : "Non-stochastic best arm identification and hyperparameter optimization",
+      "author" : [ "K. Jamieson", "A. Talwalkar" ],
+      "venue" : "In AISTATS,",
+      "citeRegEx" : "Jamieson and Talwalkar.,? \\Q2015\\E",
+      "shortCiteRegEx" : "Jamieson and Talwalkar.",
+      "year" : 2015
+    }, {
+      "title" : "Fast bayesian optimization of machine learning hyperparameters on large datasets",
+      "author" : [ "A. Klein", "S. Falkner", "S. Bartels", "P. Hennig", "F. Hutter" ],
+      "venue" : "arXiv preprint arXiv:1605.07079,",
+      "citeRegEx" : "Klein et al\\.,? \\Q2016\\E",
+      "shortCiteRegEx" : "Klein et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Learning multiple layers of features from tiny images",
+      "author" : [ "A. Krizhevsky" ],
+      "venue" : "Technical report, Department of Computer Science, Univsersity of Toronto,",
+      "citeRegEx" : "Krizhevsky.,? \\Q2009\\E",
+      "shortCiteRegEx" : "Krizhevsky.",
+      "year" : 2009
+    }, {
+      "title" : "Fast cross-validation via sequential testing",
+      "author" : [ "T. Krueger", "D. Panknin", "M. Braun" ],
+      "venue" : "Journal of Machine Learning Research,",
+      "citeRegEx" : "Krueger et al\\.,? \\Q2015\\E",
+      "shortCiteRegEx" : "Krueger et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "An empirical evaluation of deep architectures on problems with many factors of variation",
+      "author" : [ "H. Larochelle" ],
+      "venue" : "In ICML,",
+      "citeRegEx" : "Larochelle,? \\Q2007\\E",
+      "shortCiteRegEx" : "Larochelle",
+      "year" : 2007
+    }, {
+      "title" : "Hyperband: A novel banditbased approach to hyperparameter optimization",
+      "author" : [ "L. Li", "K. Jamieson", "G. DeSalvo", "A. Rostamizadeh", "A. Talwalkar" ],
+      "venue" : null,
+      "citeRegEx" : "Li et al\\.,? \\Q2016\\E",
+      "shortCiteRegEx" : "Li et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Hoeffding races: Accelerating model selection search for classification and function approximation",
+      "author" : [ "O. Maron", "A. Moore" ],
+      "venue" : "In NIPS,",
+      "citeRegEx" : "Maron and Moore.,? \\Q1993\\E",
+      "shortCiteRegEx" : "Maron and Moore.",
+      "year" : 1993
+    }, {
+      "title" : "Reading digits in natural images with unsupervised feature learning",
+      "author" : [ "Y. Netzer" ],
+      "venue" : "In NIPS Workshop on Deep Learning and Unsupervised Feature Learning,",
+      "citeRegEx" : "Netzer,? \\Q2011\\E",
+      "shortCiteRegEx" : "Netzer",
+      "year" : 2011
+    }, {
+      "title" : "Random features for large-scale kernel machines",
+      "author" : [ "A. Rahimi", "B. Recht" ],
+      "venue" : "In NIPS,",
+      "citeRegEx" : "Rahimi and Recht.,? \\Q2007\\E",
+      "shortCiteRegEx" : "Rahimi and Recht.",
+      "year" : 2007
+    }, {
+      "title" : "Soft margins for adaboost",
+      "author" : [ "G. Rätsch", "T. Onoda", "K.R. Müller" ],
+      "venue" : "Machine Learning,",
+      "citeRegEx" : "Rätsch et al\\.,? \\Q2001\\E",
+      "shortCiteRegEx" : "Rätsch et al\\.",
+      "year" : 2001
+    }, {
+      "title" : "Selecting near-optimal learners via incremental data allocation",
+      "author" : [ "A. Sabharwal", "H. Samulowitz", "G. Tesauro" ],
+      "venue" : "In AAAI,",
+      "citeRegEx" : "Sabharwal et al\\.,? \\Q2016\\E",
+      "shortCiteRegEx" : "Sabharwal et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Convolutional neural networks applied to house numbers digit classification",
+      "author" : [ "P. Sermanet", "S. Chintala", "Y. LeCun" ],
+      "venue" : "In ICPR,",
+      "citeRegEx" : "Sermanet et al\\.,? \\Q2012\\E",
+      "shortCiteRegEx" : "Sermanet et al\\.",
+      "year" : 2012
+    }, {
+      "title" : "Practical bayesian optimization of machine learning algorithms",
+      "author" : [ "J. Snoek", "H. Larochelle", "R. Adams" ],
+      "venue" : "In NIPS,",
+      "citeRegEx" : "Snoek et al\\.,? \\Q2012\\E",
+      "shortCiteRegEx" : "Snoek et al\\.",
+      "year" : 2012
+    }, {
+      "title" : "Bayesian optimization using deep neural networks",
+      "author" : [ "J. Snoek" ],
+      "venue" : "In ICML,",
+      "citeRegEx" : "Snoek,? \\Q2015\\E",
+      "shortCiteRegEx" : "Snoek",
+      "year" : 2015
+    }, {
+      "title" : "Automating model search for large scale machine learning",
+      "author" : [ "E. Sparks", "A. Talwalkar", "D. Haas", "M.J. Franklin", "M.I. Jordan", "T. Kraska" ],
+      "venue" : "In Symposium on Cloud Computing,",
+      "citeRegEx" : "Sparks et al\\.,? \\Q2015\\E",
+      "shortCiteRegEx" : "Sparks et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "Multi-task bayesian optimization",
+      "author" : [ "K. Swersky", "J. Snoek", "R. Adams" ],
+      "venue" : "In NIPS,",
+      "citeRegEx" : "Swersky et al\\.,? \\Q2013\\E",
+      "shortCiteRegEx" : "Swersky et al\\.",
+      "year" : 2013
+    }, {
+      "title" : "Freeze-thaw bayesian optimization",
+      "author" : [ "K. Swersky", "J. Snoek", "R.P. Adams" ],
+      "venue" : null,
+      "citeRegEx" : "Swersky et al\\.,? \\Q2014\\E",
+      "shortCiteRegEx" : "Swersky et al\\.",
+      "year" : 2014
+    }, {
+      "title" : "Auto-weka: Combined selection and hyperparameter optimization of classification algorithms",
+      "author" : [ "C. Thornton" ],
+      "venue" : "In KDD,",
+      "citeRegEx" : "Thornton,? \\Q2013\\E",
+      "shortCiteRegEx" : "Thornton",
+      "year" : 2013
+    }, {
+      "title" : "The CVST algorithm",
+      "author" : [ "Krueger" ],
+      "venue" : null,
+      "citeRegEx" : "Krueger,? \\Q2015\\E",
+      "shortCiteRegEx" : "Krueger",
+      "year" : 2015
+    } ],
+    "referenceMentions" : [ {
+      "referenceID" : 21,
+      "context" : "In an effort to develop more efficient search methods, the problem of hyperparameter optimization has recently been dominated by Bayesian optimization methods (Snoek et al., 2012; Hutter et al., 2011; Bergstra et al., 2011) that focus on optimizing hyperparameter configuration selection.",
+      "startOffset" : 159,
+      "endOffset" : 223
+    }, {
+      "referenceID" : 7,
+      "context" : "In an effort to develop more efficient search methods, the problem of hyperparameter optimization has recently been dominated by Bayesian optimization methods (Snoek et al., 2012; Hutter et al., 2011; Bergstra et al., 2011) that focus on optimizing hyperparameter configuration selection.",
+      "startOffset" : 159,
+      "endOffset" : 223
+    }, {
+      "referenceID" : 24,
+      "context" : "While there are methods that combine Bayesian optimization with adaptive resource allocation (Swersky et al., 2013; 2014; Domhan et al., 2015), we focus on speeding up random search as it offers a simple, parallelizable, and theoretically principled launching point and is shown to outperform grid search (Bergstra & Bengio, 2012).",
+      "startOffset" : 93,
+      "endOffset" : 142
+    }, {
+      "referenceID" : 4,
+      "context" : "While there are methods that combine Bayesian optimization with adaptive resource allocation (Swersky et al., 2013; 2014; Domhan et al., 2015), we focus on speeding up random search as it offers a simple, parallelizable, and theoretically principled launching point and is shown to outperform grid search (Bergstra & Bengio, 2012).",
+      "startOffset" : 93,
+      "endOffset" : 142
+    }, {
+      "referenceID" : 24,
+      "context" : "HYPERBAND is a general-purpose technique that makes minimal assumptions, unlike prior configuration evaluation approaches (Swersky et al., 2013; Domhan et al., 2015; Swersky et al., 2014; György & Kocsis, 2011; Agarwal et al., 2011).",
+      "startOffset" : 122,
+      "endOffset" : 232
+    }, {
+      "referenceID" : 4,
+      "context" : "HYPERBAND is a general-purpose technique that makes minimal assumptions, unlike prior configuration evaluation approaches (Swersky et al., 2013; Domhan et al., 2015; Swersky et al., 2014; György & Kocsis, 2011; Agarwal et al., 2011).",
+      "startOffset" : 122,
+      "endOffset" : 232
+    }, {
+      "referenceID" : 25,
+      "context" : "HYPERBAND is a general-purpose technique that makes minimal assumptions, unlike prior configuration evaluation approaches (Swersky et al., 2013; Domhan et al., 2015; Swersky et al., 2014; György & Kocsis, 2011; Agarwal et al., 2011).",
+      "startOffset" : 122,
+      "endOffset" : 232
+    }, {
+      "referenceID" : 0,
+      "context" : "HYPERBAND is a general-purpose technique that makes minimal assumptions, unlike prior configuration evaluation approaches (Swersky et al., 2013; Domhan et al., 2015; Swersky et al., 2014; György & Kocsis, 2011; Agarwal et al., 2011).",
+      "startOffset" : 122,
+      "endOffset" : 232
+    }, {
+      "referenceID" : 0,
+      "context" : ", 2014; György & Kocsis, 2011; Agarwal et al., 2011). In this work, we describe HYPERBAND, provide intuition for the algorithm through a detailed example, and present a wide range of empirical results comparing HYPERBAND with well established competitors. We also briefly describe the theoretical underpinnings of HYPERBAND, however a thorough theoretical treatment is beyond the scope of this paper and is deferred to Li et al. (2016).",
+      "startOffset" : 31,
+      "endOffset" : 436
+    }, {
+      "referenceID" : 7,
+      "context" : "For instance, SMAC uses random forests to model p(f |λ) as a Gaussian distribution (Hutter et al., 2011).",
+      "startOffset" : 83,
+      "endOffset" : 104
+    }, {
+      "referenceID" : 21,
+      "context" : "A third popular method, Spearmint, uses Gaussian processes (GP) to model p(f |λ) and performs slice sampling over the GP’s hyperparameters (Snoek et al., 2012).",
+      "startOffset" : 139,
+      "endOffset" : 159
+    }, {
+      "referenceID" : 0,
+      "context" : "Several works propose methods that make strong assumptions on the convergence behavior of training algorithms, providing theoretical performance guarantees under these assumptions (György & Kocsis, 2011; Agarwal et al., 2011; Swersky et al., 2013; 2014; Domhan et al., 2015; Sabharwal et al., 2016).",
+      "startOffset" : 180,
+      "endOffset" : 298
+    }, {
+      "referenceID" : 24,
+      "context" : "Several works propose methods that make strong assumptions on the convergence behavior of training algorithms, providing theoretical performance guarantees under these assumptions (György & Kocsis, 2011; Agarwal et al., 2011; Swersky et al., 2013; 2014; Domhan et al., 2015; Sabharwal et al., 2016).",
+      "startOffset" : 180,
+      "endOffset" : 298
+    }, {
+      "referenceID" : 4,
+      "context" : "Several works propose methods that make strong assumptions on the convergence behavior of training algorithms, providing theoretical performance guarantees under these assumptions (György & Kocsis, 2011; Agarwal et al., 2011; Swersky et al., 2013; 2014; Domhan et al., 2015; Sabharwal et al., 2016).",
+      "startOffset" : 180,
+      "endOffset" : 298
+    }, {
+      "referenceID" : 19,
+      "context" : "Several works propose methods that make strong assumptions on the convergence behavior of training algorithms, providing theoretical performance guarantees under these assumptions (György & Kocsis, 2011; Agarwal et al., 2011; Swersky et al., 2013; 2014; Domhan et al., 2015; Sabharwal et al., 2016).",
+      "startOffset" : 180,
+      "endOffset" : 298
+    }, {
+      "referenceID" : 12,
+      "context" : "One recent work of particular interest proposes a heuristic based on sequential analysis to determine stopping times for training configurations on increasing subsets of the data (Krueger et al., 2015).",
+      "startOffset" : 179,
+      "endOffset" : 201
+    }, {
+      "referenceID" : 22,
+      "context" : "”2 Lastly, in an effort avoid heuristics and strong assumptions, Sparks et al. (2015) proposed a halving style algorithm that did not require explicit convergence behavior, and Jamieson & Talwalkar (2015) analyzed a similar algorithm, providing theoretical guarantees and encouraging empirical results.",
+      "startOffset" : 65,
+      "endOffset" : 86
+    }, {
+      "referenceID" : 22,
+      "context" : "”2 Lastly, in an effort avoid heuristics and strong assumptions, Sparks et al. (2015) proposed a halving style algorithm that did not require explicit convergence behavior, and Jamieson & Talwalkar (2015) analyzed a similar algorithm, providing theoretical guarantees and encouraging empirical results.",
+      "startOffset" : 65,
+      "endOffset" : 205
+    }, {
+      "referenceID" : 10,
+      "context" : "Finally, Klein et al. (2016) recently introduced Fabolas, a Bayesian optimization method that combines adaptive selection and evaluation.",
+      "startOffset" : 9,
+      "endOffset" : 29
+    }, {
+      "referenceID" : 10,
+      "context" : "Finally, Klein et al. (2016) recently introduced Fabolas, a Bayesian optimization method that combines adaptive selection and evaluation. Similar to Swersky et al. (2013; 2014), it models the conditional validation error as a Gaussian process using a kernel that captures the covariance with downsampling rate to allow for adaptive evaluation. While we intended to compare HYPERBAND with Fabolas, we encountered some technical difficulties when using the package3 and are working with the authors of Klein et al. (2016) to resolve the issues.",
+      "startOffset" : 9,
+      "endOffset" : 520
+    }, {
+      "referenceID" : 11,
+      "context" : "The first two drawbacks prevent a full comparison to HYPERBAND on our selected empirical tasks, however, for completeness, we provide a comparison in Appendix A to Krueger et al. (2015) on some experimental tasks replicated from their paper.",
+      "startOffset" : 164,
+      "endOffset" : 186
+    }, {
+      "referenceID" : 10,
+      "context" : "The package provided by Klein et al. (2016) is available at https://github.",
+      "startOffset" : 24,
+      "endOffset" : 44
+    }, {
+      "referenceID" : 14,
+      "context" : "As shown in Jamieson & Talwalkar (2015) and Li et al. (2016), the budget required by SUCCESSIVEHALVING is in fact only a small factor away from this optimal approach because it capitalizes on configurations that are easy to distinguish from ν1.",
+      "startOffset" : 44,
+      "endOffset" : 61
+    }, {
+      "referenceID" : 14,
+      "context" : "As shown in Jamieson & Talwalkar (2015) and Li et al. (2016), the budget required by SUCCESSIVEHALVING is in fact only a small factor away from this optimal approach because it capitalizes on configurations that are easy to distinguish from ν1. In contrast, the naive uniform allocation strategy, which allocates B/n to each configuration, has to allocate to every configuration the resource required to distinguish ν2 from ν1. The relative size of the budget required for uniform allocation and SUCCESSIVEHALVING depends on the envelope functions bounding deviation from terminal losses as well as the distribution from which νi’s are drawn. The budget required for SUCCESSIVEHALVING is smaller when the optimal n versus B/n tradeoff requires fewer resources per configuration. Hence, if the envelope functions tighten quickly as a function of resource allocated, or the average distances between terminal losses is large, then SUCCESSIVEHALVING can be substantially faster than uniform allocation. Of course we do not have knowledge of either function in practice, so we will hedge our aggressiveness with HYPERBAND. Remarkably, despite having no knowledge of the envelope functions or the distribution of νi’s, HYPERBAND requires a budget that is only log factors larger than the optimal for SUCCESSIVEHALVING. See Li et al. (2016) for details.",
+      "startOffset" : 44,
+      "endOffset" : 1335
+    }, {
+      "referenceID" : 4,
+      "context" : "Label “SMAC early” corresponds to SMAC with the early stopping criterion proposed in Domhan et al. (2015) and label “bracket s = 4” corresponds to repeating the most exploratory bracket of HYPERBAND.",
+      "startOffset" : 85,
+      "endOffset" : 106
+    }, {
+      "referenceID" : 11,
+      "context" : "Datasets: We considered three image classification datasets: CIFAR-10 (Krizhevsky, 2009), rotated MNIST with background images (MRBI) (Larochelle et al.",
+      "startOffset" : 70,
+      "endOffset" : 88
+    }, {
+      "referenceID" : 17,
+      "context" : "We study a convolutional neural network with the same architecture as that used in Snoek et al. (2012) and Domhan et al.",
+      "startOffset" : 83,
+      "endOffset" : 103
+    }, {
+      "referenceID" : 4,
+      "context" : "(2012) and Domhan et al. (2015) from cuda-convnet.",
+      "startOffset" : 11,
+      "endOffset" : 32
+    }, {
+      "referenceID" : 4,
+      "context" : "(2012) and Domhan et al. (2015) from cuda-convnet. The search spaces used in the two previous works differ, and we used a search space similar to that of Snoek et al. (2012) with 6 hyperparameters for stochastic gradient decent and 2 hyperparameters for the response normalization layers.",
+      "startOffset" : 11,
+      "endOffset" : 174
+    }, {
+      "referenceID" : 4,
+      "context" : "(2012) and Domhan et al. (2015) from cuda-convnet. The search spaces used in the two previous works differ, and we used a search space similar to that of Snoek et al. (2012) with 6 hyperparameters for stochastic gradient decent and 2 hyperparameters for the response normalization layers. In line with the two previous works, we used a batch size of 100 for all experiments. For these experiments, we also compare against a variant of SMAC named SMAC early that uses the early termination criterion proposed in Domhan et al. (2015) for neural networks.",
+      "startOffset" : 11,
+      "endOffset" : 532
+    }, {
+      "referenceID" : 20,
+      "context" : "0% for Snoek et al. (2012)4 and 17.",
+      "startOffset" : 7,
+      "endOffset" : 27
+    }, {
+      "referenceID" : 4,
+      "context" : "2% for Domhan et al. (2015). These results are better than our results on CIFAR-10 because they use 25% more data by including the validation set and also train for more epochs.",
+      "startOffset" : 7,
+      "endOffset" : 28
+    }, {
+      "referenceID" : 1,
+      "context" : "We use the multi-class regularized least squares classification model which is known to have comparable performance to SVMs (Rifkin & Klautau, 2004; Agarwal et al., 2014) but can be trained significantly faster.",
+      "startOffset" : 124,
+      "endOffset" : 170
+    } ],
+    "year" : 2017,
+    "abstractText" : "Performance of machine learning algorithms depends critically on identifying a good set of hyperparameters. While recent approaches use Bayesian Optimization to adaptively select configurations, we focus on speeding up random search through adaptive resource allocation. We present HYPERBAND, a novel algorithm for hyperparameter optimization that is simple, flexible, and theoretically sound. HYPERBAND is a principled early-stoppping method that adaptively allocates a predefined resource, e.g., iterations, data samples or number of features, to randomly sampled configurations. We compare HYPERBAND with popular Bayesian Optimization methods on several hyperparameter optimization problems. We observe that HYPERBAND can provide more than an order of magnitude speedups over competitors on a variety of neural network and kernel-based learning problems.",
+    "creator" : "LaTeX with hyperref package"
+  }
+}

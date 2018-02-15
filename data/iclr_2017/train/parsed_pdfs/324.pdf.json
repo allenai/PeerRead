@@ -1,0 +1,567 @@
+{
+  "name" : "324.pdf",
+  "metadata" : {
+    "source" : "CRF",
+    "title" : null,
+    "authors" : [ "EFFICIENT CONVNETS", "Hao Li", "Asim Kadav", "Igor Durdanovic", "Hanan Samet" ],
+    "emails" : [ "haoli@cs.umd.edu", "asim@nec-labs.com", "igord@nec-labs.com", "hjs@cs.umd.edu", "hpg@nec-labs.com" ],
+    "sections" : [ {
+      "heading" : "1 INTRODUCTION",
+      "text" : "The ImageNet challenge has led to significant advancements in exploring various architectural choices in CNNs (Russakovsky et al. (2015); Krizhevsky et al. (2012); Simonyan & Zisserman (2015); Szegedy et al. (2015a); He et al. (2016)). The general trend since the past few years has been that the networks have grown deeper, with an overall increase in the number of parameters and convolution operations. These high capacity networks have significant inference costs especially when used with embedded sensors or mobile devices where computational and power resources may be limited. For these applications, in addition to accuracy, computational efficiency and small network sizes are crucial enabling factors (Szegedy et al. (2015b)). In addition, for web services that provide image search and image classification APIs that operate on a time budget often serving hundreds of thousands of images per second, benefit significantly from lower inference times.\nThere has been a significant amount of work on reducing the storage and computation costs by model compression (Le Cun et al. (1989); Hassibi & Stork (1993); Srinivas & Babu (2015); Han et al. (2015); Mariet & Sra (2016)). Recently Han et al. (2015; 2016b) report impressive compression rates on AlexNet (Krizhevsky et al. (2012)) and VGGNet (Simonyan & Zisserman (2015)) by pruning weights with small magnitudes and then retraining without hurting the overall accuracy. However, pruning parameters does not necessarily reduce the computation time since the majority of the parameters removed are from the fully connected layers where the computation cost is low, e.g., the fully connected layers of VGG-16 occupy 90% of the total parameters but only contribute less than 1% of the overall floating point operations (FLOP). They also demonstrate that the convolutional layers can be compressed and accelerated (Iandola et al. (2016)), but additionally require sparse\n∗Work done at NEC Labs †Supported in part by the NSF under Grant IIS-13-2079\nBLAS libraries or even specialized hardware (Han et al. (2016a)). Modern libraries that provide speedup using sparse operations over CNNs are often limited (Szegedy et al. (2015a); Liu et al. (2015)) and maintaining sparse data structures also creates an additional storage overhead which can be significant for low-precision weights.\nRecent work on CNNs have yielded deep architectures with more efficient design (Szegedy et al. (2015a;b); He & Sun (2015); He et al. (2016)), in which the fully connected layers are replaced with average pooling layers (Lin et al. (2013); He et al. (2016)), which reduces the number of parameters significantly. The computation cost is also reduced by downsampling the image at an early stage to reduce the size of feature maps (He & Sun (2015)). Nevertheless, as the networks continue to become deeper, the computation costs of convolutional layers continue to dominate.\nCNNs with large capacity usually have significant redundancy among different filters and feature channels. In this work, we focus on reducing the computation cost of well-trained CNNs by pruning filters. Compared to pruning weights across the network, filter pruning is a naturally structured way of pruning without introducing sparsity and therefore does not require using sparse libraries or any specialized hardware. The number of pruned filters correlates directly with acceleration by reducing the number of matrix multiplications, which is easy to tune for a target speedup. In addition, instead of layer-wise iterative fine-tuning (retraining), we adopt a one-shot pruning and retraining strategy to save retraining time for pruning filters across multiple layers, which is critical for pruning very deep networks. Finally, we observe that even for ResNets, which have significantly fewer parameters and inference costs than AlexNet or VGGNet, still have about 30% of FLOP reduction without sacrificing too much accuracy. We conduct sensitivity analysis for convolutional layers in ResNets that improves the understanding of ResNets."
+    }, {
+      "heading" : "2 RELATED WORK",
+      "text" : "The early work by Le Cun et al. (1989) introduces Optimal Brain Damage, which prunes weights with a theoretically justified saliency measure. Later, Hassibi & Stork (1993) propose Optimal Brain Surgeon to remove unimportant weights determined by the second-order derivative information. Mariet & Sra (2016) reduce the network redundancy by identifying a subset of diverse neurons that does not require retraining. However, this method only operates on the fully-connected layers and introduce sparse connections.\nTo reduce the computation costs of the convolutional layers, past work have proposed to approximate convolutional operations by representing the weight matrix as a low rank product of two smaller matrices without changing the original number of filters (Denil et al. (2013); Jaderberg et al. (2014); Zhang et al. (2015b;a); Tai et al. (2016); Ioannou et al. (2016)). Other approaches to reduce the convolutional overheads include using FFT based convolutions (Mathieu et al. (2013)) and fast convolution using the Winograd algorithm (Lavin & Gray (2016)). Additionally, quantization (Han et al. (2016b)) and binarization (Rastegari et al. (2016); Courbariaux & Bengio (2016)) can be used to reduce the model size and lower the computation overheads. Our method can be used in addition to these techniques to reduce computation costs without incurring additional overheads.\nSeveral work have studied removing redundant feature maps from a well trained network (Anwar et al. (2015); Polyak & Wolf (2015)). Anwar et al. (2015) introduce a three-level pruning of the weights and locate the pruning candidates using particle filtering, which selects the best combination from a number of random generated masks. Polyak & Wolf (2015) detect the less frequently activated feature maps with sample input data for face detection applications. We choose to analyze the filter weights and prune filters with their corresponding feature maps using a simple magnitude based measure, without examining possible combinations. We also introduce network-wide holistic approaches to prune filters for simple and complex convolutional network architectures.\nConcurrently with our work, there is a growing interest in training compact CNNs with sparse constraints (Lebedev & Lempitsky (2016); Zhou et al. (2016); Wen et al. (2016)). Lebedev & Lempitsky (2016) leverage group-sparsity on the convolutional filters to achieve structured brain damage, i.e., prune the entries of the convolution kernel in a group-wise fashion. Zhou et al. (2016) add group-sparse regularization on neurons during training to learn compact CNNs with reduced filters. Wen et al. (2016) add structured sparsity regularizer on each layer to reduce trivial filters, channels or even layers. In the filter-level pruning, all above work use `2,1-norm as a regularizer.\nSimilar to the above work, we use `1-norm to select unimportant filters and physically prune them. Our fine-tuning process is the same as the conventional training procedure, without introducing additional regularization. Our approach does not introduce extra layer-wise meta-parameters for the regularizer except for the percentage of filters to be pruned, which is directly related to the desired speedup. By employing stage-wise pruning, we can set a single pruning rate for all layers in one stage."
+    }, {
+      "heading" : "3 PRUNING FILTERS AND FEATURE MAPS",
+      "text" : "Let ni denote the number of input channels for the ith convolutional layer and hi/wi be the height/width of the input feature maps. The convolutional layer transforms the input feature maps xi ∈ Rni×hi×wi into the output feature maps xi+1 ∈ Rni+1×hi+1×wi+1 , which are used as input feature maps for the next convolutional layer. This is achieved by applying ni+1 3D filters Fi,j ∈ Rni×k×k on the ni input channels, in which one filter generates one feature map. Each filter is composed by ni 2D kernels K ∈ Rk×k (e.g., 3 × 3). All the filters, together, constitute the kernel matrix Fi ∈ Rni×ni+1×k×k. The number of operations of the convolutional layer is ni+1nik\n2hi+1wi+1. As shown in Figure 1, when a filter Fi,j is pruned, its corresponding feature map xi+1,j is removed, which reduces nik2hi+1wi+1 operations. The kernels that apply on the removed feature maps from the filters of the next convolutional layer are also removed, which saves an additional ni+2k2hi+2wi+2 operations. Pruning m filters of layer i will reduce m/ni+1 of the computation cost for both layers i and i+ 1."
+    }, {
+      "heading" : "3.1 DETERMINING WHICH FILTERS TO PRUNE WITHIN A SINGLE LAYER",
+      "text" : "Our method prunes the less useful filters from a well-trained model for computational efficiency while minimizing the accuracy drop. We measure the relative importance of a filter in each layer by calculating the sum of its absolute weights ∑ |Fi,j |, i.e., its `1-norm ‖Fi,j‖1. Since the number\nof input channels, ni, is the same across filters, ∑ |Fi,j | also represents the average magnitude of its kernel weights. This value gives an expectation of the magnitude of the output feature map. Filters with smaller kernel weights tend to produce feature maps with weak activations as compared to the other filters in that layer. Figure 2(a) illustrates the distribution of filters’ absolute weights sum for each convolutional layer in a VGG-16 network trained on the CIFAR-10 dataset, where the distribution varies significantly across layers. We find that pruning the smallest filters works better in comparison with pruning the same number of random or largest filters (Section 4.4). Compared to other criteria for activation-based feature map pruning (Section 4.5), we find `1-norm is a good criterion for data-free filter selection.\nThe procedure of pruning m filters from the ith convolutional layer is as follows: 1. For each filter Fi,j , calculate the sum of its absolute kernel weights sj = ∑ni\nl=1\n∑ |Kl|.\n2. Sort the filters by sj . 3. Prune m filters with the smallest sum values and their corresponding feature maps. The\nkernels in the next convolutional layer corresponding to the pruned feature maps are also removed.\n4. A new kernel matrix is created for both the ith and i+ 1th layers, and the remaining kernel weights are copied to the new model.\nRelationship to pruning weights Pruning filters with low absolute weights sum is similar to pruning low magnitude weights (Han et al. (2015)). Magnitude-based weight pruning may prune away whole filters when all the kernel weights of a filter are lower than a given threshold. However, it requires a careful tuning of the threshold and it is difficult to predict the exact number of filters that will eventually be pruned. Furthermore, it generates sparse convolutional kernels which can be hard to accelerate given the lack of efficient sparse libraries, especially for the case of low-sparsity.\nRelationship to group-sparse regularization on filters Recent work (Zhou et al. (2016); Wen et al. (2016)) apply group-sparse regularization ( ∑ni j=1 ‖Fi,j‖2 or `2,1-norm) on convolutional filters, which also favor to zero-out filters with small l2-norms, i.e. Fi,j = 0. In practice, we do not observe noticeable difference between the `2-norm and the `1-norm for filter selection, as the important filters tend to have large values for both measures (Appendix 6.1). Zeroing out weights of multiple filters during training has a similar effect to pruning filters with the strategy of iterative pruning and retraining as introduced in Section 3.4."
+    }, {
+      "heading" : "3.2 DETERMINING SINGLE LAYER’S SENSITIVITY TO PRUNING",
+      "text" : "To understand the sensitivity of each layer, we prune each layer independently and evaluate the resulting pruned network’s accuracy on the validation set. Figure 2(b) shows that layers that maintain their accuracy as filters are pruned away correspond to layers with larger slopes in Figure 2(a). On the contrary, layers with relatively flat slopes are more sensitive to pruning. We empirically determine the number of filters to prune for each layer based on their sensitivity to pruning. For deep networks such as VGG-16 or ResNets, we observe that layers in the same stage (with the same feature map size) have a similar sensitivity to pruning. To avoid introducing layer-wise meta-parameters, we use the same pruning ratio for all layers in the same stage. For layers that are sensitive to pruning, we prune a smaller percentage of these layers or completely skip pruning them."
+    }, {
+      "heading" : "3.3 PRUNING FILTERS ACROSS MULTIPLE LAYERS",
+      "text" : "We now discuss how to prune filters across the network. Previous work prunes the weights on a layer by layer basis, followed by iteratively retraining and compensating for any loss of accuracy (Han et al. (2015)). However, understanding how to prune filters of multiple layers at once can be useful: 1) For deep networks, pruning and retraining on a layer by layer basis can be extremely time-consuming 2) Pruning layers across the network gives a holistic view of the robustness of the network resulting in a smaller network 3) For complex networks, a holistic approach may be necessary. For example, for the ResNet, pruning the identity feature maps or the second layer of each residual block results in additional pruning of other layers.\nTo prune filters across multiple layers, we consider two strategies for layer-wise filter selection:\n• Independent pruning determines which filters should be pruned at each layer independent of other layers.\n• Greedy pruning accounts for the filters that have been removed in the previous layers. This strategy does not consider the kernels for the previously pruned feature maps while calculating the sum of absolute weights.\nFigure 3 illustrates the difference between two approaches in calculating the sum of absolute weights. The greedy approach, though not globally optimal, is holistic and results in pruned networks with higher accuracy especially when many filters are pruned.\nFor simpler CNNs like VGGNet or AlexNet, we can easily prune any of the filters in any convolutional layer. However, for complex network architectures such as Residual networks (He et al. (2016)), pruning filters may not be straightforward. The architecture of ResNet imposes restrictions and the filters need to be pruned carefully. We show the filter pruning for residual blocks with projection mapping in Figure 4. Here, the filters of the first layer in the residual block can be arbitrarily pruned, as it does not change the number of output feature maps of the block. However, the correspondence between the output feature maps of the second convolutional layer and the identity feature maps makes it difficult to prune. Hence, to prune the second convolutional layer of the residual block, the corresponding projected feature maps must also be pruned. Since the identical feature maps are more important than the added residual maps, the feature maps to be pruned should be determined by the pruning results of the shortcut layer. To determine which identity feature maps are to be pruned, we use the same selection criterion based on the filters of the shortcut convolutional layers (with 1× 1 kernels). The second layer of the residual block is pruned with the same filter index as selected by the pruning of the shortcut layer."
+    }, {
+      "heading" : "3.4 RETRAINING PRUNED NETWORKS TO REGAIN ACCURACY",
+      "text" : "After pruning the filters, the performance degradation should be compensated by retraining the network. There are two strategies to prune the filters across multiple layers:\n1. Prune once and retrain: Prune filters of multiple layers at once and retrain them until the original accuracy is restored. 2. Prune and retrain iteratively: Prune filters layer by layer or filter by filter and then retrain iteratively. The model is retrained before pruning the next layer for the weights to adapt to the changes from the pruning process.\nWe find that for the layers that are resilient to pruning, the prune and retrain once strategy can be used to prune away significant portions of the network and any loss in accuracy can be regained by retraining for a short period of time (less than the original training time). However, when some filters from the sensitive layers are pruned away or large portions of the networks are pruned away, it may not be possible to recover the original accuracy. Iterative pruning and retraining may yield better results, but the iterative process requires many more epochs especially for very deep networks."
+    }, {
+      "heading" : "4 EXPERIMENTS",
+      "text" : "We prune two types of networks: simple CNNs (VGG-16 on CIFAR-10) and Residual networks (ResNet-56/110 on CIFAR-10 and ResNet-34 on ImageNet). Unlike AlexNet or VGG (on ImageNet) that are often used to demonstrate model compression, both VGG (on CIFAR-10) and Residual networks have fewer parameters in the fully connected layers. Hence, pruning a large percentage of parameters from these networks is challenging. We implement our filter pruning method in Torch7 (Collobert et al. (2011)). When filters are pruned, a new model with fewer filters is created and the remaining parameters of the modified layers as well as the unaffected layers are copied into the new model. Furthermore, if a convolutional layer is pruned, the weights of the subsequent batch normalization layer are also removed. To get the baseline accuracies for each network, we train each model from scratch and follow the same pre-processing and hyper-parameters as ResNet (He et al. (2016)). For retraining, we use a constant learning rate 0.001 and retrain 40 epochs for CIFAR-10 and 20 epochs for ImageNet, which represents one-fourth of the original training epochs. Past work has reported up to 3× original training times to retrain pruned networks (Han et al. (2015))."
+    }, {
+      "heading" : "4.1 VGG-16 ON CIFAR-10",
+      "text" : "VGG-16 is a high-capacity network originally designed for the ImageNet dataset (Simonyan & Zisserman (2015)). Recently, Zagoruyko (2015) applies a slightly modified version of the model on CIFAR-10 and achieves state of the art results. As shown in Table 2, VGG-16 on CIFAR-10 consists of 13 convolutional layers and 2 fully connected layers, in which the fully connected layers do not occupy large portions of parameters due to the small input size and less hidden units. We use the model described in Zagoruyko (2015) but add Batch Normalization (Ioffe & Szegedy (2015))\nlayer after each convolutional layer and the first linear layer, without using Dropout (Srivastava et al. (2014)). Note that when the last convolutional layer is pruned, the input to the linear layer is changed and the connections are also removed.\nAs shown in Figure 2(b), each of the convolutional layers with 512 feature maps can drop at least 60% of filters without affecting the accuracy. Figure 2(c) shows that with retraining, almost 90% of the filters of these layers can be safely removed. One possible explanation is that these filters operate on 4× 4 or 2× 2 feature maps, which may have no meaningful spatial connections in such small dimensions. For instance, ResNets for CIFAR-10 do not perform any convolutions for feature maps below 8× 8 dimensions. Unlike previous work (Zeiler & Fergus (2014); Han et al. (2015)), we observe that the first layer is robust to pruning as compared to the next few layers. This is possible for a simple dataset like CIFAR-10, on which the model does not learn as much useful filters as on ImageNet (as shown in Figure. 5). Even when 80% of the filters from the first layer are pruned, the number of remaining filters (12) is still larger than the number of raw input channels. However, when removing 80% filters from the second layer, the layer corresponds to a 64 to 12 mapping, which may lose significant information from previous layers, thereby hurting the accuracy. With 50% of the filters being pruned in layer 1 and from 8 to 13, we achieve 34% FLOP reduction for the same accuracy."
+    }, {
+      "heading" : "4.2 RESNET-56/110 ON CIFAR-10",
+      "text" : "ResNets for CIFAR-10 have three stages of residual blocks for feature maps with sizes of 32× 32, 16× 16 and 8× 8. Each stage has the same number of residual blocks. When the number of feature maps increases, the shortcut layer provides an identity mapping with an additional zero padding for the increased dimensions. Since there is no projection mapping for choosing the identity feature maps, we only consider pruning the first layer of the residual block. As shown in Figure 6, most of the layers are robust to pruning. For ResNet-110, pruning some single layers without retraining even\nimproves the performance. In addition, we find that layers that are sensitive to pruning (layers 20, 38 and 54 for ResNet-56, layer 36, 38 and 74 for ResNet-110) lie at the residual blocks close to the layers where the number of feature maps changes, e.g., the first and the last residual blocks for each stage. We believe this happens because the precise residual errors are necessary for the newly added empty feature maps.\nThe retraining performance can be improved by skipping these sensitive layers. As shown in Table 1, ResNet-56-pruned-A improves the performance by pruning 10% filters while skipping the sensitive layers 16, 20, 38 and 54. In addition, we find that deeper layers are more sensitive to pruning than layers in the earlier stages of the network. Hence, we use a different pruning rate for each stage. We use pi to denote the pruning rate for layers in the ith stage. ResNet-56-pruned-B skips more layers (16, 18, 20, 34, 38, 54) and prunes layers with p1=60%, p2=30% and p3=10%. For ResNet-110, the first pruned model gets a slightly better result with p1=50% and layer 36 skipped. ResNet-110-pruned-B skips layers 36, 38, 74 and prunes with p1=50%, p2=40% and p3=30%. When there are more than two residual blocks at each stage, the middle residual blocks may be redundant and can be easily pruned. This might explain why ResNet-110 is easier to prune than ResNet-56."
+    }, {
+      "heading" : "4.3 RESNET-34 ON ILSVRC2012",
+      "text" : "ResNets for ImageNet have four stages of residual blocks for feature maps with sizes of 56 × 56, 28 × 28, 14 × 14 and 7 × 7. ResNet-34 uses the projection shortcut when the feature maps are down-sampled. We first prune the first layer of each residual block. Figure 7 shows the sensitivity of the first layer of each residual block. Similar to ResNet-56/110, the first and the last residual blocks of each stage are more sensitive to pruning than the intermediate blocks (i.e., layers 2, 8, 14, 16, 26, 28, 30, 32). We skip those layers and prune the remaining layers at each stage equally. In Table 1 we compare two configurations of pruning percentages for the first three stages: (A) p1=30%, p2=30%, p3=30%; (B) p1=50%, p2=60%, p3=40%. Option-B provides 24% FLOP reduction with about 1% loss in accuracy. As seen in the pruning results for ResNet-50/110, we can predict that ResNet-34 is relatively more difficult to prune as compared to deeper ResNets.\nWe also prune the identity shortcuts and the second convolutional layer of the residual blocks. As these layers have the same number of filters, they are pruned equally. As shown in Figure 7(b), these layers are more sensitive to pruning than the first layers. With retraining, ResNet-34-pruned-C prunes the third stage with p3=20% and results in 7.5% FLOP reduction with 0.75% loss in accuracy. Therefore, pruning the first layer of the residual block is more effective at reducing the overall FLOP\nthan pruning the second layer. This finding also correlates with the bottleneck block design for deeper ResNets, which first reduces the dimension of input feature maps for the residual layer and then increases the dimension to match the identity mapping."
+    }, {
+      "heading" : "4.4 COMPARISON WITH PRUNING RANDOM FILTERS AND LARGEST FILTERS",
+      "text" : "We compare our approach with pruning random filters and largest filters. As shown in Figure 8, pruning the smallest filters outperforms pruning random filters for most of the layers at different pruning ratios. For example, smallest filter pruning has better accuracy than random filter pruning for all layers with the pruning ratio of 90%. The accuracy of pruning filters with the largest `1-norms drops quickly as the pruning ratio increases, which indicates the importance of filters with larger `1-norms."
+    }, {
+      "heading" : "4.5 COMPARISON WITH ACTIVATION-BASED FEATURE MAP PRUNING",
+      "text" : "The activation-based feature map pruning method removes the feature maps with weak activation patterns and their corresponding filters and kernels (Polyak & Wolf (2015)), which needs sample data as input to determine which feature maps to prune. A feature map xi+1,j ∈ Rwi+1×hi+1 is generated by applying filter Fi,j ∈ Rni×k×k to feature maps of previous layer xi ∈ Rni×wi×hi , i.e., xi+1,j = Fi,j ∗ xi. Given N randomly selected images {xn1}Nn=1 from the training set, the statistics of each feature map can be estimated with one epoch forward pass of the N sampled data. Note that we calculate statistics on the feature maps generated from the convolution operations before batch normalization or non-linear activation. We compare our `1-norm based filter pruning with feature map pruning using the following criteria: σmean-mean(xi,j) = 1N ∑N n=1 mean(x n i,j), σmean-std(xi,j) =\n1 N ∑N n=1 std(x n i,j), σmean-`1(xi,j) = 1 N ∑N n=1 ‖xni,j‖1, σmean-`2(xi,j) = 1 N ∑N n=1 ‖xni,j‖2 and\nσvar-`2(xi,j) = var({‖xni,j‖2}Nn=1), where mean, std and var are standard statistics (average, standard deviation and variance) of the input. Here, σvar-`2 is the contribution variance of channel criterion proposed in Polyak & Wolf (2015), which is motivated by the intuition that an unimportant feature map has almost similar outputs for the whole training data and acts like an additional bias.\nThe estimation of the criteria becomes more accurate when more sample data is used. Here we use the whole training set (N = 50, 000 for CIFAR-10) to compute the statistics. The performance of feature map pruning with above criteria for each layer is shown in Figure 9. Smallest filter pruning outperforms feature map pruning with the criteria σmean-mean, σmean-`1 , σmean-`2 and σvar-`2 . The σmean-std criterion has better or similar performance to `1-norm up to pruning ratio of 60%. However, its performance drops quickly after that especially for layers of conv 1, conv 2 and conv 3. We find `1-norm is a good heuristic for filter selection considering that it is data free."
+    }, {
+      "heading" : "5 CONCLUSIONS",
+      "text" : "Modern CNNs often have high capacity with large training and inference costs. In this paper we present a method to prune filters with relatively low weight magnitudes to produce CNNs with reduced computation costs without introducing irregular sparsity. It achieves about 30% reduction in FLOP for VGGNet (on CIFAR-10) and deep ResNets without significant loss in the original accuracy. Instead of pruning with specific layer-wise hayperparameters and time-consuming iterative retraining, we use the one-shot pruning and retraining strategy for simplicity and ease of implementation. By performing lesion studies on very deep CNNs, we identify layers that are robust or sensitive to pruning, which can be useful for further understanding and improving the architectures."
+    }, {
+      "heading" : "ACKNOWLEDGMENTS",
+      "text" : "The authors would like to thank the anonymous reviewers for their valuable feedback."
+    }, {
+      "heading" : "6 APPENDIX",
+      "text" : "6.1 COMPARISON WITH `2-NORM BASED FILTER PRUNING\nWe compare `1-norm with `2-norm for filter pruning. As shown in Figure 10, `1-norm works slightly better than `2-norm for layer conv 2. There is no significant difference between the two norms for other layers."
+    }, {
+      "heading" : "6.2 FLOP AND WALL-CLOCK TIME",
+      "text" : "FLOP is a commonly used measure to compare the computation complexities of CNNs. It is easy to compute and can be done statically, which is independent of the underlying hardware and software implementations. Since we physically prune the filters by creating a smaller model and then copy the weights, there are no masks or sparsity introduced to the original dense BLAS operations. Therefore the FLOP and wall-clock time of the pruned model is the same as creating a model with smaller number of filters from scratch.\nWe report the inference time of the original model and the pruned model on the test set of CIFAR-10 and the validation set of ILSVRC 2012, which contains 10,000 32× 32 images and 50,000 224× 224 images respectively. The ILSVRC 2012 dataset is used only for ResNet-34. The evaluation is conducted in Torch7 with Titan X (Pascal) GPU and cuDNN v5.1, using a mini-batch size 128. As shown in Table 3, the saved inference time is close to the FLOP reduction. Note that the FLOP number only considers the operations in the Conv and FC layers, while some calculations such as Batch Normalization and other overheads are not accounted."
+    } ],
+    "references" : [ {
+      "title" : "Torch7: A matlab-like environment for machine learning",
+      "author" : [ "Ronan Collobert", "Koray Kavukcuoglu", "Clément Farabet" ],
+      "venue" : "In BigLearn, NIPS Workshop,",
+      "citeRegEx" : "Collobert et al\\.,? \\Q2011\\E",
+      "shortCiteRegEx" : "Collobert et al\\.",
+      "year" : 2011
+    }, {
+      "title" : "Binarynet: Training deep neural networks with weights and activations constrained to+ 1 or-1",
+      "author" : [ "Matthieu Courbariaux", "Yoshua Bengio" ],
+      "venue" : "arXiv preprint arXiv:1602.02830,",
+      "citeRegEx" : "Courbariaux and Bengio.,? \\Q2016\\E",
+      "shortCiteRegEx" : "Courbariaux and Bengio.",
+      "year" : 2016
+    }, {
+      "title" : "Predicting parameters in deep learning",
+      "author" : [ "Misha Denil", "Babak Shakibi", "Laurent Dinh", "Nando de Freitas" ],
+      "venue" : "In NIPS,",
+      "citeRegEx" : "Denil et al\\.,? \\Q2013\\E",
+      "shortCiteRegEx" : "Denil et al\\.",
+      "year" : 2013
+    }, {
+      "title" : "Learning both Weights and Connections for Efficient Neural Network",
+      "author" : [ "Song Han", "Jeff Pool", "John Tran", "William Dally" ],
+      "venue" : "In NIPS,",
+      "citeRegEx" : "Han et al\\.,? \\Q2015\\E",
+      "shortCiteRegEx" : "Han et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "EIE: Efficient Inference Engine on Compressed Deep Neural Network",
+      "author" : [ "Song Han", "Xingyu Liu", "Huizi Mao", "Jing Pu", "Ardavan Pedram", "Mark A Horowitz", "William J Dally" ],
+      "venue" : "In ISCA,",
+      "citeRegEx" : "Han et al\\.,? \\Q2016\\E",
+      "shortCiteRegEx" : "Han et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Deep Compression: Compressing Deep Neural Networks with Pruning, Trained Quantization and Huffman Coding",
+      "author" : [ "Song Han", "Huizi Mao", "William J Dally" ],
+      "venue" : "In ICLR,",
+      "citeRegEx" : "Han et al\\.,? \\Q2016\\E",
+      "shortCiteRegEx" : "Han et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Second Order Derivatives for Network Pruning: Optimal Brain Surgeon",
+      "author" : [ "Babak Hassibi", "David G Stork" ],
+      "venue" : "In NIPS,",
+      "citeRegEx" : "Hassibi and Stork.,? \\Q1993\\E",
+      "shortCiteRegEx" : "Hassibi and Stork.",
+      "year" : 1993
+    }, {
+      "title" : "Convolutional Neural Networks at Constrained Time Cost",
+      "author" : [ "Kaiming He", "Jian Sun" ],
+      "venue" : "In CVPR,",
+      "citeRegEx" : "He and Sun.,? \\Q2015\\E",
+      "shortCiteRegEx" : "He and Sun.",
+      "year" : 2015
+    }, {
+      "title" : "Deep Residual Learning for Image Recognition",
+      "author" : [ "Kaiming He", "Xiangyu Zhang", "Shaoqing Ren", "Jian Sun" ],
+      "venue" : null,
+      "citeRegEx" : "He et al\\.,? \\Q2016\\E",
+      "shortCiteRegEx" : "He et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "SqueezeNet: AlexNet-level accuracy with 50x fewer parameters and ¡ 1MB model size",
+      "author" : [ "Forrest Iandola", "Matthew Moskewicz", "Khalidand Ashraf", "Song Han", "William Dally", "Keutzer Kurt" ],
+      "venue" : "arXiv preprint arXiv:1602.07360,",
+      "citeRegEx" : "Iandola et al\\.,? \\Q2016\\E",
+      "shortCiteRegEx" : "Iandola et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Training CNNs with Low-Rank Filters for Efficient Image Classification",
+      "author" : [ "Yani Ioannou", "Duncan Robertson", "Jamie Shotton", "Roberto Cipolla", "Antonio Criminisi" ],
+      "venue" : "In ICLR,",
+      "citeRegEx" : "Ioannou et al\\.,? \\Q2016\\E",
+      "shortCiteRegEx" : "Ioannou et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Batch Normalization: Accelerating Deep Network Training by Reducing Internal Covariate Shift",
+      "author" : [ "Sergey Ioffe", "Christian Szegedy" ],
+      "venue" : null,
+      "citeRegEx" : "Ioffe and Szegedy.,? \\Q2015\\E",
+      "shortCiteRegEx" : "Ioffe and Szegedy.",
+      "year" : 2015
+    }, {
+      "title" : "Speeding up convolutional neural networks with low rank expansions",
+      "author" : [ "Max Jaderberg", "Andrea Vedaldi", "Andrew Zisserman" ],
+      "venue" : "In BMVC,",
+      "citeRegEx" : "Jaderberg et al\\.,? \\Q2014\\E",
+      "shortCiteRegEx" : "Jaderberg et al\\.",
+      "year" : 2014
+    }, {
+      "title" : "Imagenet Classification with Deep Convolutional Neural Networks",
+      "author" : [ "Alex Krizhevsky", "Ilya Sutskever", "Geoffrey E Hinton" ],
+      "venue" : "In NIPS,",
+      "citeRegEx" : "Krizhevsky et al\\.,? \\Q2012\\E",
+      "shortCiteRegEx" : "Krizhevsky et al\\.",
+      "year" : 2012
+    }, {
+      "title" : "Fast Algorithms for Convolutional Neural Networks",
+      "author" : [ "Andrew Lavin", "Scott Gray" ],
+      "venue" : "In CVPR,",
+      "citeRegEx" : "Lavin and Gray.,? \\Q2016\\E",
+      "shortCiteRegEx" : "Lavin and Gray.",
+      "year" : 2016
+    }, {
+      "title" : "Optimal Brain Damage",
+      "author" : [ "Yann Le Cun", "John S Denker", "Sara A Solla" ],
+      "venue" : "In NIPS,",
+      "citeRegEx" : "Cun et al\\.,? \\Q1989\\E",
+      "shortCiteRegEx" : "Cun et al\\.",
+      "year" : 1989
+    }, {
+      "title" : "Fast Convnets Using Group-wise Brain Damage",
+      "author" : [ "Vadim Lebedev", "Victor Lempitsky" ],
+      "venue" : "In CVPR,",
+      "citeRegEx" : "Lebedev and Lempitsky.,? \\Q2016\\E",
+      "shortCiteRegEx" : "Lebedev and Lempitsky.",
+      "year" : 2016
+    }, {
+      "title" : "Network in Network",
+      "author" : [ "Min Lin", "Qiang Chen", "Shuicheng Yan" ],
+      "venue" : "arXiv preprint arXiv:1312.4400,",
+      "citeRegEx" : "Lin et al\\.,? \\Q2013\\E",
+      "shortCiteRegEx" : "Lin et al\\.",
+      "year" : 2013
+    }, {
+      "title" : "Sparse Convolutional Neural Networks",
+      "author" : [ "Baoyuan Liu", "Min Wang", "Hassan Foroosh", "Marshall Tappen", "Marianna Pensky" ],
+      "venue" : "In CVPR,",
+      "citeRegEx" : "Liu et al\\.,? \\Q2015\\E",
+      "shortCiteRegEx" : "Liu et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "Fast Training of Convolutional Networks through FFTs",
+      "author" : [ "Michael Mathieu", "Mikael Henaff", "Yann LeCun" ],
+      "venue" : "arXiv preprint arXiv:1312.5851,",
+      "citeRegEx" : "Mathieu et al\\.,? \\Q2013\\E",
+      "shortCiteRegEx" : "Mathieu et al\\.",
+      "year" : 2013
+    }, {
+      "title" : "Channel-Level Acceleration of Deep Face Representations",
+      "author" : [ "Adam Polyak", "Lior Wolf" ],
+      "venue" : "IEEE Access,",
+      "citeRegEx" : "Polyak and Wolf.,? \\Q2015\\E",
+      "shortCiteRegEx" : "Polyak and Wolf.",
+      "year" : 2015
+    }, {
+      "title" : "XNOR-Net: ImageNet Classification Using Binary Convolutional Neural Networks",
+      "author" : [ "Mohammad Rastegari", "Vicente Ordonez", "Joseph Redmon", "Ali Farhadi" ],
+      "venue" : "In ECCV,",
+      "citeRegEx" : "Rastegari et al\\.,? \\Q2016\\E",
+      "shortCiteRegEx" : "Rastegari et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Very Deep Convolutional Networks for Large-Scale Image Recognition",
+      "author" : [ "Karen Simonyan", "Andrew Zisserman" ],
+      "venue" : "In ICLR,",
+      "citeRegEx" : "Simonyan and Zisserman.,? \\Q2015\\E",
+      "shortCiteRegEx" : "Simonyan and Zisserman.",
+      "year" : 2015
+    }, {
+      "title" : "Data-free Parameter Pruning for Deep Neural Networks",
+      "author" : [ "Suraj Srinivas", "R Venkatesh Babu" ],
+      "venue" : "In BMVC,",
+      "citeRegEx" : "Srinivas and Babu.,? \\Q2015\\E",
+      "shortCiteRegEx" : "Srinivas and Babu.",
+      "year" : 2015
+    }, {
+      "title" : "Dropout: A Simple Way to Prevent Neural Networks from Overfitting",
+      "author" : [ "Nitish Srivastava", "Geoffrey Hinton", "Alex Krizhevsky", "Ilya Sutskever", "Ruslan Salakhutdinov" ],
+      "venue" : null,
+      "citeRegEx" : "Srivastava et al\\.,? \\Q2014\\E",
+      "shortCiteRegEx" : "Srivastava et al\\.",
+      "year" : 2014
+    }, {
+      "title" : "Going Deeper with Convolutions",
+      "author" : [ "Christian Szegedy", "Wei Liu", "Yangqing Jia", "Pierre Sermanet", "Scott Reed", "Dragomir Anguelov", "Dumitru Erhan", "Vincent Vanhoucke", "Andrew Rabinovich" ],
+      "venue" : "In CVPR,",
+      "citeRegEx" : "Szegedy et al\\.,? \\Q2015\\E",
+      "shortCiteRegEx" : "Szegedy et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "Rethinking the Inception Architecture for Computer Vision",
+      "author" : [ "Christian Szegedy", "Vincent Vanhoucke", "Sergey Ioffe", "Jonathon Shlens", "Zbigniew Wojna" ],
+      "venue" : "arXiv preprint arXiv:1512.00567,",
+      "citeRegEx" : "Szegedy et al\\.,? \\Q2015\\E",
+      "shortCiteRegEx" : "Szegedy et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "Convolutional neural networks with low-rank regularization",
+      "author" : [ "Cheng Tai", "Tong Xiao", "Xiaogang Wang", "Weinan E" ],
+      "venue" : "In ICLR,",
+      "citeRegEx" : "Tai et al\\.,? \\Q2016\\E",
+      "shortCiteRegEx" : "Tai et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Learning Structured Sparsity in Deep Learning",
+      "author" : [ "Wei Wen", "Chunpeng Wu", "Yandan Wang", "Yiran Chen", "Hai Li" ],
+      "venue" : "In NIPS,",
+      "citeRegEx" : "Wen et al\\.,? \\Q2016\\E",
+      "shortCiteRegEx" : "Wen et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Visualizing and Understanding Convolutional Networks",
+      "author" : [ "Matthew D Zeiler", "Rob Fergus" ],
+      "venue" : "In ECCV,",
+      "citeRegEx" : "Zeiler and Fergus.,? \\Q2014\\E",
+      "shortCiteRegEx" : "Zeiler and Fergus.",
+      "year" : 2014
+    }, {
+      "title" : "Accelerating Very Deep Convolutional Networks for Classification and Detection",
+      "author" : [ "Xiangyu Zhang", "Jianhua Zou", "Kaiming He", "Jian Sun" ],
+      "venue" : "IEEE T-PAMI,",
+      "citeRegEx" : "Zhang et al\\.,? \\Q2015\\E",
+      "shortCiteRegEx" : "Zhang et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "Efficient and accurate approximations of nonlinear convolutional networks",
+      "author" : [ "Xiangyu Zhang", "Jianhua Zou", "Xiang Ming", "Kaiming He", "Jian Sun" ],
+      "venue" : "In CVPR,",
+      "citeRegEx" : "Zhang et al\\.,? \\Q2015\\E",
+      "shortCiteRegEx" : "Zhang et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "Less Is More: Towards Compact CNNs",
+      "author" : [ "Hao Zhou", "Jose Alvarez", "Fatih Porikli" ],
+      "venue" : "In ECCV,",
+      "citeRegEx" : "Zhou et al\\.,? \\Q2016\\E",
+      "shortCiteRegEx" : "Zhou et al\\.",
+      "year" : 2016
+    } ],
+    "referenceMentions" : [ {
+      "referenceID" : 8,
+      "context" : "(2015); Krizhevsky et al. (2012); Simonyan & Zisserman (2015); Szegedy et al.",
+      "startOffset" : 8,
+      "endOffset" : 33
+    }, {
+      "referenceID" : 8,
+      "context" : "(2015); Krizhevsky et al. (2012); Simonyan & Zisserman (2015); Szegedy et al.",
+      "startOffset" : 8,
+      "endOffset" : 62
+    }, {
+      "referenceID" : 8,
+      "context" : "(2015); Krizhevsky et al. (2012); Simonyan & Zisserman (2015); Szegedy et al. (2015a); He et al.",
+      "startOffset" : 8,
+      "endOffset" : 86
+    }, {
+      "referenceID" : 5,
+      "context" : "(2015a); He et al. (2016)).",
+      "startOffset" : 9,
+      "endOffset" : 26
+    }, {
+      "referenceID" : 5,
+      "context" : "(2015a); He et al. (2016)). The general trend since the past few years has been that the networks have grown deeper, with an overall increase in the number of parameters and convolution operations. These high capacity networks have significant inference costs especially when used with embedded sensors or mobile devices where computational and power resources may be limited. For these applications, in addition to accuracy, computational efficiency and small network sizes are crucial enabling factors (Szegedy et al. (2015b)).",
+      "startOffset" : 9,
+      "endOffset" : 528
+    }, {
+      "referenceID" : 5,
+      "context" : "(2015a); He et al. (2016)). The general trend since the past few years has been that the networks have grown deeper, with an overall increase in the number of parameters and convolution operations. These high capacity networks have significant inference costs especially when used with embedded sensors or mobile devices where computational and power resources may be limited. For these applications, in addition to accuracy, computational efficiency and small network sizes are crucial enabling factors (Szegedy et al. (2015b)). In addition, for web services that provide image search and image classification APIs that operate on a time budget often serving hundreds of thousands of images per second, benefit significantly from lower inference times. There has been a significant amount of work on reducing the storage and computation costs by model compression (Le Cun et al. (1989); Hassibi & Stork (1993); Srinivas & Babu (2015); Han et al.",
+      "startOffset" : 9,
+      "endOffset" : 887
+    }, {
+      "referenceID" : 5,
+      "context" : "(2015a); He et al. (2016)). The general trend since the past few years has been that the networks have grown deeper, with an overall increase in the number of parameters and convolution operations. These high capacity networks have significant inference costs especially when used with embedded sensors or mobile devices where computational and power resources may be limited. For these applications, in addition to accuracy, computational efficiency and small network sizes are crucial enabling factors (Szegedy et al. (2015b)). In addition, for web services that provide image search and image classification APIs that operate on a time budget often serving hundreds of thousands of images per second, benefit significantly from lower inference times. There has been a significant amount of work on reducing the storage and computation costs by model compression (Le Cun et al. (1989); Hassibi & Stork (1993); Srinivas & Babu (2015); Han et al.",
+      "startOffset" : 9,
+      "endOffset" : 911
+    }, {
+      "referenceID" : 5,
+      "context" : "(2015a); He et al. (2016)). The general trend since the past few years has been that the networks have grown deeper, with an overall increase in the number of parameters and convolution operations. These high capacity networks have significant inference costs especially when used with embedded sensors or mobile devices where computational and power resources may be limited. For these applications, in addition to accuracy, computational efficiency and small network sizes are crucial enabling factors (Szegedy et al. (2015b)). In addition, for web services that provide image search and image classification APIs that operate on a time budget often serving hundreds of thousands of images per second, benefit significantly from lower inference times. There has been a significant amount of work on reducing the storage and computation costs by model compression (Le Cun et al. (1989); Hassibi & Stork (1993); Srinivas & Babu (2015); Han et al.",
+      "startOffset" : 9,
+      "endOffset" : 935
+    }, {
+      "referenceID" : 3,
+      "context" : "(1989); Hassibi & Stork (1993); Srinivas & Babu (2015); Han et al. (2015); Mariet & Sra (2016)).",
+      "startOffset" : 56,
+      "endOffset" : 74
+    }, {
+      "referenceID" : 3,
+      "context" : "(1989); Hassibi & Stork (1993); Srinivas & Babu (2015); Han et al. (2015); Mariet & Sra (2016)).",
+      "startOffset" : 56,
+      "endOffset" : 95
+    }, {
+      "referenceID" : 3,
+      "context" : "(1989); Hassibi & Stork (1993); Srinivas & Babu (2015); Han et al. (2015); Mariet & Sra (2016)). Recently Han et al. (2015; 2016b) report impressive compression rates on AlexNet (Krizhevsky et al. (2012)) and VGGNet (Simonyan & Zisserman (2015)) by pruning weights with small magnitudes and then retraining without hurting the overall accuracy.",
+      "startOffset" : 56,
+      "endOffset" : 204
+    }, {
+      "referenceID" : 3,
+      "context" : "(1989); Hassibi & Stork (1993); Srinivas & Babu (2015); Han et al. (2015); Mariet & Sra (2016)). Recently Han et al. (2015; 2016b) report impressive compression rates on AlexNet (Krizhevsky et al. (2012)) and VGGNet (Simonyan & Zisserman (2015)) by pruning weights with small magnitudes and then retraining without hurting the overall accuracy.",
+      "startOffset" : 56,
+      "endOffset" : 245
+    }, {
+      "referenceID" : 3,
+      "context" : "(1989); Hassibi & Stork (1993); Srinivas & Babu (2015); Han et al. (2015); Mariet & Sra (2016)). Recently Han et al. (2015; 2016b) report impressive compression rates on AlexNet (Krizhevsky et al. (2012)) and VGGNet (Simonyan & Zisserman (2015)) by pruning weights with small magnitudes and then retraining without hurting the overall accuracy. However, pruning parameters does not necessarily reduce the computation time since the majority of the parameters removed are from the fully connected layers where the computation cost is low, e.g., the fully connected layers of VGG-16 occupy 90% of the total parameters but only contribute less than 1% of the overall floating point operations (FLOP). They also demonstrate that the convolutional layers can be compressed and accelerated (Iandola et al. (2016)), but additionally require sparse ∗Work done at NEC Labs †Supported in part by the NSF under Grant IIS-13-2079",
+      "startOffset" : 56,
+      "endOffset" : 807
+    }, {
+      "referenceID" : 3,
+      "context" : "BLAS libraries or even specialized hardware (Han et al. (2016a)).",
+      "startOffset" : 45,
+      "endOffset" : 64
+    }, {
+      "referenceID" : 3,
+      "context" : "BLAS libraries or even specialized hardware (Han et al. (2016a)). Modern libraries that provide speedup using sparse operations over CNNs are often limited (Szegedy et al. (2015a); Liu et al.",
+      "startOffset" : 45,
+      "endOffset" : 180
+    }, {
+      "referenceID" : 3,
+      "context" : "BLAS libraries or even specialized hardware (Han et al. (2016a)). Modern libraries that provide speedup using sparse operations over CNNs are often limited (Szegedy et al. (2015a); Liu et al. (2015)) and maintaining sparse data structures also creates an additional storage overhead which can be significant for low-precision weights.",
+      "startOffset" : 45,
+      "endOffset" : 199
+    }, {
+      "referenceID" : 3,
+      "context" : "BLAS libraries or even specialized hardware (Han et al. (2016a)). Modern libraries that provide speedup using sparse operations over CNNs are often limited (Szegedy et al. (2015a); Liu et al. (2015)) and maintaining sparse data structures also creates an additional storage overhead which can be significant for low-precision weights. Recent work on CNNs have yielded deep architectures with more efficient design (Szegedy et al. (2015a;b); He & Sun (2015); He et al.",
+      "startOffset" : 45,
+      "endOffset" : 457
+    }, {
+      "referenceID" : 3,
+      "context" : "BLAS libraries or even specialized hardware (Han et al. (2016a)). Modern libraries that provide speedup using sparse operations over CNNs are often limited (Szegedy et al. (2015a); Liu et al. (2015)) and maintaining sparse data structures also creates an additional storage overhead which can be significant for low-precision weights. Recent work on CNNs have yielded deep architectures with more efficient design (Szegedy et al. (2015a;b); He & Sun (2015); He et al. (2016)), in which the fully connected layers are replaced with average pooling layers (Lin et al.",
+      "startOffset" : 45,
+      "endOffset" : 475
+    }, {
+      "referenceID" : 3,
+      "context" : "BLAS libraries or even specialized hardware (Han et al. (2016a)). Modern libraries that provide speedup using sparse operations over CNNs are often limited (Szegedy et al. (2015a); Liu et al. (2015)) and maintaining sparse data structures also creates an additional storage overhead which can be significant for low-precision weights. Recent work on CNNs have yielded deep architectures with more efficient design (Szegedy et al. (2015a;b); He & Sun (2015); He et al. (2016)), in which the fully connected layers are replaced with average pooling layers (Lin et al. (2013); He et al.",
+      "startOffset" : 45,
+      "endOffset" : 573
+    }, {
+      "referenceID" : 3,
+      "context" : "BLAS libraries or even specialized hardware (Han et al. (2016a)). Modern libraries that provide speedup using sparse operations over CNNs are often limited (Szegedy et al. (2015a); Liu et al. (2015)) and maintaining sparse data structures also creates an additional storage overhead which can be significant for low-precision weights. Recent work on CNNs have yielded deep architectures with more efficient design (Szegedy et al. (2015a;b); He & Sun (2015); He et al. (2016)), in which the fully connected layers are replaced with average pooling layers (Lin et al. (2013); He et al. (2016)), which reduces the number of parameters significantly.",
+      "startOffset" : 45,
+      "endOffset" : 591
+    }, {
+      "referenceID" : 3,
+      "context" : "BLAS libraries or even specialized hardware (Han et al. (2016a)). Modern libraries that provide speedup using sparse operations over CNNs are often limited (Szegedy et al. (2015a); Liu et al. (2015)) and maintaining sparse data structures also creates an additional storage overhead which can be significant for low-precision weights. Recent work on CNNs have yielded deep architectures with more efficient design (Szegedy et al. (2015a;b); He & Sun (2015); He et al. (2016)), in which the fully connected layers are replaced with average pooling layers (Lin et al. (2013); He et al. (2016)), which reduces the number of parameters significantly. The computation cost is also reduced by downsampling the image at an early stage to reduce the size of feature maps (He & Sun (2015)).",
+      "startOffset" : 45,
+      "endOffset" : 780
+    }, {
+      "referenceID" : 9,
+      "context" : "The early work by Le Cun et al. (1989) introduces Optimal Brain Damage, which prunes weights with a theoretically justified saliency measure.",
+      "startOffset" : 21,
+      "endOffset" : 39
+    }, {
+      "referenceID" : 9,
+      "context" : "The early work by Le Cun et al. (1989) introduces Optimal Brain Damage, which prunes weights with a theoretically justified saliency measure. Later, Hassibi & Stork (1993) propose Optimal Brain Surgeon to remove unimportant weights determined by the second-order derivative information.",
+      "startOffset" : 21,
+      "endOffset" : 172
+    }, {
+      "referenceID" : 9,
+      "context" : "The early work by Le Cun et al. (1989) introduces Optimal Brain Damage, which prunes weights with a theoretically justified saliency measure. Later, Hassibi & Stork (1993) propose Optimal Brain Surgeon to remove unimportant weights determined by the second-order derivative information. Mariet & Sra (2016) reduce the network redundancy by identifying a subset of diverse neurons that does not require retraining.",
+      "startOffset" : 21,
+      "endOffset" : 307
+    }, {
+      "referenceID" : 2,
+      "context" : "To reduce the computation costs of the convolutional layers, past work have proposed to approximate convolutional operations by representing the weight matrix as a low rank product of two smaller matrices without changing the original number of filters (Denil et al. (2013); Jaderberg et al.",
+      "startOffset" : 254,
+      "endOffset" : 274
+    }, {
+      "referenceID" : 2,
+      "context" : "To reduce the computation costs of the convolutional layers, past work have proposed to approximate convolutional operations by representing the weight matrix as a low rank product of two smaller matrices without changing the original number of filters (Denil et al. (2013); Jaderberg et al. (2014); Zhang et al.",
+      "startOffset" : 254,
+      "endOffset" : 299
+    }, {
+      "referenceID" : 2,
+      "context" : "To reduce the computation costs of the convolutional layers, past work have proposed to approximate convolutional operations by representing the weight matrix as a low rank product of two smaller matrices without changing the original number of filters (Denil et al. (2013); Jaderberg et al. (2014); Zhang et al. (2015b;a); Tai et al. (2016); Ioannou et al.",
+      "startOffset" : 254,
+      "endOffset" : 342
+    }, {
+      "referenceID" : 2,
+      "context" : "To reduce the computation costs of the convolutional layers, past work have proposed to approximate convolutional operations by representing the weight matrix as a low rank product of two smaller matrices without changing the original number of filters (Denil et al. (2013); Jaderberg et al. (2014); Zhang et al. (2015b;a); Tai et al. (2016); Ioannou et al. (2016)).",
+      "startOffset" : 254,
+      "endOffset" : 365
+    }, {
+      "referenceID" : 2,
+      "context" : "To reduce the computation costs of the convolutional layers, past work have proposed to approximate convolutional operations by representing the weight matrix as a low rank product of two smaller matrices without changing the original number of filters (Denil et al. (2013); Jaderberg et al. (2014); Zhang et al. (2015b;a); Tai et al. (2016); Ioannou et al. (2016)). Other approaches to reduce the convolutional overheads include using FFT based convolutions (Mathieu et al. (2013)) and fast convolution using the Winograd algorithm (Lavin & Gray (2016)).",
+      "startOffset" : 254,
+      "endOffset" : 482
+    }, {
+      "referenceID" : 2,
+      "context" : "To reduce the computation costs of the convolutional layers, past work have proposed to approximate convolutional operations by representing the weight matrix as a low rank product of two smaller matrices without changing the original number of filters (Denil et al. (2013); Jaderberg et al. (2014); Zhang et al. (2015b;a); Tai et al. (2016); Ioannou et al. (2016)). Other approaches to reduce the convolutional overheads include using FFT based convolutions (Mathieu et al. (2013)) and fast convolution using the Winograd algorithm (Lavin & Gray (2016)).",
+      "startOffset" : 254,
+      "endOffset" : 554
+    }, {
+      "referenceID" : 2,
+      "context" : "To reduce the computation costs of the convolutional layers, past work have proposed to approximate convolutional operations by representing the weight matrix as a low rank product of two smaller matrices without changing the original number of filters (Denil et al. (2013); Jaderberg et al. (2014); Zhang et al. (2015b;a); Tai et al. (2016); Ioannou et al. (2016)). Other approaches to reduce the convolutional overheads include using FFT based convolutions (Mathieu et al. (2013)) and fast convolution using the Winograd algorithm (Lavin & Gray (2016)). Additionally, quantization (Han et al. (2016b)) and binarization (Rastegari et al.",
+      "startOffset" : 254,
+      "endOffset" : 603
+    }, {
+      "referenceID" : 2,
+      "context" : "To reduce the computation costs of the convolutional layers, past work have proposed to approximate convolutional operations by representing the weight matrix as a low rank product of two smaller matrices without changing the original number of filters (Denil et al. (2013); Jaderberg et al. (2014); Zhang et al. (2015b;a); Tai et al. (2016); Ioannou et al. (2016)). Other approaches to reduce the convolutional overheads include using FFT based convolutions (Mathieu et al. (2013)) and fast convolution using the Winograd algorithm (Lavin & Gray (2016)). Additionally, quantization (Han et al. (2016b)) and binarization (Rastegari et al. (2016); Courbariaux & Bengio (2016)) can be used to reduce the model size and lower the computation overheads.",
+      "startOffset" : 254,
+      "endOffset" : 646
+    }, {
+      "referenceID" : 2,
+      "context" : "To reduce the computation costs of the convolutional layers, past work have proposed to approximate convolutional operations by representing the weight matrix as a low rank product of two smaller matrices without changing the original number of filters (Denil et al. (2013); Jaderberg et al. (2014); Zhang et al. (2015b;a); Tai et al. (2016); Ioannou et al. (2016)). Other approaches to reduce the convolutional overheads include using FFT based convolutions (Mathieu et al. (2013)) and fast convolution using the Winograd algorithm (Lavin & Gray (2016)). Additionally, quantization (Han et al. (2016b)) and binarization (Rastegari et al. (2016); Courbariaux & Bengio (2016)) can be used to reduce the model size and lower the computation overheads.",
+      "startOffset" : 254,
+      "endOffset" : 675
+    }, {
+      "referenceID" : 2,
+      "context" : "To reduce the computation costs of the convolutional layers, past work have proposed to approximate convolutional operations by representing the weight matrix as a low rank product of two smaller matrices without changing the original number of filters (Denil et al. (2013); Jaderberg et al. (2014); Zhang et al. (2015b;a); Tai et al. (2016); Ioannou et al. (2016)). Other approaches to reduce the convolutional overheads include using FFT based convolutions (Mathieu et al. (2013)) and fast convolution using the Winograd algorithm (Lavin & Gray (2016)). Additionally, quantization (Han et al. (2016b)) and binarization (Rastegari et al. (2016); Courbariaux & Bengio (2016)) can be used to reduce the model size and lower the computation overheads. Our method can be used in addition to these techniques to reduce computation costs without incurring additional overheads. Several work have studied removing redundant feature maps from a well trained network (Anwar et al. (2015); Polyak & Wolf (2015)).",
+      "startOffset" : 254,
+      "endOffset" : 980
+    }, {
+      "referenceID" : 2,
+      "context" : "To reduce the computation costs of the convolutional layers, past work have proposed to approximate convolutional operations by representing the weight matrix as a low rank product of two smaller matrices without changing the original number of filters (Denil et al. (2013); Jaderberg et al. (2014); Zhang et al. (2015b;a); Tai et al. (2016); Ioannou et al. (2016)). Other approaches to reduce the convolutional overheads include using FFT based convolutions (Mathieu et al. (2013)) and fast convolution using the Winograd algorithm (Lavin & Gray (2016)). Additionally, quantization (Han et al. (2016b)) and binarization (Rastegari et al. (2016); Courbariaux & Bengio (2016)) can be used to reduce the model size and lower the computation overheads. Our method can be used in addition to these techniques to reduce computation costs without incurring additional overheads. Several work have studied removing redundant feature maps from a well trained network (Anwar et al. (2015); Polyak & Wolf (2015)).",
+      "startOffset" : 254,
+      "endOffset" : 1002
+    }, {
+      "referenceID" : 2,
+      "context" : "To reduce the computation costs of the convolutional layers, past work have proposed to approximate convolutional operations by representing the weight matrix as a low rank product of two smaller matrices without changing the original number of filters (Denil et al. (2013); Jaderberg et al. (2014); Zhang et al. (2015b;a); Tai et al. (2016); Ioannou et al. (2016)). Other approaches to reduce the convolutional overheads include using FFT based convolutions (Mathieu et al. (2013)) and fast convolution using the Winograd algorithm (Lavin & Gray (2016)). Additionally, quantization (Han et al. (2016b)) and binarization (Rastegari et al. (2016); Courbariaux & Bengio (2016)) can be used to reduce the model size and lower the computation overheads. Our method can be used in addition to these techniques to reduce computation costs without incurring additional overheads. Several work have studied removing redundant feature maps from a well trained network (Anwar et al. (2015); Polyak & Wolf (2015)). Anwar et al. (2015) introduce a three-level pruning of the weights and locate the pruning candidates using particle filtering, which selects the best combination from a number of random generated masks.",
+      "startOffset" : 254,
+      "endOffset" : 1024
+    }, {
+      "referenceID" : 2,
+      "context" : "To reduce the computation costs of the convolutional layers, past work have proposed to approximate convolutional operations by representing the weight matrix as a low rank product of two smaller matrices without changing the original number of filters (Denil et al. (2013); Jaderberg et al. (2014); Zhang et al. (2015b;a); Tai et al. (2016); Ioannou et al. (2016)). Other approaches to reduce the convolutional overheads include using FFT based convolutions (Mathieu et al. (2013)) and fast convolution using the Winograd algorithm (Lavin & Gray (2016)). Additionally, quantization (Han et al. (2016b)) and binarization (Rastegari et al. (2016); Courbariaux & Bengio (2016)) can be used to reduce the model size and lower the computation overheads. Our method can be used in addition to these techniques to reduce computation costs without incurring additional overheads. Several work have studied removing redundant feature maps from a well trained network (Anwar et al. (2015); Polyak & Wolf (2015)). Anwar et al. (2015) introduce a three-level pruning of the weights and locate the pruning candidates using particle filtering, which selects the best combination from a number of random generated masks. Polyak & Wolf (2015) detect the less frequently activated feature maps with sample input data for face detection applications.",
+      "startOffset" : 254,
+      "endOffset" : 1228
+    }, {
+      "referenceID" : 2,
+      "context" : "To reduce the computation costs of the convolutional layers, past work have proposed to approximate convolutional operations by representing the weight matrix as a low rank product of two smaller matrices without changing the original number of filters (Denil et al. (2013); Jaderberg et al. (2014); Zhang et al. (2015b;a); Tai et al. (2016); Ioannou et al. (2016)). Other approaches to reduce the convolutional overheads include using FFT based convolutions (Mathieu et al. (2013)) and fast convolution using the Winograd algorithm (Lavin & Gray (2016)). Additionally, quantization (Han et al. (2016b)) and binarization (Rastegari et al. (2016); Courbariaux & Bengio (2016)) can be used to reduce the model size and lower the computation overheads. Our method can be used in addition to these techniques to reduce computation costs without incurring additional overheads. Several work have studied removing redundant feature maps from a well trained network (Anwar et al. (2015); Polyak & Wolf (2015)). Anwar et al. (2015) introduce a three-level pruning of the weights and locate the pruning candidates using particle filtering, which selects the best combination from a number of random generated masks. Polyak & Wolf (2015) detect the less frequently activated feature maps with sample input data for face detection applications. We choose to analyze the filter weights and prune filters with their corresponding feature maps using a simple magnitude based measure, without examining possible combinations. We also introduce network-wide holistic approaches to prune filters for simple and complex convolutional network architectures. Concurrently with our work, there is a growing interest in training compact CNNs with sparse constraints (Lebedev & Lempitsky (2016); Zhou et al.",
+      "startOffset" : 254,
+      "endOffset" : 1772
+    }, {
+      "referenceID" : 2,
+      "context" : "To reduce the computation costs of the convolutional layers, past work have proposed to approximate convolutional operations by representing the weight matrix as a low rank product of two smaller matrices without changing the original number of filters (Denil et al. (2013); Jaderberg et al. (2014); Zhang et al. (2015b;a); Tai et al. (2016); Ioannou et al. (2016)). Other approaches to reduce the convolutional overheads include using FFT based convolutions (Mathieu et al. (2013)) and fast convolution using the Winograd algorithm (Lavin & Gray (2016)). Additionally, quantization (Han et al. (2016b)) and binarization (Rastegari et al. (2016); Courbariaux & Bengio (2016)) can be used to reduce the model size and lower the computation overheads. Our method can be used in addition to these techniques to reduce computation costs without incurring additional overheads. Several work have studied removing redundant feature maps from a well trained network (Anwar et al. (2015); Polyak & Wolf (2015)). Anwar et al. (2015) introduce a three-level pruning of the weights and locate the pruning candidates using particle filtering, which selects the best combination from a number of random generated masks. Polyak & Wolf (2015) detect the less frequently activated feature maps with sample input data for face detection applications. We choose to analyze the filter weights and prune filters with their corresponding feature maps using a simple magnitude based measure, without examining possible combinations. We also introduce network-wide holistic approaches to prune filters for simple and complex convolutional network architectures. Concurrently with our work, there is a growing interest in training compact CNNs with sparse constraints (Lebedev & Lempitsky (2016); Zhou et al. (2016); Wen et al.",
+      "startOffset" : 254,
+      "endOffset" : 1792
+    }, {
+      "referenceID" : 2,
+      "context" : "To reduce the computation costs of the convolutional layers, past work have proposed to approximate convolutional operations by representing the weight matrix as a low rank product of two smaller matrices without changing the original number of filters (Denil et al. (2013); Jaderberg et al. (2014); Zhang et al. (2015b;a); Tai et al. (2016); Ioannou et al. (2016)). Other approaches to reduce the convolutional overheads include using FFT based convolutions (Mathieu et al. (2013)) and fast convolution using the Winograd algorithm (Lavin & Gray (2016)). Additionally, quantization (Han et al. (2016b)) and binarization (Rastegari et al. (2016); Courbariaux & Bengio (2016)) can be used to reduce the model size and lower the computation overheads. Our method can be used in addition to these techniques to reduce computation costs without incurring additional overheads. Several work have studied removing redundant feature maps from a well trained network (Anwar et al. (2015); Polyak & Wolf (2015)). Anwar et al. (2015) introduce a three-level pruning of the weights and locate the pruning candidates using particle filtering, which selects the best combination from a number of random generated masks. Polyak & Wolf (2015) detect the less frequently activated feature maps with sample input data for face detection applications. We choose to analyze the filter weights and prune filters with their corresponding feature maps using a simple magnitude based measure, without examining possible combinations. We also introduce network-wide holistic approaches to prune filters for simple and complex convolutional network architectures. Concurrently with our work, there is a growing interest in training compact CNNs with sparse constraints (Lebedev & Lempitsky (2016); Zhou et al. (2016); Wen et al. (2016)).",
+      "startOffset" : 254,
+      "endOffset" : 1811
+    }, {
+      "referenceID" : 2,
+      "context" : "To reduce the computation costs of the convolutional layers, past work have proposed to approximate convolutional operations by representing the weight matrix as a low rank product of two smaller matrices without changing the original number of filters (Denil et al. (2013); Jaderberg et al. (2014); Zhang et al. (2015b;a); Tai et al. (2016); Ioannou et al. (2016)). Other approaches to reduce the convolutional overheads include using FFT based convolutions (Mathieu et al. (2013)) and fast convolution using the Winograd algorithm (Lavin & Gray (2016)). Additionally, quantization (Han et al. (2016b)) and binarization (Rastegari et al. (2016); Courbariaux & Bengio (2016)) can be used to reduce the model size and lower the computation overheads. Our method can be used in addition to these techniques to reduce computation costs without incurring additional overheads. Several work have studied removing redundant feature maps from a well trained network (Anwar et al. (2015); Polyak & Wolf (2015)). Anwar et al. (2015) introduce a three-level pruning of the weights and locate the pruning candidates using particle filtering, which selects the best combination from a number of random generated masks. Polyak & Wolf (2015) detect the less frequently activated feature maps with sample input data for face detection applications. We choose to analyze the filter weights and prune filters with their corresponding feature maps using a simple magnitude based measure, without examining possible combinations. We also introduce network-wide holistic approaches to prune filters for simple and complex convolutional network architectures. Concurrently with our work, there is a growing interest in training compact CNNs with sparse constraints (Lebedev & Lempitsky (2016); Zhou et al. (2016); Wen et al. (2016)). Lebedev & Lempitsky (2016) leverage group-sparsity on the convolutional filters to achieve structured brain damage, i.",
+      "startOffset" : 254,
+      "endOffset" : 1840
+    }, {
+      "referenceID" : 2,
+      "context" : "To reduce the computation costs of the convolutional layers, past work have proposed to approximate convolutional operations by representing the weight matrix as a low rank product of two smaller matrices without changing the original number of filters (Denil et al. (2013); Jaderberg et al. (2014); Zhang et al. (2015b;a); Tai et al. (2016); Ioannou et al. (2016)). Other approaches to reduce the convolutional overheads include using FFT based convolutions (Mathieu et al. (2013)) and fast convolution using the Winograd algorithm (Lavin & Gray (2016)). Additionally, quantization (Han et al. (2016b)) and binarization (Rastegari et al. (2016); Courbariaux & Bengio (2016)) can be used to reduce the model size and lower the computation overheads. Our method can be used in addition to these techniques to reduce computation costs without incurring additional overheads. Several work have studied removing redundant feature maps from a well trained network (Anwar et al. (2015); Polyak & Wolf (2015)). Anwar et al. (2015) introduce a three-level pruning of the weights and locate the pruning candidates using particle filtering, which selects the best combination from a number of random generated masks. Polyak & Wolf (2015) detect the less frequently activated feature maps with sample input data for face detection applications. We choose to analyze the filter weights and prune filters with their corresponding feature maps using a simple magnitude based measure, without examining possible combinations. We also introduce network-wide holistic approaches to prune filters for simple and complex convolutional network architectures. Concurrently with our work, there is a growing interest in training compact CNNs with sparse constraints (Lebedev & Lempitsky (2016); Zhou et al. (2016); Wen et al. (2016)). Lebedev & Lempitsky (2016) leverage group-sparsity on the convolutional filters to achieve structured brain damage, i.e., prune the entries of the convolution kernel in a group-wise fashion. Zhou et al. (2016) add group-sparse regularization on neurons during training to learn compact CNNs with reduced filters.",
+      "startOffset" : 254,
+      "endOffset" : 2023
+    }, {
+      "referenceID" : 2,
+      "context" : "To reduce the computation costs of the convolutional layers, past work have proposed to approximate convolutional operations by representing the weight matrix as a low rank product of two smaller matrices without changing the original number of filters (Denil et al. (2013); Jaderberg et al. (2014); Zhang et al. (2015b;a); Tai et al. (2016); Ioannou et al. (2016)). Other approaches to reduce the convolutional overheads include using FFT based convolutions (Mathieu et al. (2013)) and fast convolution using the Winograd algorithm (Lavin & Gray (2016)). Additionally, quantization (Han et al. (2016b)) and binarization (Rastegari et al. (2016); Courbariaux & Bengio (2016)) can be used to reduce the model size and lower the computation overheads. Our method can be used in addition to these techniques to reduce computation costs without incurring additional overheads. Several work have studied removing redundant feature maps from a well trained network (Anwar et al. (2015); Polyak & Wolf (2015)). Anwar et al. (2015) introduce a three-level pruning of the weights and locate the pruning candidates using particle filtering, which selects the best combination from a number of random generated masks. Polyak & Wolf (2015) detect the less frequently activated feature maps with sample input data for face detection applications. We choose to analyze the filter weights and prune filters with their corresponding feature maps using a simple magnitude based measure, without examining possible combinations. We also introduce network-wide holistic approaches to prune filters for simple and complex convolutional network architectures. Concurrently with our work, there is a growing interest in training compact CNNs with sparse constraints (Lebedev & Lempitsky (2016); Zhou et al. (2016); Wen et al. (2016)). Lebedev & Lempitsky (2016) leverage group-sparsity on the convolutional filters to achieve structured brain damage, i.e., prune the entries of the convolution kernel in a group-wise fashion. Zhou et al. (2016) add group-sparse regularization on neurons during training to learn compact CNNs with reduced filters. Wen et al. (2016) add structured sparsity regularizer on each layer to reduce trivial filters, channels or even layers.",
+      "startOffset" : 254,
+      "endOffset" : 2144
+    }, {
+      "referenceID" : 3,
+      "context" : "Relationship to pruning weights Pruning filters with low absolute weights sum is similar to pruning low magnitude weights (Han et al. (2015)).",
+      "startOffset" : 123,
+      "endOffset" : 141
+    }, {
+      "referenceID" : 31,
+      "context" : "Relationship to group-sparse regularization on filters Recent work (Zhou et al. (2016); Wen et al.",
+      "startOffset" : 68,
+      "endOffset" : 87
+    }, {
+      "referenceID" : 28,
+      "context" : "(2016); Wen et al. (2016)) apply group-sparse regularization ( ∑ni j=1 ‖Fi,j‖2 or `2,1-norm) on convolutional filters, which also favor to zero-out filters with small l2-norms, i.",
+      "startOffset" : 8,
+      "endOffset" : 26
+    }, {
+      "referenceID" : 3,
+      "context" : "Previous work prunes the weights on a layer by layer basis, followed by iteratively retraining and compensating for any loss of accuracy (Han et al. (2015)).",
+      "startOffset" : 138,
+      "endOffset" : 156
+    }, {
+      "referenceID" : 8,
+      "context" : "However, for complex network architectures such as Residual networks (He et al. (2016)), pruning filters may not be straightforward.",
+      "startOffset" : 70,
+      "endOffset" : 87
+    }, {
+      "referenceID" : 0,
+      "context" : "We implement our filter pruning method in Torch7 (Collobert et al. (2011)).",
+      "startOffset" : 50,
+      "endOffset" : 74
+    }, {
+      "referenceID" : 0,
+      "context" : "We implement our filter pruning method in Torch7 (Collobert et al. (2011)). When filters are pruned, a new model with fewer filters is created and the remaining parameters of the modified layers as well as the unaffected layers are copied into the new model. Furthermore, if a convolutional layer is pruned, the weights of the subsequent batch normalization layer are also removed. To get the baseline accuracies for each network, we train each model from scratch and follow the same pre-processing and hyper-parameters as ResNet (He et al. (2016)).",
+      "startOffset" : 50,
+      "endOffset" : 548
+    }, {
+      "referenceID" : 0,
+      "context" : "We implement our filter pruning method in Torch7 (Collobert et al. (2011)). When filters are pruned, a new model with fewer filters is created and the remaining parameters of the modified layers as well as the unaffected layers are copied into the new model. Furthermore, if a convolutional layer is pruned, the weights of the subsequent batch normalization layer are also removed. To get the baseline accuracies for each network, we train each model from scratch and follow the same pre-processing and hyper-parameters as ResNet (He et al. (2016)). For retraining, we use a constant learning rate 0.001 and retrain 40 epochs for CIFAR-10 and 20 epochs for ImageNet, which represents one-fourth of the original training epochs. Past work has reported up to 3× original training times to retrain pruned networks (Han et al. (2015)).",
+      "startOffset" : 50,
+      "endOffset" : 830
+    }, {
+      "referenceID" : 21,
+      "context" : "layer after each convolutional layer and the first linear layer, without using Dropout (Srivastava et al. (2014)).",
+      "startOffset" : 88,
+      "endOffset" : 113
+    }, {
+      "referenceID" : 21,
+      "context" : "layer after each convolutional layer and the first linear layer, without using Dropout (Srivastava et al. (2014)). Note that when the last convolutional layer is pruned, the input to the linear layer is changed and the connections are also removed. As shown in Figure 2(b), each of the convolutional layers with 512 feature maps can drop at least 60% of filters without affecting the accuracy. Figure 2(c) shows that with retraining, almost 90% of the filters of these layers can be safely removed. One possible explanation is that these filters operate on 4× 4 or 2× 2 feature maps, which may have no meaningful spatial connections in such small dimensions. For instance, ResNets for CIFAR-10 do not perform any convolutions for feature maps below 8× 8 dimensions. Unlike previous work (Zeiler & Fergus (2014); Han et al.",
+      "startOffset" : 88,
+      "endOffset" : 811
+    }, {
+      "referenceID" : 3,
+      "context" : "Unlike previous work (Zeiler & Fergus (2014); Han et al. (2015)), we observe that the first layer is robust to pruning as compared to the next few layers.",
+      "startOffset" : 46,
+      "endOffset" : 64
+    } ],
+    "year" : 2017,
+    "abstractText" : "The success of CNNs in various applications is accompanied by a significant increase in the computation and parameter storage costs. Recent efforts toward reducing these overheads involve pruning and compressing the weights of various layers without hurting original accuracy. However, magnitude-based pruning of weights reduces a significant number of parameters from the fully connected layers and may not adequately reduce the computation costs in the convolutional layers due to irregular sparsity in the pruned networks. We present an acceleration method for CNNs, where we prune filters from CNNs that are identified as having a small effect on the output accuracy. By removing whole filters in the network together with their connecting feature maps, the computation costs are reduced significantly. In contrast to pruning weights, this approach does not result in sparse connectivity patterns. Hence, it does not need the support of sparse convolution libraries and can work with existing efficient BLAS libraries for dense matrix multiplications. We show that even simple filter pruning techniques can reduce inference costs for VGG-16 by up to 34% and ResNet-110 by up to 38% on CIFAR10 while regaining close to the original accuracy by retraining the networks.",
+    "creator" : "LaTeX with hyperref package"
+  }
+}

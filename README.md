@@ -19,6 +19,9 @@ data/arxiv.cs.lg_2007-2017/
 data/iclr_2017/
 data/acl_2017/ #only in May 2018
 code/
+code/data_prepare   # codes for collecting and pre-processing datasets
+code/accept_predict # codes for acceptance classification
+code/aspect_predict # codes for aspect score prediction
 misc/
 ```
 

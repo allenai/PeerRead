@@ -14,7 +14,7 @@ data/
 data/conll_2016/
 data/nips_2013-2016/
 data/arxiv.cs.ai_2007-2017/
-data/arxiv.cs.cs_2007-2017/
+data/arxiv.cs.cl_2007-2017/
 data/arxiv.cs.lg_2007-2017/
 data/iclr_2017/
 data/acl_2017/ #only in May 2018

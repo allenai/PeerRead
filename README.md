@@ -2,11 +2,12 @@
 Data and code for Kang et al., 2018's paper titled "A Dataset of Peer Reviews (PeerReaD): Collection, Insights and NLP Applications"
 
 
-# Version 2 will includes ACL_2017, ICLR_2018, NIPS 2017
+# V2
+* Version 2 will include ACL_2017 (license opens), ICLR_2018, NIPS 2017
 
 # TODOs
 * Add a script for downloading the nips papers 2013-2017 (PDFs and reviews), splitting them similarly to the paper, as described [here](./data/nips_2013-2016/README.md)
-* Copy arxiv papers from each split in the old repo to one or more subdirectories in `data/arxiv.cs.ai_2007-2017/{train|dev|test}`.
+* [Done] Copy arxiv papers from each split in the old repo to one or more subdirectories in `data/arxiv.cs.ai_2007-2017/{train|dev|test}`.
 * Add Madeleine's annotations to ICLR 2017 reviews.
 * Move code from the old repo to new repo (see agreed upon structure below).
 
@@ -26,7 +27,6 @@ misc/
 ```
 
 Each section should have a license file, e.g., `data/conll_2016/LICENSE.md`
-
 Each of the splits in a data section should have the following structure for all papers, e.g., for the `data/conll_2016/train` split:
 ```
 data/conll_2016/train/pdfs/$paper_id.pdf

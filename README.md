@@ -1,8 +1,8 @@
-# PeerReaD
+# PeerReaD v1
 Data and code for Kang et al., 2018's paper titled "A Dataset of Peer Reviews (PeerReaD): Collection, Insights and NLP Applications"
 
 
-# V2
+# v2 update (around May 2018)
 * Version 2 will include ACL_2017 (license opens), ICLR_2018, NIPS 2017
 
 # TODOs

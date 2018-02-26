@@ -1,0 +1,400 @@
+{
+  "name" : "1702.07005.pdf",
+  "metadata" : {
+    "source" : "CRF",
+    "title" : "Large-Scale Stochastic Learning using GPUs",
+    "authors" : [ "Thomas Parnell", "Celestine Dünner", "Kubilay Atasu", "Manolis Sifalakis", "Haris Pozidis" ],
+    "emails" : [ "hap}@zurich.ibm.com" ],
+    "sections" : [ {
+      "heading" : null,
+      "text" : "I. INTRODUCTION\nGraphics processing units (GPUs) have found a wide range of applications in machine learning and other scientific fields. Most recently, they have become widely adopted to tackle the problem of training deep neural networks [1]. Due to their massively parallel architecture, GPUs are well suited to this task, since the training procedure can be naturally expressed as a sequence of matrix operations. By making carefully constructed calls to libraries such as NVIDIA’s cuBLAS (or even cuDNN) one can typically achieve the maximum theoretical floating point performance of the processor.\nWhile neural networks are a topic of significant interest, many other machine learning applications rely on other techniques such as fitting generalized linear models for regression or classification [2, Chapters 3 and 4]. While the training of such models can generally also be mapped to a sequence of matrix operations, this tends to apply only when using batch methods such as gradient descent. The batch gradient descent technique updates the model parameters by computing a gradient vector across all available training examples. It is well known that faster convergence can be achieved over batch methods by using stochastic learning algorithms such as stochastic gradient descent (SGD) [3] or stochastic coordinate descent (SCD) [4]. These algorithms compute an update to the model parameters by computing a gradient using only a single training example or optimizing with respect to a single feature respectively. Compared to batch methods, such algorithms are\ninherently sequential and each successive iteration involves only a single vector inner product computation. Furthermore, these vectors are sparse for many datasets of interest. For these reasons, mapping such algorithms onto GPUs become more difficult since, within a single iteration, one cannot benefit significantly from the massively parallel architecture.\nA further challenge is the issue of limited GPU memory. State-of-the-art GPUs have a main memory capacity of up to 16GB. Modern internet-scale datasets [5] can grow many times larger than this. Therefore, stochastic learning algorithms that run on a single GPU are of limited interest and to build a useful GPU-based implementation it is necessary to consider distributed techniques. Distribution of stochastic learning is an active field of research and many promising techniques have been proposed. In [6] a method was proposed whereby worker nodes perform stochastic updates of a local model and asynchronously communicate their model updates to a parameter server. Alternatively, one may consider synchronous techniques such as [7] in which worker nodes perform stochastic updates using the data that is locally available to them and after a number of steps, all updates are aggregated on a master node and the resulting model (or some representation thereof) is then broadcast back to the workers for the next round. Unless the data has been partitioned in a way to exploit underlying structure, distributed algorithms tend to converge slower (in terms of number of model updates) compared to their non-distributed counterparts due to the delay incurred in sharing model updates between workers [8]. However, when one is truly dealing with very large data, scaling out across multiple machines (or indeed GPUs) becomes a necessity rather than a choice.\nIn this work we will begin with an overview of the ridge regression problem (L2-regularized linear regression) and explain how it can be solved using stochastic coordinate descent/ascent techniques in its primal formulation as well as its dual formulation. While we have opted to focus on ridge regression for the sake of simplicity, stochastic coordinate methods are used in the field of machine learning to solve other problem such as regression with elastic net regularization as well as support vector machines. We proceed to review the state-of-the-art implementations of SCD on the CPU, covering both single-threaded and multi-threaded implementations. We will then present a twice parallel, asynchronous implementation of SCD (TPA-SCD) that is specifically designed to take advantage of the massively parallel hardware that is available on modern GPUs. We will demonstrate that this new\nCopyright c© 2017 IEEE. Personal use of this material is permitted. Permission from IEEE must be obtained for all other uses, in any current or future media, including reprinting/republishing this material for advertising or promotional purposes, creating new collective works, for resale or redistribution to\nservers or lists, or reuse of any copyrighted component of this work in other works\nar X\niv :1\n70 2.\n07 00\n5v 1\n[ cs\n.L G\n] 2\n2 Fe\nb 20\n17\nimplementation can achieve up to a 35× speed-up in training time relative to existing single-threaded algorithms. We will then turn our attention to the problem of training on very large datasets and discuss how SCD can be distributed across multiple workers nodes that communicate over a network. We will consider the case where the training data is distributed across the workers nodes by training example as well as the case where the data is distributed by feature. We will then study a core component of synchronous distributed learning algorithms: the aggregation step. We propose a novel technique for direct optimization of the aggregation step for the case of distributed ridge regression. We will demonstrate that by using optimized aggregation, it is possible to scale out across up to 8 nodes without experiencing any significant slowdown in training time. Finally, we will combine these two techniques and demonstrate distributed stochastic learning across clusters of GPUs. We show that by using a cluster of 4 GPUs running TPA-SCD it is possible to train a 40GB sample of the criteo dataset (200 million examples, 75 million non-zero features) to a high degree of accuracy in around 4 seconds, providing a 20× speed-up over a state-of-the-art multi-threaded, distributed implementation."
+    }, {
+      "heading" : "II. RIDGE REGRESSION",
+      "text" : "Let A ∈ RN×M denote the training data matrix where N is the number of training examples and M is the number of features. The corresponding labels for the training examples are provided by the vector y ∈ RN . The parameter λ ∈ R+ controls regularization and prevents over-fitting. The operator ||.|| denotes the standard L2-norm and the operator 〈.〉 denotes the Euclidean inner product between two vectors."
+    }, {
+      "heading" : "A. Primal Form",
+      "text" : "Ridge regression in its primal form is defined by the following objective function:\nP(β) = 1 2N ||Aβ − y||2 + λ 2 ||β||2, (1)\nwhere β ∈ RM are the primal model weights. The function P(β) is strongly convex and the optimal values are given by:\nβ∗ = arg min β P(β).\nCoordinate descent methods aim to iteratively minimize the primal objective (1) by successively optimizing individual coordinates. The partial derivative of the primal function with respect to the m-th coordinate is given by:\n∂P (β)\n∂βm =\n1\nN 〈Aβ − y, am〉+ λβm,\nwhere am denotes the m-th column of data matrix A. Let β(t) denote the approximate solution at iteration t. By following the approach of [4] and optimizing with respect to the mth coordinate while keeping the model weights for all other coordinates fixed, one obtains the following update rule:\nβ(t+1) = β(t) +\n(〈 y − w(t), am 〉 − λNβ(t)m\n||am||2 + λN\n) em, (2)\nwhere w(t) = Aβ(t) ∈ RN is known as the shared vector at iteration t and em ∈ {0, 1}M is a vector that is all-zero apart from the m-th coordinate. The following update rule for the shared vector follows easily:\nw(t+1) = w(t) + am(β (t+1) m − β(t)m )."
+    }, {
+      "heading" : "B. Dual Form",
+      "text" : "Ridge regression in its dual form is defined by the following objective function:\nD(α) = −N 2 ||α||2 − 1 2λ ||ATα||2 + αT y, (3)\nwhere α ∈ RN are the dual model weights. The optimal value for the model weights can be found by solving the following maximization problem:\nα∗ = arg max α D(α).\nThe dual problem can also be solved using iterative techniques that maximize the objective function (3) using a single coordinate at a time. The partial derivative with respect to the n-th coordinate is given by:\n∂D(α)\n∂αn = −Nαn −\n1\nλ\n〈 ATα, ān 〉 + yn,\nwhere ān denotes the n-th row of the data matrix A. Let α (t) i denote the estimate of the optimal model weights at iteration t. It was shown in [9] that one can optimize the dual objective function for a selected coordinate n while keeping the model weights for all other coordinates fixed, leading to the following update rule:\nα(t+1) = α(t) +\n( λyn − 〈 w̄(t), ān 〉 − λNα(t)i\nλN + ||ān||2\n) ēn, (4)\nwhere w̄(t) = ATα(t) ∈ RM denotes the dual shared vector and ēn ∈ {0, 1}N is a vector that is all-zero apart from the n-th coordinate. The update rule for the dual shared vector is given by:\nw̄(t+1) = w̄(t) + ān(α (t+1) n − α(t)n )."
+    }, {
+      "heading" : "C. Duality Gap",
+      "text" : "The Fenchel-Rockafellar duality theorem [10] dictates that P(β∗) = D(α∗) and the following conditions must hold for the optimal values of β∗ and α∗:\nβ∗ = 1\nλ ATα∗, (5)\nα∗ = 1\nN (y −Aβ∗). (6)\nIn order to compare the convergence behavior of the two methods we can define the duality gap for the primal, dual algorithms respectively as follows:\nGP\n( β(t) ) = ∣∣∣∣P (β(t))−D( 1N (y −Aβ(t)) )∣∣∣∣ ,\nGD\n( α(t) ) = ∣∣∣∣P ( 1λATα(t) ) −D ( α(t) )∣∣∣∣ .\nWe use the duality gap to compare convergence of algorithms that solve the primal and dual formulations of ridge regression since it does not depend on the scale of either objective and its limit when the number of iterations is large is known: it must always converge to zero. In the next section we will implement these algorithms and compare their convergence behavior."
+    }, {
+      "heading" : "III. STOCHASTIC LEARNING ON THE GPU",
+      "text" : "In this section we will consider how to implement stochastic coordinate descent methods. Since the dual maximization problem can always be transformed into a minimization by applying a change of sign, in what follows we will solely refer to stochastic coordinate descent (SCD) methods for solving both formulations of ridge regression. We first review the standard sequential implementation on the CPU and the existing work on asynchronous, multi-threaded implementations. We will then describe a new implementation (TPA-SCD) that is designed to exploit the massively parallel computing resources provided by modern GPUs."
+    }, {
+      "heading" : "A. Sequential CPU Implementation",
+      "text" : "Algorithm 1 Sequential SCD [4]. Initialize: t = 0, β(t) = 0, w(t) = 0. for epoch = 1 . . . , nepochs do\nGenerate random permutation of features Pepoch. for j = 1 . . .M do\nUpdate randomized coordinate: m = Pepoch(j)\n∆β = ( ||am||2 +Nλ )−1 (〈 y − w(t), am 〉 −Nλβ(t)m ) β(t+1) = β(t) + em∆β Update shared vector: w(t+1) = w(t) + am∆β t = t+ 1\nend for end for\nIn Algorithm 1 we review the algorithm proposed in [4] for sequential SCD. The algorithm is presented for the primal form of ridge regression, however the equivalent variation for the dual formulation is almost identical up to the update rule (4). For the primal form of the algorithm, one epoch is defined to be one pass through all the M permuted features. Conversely, for the dual form an epoch is defined as one pass through all the N permuted training samples. Both variants of the algorithm have been implemented in C++. Optimization flags were passed to the gcc compiler to ensure that vectorization occurs when evaluating the inner products. The data matrix and model parameters are represented using 32-bit floating point data types. The implementation has been designed assuming that the data matrix A is sparse, so that any unnecessary computation is avoided."
+    }, {
+      "heading" : "B. Asynchronous CPU Implementations",
+      "text" : "SCD is an inherently sequential algorithm and is thus nontrivial to parallelize. However, recent work into asynchronous techniques has shown that it is possible to accelerate stochastic learning algorithms by running multiple threads (each updating using a single coordinate or example) that read the current value of the model parameters (and any associated vectors) from shared memory and write back their updates without using complex locking schemes such as those proposed in [11]. In [12] an asynchronous implementation of stochastic gradient descent was proposed (“Hogwild!”) that comprises many parallel threads each computing the gradient using a random training example and updating the model weights using atomic operations. While this work significantly developed the concept of asynchronous learning, asynchronous coordinate descent methods were not considered.\nIn [13], an asynchronous version of Algorithm 1 was proposed (A-SCD) whereby the inner loop over the shuffled coordinates is parallelized across multiple CPU threads. Since different threads can potentially write updates to the shared vector in the same location, an atomic addition was used to ensure that updates to the shared vector are always applied. The authors found that, while a good speed-up was attained, issues arose due to the shared vector becoming inconsistent with the model weights. To resolve this problem, a scheme for occasionally re-computing the shared vector was proposed. In [14] it was reported that one can achieve faster convergence if instead of using atomic addition, one allows a “wild” behavior where updates to the shared vector can be overwritten or not applied at all. While the authors reported an almost linear speed-up in training time using this algorithm (PASSCoDeWild), it was shown that such an implementation will converge to a solution that violates the optimality conditions (5) and (6).\nFinally, in [15], an asynchronous coordinate descent algorithm was proposed (AsySCD) and close-to-linear scaling was demonstrated using a 40-core CPU. This algorithm differs from Algorithm 1 in two important respects. Firstly, instead of optimizing for each coordinate exactly, a small gradient descent step is taken thus introducing an additional step size parameter that must be tuned. Secondly, the algorithm is implemented without the use of a shared vector. Instead, the computation of a Hessian matrix is required. This takes a considerable amount of time and significantly increases the memory requirements, thus rendering the algorithm unsuitable for very large datasets. Both of these differences were already noted in [14], in which the authors were able to reproduce the linear scaling behavior of AsySCD but demonstrated that it is slower than even a single threaded implementation of Algorithm 1.\nFor comparison with our GPU-based implementation we have implemented the algorithm proposed in [13] that uses atomic addition (A-SCD) and the “wild” implementation proposed in [14] (PASSCoDE-Wild). Both implementations were written in C++ using the OpenMP library. All CPU-based\nexperiments were run on 8-core Intel Xeon1 CPUs with a clock frequency of 2.40GHz. Each core can run up to 2 threads resulting in a maximum number of 16 threads."
+    }, {
+      "heading" : "C. Twice Parallel, Asynchronous GPU Implementation",
+      "text" : "In Algorithm 2 we present a twice parallel, asynchronous implementation of SCD (TPA-SCD) designed to run on massively parallel GPU architectures. The algorithm is presented for the primal form of ridge regression, however the equivalent variation for the dual formulation is almost identical up to the update rule (4). Our algorithm exploits two levels or parallelism. Firstly, in any given epoch, every coordinate is updated by a dedicated thread block and the thread blocks are scheduled for execution in parallel (or concurrently) on the streaming multiprocessors (SMs) that are available on the GPU. Secondly, within each thread block the computations that are required to perform the coordinate update are divided up amongst multiple threads at a very fine granularity. Furthermore, the updates to the shared vector are written out to the GPU main memory using all available threads. This helps to ensure that the shared vector and the model weights remain consistent throughout operation and thus a good convergence behavior is achieved. Rather than implement a complex locking scheme, we implemented the shared vector updates using the floating point atomic additions operations that are offered by most modern GPUs. These operations ensure that all updates to the shared vector are applied without any blocking occurring. The implementation of TPA-SCD was written in CUDA/C++ and all data is represented using 32-bit floating point data types. We have implemented and tested the\n1Intel and Intel Xeon are trademarks or registered trademarks of Intel Corporation or its subsidiaries in the United States and other countries. Other product or service names may be trademarks or service marks of IBM or other companies.\nalgorithm on the NVIDIA Quadro M4000 GPU as well as the GeForce GTX Titan X.\nAlgorithm 2 TPA-SCD (for GPU hardware). Initialize: β = 0, w = 0. Copy initial vectors β and w onto GPU. for epoch = 1, . . . , nepochs do\nGenerate random permutation of features Pepoch. for j = 1 . . .M (as async. GPU thread blocks) do\nfor u = 1 . . . nthreads (executed as warps on SM) do if u = 0 then m = Pepoch(j) {Get shuffled coordinate}\nend if dpu = 0 {Evaluate partial inner product} i = u while i < N do dpu = dpu + (yi − wi)Ai,m i = i+ nthreads end while cache[u] = dpu{Cache in shared memory} synchronizeThreads() v = nthreads/2 {Reduce inner products} while v 6= 0 do\nif u < v then cache[u] = cache[u+ v] end if synchronizeThreads() v = v/2\nend while if u = 0 then\n∆βm = ( ||am||2 +Nλ )−1 (cache[0]−Nλβm)\nend if synchronizeThreads() i = u {Write out updates to shared vector} while i < N do wi = wi +Ai,m∆βm{Atomic addition} i = i+ nthreads\nend while end for\nend for end for Copy model weights β back from GPU."
+    }, {
+      "heading" : "D. Performance Comparison",
+      "text" : "In Fig. 1 we compare the convergence behavior of a number of the algorithms that have been proposed to solve the primal form of ridge regression. The dataset that was used was a training sample of the webspam dataset [16] that consists of 262, 938 examples and 680, 715 non-zero features. This sample was obtained by sampling the training examples uniformly at random to create a 75%/25% train/test split of the full dataset. A compressed sparse column format was used to represent the data matrix in the memory of the GPU when solving the primal problem and a compressed sparse row format was used when solving the dual. The sampled webspam\ndataset consumes around 7.3GB of GPU memory and thus fits inside the memory capacity of the M4000 (the limit is 8GB). In Fig. 1a we study the convergence as function of epochs and in Fig. 1b we compare the convergence as a function of time. When we refer to an algorithm exhibiting a “speed up” in training time we mean that the same level of duality gap can be achieved in a shorter amount of time (even if more epochs are required). Firstly, let us consider the sequential SCD (Algorithm 1) using a single CPU thread and compare its performance with that of A-SCD and PASSCoDe-Wild (both using 16 threads). While the atomic implementation (A-SCD) has exactly the same convergence properties as the sequential algorithm as a function of epochs, we observe only a modest speed-up (around 2×) which we attribute to the lack of hardware support for floating point atomic addition on this particular CPU. On the other hand, for the wild implementation (PASSCoDe-Wild) we see a much more significant speed-up (4×), but the algorithm converges to a solution that violates the optimality conditions (5) and (6). Accordingly, the duality gap does not tend towards zero. Now turning our attention to the GPU-based implementations of TPA-SCD, we observe near-perfect convergence for the algorithm on both GPUs as a function of epochs and significant gains in training time: around 14× for the M4000 and 25× for the Titan X. All speed-ups are measured relative to the sequential singlethreaded implementation.\nIn Fig. 2 we compare the convergence behavior of the same set of algorithms for the dual form of ridge regression using the same dataset. From Fig. 2a we can see that things look very similar to the primal case: all implementations converge in the same manner as the sequential algorithm except PASSCoDEWild. The convergence behavior as a function of time is shown in Fig. 2b. We observe similar speed-ups for the multi-threaded CPU implementations (relative to the sequential algorithm)\nas were observed for the primal case. For the TPA-SCD on the M4000 we achieve a 10× speed-up and on the Titan X we achieve a 35× speed-up relative to the sequential SCD algorithm."
+    }, {
+      "heading" : "IV. DISTRIBUTED STOCHASTIC LEARNING",
+      "text" : "Modern GPUs have a memory capacity of up to 16GB thus severely limiting the size of the datasets on which we are able to learn. If we want to train on very large datasets and still benefit from the large acceleration that has been demonstrated in the previous section, it is essential that we are able to scale out the training across multiple GPUs. In this section we will review distributed SCD-based methods and introduce a technique for optimizing the aggregation of workers’ model updates to accelerate convergence and improve scaling."
+    }, {
+      "heading" : "A. Distributed SCD",
+      "text" : "Algorithm 3 Distributed SCD [7]. Initialize: w(0) = 0. Partition data by feature and distribute on the K workers. On all workers, initialize the model weights corresponding to the local features: β(0,k) = 0 for k = 1 . . . ,K for t = 1, . . . , nepochs do\nBroadcast w(t−1) to the K workers. for k = 1, . . . ,K (in parallel on workers) do\nRun one epoch of SCD on the local set of features to obtain β(t,k) and w(t,k). Compute updates to local model weights and local version of the shared vector: ∆β(t,k) = β(t,k) − β(t−1) ∆w(t,k) = w(t,k) − w(t−1) Update local model weights to ensure consistency with aggregated shared vector: β(t,k) = β(t−1,k) + 1K∆β (t,k)\nSend ∆w(t,k) to the master over the network interface. end for Aggregate updates to shared vector on master: w(t) = w(t−1) + 1K ∑ k ∆w (t,k)\nend for\nTraining algorithms that can be distributed across multiple machines have been the subject of a significant amount of research. Distributed techniques based on stochastic gradient descent have been proposed (see [17] and [18]) as well as methods based on coordinate descent/ascent (see [7], [19], [20], [21] and [22]). These distributed learning algorithms typically involve each machine (or worker) performing a number of optimization steps to approximately minimize the global objective function using the local data that it has available. The training data can either be distributed by sample (rows of the matrix A) or by feature (columns of the matrix A). The model updates from all of the workers are then communicated over the network to a master node. The master then aggregates all of the updates and computes a new set of model parameters.\nThe updated model parameters are then broadcast back to the workers over the network and the process repeats.\nTraining of ridge regression models using stochastic coordinate methods can be distributed across a cluster of machines (or a cluster of GPUs) following the aforementioned approach. One can choose whether to distribute the data matrix A across the workers by features and solve the primal form of the problem or distribute the data by example and solve the problem in its dual form. During each epoch, each worker performs a permuted pass through its set of local coordinates and performs incremental optimization of the objective function (keeping all unselected coordinates fixed, including those that exist on the other workers). The coordinate updates on each worker can be computed using any of the techniques discussed in the previous section. After all workers have finished passing through their coordinates, an aggregation step is performed whereby the updates to the shared vector on each worker are sent over the network to a master node where they are aggregated. An updated value for the shared vector is then computed on the master and broadcast back to the workers and the next epoch can begin.\nThe algorithm that has been implemented in described in detail in Algorithm 3 for the primal formulation of ridge regression where data is distributed by features. It should be appreciated that the same procedure can be applied to dual formulation without significant modification. The procedure that is described can be thought of as a special case of the more general CoCoA framework [7] applied specifically to the ridge regression problem (with the CoCoA hyper-parameter σ set to 1). The distributed aspects of the algorithm were implemented in C++ using MPI. In particular, the implementation leverages the Broadcast and Reduce functions that are offered by the Open MPI library.\nIn Fig. 3 we plot the convergence in duality gap as a function of epochs for an increasing number of workers for\nboth the primal form (where the data is distributed by features) and the dual form (where the data is distributed by examples). The experiment was run using a cluster of 4 Intel Xeon-based machines connected via a 10Gbit ethernet link with up to two workers per machine. Each worker uses the single-threaded, sequential Algorithm 1 as its local solver. One can see that in both cases, the distributed algorithm converges to the optimum but there appears to be an approximately linear slow-down in convergence speed as a function of epochs. This is an inevitable effect that arises due to the workers using an outof-date shared vector during each epoch. This effect can be somewhat alleviated if one was able to communicate shared vector updates more frequently and thus perform fewer coordinate updates on the workers between communication stages. It has been shown in [23] that there exists an infrastructuredependent trade-off between computation and communication for distributed learning algorithms. By carefully tuning the ratio of communication to computation, it may be possible to improve the convergence behavior of the distributed algorithm further but we consider such optimizations beyond the scope of this paper."
+    }, {
+      "heading" : "B. Adaptive Aggregation",
+      "text" : "The convergence behavior of the distributed SCD algorithm can be improved by optimizing the aggregation step. Existing work has considered both averaging and adding of updates [24], introducing an aggregation parameter that can be set freely [25] and even performing a line search method to explicitly optimize the aggregation parameter [21]. We propose a new method to optimize aggregation for distributed ridge regression whereby an optimal value of an aggregation parameter is precisely computed in a distributed manner.\nLet us denote the aggregated model weights and shared vector at the end of epoch t as follows:\nβ(t+1) = β(t) + γt K∑ k=1 ∆β(t,k) = β(t) + γt∆β (t),\nw(t+1) = w(t) + γt K∑ k=1 ∆w(t,k) = w(t) + γt∆w (t),\nwhere γt is the aggregation parameter in the t-th epoch. For the primal formulation of ridge regression, we can then optimize the objective function to explicitly find the best aggregation parameter at every epoch:\nγ (∗) t = arg min γ P ( β(t) + γ∆β(t), w(t) + γ∆w(t) ) .\nThe above equation has the following explicit solution:\nγ (∗) t = −\n(〈 w(t),∆w(t) 〉 +Nλ 〈 β(t),∆β(t) 〉) ||∆w(t)||2 +Nλ||∆β(t)||2 . (7)\nWhile the aggregated changes to the shared vector ∆w(t) are already available on the master node, the aggregated changes to the model weights ∆β(t) are not. However, since all workers only update the coordinates corresponding to their local data,\nAlgorithm 4 Distributed SCD with Adaptive Aggregation. Initialize: w(0) = 0, γ0 = 1. Partition data by feature and distribute on the K workers. On all workers, initialize the model weights: β(0,k) = 0. Broadcast w(0) to all K workers. for t = 1, . . . , nepochs do\nfor k = 1, . . . ,K (in parallel on workers) do Run one epoch of randomized coordinate descent on the local set of features to obtain β(t,k) and w(t,k). Compute changes to local model and shared vector: ∆β(t,k) = β(t,k) − β(t−1) ∆w(t,k) = w(t,k) − w(t−1) Compute ||∆β(t,k)||2 and 〈 β(t,k),∆β(t,k) 〉 . end for Aggregate updates on master: ∆w(t) = ∑ k ∆w\n(t,k)〈 β(t),∆β(t) 〉 = ∑K k=1 〈 β(t,k),∆β(t,k) 〉 ||∆β(t)||2 = ∑K k=1 ||∆β(t,k)||2 Compute optimal aggregation γt parameter using (7). Apply aggregated updates to the shared vector: w(t) = w(t−1) + γt∆w (t) Broadcast w(t) and γt to all K workers. for k = 1, . . . ,K (in parallel on workers) do\nUpdate local model weights for consistency: β(t,k) = β(t−1,k) + γt∆β (t,k)\nend for end for\nthe following property allows us to compute 〈 β(t),∆β(t) 〉 and ||∆β(t)||2 in a distributed manner:〈 β(t),∆β(t) 〉 =\nK∑ k=1 〈 β(t,k),∆β(t,k) 〉 ,\n||∆β(t)||2 = K∑ k=1 ||∆β(t,k)||2.\nThe distributed algorithm is defined precisely in Algorithm 4 for the primal form of ridge regression. The additional communication that is introduced in order to achieve the optimized aggregation amounts to the transfer of a few scalars over the network interface per epoch. The equivalent algorithm for the dual form follows easily from the following expression for the optimal aggregation parameter in the dual setting:\nγ̄ (∗) t =\n〈 ∆α(t), y 〉 −N 〈 ∆α(t), α(t) 〉 − 1λ 〈 ∆w̄(t), w̄(t) 〉 1 λ ||∆w̄(t)||2 +N ||α(t)||2 .\nIn Fig. 4 we plot the convergence behavior of distributed SCD using adaptive aggregation on the ridge regression problem and compare it with the algorithm that uses averaging for aggregating the updates to the shared vector. We observe that for the algorithm that solves the primal formulation there is a speed-up in convergence that approaches 2× for small values of duality gap. For the algorithm that solves the dual, the effect is less pronounced: for relatively large values of the\nduality gap the algorithm with adaptive aggregation can be slower (since we explicitly minimize the dual objective, the duality gap is not necessarily minimized) but for small values of the duality gap we observe an speed-up of around 1.2×.\nIn Fig. 5 we show the evolution of the optimal value of the aggregation parameter as a function of epochs. We can observe a trend: it tends to start off relatively low before increasing and finally converging to some value. It is interesting to note that the value to which it converges to is significantly larger than the value that corresponds to averaging (i.e., γ = 1/K).\nIn Fig. 6 we plot the time to reach a desired duality gap as a function of the number of workers for the webspam dataset. In Fig. 6a we show the scaling behavior for the distributed solver for the primal form of ridge regression and\nin Fig. 6b we show the same but for the dual formulation. In both cases we can compare the scaling behavior, for different levels of desired accuracy, with and without the adaptive aggregation technique. In both cases we observe that the adaptive aggregation technique allows us to scale out across multiple worker nodes while keeping the training time roughly constant. For the dual problem on the webspam dataset, we see that for relatively high values of the duality gap, the adaptive aggregation can slow down convergence somewhat. This is consistent with Fig. 4b where we observed a crossover point at around duality gap 5× 10−4.\nThis scaling behavior is very consistent with that reported for CoCoA+ in [24]. The acceleration that comes from each worker processing a factor of K less data per iteration is just enough to compensate for the linear slow-down in convergence that occurs due to each worker using an outdated model (see Fig. 3). The scaling behavior strongly depends on the nature of the underlying dataset. In particular, the slow-down in convergence is determined by the level of correlation between coordinates on the different workers. If there exists some additional structure (for instance, a large number of one-hot encoded categorical variables) then one can partition the coordinates in an intelligent way to achieve a faster convergence and thus better scaling [22]."
+    }, {
+      "heading" : "V. SCALING OUT ACROSS MULTIPLE GPUS",
+      "text" : "In this section we will combine the methods of Sections III and IV to construct an accelerated implementation of TPASCD that can scale across multiple GPUs connected over a network and train on datasets much larger than the memory capacity of single GPU device."
+    }, {
+      "heading" : "A. Distributed TPA-SCD",
+      "text" : "The general approach is illustrated in Fig. 7. The training is distributed across K workers using the algorithms described\nin the previous section. Each worker consists of a CPU-based machine with at least one GPU attached over a PCIe interface. During each epoch, every worker runs the TPA-SCD algorithm on the streaming multiprocessors of its GPU and computes updates to its local model weights as well the shared vector. Each worker is then responsible for copying the shared vector updates from the GPU device memory into its host memory and then communicating the updates to the master over the network interface. The master then aggregates the updates and broadcasts the new shared vector back to the workers. The worker must then copy the new shared vector from its host memory back into the GPU device memory. Thus, we have opted to use synchronous communication between the workers at the network level and asynchronous communication between the “sub-workers” at the GPU level (i.e., the thread blocks that are processing different coordinates). Note that the dataset on which we are training is transferred into the GPU memory once at the beginning of operation and does not move. Thus the penalties associated with transferring large amount of data over the network are for the most part avoided. Communication of vectors on and off the GPU during each epoch was implemented using the pinned memory functionality offered by CUDA to achieve maximum throughput over the PCIe interface between the workers’ host memory and device memory.\nIn Fig. 8 we show the scaling behavior of distributed TPA-SCD (with averaging) for the webspam dataset using two different GPU clusters. The dual formulation of ridge regression is being solved and the data is thus distributed across the GPU memory by training examples. In Fig. 8a we have used a cluster of eight NVIDIA Quadro M4000 GPUs that are connected via a 10Gbit ethernet network link. We observe a 10× speed-up over the equivalent distributed implementation that uses sequential SCD. In Fig. 8b we show\nresults using a cluster of 4 GeForce GTX Titan X GPUs that are attached to a single machine and communicate over the PCIe interface. These GPUs are significantly faster than the M4000s and we observe around a 30× speed-up and similar scaling behavior. Note that in these results we have not applied the adaptive aggregation technique and thus all speed-ups reported are solely due to execution of the local solver on the GPU hardware.\nIn Fig. 9 we examine the scaling behavior on the M4000 cluster in more detail. The execution time is broken down into the time spent computing (both on the GPU and on the host), the time spent transferring data on/off the GPU over PCIe and the time spent communicating over the 10Gbit ethernet network. While we observe that the time spent computing on\nthe GPU dominates the execution time in all cases, we notice that the communication overheads increase as the number of workers grows. However, with 8 workers the communication time is still only around 17% of the total execution time, suggesting that it should be possible to scale out across more workers before the communication overheads become prohibitive. Naturally, these results indicate that the use of a 100Gbit ethernet network interface would improve the scaling behavior further. We would like to stress that the scaling behavior that has been demonstrated does not imply that training can be accelerated if the size of the dataset remains fixed. However, as we will now demonstrate, this scaling property allows one to leverage GPU acceleration when training massive datasets that do not fit inside the memory of a single GPU."
+    }, {
+      "heading" : "B. Large-scale data",
+      "text" : "While the speed-ups we observe for the webspam dataset are consistent with the results reported in Fig. 2b using a single GPU, we now have the ability to train using much larger datasets that do not fit inside the memory of a single GPU. For our next experiment we sampled one day’s worth of data from the criteo dataset [5]. This sample consists of approximately 200 million training examples and 75 million unique features and occupies around 40GB of GPU memory using a compressed sparse row format2.\nWe partition the dataset by training example and thus randomly distribute the rows of the training data matrix across the 4 workers of the Titan X GPU cluster. We then ran distributed TPA-SCD with adaptive aggregation and compared the convergence behavior (as a function of time) with that of two reference distributed implementations. The first reference implementation is distributed SCD (Algorithm 3) using 4 workers. Each worker uses single-threaded, sequential SCD as its local solver. The second reference is the same except all workers use PASSCoDe-Wild (with 16 threads) as their local solver. We have decided not to compare with the distributed implementation consisting of 64 single-threaded workers (i.e., 16 workers on each of the 4 CPUs) since it has been established in Section IV that using more workers does not lead to faster convergence.\nThe convergence in duality gap for these three schemes is presented in Fig. 10. We see around a 40× speed-up relative to the single-threaded SCD and around a 20× speed-up relative to PASSCoDe-Wild. Note that since the optimality conditions are violated by the multi-threaded CPU implementation, the duality gap does not converge to zero. However, the solution that it has found may still be useful depending on the application."
+    }, {
+      "heading" : "VI. CONCLUSION",
+      "text" : "In this work we have presented a new implementation of stochastic coordinate descent (TPA-SCD) that has been\n2For this sample the values in the training data matrix are always 1 and so one could halve the memory usage by re-writing the code to explicitly assume this. Even so, the dataset would not fit in the memory of a single GPU\ncarefully designed to efficiently make use of the compute architecture provided by modern GPUs. We have demonstrated that GPUs can be used to train a ridge regression model to a desired degree of accuracy 35× faster than a singlethreaded CPU implementation and 10× faster than a multithreaded CPU implementation. In order to scale up to very large datasets that consist of hundreds of millions of training examples and features we have demonstrated that it is possible to scale out our stochastic learning system across 8 GPUs without any significant loss of training speed or accuracy. Furthermore, we have presented a novel distributed method for exact optimization of the aggregation step for distributed ridge regression. By scaling out across 4 Titan X GPUs and using the adaptive aggregation method we were able to train on a 40GB dataset and demonstrate a 20× speed-up relative to a multi-threaded distributed implementation across 4 CPUbased workers."
+    }, {
+      "heading" : "ACKNOWLEDGMENT",
+      "text" : "The authors would like to thank Evangelos Eleftheriou, IBM Research - Zurich for his support of this work and Martin Jaggi, EPFL for useful discussions regarding distributed learning algorithms."
+    } ],
+    "references" : [ {
+      "title" : "Imagenet classification with deep convolutional neural networks",
+      "author" : [ "A. Krizhevsky", "I. Sutskever", "G.E. Hinton" ],
+      "venue" : "Advances in neural information processing systems, 2012, pp. 1097–1105.",
+      "citeRegEx" : "1",
+      "shortCiteRegEx" : null,
+      "year" : 2012
+    }, {
+      "title" : "The elements of statistical learning. Springer series in statistics Springer, Berlin",
+      "author" : [ "J. Friedman", "T. Hastie", "R. Tibshirani" ],
+      "venue" : null,
+      "citeRegEx" : "2",
+      "shortCiteRegEx" : "2",
+      "year" : 2001
+    }, {
+      "title" : "Online learning and stochastic approximations",
+      "author" : [ "L. Bottou" ],
+      "venue" : "On-line learning in neural networks, vol. 17, no. 9, p. 142, 1998.",
+      "citeRegEx" : "3",
+      "shortCiteRegEx" : null,
+      "year" : 1998
+    }, {
+      "title" : "Regularization paths for generalized linear models via coordinate descent",
+      "author" : [ "J. Friedman", "T. Hastie", "R. Tibshirani" ],
+      "venue" : "Journal of statistical software, vol. 33, no. 1, p. 1, 2010.",
+      "citeRegEx" : "4",
+      "shortCiteRegEx" : null,
+      "year" : 2010
+    }, {
+      "title" : "Scaling distributed machine learning with the parameter server",
+      "author" : [ "M. Li", "D.G. Andersen", "J.W. Park", "A.J. Smola", "A. Ahmed", "V. Josifovski", "J. Long", "E.J. Shekita", "B.-Y. Su" ],
+      "venue" : "11th USENIX Symposium on Operating Systems Design and Implementation (OSDI 14), 2014, pp. 583–598.",
+      "citeRegEx" : "6",
+      "shortCiteRegEx" : null,
+      "year" : 2014
+    }, {
+      "title" : "Communication-efficient distributed dual coordinate ascent",
+      "author" : [ "M. Jaggi", "V. Smith", "M. Takác", "J. Terhorst", "S. Krishnan", "T. Hofmann", "M.I. Jordan" ],
+      "venue" : "Advances in Neural Information Processing Systems, 2014, pp. 3068–3076.",
+      "citeRegEx" : "7",
+      "shortCiteRegEx" : null,
+      "year" : 2014
+    }, {
+      "title" : "Scaling up machine learning: Parallel and distributed approaches",
+      "author" : [ "R. Bekkerman", "M. Bilenko", "J. Langford" ],
+      "venue" : null,
+      "citeRegEx" : "8",
+      "shortCiteRegEx" : "8",
+      "year" : 2011
+    }, {
+      "title" : "Stochastic dual coordinate ascent methods for regularized loss minimization",
+      "author" : [ "S. Shalev-Shwartz", "T. Zhang" ],
+      "venue" : "Journal of Machine Learning Research, vol. 14, no. Feb, pp. 567–599, 2013.",
+      "citeRegEx" : "9",
+      "shortCiteRegEx" : null,
+      "year" : 2013
+    }, {
+      "title" : "Stochastic gradient descent on GPUs",
+      "author" : [ "R. Kaleem", "S. Pai", "K. Pingali" ],
+      "venue" : "Proceedings of the 8th Workshop on General Purpose Processing using GPUs. ACM, 2015, pp. 81–89.",
+      "citeRegEx" : "11",
+      "shortCiteRegEx" : null,
+      "year" : 2015
+    }, {
+      "title" : "Hogwild: A lock-free approach to parallelizing stochastic gradient descent",
+      "author" : [ "B. Recht", "C. Re", "S. Wright", "F. Niu" ],
+      "venue" : "Advances in Neural Information Processing Systems, 2011, pp. 693–701.",
+      "citeRegEx" : "12",
+      "shortCiteRegEx" : null,
+      "year" : 2011
+    }, {
+      "title" : "Scaling up stochastic dual coordinate ascent",
+      "author" : [ "K. Tran", "S. Hosseini", "L. Xiao", "T. Finley", "M. Bilenko" ],
+      "venue" : "Proceedings of the 21th ACM SIGKDD International Conference on Knowledge Discovery and Data Mining. ACM, 2015, pp. 1185–1194.",
+      "citeRegEx" : "13",
+      "shortCiteRegEx" : null,
+      "year" : 2015
+    }, {
+      "title" : "PASSCoDe: Parallel ASynchronous Stochastic dual Co-ordinate Descent.",
+      "author" : [ "C.-J. Hsieh", "H.-F. Yu", "I.S. Dhillon" ],
+      "venue" : "in ICML,",
+      "citeRegEx" : "14",
+      "shortCiteRegEx" : "14",
+      "year" : 2015
+    }, {
+      "title" : "An asynchronous parallel stochastic coordinate descent algorithm",
+      "author" : [ "J. Liu", "S.J. Wright", "C. Ré", "V. Bittorf", "S. Sridhar" ],
+      "venue" : "Journal of Machine Learning Research, vol. 16, no. 285-322, pp. 1–5, 2015.",
+      "citeRegEx" : "15",
+      "shortCiteRegEx" : null,
+      "year" : 2015
+    }, {
+      "title" : "Evolutionary study of web spam: Webb spam corpus 2011 versus webb spam corpus 2006",
+      "author" : [ "D. Wang", "D. Irani", "C. Pu" ],
+      "venue" : "Collaborative Computing: Networking, Applications and Worksharing (Collaborate- Com), 2012 8th International Conference on. IEEE, 2012, pp. 40–49.",
+      "citeRegEx" : "16",
+      "shortCiteRegEx" : null,
+      "year" : 2012
+    }, {
+      "title" : "Large Scale Distributed Deep Networks",
+      "author" : [ "J. Dean", "G.S. Corrado", "R. Monga", "K. Chen", "M. Devin", "Q.V. Le", "M.Z. Mao", "M. Ranzato", "A. Senior", "P. Tucker", "K. Yang", "A.Y. Ng" ],
+      "venue" : "NIPS, 2012.",
+      "citeRegEx" : "17",
+      "shortCiteRegEx" : null,
+      "year" : 2012
+    }, {
+      "title" : "Revisiting distributed synchronous SGD",
+      "author" : [ "J. Chen", "R. Monga", "S. Bengio", "R. Jozefowicz" ],
+      "venue" : "arXiv preprint arXiv:1604.00981, 2016.",
+      "citeRegEx" : "18",
+      "shortCiteRegEx" : null,
+      "year" : 2016
+    }, {
+      "title" : "Distributed mini-batch SDCA",
+      "author" : [ "M. Takáč", "P. Richtárik", "N. Srebro" ],
+      "venue" : "arXiv preprint arXiv:1507.08322, 2015.",
+      "citeRegEx" : "19",
+      "shortCiteRegEx" : null,
+      "year" : 2015
+    }, {
+      "title" : "A distributed block coordinate descent method for training L1 regularized linear classifiers",
+      "author" : [ "D. Mahajan", "S.S. Keerthi", "S. Sundararajan" ],
+      "venue" : "arXiv preprint arXiv:1405.4544, 2014.",
+      "citeRegEx" : "20",
+      "shortCiteRegEx" : null,
+      "year" : 2014
+    }, {
+      "title" : "Distributed Coordinate Descent for L1regularized Logistic Regression",
+      "author" : [ "I. Trofimov", "A. Genkin" ],
+      "venue" : "International Conference on Analysis of Images, Social Networks and Texts. Springer, 2015, pp. 243–254.",
+      "citeRegEx" : "21",
+      "shortCiteRegEx" : null,
+      "year" : 2015
+    }, {
+      "title" : "Robust Large-Scale Machine Learning in the Cloud",
+      "author" : [ "S. Rendle", "D. Fetterly", "E.J. Shekita", "B.-y. Su" ],
+      "venue" : "Proceedings of the 22nd ACM SIGKDD International Conference on Knowledge Discovery and Data Mining. ACM, 2016, pp. 1125–1134.",
+      "citeRegEx" : "22",
+      "shortCiteRegEx" : null,
+      "year" : 2016
+    }, {
+      "title" : "High- Performance Distributed Machine Learning using Apache SPARK",
+      "author" : [ "C. Dünner", "T. Parnell", "K. Atasu", "M. Sifalakis", "H. Pozidis" ],
+      "venue" : "arXiv preprint arXiv:1612.01437, 2016.",
+      "citeRegEx" : "23",
+      "shortCiteRegEx" : null,
+      "year" : 2016
+    }, {
+      "title" : "Adding vs. Averaging in Distributed Primal-Dual Optimization",
+      "author" : [ "C. Ma", "V. Smith", "M. Jaggi", "M.I. Jordan", "P. Richtárik", "M. Takáč" ],
+      "venue" : "Proceedings of the 32nd International Conference on Machine Learning, Lille, France, 2015, ser. JMLR Workshop and Conference Proceedings, F. Bach and D. Blei, Eds., vol. 37. S.l.: JMLR, 2015, pp. 1973–1982.",
+      "citeRegEx" : "24",
+      "shortCiteRegEx" : null,
+      "year" : 2015
+    }, {
+      "title" : "L1-regularized distributed optimization: A communication-efficient primal-dual framework",
+      "author" : [ "V. Smith", "S. Forte", "M.I. Jordan", "M. Jaggi" ],
+      "venue" : "arXiv preprint arXiv:1512.04011, 2015.",
+      "citeRegEx" : "25",
+      "shortCiteRegEx" : null,
+      "year" : 2015
+    } ],
+    "referenceMentions" : [ {
+      "referenceID" : 0,
+      "context" : "Most recently, they have become widely adopted to tackle the problem of training deep neural networks [1].",
+      "startOffset" : 102,
+      "endOffset" : 105
+    }, {
+      "referenceID" : 2,
+      "context" : "It is well known that faster convergence can be achieved over batch methods by using stochastic learning algorithms such as stochastic gradient descent (SGD) [3] or stochastic coordinate descent (SCD) [4].",
+      "startOffset" : 158,
+      "endOffset" : 161
+    }, {
+      "referenceID" : 3,
+      "context" : "It is well known that faster convergence can be achieved over batch methods by using stochastic learning algorithms such as stochastic gradient descent (SGD) [3] or stochastic coordinate descent (SCD) [4].",
+      "startOffset" : 201,
+      "endOffset" : 204
+    }, {
+      "referenceID" : 4,
+      "context" : "In [6] a method was proposed whereby worker nodes perform stochastic updates of a local model and asynchronously communicate their model updates to a parameter server.",
+      "startOffset" : 3,
+      "endOffset" : 6
+    }, {
+      "referenceID" : 5,
+      "context" : "Alternatively, one may consider synchronous techniques such as [7] in which worker nodes perform stochastic updates using the data that is locally available to them and after a number of steps, all updates are aggregated on a master node and the resulting model (or some representation thereof) is then broadcast back to the workers for the next round.",
+      "startOffset" : 63,
+      "endOffset" : 66
+    }, {
+      "referenceID" : 6,
+      "context" : "Unless the data has been partitioned in a way to exploit underlying structure, distributed algorithms tend to converge slower (in terms of number of model updates) compared to their non-distributed counterparts due to the delay incurred in sharing model updates between workers [8].",
+      "startOffset" : 278,
+      "endOffset" : 281
+    }, {
+      "referenceID" : 3,
+      "context" : "By following the approach of [4] and optimizing with respect to the mth coordinate while keeping the model weights for all other coordinates fixed, one obtains the following update rule:",
+      "startOffset" : 29,
+      "endOffset" : 32
+    }, {
+      "referenceID" : 7,
+      "context" : "It was shown in [9] that one can optimize the dual objective function for a selected coordinate n while keeping the model weights for all other coordinates fixed, leading to the following update rule:",
+      "startOffset" : 16,
+      "endOffset" : 19
+    }, {
+      "referenceID" : 3,
+      "context" : "Algorithm 1 Sequential SCD [4].",
+      "startOffset" : 27,
+      "endOffset" : 30
+    }, {
+      "referenceID" : 3,
+      "context" : "In Algorithm 1 we review the algorithm proposed in [4] for sequential SCD.",
+      "startOffset" : 51,
+      "endOffset" : 54
+    }, {
+      "referenceID" : 8,
+      "context" : "However, recent work into asynchronous techniques has shown that it is possible to accelerate stochastic learning algorithms by running multiple threads (each updating using a single coordinate or example) that read the current value of the model parameters (and any associated vectors) from shared memory and write back their updates without using complex locking schemes such as those proposed in [11].",
+      "startOffset" : 399,
+      "endOffset" : 403
+    }, {
+      "referenceID" : 9,
+      "context" : "In [12] an asynchronous implementation of stochastic gradient descent was proposed (“Hogwild!”) that comprises many parallel threads each computing the gradient using a random training example and updating the model weights using atomic operations.",
+      "startOffset" : 3,
+      "endOffset" : 7
+    }, {
+      "referenceID" : 10,
+      "context" : "In [13], an asynchronous version of Algorithm 1 was proposed (A-SCD) whereby the inner loop over the shuffled coordinates is parallelized across multiple CPU threads.",
+      "startOffset" : 3,
+      "endOffset" : 7
+    }, {
+      "referenceID" : 11,
+      "context" : "In [14] it was reported that one can achieve faster convergence if instead of using atomic addition, one allows a “wild” behavior where updates to the shared vector can be overwritten or not applied at all.",
+      "startOffset" : 3,
+      "endOffset" : 7
+    }, {
+      "referenceID" : 12,
+      "context" : "Finally, in [15], an asynchronous coordinate descent algorithm was proposed (AsySCD) and close-to-linear scaling was demonstrated using a 40-core CPU.",
+      "startOffset" : 12,
+      "endOffset" : 16
+    }, {
+      "referenceID" : 11,
+      "context" : "Both of these differences were already noted in [14], in which the authors were able to reproduce the linear scaling behavior of AsySCD but demonstrated that it is slower than even a single threaded implementation of Algorithm 1.",
+      "startOffset" : 48,
+      "endOffset" : 52
+    }, {
+      "referenceID" : 10,
+      "context" : "For comparison with our GPU-based implementation we have implemented the algorithm proposed in [13] that uses atomic addition (A-SCD) and the “wild” implementation proposed in [14] (PASSCoDE-Wild).",
+      "startOffset" : 95,
+      "endOffset" : 99
+    }, {
+      "referenceID" : 11,
+      "context" : "For comparison with our GPU-based implementation we have implemented the algorithm proposed in [13] that uses atomic addition (A-SCD) and the “wild” implementation proposed in [14] (PASSCoDE-Wild).",
+      "startOffset" : 176,
+      "endOffset" : 180
+    }, {
+      "referenceID" : 13,
+      "context" : "The dataset that was used was a training sample of the webspam dataset [16] that consists of 262, 938 examples and 680, 715 non-zero features.",
+      "startOffset" : 71,
+      "endOffset" : 75
+    }, {
+      "referenceID" : 5,
+      "context" : "Algorithm 3 Distributed SCD [7].",
+      "startOffset" : 28,
+      "endOffset" : 31
+    }, {
+      "referenceID" : 14,
+      "context" : "Distributed techniques based on stochastic gradient descent have been proposed (see [17] and [18]) as well as methods based on coordinate descent/ascent (see [7], [19], [20], [21] and [22]).",
+      "startOffset" : 84,
+      "endOffset" : 88
+    }, {
+      "referenceID" : 15,
+      "context" : "Distributed techniques based on stochastic gradient descent have been proposed (see [17] and [18]) as well as methods based on coordinate descent/ascent (see [7], [19], [20], [21] and [22]).",
+      "startOffset" : 93,
+      "endOffset" : 97
+    }, {
+      "referenceID" : 5,
+      "context" : "Distributed techniques based on stochastic gradient descent have been proposed (see [17] and [18]) as well as methods based on coordinate descent/ascent (see [7], [19], [20], [21] and [22]).",
+      "startOffset" : 158,
+      "endOffset" : 161
+    }, {
+      "referenceID" : 16,
+      "context" : "Distributed techniques based on stochastic gradient descent have been proposed (see [17] and [18]) as well as methods based on coordinate descent/ascent (see [7], [19], [20], [21] and [22]).",
+      "startOffset" : 163,
+      "endOffset" : 167
+    }, {
+      "referenceID" : 17,
+      "context" : "Distributed techniques based on stochastic gradient descent have been proposed (see [17] and [18]) as well as methods based on coordinate descent/ascent (see [7], [19], [20], [21] and [22]).",
+      "startOffset" : 169,
+      "endOffset" : 173
+    }, {
+      "referenceID" : 18,
+      "context" : "Distributed techniques based on stochastic gradient descent have been proposed (see [17] and [18]) as well as methods based on coordinate descent/ascent (see [7], [19], [20], [21] and [22]).",
+      "startOffset" : 175,
+      "endOffset" : 179
+    }, {
+      "referenceID" : 19,
+      "context" : "Distributed techniques based on stochastic gradient descent have been proposed (see [17] and [18]) as well as methods based on coordinate descent/ascent (see [7], [19], [20], [21] and [22]).",
+      "startOffset" : 184,
+      "endOffset" : 188
+    }, {
+      "referenceID" : 5,
+      "context" : "The procedure that is described can be thought of as a special case of the more general CoCoA framework [7] applied specifically to the ridge regression problem (with the CoCoA hyper-parameter σ set to 1).",
+      "startOffset" : 104,
+      "endOffset" : 107
+    }, {
+      "referenceID" : 20,
+      "context" : "It has been shown in [23] that there exists an infrastructuredependent trade-off between computation and communication for distributed learning algorithms.",
+      "startOffset" : 21,
+      "endOffset" : 25
+    }, {
+      "referenceID" : 21,
+      "context" : "Existing work has considered both averaging and adding of updates [24], introducing an aggregation parameter that can be set freely [25] and even performing a line search method to explicitly optimize the aggregation parameter [21].",
+      "startOffset" : 66,
+      "endOffset" : 70
+    }, {
+      "referenceID" : 22,
+      "context" : "Existing work has considered both averaging and adding of updates [24], introducing an aggregation parameter that can be set freely [25] and even performing a line search method to explicitly optimize the aggregation parameter [21].",
+      "startOffset" : 132,
+      "endOffset" : 136
+    }, {
+      "referenceID" : 18,
+      "context" : "Existing work has considered both averaging and adding of updates [24], introducing an aggregation parameter that can be set freely [25] and even performing a line search method to explicitly optimize the aggregation parameter [21].",
+      "startOffset" : 227,
+      "endOffset" : 231
+    }, {
+      "referenceID" : 21,
+      "context" : "This scaling behavior is very consistent with that reported for CoCoA+ in [24].",
+      "startOffset" : 74,
+      "endOffset" : 78
+    }, {
+      "referenceID" : 19,
+      "context" : "If there exists some additional structure (for instance, a large number of one-hot encoded categorical variables) then one can partition the coordinates in an intelligent way to achieve a faster convergence and thus better scaling [22].",
+      "startOffset" : 231,
+      "endOffset" : 235
+    } ],
+    "year" : 2017,
+    "abstractText" : "In this work we propose an accelerated stochastic learning system for very large-scale applications. Acceleration is achieved by mapping the training algorithm onto massively parallel processors: we demonstrate a parallel, asynchronous GPU implementation of the widely used stochastic coordinate descent/ascent algorithm that can provide up to 35× speedup over a sequential CPU implementation. In order to train on very large datasets that do not fit inside the memory of a single GPU, we then consider techniques for distributed stochastic learning. We propose a novel method for optimally aggregating model updates from worker nodes when the training data is distributed either by example or by feature. Using this technique, we demonstrate that one can scale out stochastic learning across up to 8 worker nodes without any significant loss of training time. Finally, we combine GPU acceleration with the optimized distributed method to train on a dataset consisting of 200 million training examples and 75 million features. We show by scaling out across 4 GPUs, one can attain a high degree of training accuracy in around 4 seconds: a 20× speed-up in training time compared to a multi-threaded, distributed implementation across 4 CPUs.",
+    "creator" : "LaTeX with hyperref package"
+  }
+}

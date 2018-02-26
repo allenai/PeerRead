@@ -1,0 +1,492 @@
+{
+  "name" : "1511.05952.pdf",
+  "metadata" : {
+    "source" : "CRF",
+    "title" : "PRIORITIZED EXPERIENCE REPLAY",
+    "authors" : [ "Tom Schaul", "John Quan", "Ioannis Antonoglou" ],
+    "emails" : [ "schaul@google.com", "johnquan@google.com", "ioannisa@google.com", "davidsilver@google.com" ],
+    "sections" : [ {
+      "heading" : "1 INTRODUCTION",
+      "text" : "Online reinforcement learning (RL) agents incrementally update their parameters (of the policy, value function or model) while they observe a stream of experience. In their simplest form, they discard incoming data immediately, after a single update. Two issues with this are (a) strongly correlated updates that break the i.i.d. assumption of many popular stochastic gradient-based algorithms, and (b) the rapid forgetting of possibly rare experiences that would be useful later on.\nExperience replay (Lin, 1992) addresses both of these issues: with experience stored in a replay memory, it becomes possible to break the temporal correlations by mixing more and less recent experience for the updates, and rare experience will be used for more than just a single update. This was demonstrated in the Deep Q-Network (DQN) algorithm (Mnih et al., 2013; 2015), which stabilized the training of a value function, represented by a deep neural network, by using experience replay. Specifically, DQN used a large sliding-window replay memory, sampled from it uniformly at random, and effectively revisited each transition1 eight times. In general, experience replay can reduce the amount of experience required to learn, and replace it with more computation and more memory – which are often cheaper resources than the RL agent’s interactions with its environment.\nIn this paper, we investigate how prioritizing which transitions are replayed can make experience replay more efficient and effective than if all transitions are replayed uniformly. The key idea is that an RL agent can learn more effectively from some transitions than from others. Transitions may be more or less surprising, redundant, or task-relevant. Some transitions may not be immediately useful to the agent, but might become so when the agent competence increases (Schmidhuber, 1991). Experience replay liberates online learning agents from processing transitions in the exact order they are experienced. Prioritized replay further liberates agents from considering transitions with the same frequency that they are experienced.\nIn particular, we propose to more frequently replay transitions with high expected learning progress, as measured by the magnitude of their temporal-difference (TD) error. This prioritization can lead to a loss of diversity, which we alleviate with stochastic prioritization, and introduce bias, which we correct with importance sampling. Our resulting algorithms is robust and scalable, which we demonstrate on the Atari 2600 benchmark suite, where we obtain faster learning and state-of-the-art performance.\n1 A transition is the atomic unit of interaction in RL, in our case a tuple of (state St−1, action At−1, reward Rt, discount γt, next state St). We choose this for simplicity, but most of the arguments in this paper also hold for a coarser ways of chunking experience, e.g. into sequences or episodes.\nar X\niv :1\n51 1.\n05 95\n2v 1\n[ cs\n.L G\n] 1\n8 N\nov 2\n01 5"
+    }, {
+      "heading" : "2 BACKGROUND",
+      "text" : "Numerous neuroscience studies have identified mechanisms of experience replay in the hippocampus of rodents, where sequences of prior experience are replayed, either during awake resting or sleep, and in particular that this happens more for rewarded paths (Atherton et al., 2015; Ólafsdóttir et al., 2015; Foster & Wilson, 2006). Furthermore, there is a likely link between increased replay of an experience, and how much can be learned from it, or its TD-error (Singer & Frank, 2009; McNamara et al., 2014).\nThe best-known use of prioritized updates in RL is prioritized sweeping (Moore & Atkeson, 1993; Andre et al., 1998), a method that makes planning algorithms like value iteration more efficient by prioritizing those updates that are expected to lead to the largest changes in value. The key differences are that our approach is for model-free RL rather than model-based planning in RL, and that our stochastic prioritization is explicitly designed for robustness in the function approximation (FA) case.\nThere is a widespread use of TD-errors for determining where to focus resources, for example when choosing where to explore (White et al., 2014) or which features to select (Geramifard et al., 2011; Sun et al., 2011), as well as for guiding prioritized sweeping (Andre et al., 1998; van Seijen & Sutton, 2013), but so far as we are aware, never for modulating experience replay.\nIn supervised learning, there are numerous techniques to deal with imbalanced datasets when class identities are known, including re-sampling, under-sampling and over-sampling techniques, possibly combined with ensemble methods (Galar et al., 2012). A form of non-uniform sampling based on error, and with importance sampling correction was introduced by Hinton (2007), and led to a reported 3x speed-up on MNIST digit classification.\nThere have been several proposed methods for playing Atari with deep reinforcement learning, including (Mnih et al., 2013; 2015; Guo et al., 2014; Stadie et al., 2015; Nair et al., 2015; Bellemare et al., 2016), and (van Hasselt et al., 2016) which is the current published state-of-the-art. Simultaneously with our work, an architectural innovation that separates advantages from the value function (see the co-submission by Wang et al., 2015) has also led to substantial improvements on the Atari benchmark. We are quite confident that this approach is complementary to our improvement on the replay mechanism, and that their combination could further improve the state-of-the-art."
+    }, {
+      "heading" : "3 PRIORITIZED REPLAY",
+      "text" : "Using a replay memory leads to design choices at two levels: which experience to store and which to forget, and which experience to replay (and how to do so). This paper addresses only the latter: making the most effective use of the replay memory for learning, assuming that its contents are outside of our control (but see also Section 6)."
+    }, {
+      "heading" : "3.1 A MOTIVATING EXAMPLE",
+      "text" : "To show how much potential uniform replay leaves untapped, we propose to look at a simple ‘Blind Cliffwalk’ environment (described in Figure 1, left), which exemplifies the challenge of exploration when rewards, or informative experiences are rare. With only n states, the environment requires an exponential number of random steps until the first non-zero reward; to be precise, the chance that a random sequence of actions will lead to the reward is 2−n. Furthermore, the most relevant transitions (from rare successes) are hidden in a mass of highly redundant failure cases (similar to a bipedal robot falling over repeatedly, before it discovers how to walk).\nThis example allows us to highlight the difference between the learning times of two identical Qlearning agents, with the same replay memory, where one of them replays transitions uniformly at random and the other invokes an oracle that provides the optimal transition to be replayed, i.e., the one that greedily reduces the global loss in its current state (in hindsight, after the parameter update). For the details of the setup, see Appendix B.1. Figure 1 (right) shows that picking the transitions in a good order can lead to exponential speed-ups over the uniform choice. Such an oracle is of course not realistic, yet the large gap motivates our search for a practical approach that improves on uniform random replay."
+    }, {
+      "heading" : "3.2 PRIORITIZING WITH TD-ERROR",
+      "text" : "The central component of prioritized replay is the criterion by which the importance of each transition is measured. One idealised criterion would be the amount the RL agent can expect to learn from that transition in its current state (expected learning progress). While this measure is not directly accessible, a reasonable proxy is the magnitude of a transition’s TD error δ, which indicates how “surprising” or unexpected the transition is: specifically, how far the value is from its nextstep bootstrap estimate (Andre et al., 1998). This is particularly suitable for incremental, online RL algorithms, such as SARSA or Q-learning, that update the parameters in proportion to δ. While appropriate in many circumstances, the TD-error can sometimes be a poor estimate as well, see Appendix A for a discussion of alternatives.\nFor the initial explanation of the idea, consider Q-learning updates on transitions drawn uniformly at random from a replay memory of Blind Cliffwalk experience. To show the effect of prioritizing replay in a pure form, we compare the uniform and oracle baselines from above to a ‘greedy prioritization’ algorithm that stores the last encountered TD-error for each transition, and always replays the transition with the largest absolute TD-error. New transitions arrive without a known TD-error, so we put them at maximal priority in order to guarantee that all experience is seen at least once. Figure 2 (left), shows that this results in a substantial reduction in required updates in the tabular setting.2\nImplementation: To scale to large memory sizes N , we use a binary heap data structure for the priority queue, for which finding the maximum priority transition when sampling is O(1), and updating priorities (with the new TD-error after a learning step) is O(logN). See Appendix B.2.1 for more details."
+    }, {
+      "heading" : "3.3 STOCHASTIC PRIORITIZATION",
+      "text" : "Greedily picking the transition with the largest last-observed error has a number of failure modes. For one, transitions that have a low error on first visit may not be replayed for a long time (which means never, with a sliding-window replay memory). This is due to TD-errors becoming stale quickly, because it is not feasible to keep recomputing them for the entire replay memory. Further, it is sensitive to noise spikes (e.g. when rewards are stochastic), which can be exacerbated by bootstrapping, where approximation errors appear as another source of noise. The main issue, however, is when using greedy prioritized sampling together with function approximation: the replayed transitions are invariably drawn from a small subset of the available experience (because errors shrink only slowly), a lack of diversity that makes the system highly prone to over-fitting.\n2 Note that a random (or optimistic) initialization of the Q-values is necessary with greedy prioritization. If initializing with zero instead, unrewarded transitions would appear to have zero error initially, be placed at the bottom of the queue, and not be revisited until the error on other transitions drops below numerical precision.\nTherefore, we introduce stochastic sampling that interpolates between a pure greedy prioritization and a uniform random sampling in such a way that the probability of being sampled is monotonic in a transition’s priority, while guaranteeing a non-zero probability even for the lowest-priority transition. Concretely, we define the probability of sampling transition i as\nP (i) = pαi∑ k p α k\n(1)\nwhere pi > 0 is the priority of transition i. The exponent α determines how much prioritization is used, with α = 0 corresponding to the uniform case.\nThe first variant we consider is the direct, proportional prioritization where pi = |δi|+ , where is a small positive constant that prevents the edge-case of transitions not ever being revisited once their error is zero. The second variant is an indirect, rank-based prioritization where pi = 1rank(i) , where rank(i) is the rank of transition i when the replay memory is sorted according to |δi|. In this case, P becomes a power-law distribution with exponent α. Both distributions are monotonic in |δ|, but the latter is more robust, as it is not sensitive to outliers. Both variants of stochastic prioritization lead to large speed-ups over the uniform baseline on the Blind Cliffwalk task, as shown on Figure 2 (right).\nImplementation: To efficiently sample from distribution (1), the complexity cannot depend on N . For the rank-based variant, we can approximate the cumulative density function with a piece-wise linear function with k segments of equal probability. The segment boundaries can be precomputed (they change only when N or α change). At runtime, we sample a segment, and then sample uniformly among the transitions within it. This works particularly well in conjunction with a minibatchbased learning algorithm: choose k to be the size of the minibatch, and sample exactly one transition from each segment – this is a form of stratified sampling that has the added advantage of balancing out the minibatch (there will always be exactly one transition with high magnitude δ, one with medium magnitude, etc). The proportional variant is different, but it also admits an implementation that can be efficiently updated and sampled from. This implementation uses a “sum-tree” data structure, where every node is the sum of its children, with the priorities as the leaf nodes. See Appendix B.2.1 for more additional details."
+    }, {
+      "heading" : "3.4 ANNEALING THE BIAS",
+      "text" : "The estimation of the expected value with stochastic updates relies on those updates corresponding to the same distribution as its expectation. Prioritized replay introduces bias because it changes this distribution in an uncontrolled fashion, and therefore changes the solution that the estimates will converge to (even if the policy and state distribution are fixed). We can correct this bias by using\nAlgorithm 1 Double DQN with proportional prioritization 1: Input: minibatch k, step-size η, replay period K and size N , exponents α and β, budget T . 2: Initialize replay memoryH = ∅ 3: for t = 1 to T do 4: Observe St, Rt, γt 5: Store transitionH ← H∪ (St−1, At−1, Rt, γt, St) with maximal priority pt = maxi<t pi 6: if t ≡ 0 mod K then 7: for j = 1 to k do 8: Sample transition j ∼ P (j) = pαj / ∑ i p α i\n9: Compute importance-sampling weight wj = (N · P (j))−β /maxi wi 10: Compute TD-error: δj = Rj + γjQtarget (Sj , arg maxaQ(Sj , a))−Q(Sj−1, Aj−1) 11: Update transition priority pj ← |δj | inH 12: Accumulate weight-change ∆← ∆ + wj · δj · ∇θQ ∣∣ Sj−1,Aj−1 13: end for 14: Update weights θ ← θ + η ·∆, reset ∆ = 0 15: end if 16: Choose action At ∼ πθ(St) 17: end for\nimportance-sampling (IS) weights\nwi =\n( 1\nN · 1 P (i) )β that fully compensates for the non-uniform probabilities P (i) if β = 1. These weights can be folded into the update by using wiδi instead of δi in the Q-learning update (this is thus weighted IS, not ordinary IS, see e.g., Mahmood et al., 2014). For stability reasons, we always normalize weights by 1/maxi wi so that they only scale the update downwards. See also Algorithm 1, where all the components are combined in a Double DQN agent.\nIn typical reinforcement learning scenarios, the unbiased nature of the updates is most important near convergence at the end of training, as the process is highly non-stationary anyway, due to changing policies, state distributions and bootstrap targets; we hypothesize that a small bias can be ignored in this context (see also Figure 11 in the appendix for a case study of full IS correction on Atari). We therefore exploit the flexibility of annealing the amount of importance-sampling correction over time, by defining a schedule on the exponent β that reaches 1 only at the end of learning. In practice, we linearly anneal β from its initial value β0 to 1. Note that the choice of this hyper-parameter interacts with choice of α; increasing both simultaneously makes prioritization more aggressive at the same time as correcting for it more strongly.\nImportance sampling has another benefit when combined with prioritized replay in the context of non-linear FA (like deep neural networks): The gradient magnitudes (and thus the effective steps in parameter space) are proportional to the error, however, because in the non-linear case the 1storder approximation of the gradient is only reliable locally, this means that large steps can be very disruptive, and the global step-size must be small to prevent them. Instead, doing many small updates on high-error transitions also alleviates the issue because the Taylor expansion is re-approximated, allowing the algorithm follow the curvature of highly non-linear optimization landscapes. This is exactly what happens in our approach: the prioritization makes sure the high-error transition is seen many times, and the IS correction weight makes each resulting step a small one."
+    }, {
+      "heading" : "4 ATARI EXPERIMENTS",
+      "text" : "With all these concepts in place, we now investigate to what extent replay with such prioritized sampling can improve performance in realistic problem domains. For this, we chose the collection of Atari benchmarks (Bellemare et al., 2012) with their end-to-end RL from vision setup, because they are popular and contain diverse sets of challenges, including delayed credit assignment, partial observability, and difficult function approximation (Mnih et al., 2015; van Hasselt et al., 2016).\nOur hypothesis is that prioritized replay is generically useful, so that it will make learning with experience replay more efficient without requiring careful problem-specific hyper-parameter tuning.\nWe consider two baseline algorithms that use uniform experience replay, namely the version of the DQN algorithm from the Nature paper (Mnih et al., 2015), and its recent extension Double DQN (van Hasselt et al., 2016) that substantially improved the state-of-the-art by reducing the overestimation bias with Double Q-learning (van Hasselt, 2010). The most relevant component for this work is how the replay memory functions: all experienced transitions are stored in a sliding-window memory that retains the last 106 transitions and automatically drops older ones. The learning algorithm processes minibatches of 32 transitions for each update, which are sampled uniformly from the memory. There is one minibatch update for each 4 new transitions entering the memory, so all experience is replayed 8 times on average. Rewards and TD-errors are clipped to fall within [−1, 1] for stability reasons.\nWe use the identical neural network architecture, learning algorithm, replay memory and evaluation setup as for the baselines. The only difference is the mechanism for sampling transitions from the replay memory, with is now done according to Algorithm 1 instead of uniformly. We compare the baselines to both variants of prioritized replay (rank-based and proportional prioritization).\nOnly a single hyper-parameter adjustment was necessary compared to the baseline: Given that prioritized replay picks high-error transitions more often, the typical gradient magnitudes are larger: we thus had reduced the step-size η by a factor 4 compared to the (Double) DQN setup. For the α and β0 hyper-parameters that are introduced by prioritization, we did a coarse grid search (evaluated on a subset of 8 games), and found the sweet spot to be α = 0.7, β0 = 0.5 for the rank-based variant and α = 0.6, β0 = 0.4 for the proportional variant. These choices are trading off aggressiveness with robustness, by reducing α and/or increasing β and it is always possible to revert to a behavior closer to the baseline.\nWe produce the results by running each variant with a single hyper-parameter setting across all games, as was done for the baselines. Our main evaluation metric is the policy quality in terms of average score per episode, given start states sampled from human traces (as introduced in Nair et al., 2015 and used in van Hasselt et al., 2016), which requires more robustness and generalization (the agent cannot rely on repeating a single memorized trajectory). These results are summarized in Table 6, raw scores and additional evaluation metrics can be found in Tables 8 and 9 in the Appendix.\nWe find that adding prioritized replay to DQN leads to a substantial improvement in final score on 42 out of 57 games (compare columns 3 and 4 of Table 6 or Figure 8 in the appendix), with the median normalized performance score across 57 games increased from 69% to 97%. Furthermore, we find\nthat the boost from prioritized experience replay is complementary to the one from introducing Double Q-learning into DQN: performance increases another notch, leading to the current state-ofthe-art on the Atari benchmark (see Figure 3). Compared to Double DQN, the mean performance increased from 389% to 551%, and the median performance from 110% to 128% bringing additional games such as River Raid, Seaquest and Surround to a human level for the first time, and making large jumps on others (e.g., Atlantis, Gopher, James Bond 007 or Space Invaders). Note that mean performance is not a very reliable metric because a single game (Video Pinball) has a dominant contribution. Adding in prioritized replay gives a performance boost on almost all games, and learning is also faster (see Figures 6 and 7). The learning curves on Figure 6 illustrate that while the two variants of prioritization usually lead to similar results, there are games where one of them remains close to the Double DQN baseline while the other one leads to a big boost, for example Double Dunk or Surround for the rank-based variant, and Alien, Asterix, Enduro, Phoenix or Space Invaders for the proportional variant. Another observation from the learning curves is that compared to the uniform baseline, prioritization is effective at reducing the delay until performance gets off the ground in games that suffer from that, such as Battlezone, Zaxxon or Frostbite – but it fails to solve Montezuma’s Revenge."
+    }, {
+      "heading" : "5 DISCUSSION",
+      "text" : "In the head-to-head comparison between rank-based prioritization and proportional prioritization, we expected the rank-based variant to be much more robust, because it is not affected by outliers or by absolute magnitudes of errors. Furthermore, its heavy-tail property also guarantees that samples will be diverse, and the stratified sampling from partitions of different error magnitudes will keep the total minibatch gradient at a stable magnitude throughout training. On the other hand, the ranks make the algorithm blind to the relative error scales, which could incur a performance drop when there is structure in the distribution of errors to be exploited, such as in sparse reward scenarios. Perhaps surprisingly, both variants perform similarly in practice; we suspect this is due to the heavy use of clipping (of rewards and TD-errors) in the DQN algorithm, which protects it from outliers. We looked at the distribution of TD-errors as a function of time for a number of games (see Figure 9 in the appendix), and found that it becomes close to a heavy-tailed distribution as learning progresses, while still differing substantially across games; this empirically validates the form of Equation 1, as well as its piece-wise linear approximation. Figure 10, in the appendix, shows how this distribution interacts with Equation 1 to produce the effective replay probabilities.\nWhile doing this analysis, we stumbled upon another phenomenon (obvious in retrospect), namely that some fraction of the visited transitions are never replayed before they drop out of the sliding window memory, and many more are first replayed only a long time after they are encountered. Also, uniform sampling is implicitly biased toward out-of-date transitions that were generated by a policy that has typically seen hundreds of thousands of updates since. Prioritized replay with its bonus for unseen transitions directly corrects the first of these issues, and also tends to help with the second one, as more recent transitions tend to have larger error – this is because old transitions will have had more opportunities to have them corrected, and because novel data tends to be less well predicted by the value function.\nWe hypothesize that deep neural networks interact with prioritized replay in another interesting way. When we distinguish learning the value given a representation (i.e., the top layers) from learning an\nimproved representation (i.e., the bottom layers), then transitions for which the representation is good will quickly reduce their error and then be replayed much less, increasing the learning focus on others where the representation is poor, thus putting more resources into distinguishing aliased states – if the observations and network capacity allow for it."
+    }, {
+      "heading" : "6 EXTENSIONS",
+      "text" : "Prioritized Supervised Learning: The analogous approach to prioritized replay in the context of supervised learning is to sample non-uniformly from the dataset, each sample using a priority based on its last-seen error. This can help focus the learning on those samples that can still be learned from, devoting additional resources to the (hard) boundary cases, somewhat similarly to boosting (Galar et al., 2012). Furthermore, if the dataset is imbalanced, we hypothesize that samples from the rare classes will be sampled disproportionately often, because their errors shrink less fast, and the chosen samples from the common classes will be those nearest to the decision boundaries, leading to an effect similar to hard negative mining (Felzenszwalb et al., 2008). To check whether these intuitions hold, we conducted a preliminary experiment on a class-imbalanced variant of the classical MNIST digit classification problem (LeCun et al., 1998), where we removed 99% of the samples for digits 0, 1, 2, 3, 4 in the training set, while leaving the test/validation sets untouched (i.e., those retain class balance). We compare two scenarios: in the informed case, we reweight the errors of the impoverished classes artificially (by a factor 100), in the uninformed scenario, we provide no hint that the test distribution will be a different one. See Appendix B.3 for the details of the convolutional neural network training setup. Prioritized sampling (uninformed, with α = 1, β = 0) outperforms the uninformed uniform baseline, and approaches the performance of the informed uniform baseline in terms of generalization (see Figure 4); prioritized training is also faster in terms of learning speed.\nOff-policy Replay: Two standard approaches to off-policy RL are rejection sampling, and using importance sampling ratios ρ to correct for how likely a transition would have been on-policy. Our approach contains analogues to both these approaches, the replay probability P and the IS-correction w. It appears therefore natural to apply it to off-policy RL, if transitions are available in a replay memory. In particular, we recover weighted IS with w = ρ, α = 0, β = 1 and rejection sampling with p = min(1; ρ), α = 1, β = 0, in the proportional variant. Our results indicate that intermediate variants, possibly with annealing or ranking, could be more useful in practice – especially when IS ratios introduce high variance, i.e., when the policy of interest differs substantially from the behavior policy in some states. Of course, the off-policy correction is complementary to our prioritization based on expected learning progress, and the same framework can be used for a hybrid prioritization by defining p = ρ · |δ|, or some other sensible trade-off based on both ρ and δ. Feedback for Exploration: An interesting side-effect of prioritized replay is that the total number Mi that a transition will end up being replayed varies widely, and this gives a rough indication of how useful it was to the agent. This potentially valuable signal can be fed back to the exploration strategy that generates the transitions. For example, we could sample exploration hyper-parameters\n(such as the fraction of random actions , the Boltzmann temperature, or the amount of of intrinsic reward to mix in) from a parameterized distribution at the beginning of each episode, monitor the usefulness of the experience via Mi, and updatethe distribution toward generating more useful experience. Or, in a parallel system like the Gorila agent (Nair et al., 2015), it could guide resource allocation between a collection of concurrent but heterogeneous “actors”, each with different exploration hyper-parameters.\nPrioritized Memories: Considerations that help determine which transitions to replay are likely to be relevant for determining which memories to store and when to erase them (i.e., when it becomes unlikely that we would ever want to replay them anymore). An explicit control over which memories to keep or erase can help reduce the required total memory size, because it reduces redundancy (frequently visited transitions will have low error, so many of them will be dropped), while automatically adjusting for what has been learned already (dropping many of the ‘easy’ transitions) and biasing the contents of the memory to where the errors remain high. This is a non-trivial aspect, because memory requirements for DQN are currently dominated by the size of the replay memory, no longer by the size of the neural network. Erasing is a more final decision than reducing the replay probability, thus an even stronger emphasis of diversity may be necessary, for example by tracking the age of each transitions and using it to modulate the priority in such a way as to preserve sufficient old experience to prevent cycles (related to ‘hall of fame’ ideas in multi-agent literature, Rosin & Belew, 1997) or collapsing value functions. The priority mechanism is also flexible enough to permit integrating experience from other sources, such as from a planner or from human expert trajectories (Guo et al., 2014), since knowing the source can be used to modulate each transition’s priority, for example in such a way as to preserve a sufficient fraction of external experience in memory."
+    }, {
+      "heading" : "7 CONCLUSION",
+      "text" : "This paper introduced prioritized replay, a method that can make learning from experience replay more efficient. We studied a couple of variants, devised implementations that scale to large replay memories, and found that prioritized replay speeds up learning and leads to a new state-of-the-art on the Atari benchmark. We laid out further variants and extensions that hold promise, namely for class-imbalanced supervised learning."
+    }, {
+      "heading" : "ACKNOWLEDGMENTS",
+      "text" : "We thank our Deepmind colleagues, in particular Hado van Hasselt, Joseph Modayil, Nicolas Heess, Marc Bellemare, Razvan Pascanu, Dharshan Kumaran, Daan Wierstra, Arthur Guez, Charles Blundell, Alex Pritzel, Alex Graves, Balaji Lakshminarayanan, Ziyu Wang, Nando de Freitas, Remi Munos and Geoff Hinton for insightful discussions and feedback."
+    }, {
+      "heading" : "A PRIORITIZATION VARIANTS",
+      "text" : "The absolute TD-error is only one possible proxy for the ideal priority measure of expected learning progress. While it captures the scale of potential improvement, it ignores inherent stochasticity in rewards or transitions, as well as possible limitations from partial observability or FA capacity; in other words, it is problematic when there are unlearnable transitions. In that case, its derivative – which could be approximated by the difference between a transition’s current |δ| and the |δ| when it was last replayed3 – may be more useful. This measure is less immediately available, however, and is influenced by whatever was replayed in the meanwhile, which increases its variance. In preliminary experiments, we found it did not outperform |δ|, but this may say more about the class of (near-deterministic) environments we investigated, than about the measure itself.\nAn orthogonal variant is to consider the norm of the weight-change induced by replaying a transition – this can be effective if the underlying optimizer employs adaptive step-sizes that reduce gradients in high-noise directions (Schaul et al., 2013; Kingma & Ba, 2014), thus placing the burden of distinguishing between learnable and unlearnable errors on the optimizer.\nIt is possible to modulate prioritization by not treating positive TD-errors the same than negative ones; we can for example invoke the Anna Karenina principle (Diamond, 1994), interpreted to mean that there are many ways in which a transition can be less good than expected, but only one in which can be better, to introduce an asymmetry and prioritize positive TD-errors more than negative ones of equal magnitude, because the former are more likely to be informative. Such an asymmetry in replay frequency was also observed in rat studies (Singer & Frank, 2009). Again, our preliminary experiments with such variants were inconclusive.\nFor the issue of preserving sufficient diversity, there are alternative solutions to our choice of introducing stochasticity, for example, the priorities could be modulated by a novelty measure in observation space. An orthogonal idea is to increase priorities of transitions that have not been replayed for a while, by introducing an explicit staleness bonus that guarantees that every transition is revisited from time to time, with that chance increasing at the same rate as its last-seen TD-error becomes stale. In the simple case where this bonus grows linearly with time, this can be implemented at no additional cost by subtracting a quantity proportional to the global step-count from the new priority on any update. 4\nIn the particular case of RL with bootstrapping from value functions, it is possible to exploit the sequential structure of the replay memory using the following intuition: a transition that led to a large amount of learning (about its outgoing state) has the potential to change the bootstrapping target for all transitions leading into that state, and thus there is more to be learned about these. Of course we know at least one of these, namely the historic predecessor transition, and so boosting its priority makes it more likely to be revisited soon. Similarly to eligibility traces, this lets information trickle backward from a future outcome to the value estimates of the actions and states that led to it. In practice, we add |δ| of the current transition to predecessor transition’s priority, but only if the predecessor transition is not a terminal one. This idea is related to ‘reverse replay’ observed in rodents Foster & Wilson (2006), and to a recent extension of prioritized sweeping (van Seijen & Sutton, 2013)."
+    }, {
+      "heading" : "B EXPERIMENTAL DETAILS",
+      "text" : ""
+    }, {
+      "heading" : "B.1 BLIND CLIFFWALK",
+      "text" : "For the Blind Cliffwalk experiments (Section 3.1 and following), we use a straight-forward Qlearning (Watkins & Dayan, 1992) setup. The Q-values are represented using either a tabular look-up table, or a linear function approximator, in both cases represented Q(s, a) := θ>φ(s, a). For each\n3Of course, more robust approximations would be a function of the history of all encountered δ values. In particular, one could imagine an RProp-style update (Riedmiller, 1994) to priorities that increase the priority while the signs match, and reduce it whenever consecutive errors (for the same transition) differ in sign.\n4 If bootstrapping is used with policy iteration, such that the target values come from separate network (as is the case for DQN), then there is a large increase in uncertainty about the priorities when the target network is updated in the outer iteration. At these points, the staleness bonus is increased in proportion to the number of individual (low-level) updates that happened in-between.\ntransition, we compute its TD-error using:\nδt := Rt + γt max a\nQ(St, a)−Q(St−1, At−1) (2)\nand update the parameters using stochastic gradient ascent: θ ← θ + η · δt · ∇θQ ∣∣ St−1,At−1 = θ + η · δt · φ(St−1, At−1) (3)\nFor the linear FA case we use a very simple encoding of state as a 1-hot vector (as for tabular), but concatenated with a constant bias feature of value 1. To make generalization across actions impossible, we alternate which action is ‘right’ and which one is ‘wrong’ for each state. All elements are initialized with small values near zero, θi ∼ N (0, 0.1). We vary the size of the problem (number of states n) from 2 to 16. The discount factor is set to γ = 1 − 1n which keeps values on approximately the same scale independently of n. This allos us to used a fixed step-size of η = 14 in all experiments.\nThe replay memory is filled by exhaustively executing all 2n possible sequences of actions until termination (in random order). This guarantees that exactly one sequence will succeed and hit the final reward, and all others will fail with zero reward. The replay memory contains all the relevant experience (the total number of transitions is 2n+1 − 2), at the frequency that it would be encountered when acting online with a random behavior policy. Given this, can in principle learn until convergence by just increasing the amount of computation; here, convergence is defined as a mean-squared error (MSE) between the Q-value estimates and the ground truth below 10−3."
+    }, {
+      "heading" : "B.2 ATARI EXPERIMENTS",
+      "text" : "B.2.1 IMPLEMENTATION DETAILS\nPrioritizing using replay memory with N = 106 transitions introduced some performance challenges. Here we describe a number of things we did to minimize additional run-time and memory overhead, extending the discussion in Section 3.\nRank-based prioritization Early experiments with Atari showed that maintaining a sorted data structure of 106 transitions with constantly changing TD-errors dominated running time. Our final solution was to store transitions in a priority queue implemented using an array representation of a binary heap. The underlying heap array was then directly used as an approximation of a sorted array. This is unconventional, however our tests on smaller environments showed that it did not affect learning compared to using a perfectly sorted array. Likely this is in part due to TD-errors already being an proxy for the usefulness of a transition and our use of stochastic prioritized sampling. Another small improvement came from avoiding recalculation of partitions. We reused the same partition for values ofN that are close together and by updating α and β infrequently where possible. Our final implementation for rank-based prioritization produced an additional 2%-4% increase in running time and negligible additional memory usage. This could be reduced further in a number of ways e.g. with a more efficient heap implementation, but was good enough for our experiments.\nProportional prioritization The “sum-tree” data structure used here is very similar in spirit to the array representation of a binary heap. However, instead of the usual heap property, the value of a parent node is the sum of its children. Leaf nodes store the transition priorities and the internal nodes are intermediate sums, with the parent node containing the sum over all priorities, ptotal. This provides a efficient way of calculating the cumulative sum of priorities, allowing O(logN) updates and sampling. To sample a minibatch of size k, the range [0, ptotal] is divided equally into k ranges. Next, a value is uniformly sampled from each range. Finally the transitions that correspond to each of these sampled values are retrieved from the tree. Performance overhead is similar to rank-based prioritization.\nAs mentioned in Section 3.4, whenever importance sampling is used, all weights wi were scaled so that maxi wi = 1. We found that this worked better in practice as it kept all weights within a reasonable range, avoiding the possibility of extremely large updates. It is worth mentioning that this normalization interacts with annealing on β: as β approaches 1, the normalization constant grows, which reduces the effective average update in a similar way to annealing the learning rate η."
+    }, {
+      "heading" : "B.2.2 HYPERPARAMETERS",
+      "text" : "Throughout this paper our baseline was DQN and Double DQN, specifically the versions with tuned parameters, and in the case of Double DQN, with the shared bias improvement (van Hasselt et al., 2016). Tuning of hyperparameters was done over a small subset of Atari games (Breakout, Pong, Ms. Pac-Man, Q*bert, Alien, Battlezone, Asterix)."
+    }, {
+      "heading" : "B.2.3 EVALUATION",
+      "text" : "Table 4 and Table 5 show the differences between the evaluation methods and the value of used in the -greedy policy for each agent. The agent used for the no-ops and human starts evaluation is the best agent seen during training, where the best is determined by periodic test evaluations."
+    }, {
+      "heading" : "B.3 CLASS-IMBALANCED MNIST",
+      "text" : ""
+    }, {
+      "heading" : "B.3.1 DATASET SETUP",
+      "text" : "In our supervised learning setting we modified MNIST to obtain a new training dataset with a significant label imbalance. This new dataset was obtained by considering a small subset of the samples that correspond to the first 5 digits (0, 1, 2, 3, 4) and all of the samples that correspond to the remaining 5 labels (5, 6, 7, 8, 9). For each of the first 5 digits we randomly sampled 1% of the available examples, i.e. 1% of the available 0s, 1% of the available 1s etc. In the resulting dataset there are\nexamples of all 10 different classes but it is highly imbalanced since there are 100 times more examples that correspond to the 5, 6, 7, 8, 9 classes than to the 0, 1, 2, 3, 4 ones. In all our experiments we used the original MNIST test dataset without removing any samples."
+    }, {
+      "heading" : "B.3.2 TRAINING SETUP",
+      "text" : "In our experiments we used a 4 layers feedforward neural network with an architecture similar to that of LeNet5 (Lecun et al., 1998). This is a 2 layer convolutional neural network followed by 2 fully connected layers at the top. Each convolutional layer is comprised of a pure convolution followed by a rectifier non-linearity and a subsampling max pooling operation. The two fully-connected layers in the network are also separated by a rectifier non-linearity. The last layer is a softmax which is used to obtain a normalized distribution over the possible labels. The complete architecture is shown in Figure 5, and is implemented using Torch7 (Collobert et al., 2011). The model was trained using stochastic gradient descent with no momentum and a minibatch of size 60. In all our experiments we considered 6 different step-sizes (0.3, 0.1, 0.03, 0.01, 0.003 and 0.001) and for each case presented in this work, we selected the step-size that lead to the best (balanced) validation performance. We used the negative log-likelihood loss criterion and we ran experiments with both the weighted and unweighted version of the loss. In the weighted case the loss of the examples that correspond to the first 5 digits (0, 1, 2, 3, 4) was scaled by a factor of a 100 to accommodate for the label imbalance in the training set as it was described above."
+    } ],
+    "references" : [ {
+      "title" : "Generalized prioritized sweeping",
+      "author" : [ "Andre", "David", "Friedman", "Nir", "Parr", "Ronald" ],
+      "venue" : "In Advances in Neural Information Processing Systems. Citeseer,",
+      "citeRegEx" : "Andre et al\\.,? \\Q1998\\E",
+      "shortCiteRegEx" : "Andre et al\\.",
+      "year" : 1998
+    }, {
+      "title" : "Memory trace replay: the shaping of memory consolidation by neuromodulation",
+      "author" : [ "Atherton", "Laura A", "Dupret", "David", "Mellor", "Jack R" ],
+      "venue" : "Trends in neurosciences,",
+      "citeRegEx" : "Atherton et al\\.,? \\Q2015\\E",
+      "shortCiteRegEx" : "Atherton et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "The arcade learning environment: An evaluation platform for general agents",
+      "author" : [ "Bellemare", "Marc G", "Naddaf", "Yavar", "Veness", "Joel", "Bowling", "Michael" ],
+      "venue" : "arXiv preprint arXiv:1207.4708,",
+      "citeRegEx" : "Bellemare et al\\.,? \\Q2012\\E",
+      "shortCiteRegEx" : "Bellemare et al\\.",
+      "year" : 2012
+    }, {
+      "title" : "Increasing the action gap: New operators for reinforcement learning",
+      "author" : [ "Bellemare", "Marc G", "Ostrovski", "Georg", "Guez", "Arthur", "Thomas", "Philip S", "Munos", "Rémi" ],
+      "venue" : "In Proceedings of the AAAI Conference on Artificial Intelligence,",
+      "citeRegEx" : "Bellemare et al\\.,? \\Q2016\\E",
+      "shortCiteRegEx" : "Bellemare et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Torch7: A matlab-like environment for machine learning",
+      "author" : [ "Collobert", "Ronan", "Kavukcuoglu", "Koray", "Farabet", "Clément" ],
+      "venue" : "In BigLearn, NIPS Workshop, number EPFL-CONF-192376,",
+      "citeRegEx" : "Collobert et al\\.,? \\Q2011\\E",
+      "shortCiteRegEx" : "Collobert et al\\.",
+      "year" : 2011
+    }, {
+      "title" : "Zebras and the Anna Karenina principle",
+      "author" : [ "Diamond", "Jared" ],
+      "venue" : "Natural History,",
+      "citeRegEx" : "Diamond and Jared.,? \\Q1994\\E",
+      "shortCiteRegEx" : "Diamond and Jared.",
+      "year" : 1994
+    }, {
+      "title" : "A discriminatively trained, multiscale, deformable part model",
+      "author" : [ "Felzenszwalb", "Pedro", "McAllester", "David", "Ramanan", "Deva" ],
+      "venue" : "In Computer Vision and Pattern Recognition,",
+      "citeRegEx" : "Felzenszwalb et al\\.,? \\Q2008\\E",
+      "shortCiteRegEx" : "Felzenszwalb et al\\.",
+      "year" : 2008
+    }, {
+      "title" : "Reverse replay of behavioural sequences in hippocampal place cells during the awake",
+      "author" : [ "Foster", "David J", "Wilson", "Matthew A" ],
+      "venue" : "state. Nature,",
+      "citeRegEx" : "Foster et al\\.,? \\Q2006\\E",
+      "shortCiteRegEx" : "Foster et al\\.",
+      "year" : 2006
+    }, {
+      "title" : "A review on ensembles for the class imbalance problem: bagging-, boosting-, and hybridbased approaches. Systems, Man, and Cybernetics, Part C: Applications and Reviews",
+      "author" : [ "Galar", "Mikel", "Fernandez", "Alberto", "Barrenechea", "Edurne", "Bustince", "Humberto", "Herrera", "Francisco" ],
+      "venue" : "IEEE Transactions on,",
+      "citeRegEx" : "Galar et al\\.,? \\Q2012\\E",
+      "shortCiteRegEx" : "Galar et al\\.",
+      "year" : 2012
+    }, {
+      "title" : "Online discovery of feature dependencies",
+      "author" : [ "Geramifard", "Alborz", "Doshi", "Finale", "Redding", "Joshua", "Roy", "Nicholas", "How", "Jonathan" ],
+      "venue" : "In Proceedings of the 28th International Conference on Machine Learning",
+      "citeRegEx" : "Geramifard et al\\.,? \\Q2011\\E",
+      "shortCiteRegEx" : "Geramifard et al\\.",
+      "year" : 2011
+    }, {
+      "title" : "Deep Learning for Real-Time Atari Game Play Using Offline Monte-Carlo Tree Search Planning",
+      "author" : [ "Guo", "Xiaoxiao", "Singh", "Satinder", "Lee", "Honglak", "Lewis", "Richard L", "Wang", "Xiaoshi" ],
+      "venue" : "Advances in Neural Information Processing Systems",
+      "citeRegEx" : "Guo et al\\.,? \\Q2014\\E",
+      "shortCiteRegEx" : "Guo et al\\.",
+      "year" : 2014
+    }, {
+      "title" : "To recognize shapes, first learn to generate images",
+      "author" : [ "Hinton", "Geoffrey E" ],
+      "venue" : "Progress in brain research,",
+      "citeRegEx" : "Hinton and E.,? \\Q2007\\E",
+      "shortCiteRegEx" : "Hinton and E.",
+      "year" : 2007
+    }, {
+      "title" : "Adam: A method for stochastic optimization",
+      "author" : [ "Kingma", "Diederik P", "Ba", "Jimmy" ],
+      "venue" : "CoRR, abs/1412.6980,",
+      "citeRegEx" : "Kingma et al\\.,? \\Q2014\\E",
+      "shortCiteRegEx" : "Kingma et al\\.",
+      "year" : 2014
+    }, {
+      "title" : "Gradient-based learning applied to document recognition",
+      "author" : [ "Y. Lecun", "L. Bottou", "Y. Bengio", "P. Haffner" ],
+      "venue" : "Proceedings of the IEEE,",
+      "citeRegEx" : "Lecun et al\\.,? \\Q1998\\E",
+      "shortCiteRegEx" : "Lecun et al\\.",
+      "year" : 1998
+    }, {
+      "title" : "Self-improving reactive agents based on reinforcement learning, planning and teaching",
+      "author" : [ "Lin", "Long-Ji" ],
+      "venue" : "Machine learning,",
+      "citeRegEx" : "Lin and Long.Ji.,? \\Q1992\\E",
+      "shortCiteRegEx" : "Lin and Long.Ji.",
+      "year" : 1992
+    }, {
+      "title" : "Weighted importance sampling for off-policy learning with linear function approximation",
+      "author" : [ "Mahmood", "A Rupam", "van Hasselt", "Hado P", "Sutton", "Richard S" ],
+      "venue" : "In Advances in Neural Information Processing Systems,",
+      "citeRegEx" : "Mahmood et al\\.,? \\Q2014\\E",
+      "shortCiteRegEx" : "Mahmood et al\\.",
+      "year" : 2014
+    }, {
+      "title" : "Dopaminergic neurons promote hippocampal reactivation and spatial memory persistence",
+      "author" : [ "McNamara", "Colin G", "Tejero-Cantero", "Álvaro", "Trouche", "Stéphanie", "Campo-Urriza", "Natalia", "Dupret", "David" ],
+      "venue" : "Nature neuroscience,",
+      "citeRegEx" : "McNamara et al\\.,? \\Q2014\\E",
+      "shortCiteRegEx" : "McNamara et al\\.",
+      "year" : 2014
+    }, {
+      "title" : "Playing atari with deep reinforcement learning",
+      "author" : [ "Mnih", "Volodymyr", "Kavukcuoglu", "Koray", "Silver", "David", "Graves", "Alex", "Antonoglou", "Ioannis", "Wierstra", "Daan", "Riedmiller", "Martin" ],
+      "venue" : "arXiv preprint arXiv:1312.5602,",
+      "citeRegEx" : "Mnih et al\\.,? \\Q2013\\E",
+      "shortCiteRegEx" : "Mnih et al\\.",
+      "year" : 2013
+    }, {
+      "title" : "Human-level control through deep reinforcement learning",
+      "author" : [ "Mnih", "Volodymyr", "Kavukcuoglu", "Koray", "Silver", "David", "Rusu", "Andrei A", "Veness", "Joel", "Bellemare", "Marc G", "Graves", "Alex", "Riedmiller", "Martin", "Fidjeland", "Andreas K", "Ostrovski", "Georg", "Petersen", "Stig", "Beattie", "Charles", "Sadik", "Amir", "Antonoglou", "Ioannis", "King", "Helen", "Kumaran", "Dharshan", "Wierstra", "Daan", "Legg", "Shane", "Hassabis", "Demis" ],
+      "venue" : "Nature, 518(7540):529–533,",
+      "citeRegEx" : "Mnih et al\\.,? \\Q2015\\E",
+      "shortCiteRegEx" : "Mnih et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "Prioritized sweeping: Reinforcement learning with less data and less time",
+      "author" : [ "Moore", "Andrew W", "Atkeson", "Christopher G" ],
+      "venue" : "Machine Learning,",
+      "citeRegEx" : "Moore et al\\.,? \\Q1993\\E",
+      "shortCiteRegEx" : "Moore et al\\.",
+      "year" : 1993
+    }, {
+      "title" : "Massively parallel methods for deep reinforcement learning",
+      "author" : [ "Nair", "Arun", "Srinivasan", "Praveen", "Blackwell", "Sam", "Alcicek", "Cagdas", "Fearon", "Rory", "Maria", "Alessandro De", "Panneershelvam", "Vedavyas", "Suleyman", "Mustafa", "Beattie", "Charles", "Petersen", "Stig", "Legg", "Shane", "Mnih", "Volodymyr", "Kavukcuoglu", "Koray", "Silver", "David" ],
+      "venue" : "arXiv preprint arXiv:1507.04296,",
+      "citeRegEx" : "Nair et al\\.,? \\Q2015\\E",
+      "shortCiteRegEx" : "Nair et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "Hippocampal place cells construct reward related sequences through unexplored",
+      "author" : [ "Ólafsdóttir", "H Freyja", "Barry", "Caswell", "Saleem", "Aman B", "Hassabis", "Demis", "Spiers", "Hugo J" ],
+      "venue" : "space. Elife,",
+      "citeRegEx" : "Ólafsdóttir et al\\.,? \\Q2015\\E",
+      "shortCiteRegEx" : "Ólafsdóttir et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "Rprop-description and implementation",
+      "author" : [ "Riedmiller", "Martin" ],
+      "venue" : null,
+      "citeRegEx" : "Riedmiller and Martin.,? \\Q1994\\E",
+      "shortCiteRegEx" : "Riedmiller and Martin.",
+      "year" : 1994
+    }, {
+      "title" : "New methods for competitive coevolution",
+      "author" : [ "Rosin", "Christopher D", "Belew", "Richard K" ],
+      "venue" : "Evolutionary Computation,",
+      "citeRegEx" : "Rosin et al\\.,? \\Q1997\\E",
+      "shortCiteRegEx" : "Rosin et al\\.",
+      "year" : 1997
+    }, {
+      "title" : "No more pesky learning rates",
+      "author" : [ "Schaul", "Tom", "Zhang", "Sixin", "Lecun", "Yann" ],
+      "venue" : "In Proceedings of the 30th International Conference on Machine Learning",
+      "citeRegEx" : "Schaul et al\\.,? \\Q2013\\E",
+      "shortCiteRegEx" : "Schaul et al\\.",
+      "year" : 2013
+    }, {
+      "title" : "Curious model-building control systems",
+      "author" : [ "Schmidhuber", "Jürgen" ],
+      "venue" : "In Neural Networks,",
+      "citeRegEx" : "Schmidhuber and Jürgen.,? \\Q1991\\E",
+      "shortCiteRegEx" : "Schmidhuber and Jürgen.",
+      "year" : 1991
+    }, {
+      "title" : "Rewarded outcomes enhance reactivation of experience in the hippocampus",
+      "author" : [ "Singer", "Annabelle C", "Frank", "Loren M" ],
+      "venue" : null,
+      "citeRegEx" : "Singer et al\\.,? \\Q2009\\E",
+      "shortCiteRegEx" : "Singer et al\\.",
+      "year" : 2009
+    }, {
+      "title" : "Incentivizing exploration in reinforcement learning with deep predictive models",
+      "author" : [ "Stadie", "Bradly C", "Levine", "Sergey", "Abbeel", "Pieter" ],
+      "venue" : "arXiv preprint arXiv:1507.00814,",
+      "citeRegEx" : "Stadie et al\\.,? \\Q2015\\E",
+      "shortCiteRegEx" : "Stadie et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "Incremental basis construction from temporal difference error",
+      "author" : [ "Sun", "Yi", "Ring", "Mark", "Schmidhuber", "Jürgen", "Gomez", "Faustino J" ],
+      "venue" : "In Proceedings of the 28th International Conference on Machine Learning",
+      "citeRegEx" : "Sun et al\\.,? \\Q2011\\E",
+      "shortCiteRegEx" : "Sun et al\\.",
+      "year" : 2011
+    }, {
+      "title" : "Double Q-learning",
+      "author" : [ "van Hasselt", "Hado" ],
+      "venue" : "In Advances in Neural Information Processing Systems, pp. 2613–2621,",
+      "citeRegEx" : "Hasselt and Hado.,? \\Q2010\\E",
+      "shortCiteRegEx" : "Hasselt and Hado.",
+      "year" : 2010
+    }, {
+      "title" : "Deep Reinforcement Learning with Double Qlearning",
+      "author" : [ "van Hasselt", "Hado", "Guez", "Arthur", "Silver", "David" ],
+      "venue" : "In Proceedings of the Thirtieth AAAI Conference on Artificial Intelligence,",
+      "citeRegEx" : "Hasselt et al\\.,? \\Q2016\\E",
+      "shortCiteRegEx" : "Hasselt et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Planning by prioritized sweeping with small backups",
+      "author" : [ "van Seijen", "Harm", "Sutton", "Richard" ],
+      "venue" : "In Proceedings of The 30th International Conference on Machine Learning,",
+      "citeRegEx" : "Seijen et al\\.,? \\Q2013\\E",
+      "shortCiteRegEx" : "Seijen et al\\.",
+      "year" : 2013
+    }, {
+      "title" : "Dueling network architectures for deep reinforcement learning",
+      "author" : [ "Z. Wang", "N. de Freitas", "M. Lanctot" ],
+      "venue" : "Technical report,",
+      "citeRegEx" : "Wang et al\\.,? \\Q2015\\E",
+      "shortCiteRegEx" : "Wang et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "Surprise and curiosity for big data robotics",
+      "author" : [ "White", "Adam", "Modayil", "Joseph", "Sutton", "Richard S" ],
+      "venue" : "In Workshops at the Twenty-Eighth AAAI Conference on Artificial Intelligence,",
+      "citeRegEx" : "White et al\\.,? \\Q2014\\E",
+      "shortCiteRegEx" : "White et al\\.",
+      "year" : 2014
+    }, {
+      "title" : "B EXPERIMENTAL DETAILS B.1 BLIND CLIFFWALK For the Blind Cliffwalk experiments (Section 3.1 and following), we use a straight-forward Qlearning",
+      "author" : [ "Sutton" ],
+      "venue" : "(Watkins & Dayan,",
+      "citeRegEx" : "Sutton and 2013..,? \\Q1992\\E",
+      "shortCiteRegEx" : "Sutton and 2013..",
+      "year" : 1992
+    }, {
+      "title" : "Normalized scores on 57 Atari games (random is 0%, human is 100%), from a single training run each, using the human starts evaluation (see Table 4). Baselines and calculation methodology",
+      "author" : [ "van Hasselt" ],
+      "venue" : null,
+      "citeRegEx" : "Hasselt,? \\Q2016\\E",
+      "shortCiteRegEx" : "Hasselt",
+      "year" : 2016
+    }, {
+      "title" : "Scores obtained on the original 49 Atari games plus 8 others. Each number is from a single training run, but the score is averaged over 100 evaluations of 30 minutes each, with start states sampled randomly from human traces. Also includes the random and human baseline scores used for normalization. Human and random scores",
+      "author" : [ "Nair" ],
+      "venue" : null,
+      "citeRegEx" : "475",
+      "shortCiteRegEx" : "475",
+      "year" : 2015
+    } ],
+    "referenceMentions" : [ {
+      "referenceID" : 17,
+      "context" : "This was demonstrated in the Deep Q-Network (DQN) algorithm (Mnih et al., 2013; 2015), which stabilized the training of a value function, represented by a deep neural network, by using experience replay.",
+      "startOffset" : 60,
+      "endOffset" : 85
+    }, {
+      "referenceID" : 1,
+      "context" : "2 BACKGROUND Numerous neuroscience studies have identified mechanisms of experience replay in the hippocampus of rodents, where sequences of prior experience are replayed, either during awake resting or sleep, and in particular that this happens more for rewarded paths (Atherton et al., 2015; Ólafsdóttir et al., 2015; Foster & Wilson, 2006).",
+      "startOffset" : 270,
+      "endOffset" : 342
+    }, {
+      "referenceID" : 21,
+      "context" : "2 BACKGROUND Numerous neuroscience studies have identified mechanisms of experience replay in the hippocampus of rodents, where sequences of prior experience are replayed, either during awake resting or sleep, and in particular that this happens more for rewarded paths (Atherton et al., 2015; Ólafsdóttir et al., 2015; Foster & Wilson, 2006).",
+      "startOffset" : 270,
+      "endOffset" : 342
+    }, {
+      "referenceID" : 16,
+      "context" : "Furthermore, there is a likely link between increased replay of an experience, and how much can be learned from it, or its TD-error (Singer & Frank, 2009; McNamara et al., 2014).",
+      "startOffset" : 132,
+      "endOffset" : 177
+    }, {
+      "referenceID" : 0,
+      "context" : "The best-known use of prioritized updates in RL is prioritized sweeping (Moore & Atkeson, 1993; Andre et al., 1998), a method that makes planning algorithms like value iteration more efficient by prioritizing those updates that are expected to lead to the largest changes in value.",
+      "startOffset" : 72,
+      "endOffset" : 115
+    }, {
+      "referenceID" : 33,
+      "context" : "There is a widespread use of TD-errors for determining where to focus resources, for example when choosing where to explore (White et al., 2014) or which features to select (Geramifard et al.",
+      "startOffset" : 124,
+      "endOffset" : 144
+    }, {
+      "referenceID" : 9,
+      "context" : ", 2014) or which features to select (Geramifard et al., 2011; Sun et al., 2011), as well as for guiding prioritized sweeping (Andre et al.",
+      "startOffset" : 36,
+      "endOffset" : 79
+    }, {
+      "referenceID" : 28,
+      "context" : ", 2014) or which features to select (Geramifard et al., 2011; Sun et al., 2011), as well as for guiding prioritized sweeping (Andre et al.",
+      "startOffset" : 36,
+      "endOffset" : 79
+    }, {
+      "referenceID" : 0,
+      "context" : ", 2011), as well as for guiding prioritized sweeping (Andre et al., 1998; van Seijen & Sutton, 2013), but so far as we are aware, never for modulating experience replay.",
+      "startOffset" : 53,
+      "endOffset" : 100
+    }, {
+      "referenceID" : 8,
+      "context" : "In supervised learning, there are numerous techniques to deal with imbalanced datasets when class identities are known, including re-sampling, under-sampling and over-sampling techniques, possibly combined with ensemble methods (Galar et al., 2012).",
+      "startOffset" : 228,
+      "endOffset" : 248
+    }, {
+      "referenceID" : 17,
+      "context" : "There have been several proposed methods for playing Atari with deep reinforcement learning, including (Mnih et al., 2013; 2015; Guo et al., 2014; Stadie et al., 2015; Nair et al., 2015; Bellemare et al., 2016), and (van Hasselt et al.",
+      "startOffset" : 103,
+      "endOffset" : 210
+    }, {
+      "referenceID" : 10,
+      "context" : "There have been several proposed methods for playing Atari with deep reinforcement learning, including (Mnih et al., 2013; 2015; Guo et al., 2014; Stadie et al., 2015; Nair et al., 2015; Bellemare et al., 2016), and (van Hasselt et al.",
+      "startOffset" : 103,
+      "endOffset" : 210
+    }, {
+      "referenceID" : 27,
+      "context" : "There have been several proposed methods for playing Atari with deep reinforcement learning, including (Mnih et al., 2013; 2015; Guo et al., 2014; Stadie et al., 2015; Nair et al., 2015; Bellemare et al., 2016), and (van Hasselt et al.",
+      "startOffset" : 103,
+      "endOffset" : 210
+    }, {
+      "referenceID" : 20,
+      "context" : "There have been several proposed methods for playing Atari with deep reinforcement learning, including (Mnih et al., 2013; 2015; Guo et al., 2014; Stadie et al., 2015; Nair et al., 2015; Bellemare et al., 2016), and (van Hasselt et al.",
+      "startOffset" : 103,
+      "endOffset" : 210
+    }, {
+      "referenceID" : 3,
+      "context" : "There have been several proposed methods for playing Atari with deep reinforcement learning, including (Mnih et al., 2013; 2015; Guo et al., 2014; Stadie et al., 2015; Nair et al., 2015; Bellemare et al., 2016), and (van Hasselt et al.",
+      "startOffset" : 103,
+      "endOffset" : 210
+    }, {
+      "referenceID" : 0,
+      "context" : "The best-known use of prioritized updates in RL is prioritized sweeping (Moore & Atkeson, 1993; Andre et al., 1998), a method that makes planning algorithms like value iteration more efficient by prioritizing those updates that are expected to lead to the largest changes in value. The key differences are that our approach is for model-free RL rather than model-based planning in RL, and that our stochastic prioritization is explicitly designed for robustness in the function approximation (FA) case. There is a widespread use of TD-errors for determining where to focus resources, for example when choosing where to explore (White et al., 2014) or which features to select (Geramifard et al., 2011; Sun et al., 2011), as well as for guiding prioritized sweeping (Andre et al., 1998; van Seijen & Sutton, 2013), but so far as we are aware, never for modulating experience replay. In supervised learning, there are numerous techniques to deal with imbalanced datasets when class identities are known, including re-sampling, under-sampling and over-sampling techniques, possibly combined with ensemble methods (Galar et al., 2012). A form of non-uniform sampling based on error, and with importance sampling correction was introduced by Hinton (2007), and led to a reported 3x speed-up on MNIST digit classification.",
+      "startOffset" : 96,
+      "endOffset" : 1251
+    }, {
+      "referenceID" : 0,
+      "context" : "While this measure is not directly accessible, a reasonable proxy is the magnitude of a transition’s TD error δ, which indicates how “surprising” or unexpected the transition is: specifically, how far the value is from its nextstep bootstrap estimate (Andre et al., 1998).",
+      "startOffset" : 251,
+      "endOffset" : 271
+    }, {
+      "referenceID" : 2,
+      "context" : "For this, we chose the collection of Atari benchmarks (Bellemare et al., 2012) with their end-to-end RL from vision setup, because they are popular and contain diverse sets of challenges, including delayed credit assignment, partial observability, and difficult function approximation (Mnih et al.",
+      "startOffset" : 54,
+      "endOffset" : 78
+    }, {
+      "referenceID" : 18,
+      "context" : ", 2012) with their end-to-end RL from vision setup, because they are popular and contain diverse sets of challenges, including delayed credit assignment, partial observability, and difficult function approximation (Mnih et al., 2015; van Hasselt et al., 2016).",
+      "startOffset" : 214,
+      "endOffset" : 259
+    }, {
+      "referenceID" : 18,
+      "context" : "We consider two baseline algorithms that use uniform experience replay, namely the version of the DQN algorithm from the Nature paper (Mnih et al., 2015), and its recent extension Double DQN (van Hasselt et al.",
+      "startOffset" : 134,
+      "endOffset" : 153
+    }, {
+      "referenceID" : 8,
+      "context" : "This can help focus the learning on those samples that can still be learned from, devoting additional resources to the (hard) boundary cases, somewhat similarly to boosting (Galar et al., 2012).",
+      "startOffset" : 173,
+      "endOffset" : 193
+    }, {
+      "referenceID" : 6,
+      "context" : "Furthermore, if the dataset is imbalanced, we hypothesize that samples from the rare classes will be sampled disproportionately often, because their errors shrink less fast, and the chosen samples from the common classes will be those nearest to the decision boundaries, leading to an effect similar to hard negative mining (Felzenszwalb et al., 2008).",
+      "startOffset" : 324,
+      "endOffset" : 351
+    }, {
+      "referenceID" : 20,
+      "context" : "Or, in a parallel system like the Gorila agent (Nair et al., 2015), it could guide resource allocation between a collection of concurrent but heterogeneous “actors”, each with different exploration hyper-parameters.",
+      "startOffset" : 47,
+      "endOffset" : 66
+    }, {
+      "referenceID" : 10,
+      "context" : "The priority mechanism is also flexible enough to permit integrating experience from other sources, such as from a planner or from human expert trajectories (Guo et al., 2014), since knowing the source can be used to modulate each transition’s priority, for example in such a way as to preserve a sufficient fraction of external experience in memory.",
+      "startOffset" : 157,
+      "endOffset" : 175
+    }, {
+      "referenceID" : 24,
+      "context" : "An orthogonal variant is to consider the norm of the weight-change induced by replaying a transition – this can be effective if the underlying optimizer employs adaptive step-sizes that reduce gradients in high-noise directions (Schaul et al., 2013; Kingma & Ba, 2014), thus placing the burden of distinguishing between learnable and unlearnable errors on the optimizer.",
+      "startOffset" : 228,
+      "endOffset" : 268
+    }, {
+      "referenceID" : 24,
+      "context" : "An orthogonal variant is to consider the norm of the weight-change induced by replaying a transition – this can be effective if the underlying optimizer employs adaptive step-sizes that reduce gradients in high-noise directions (Schaul et al., 2013; Kingma & Ba, 2014), thus placing the burden of distinguishing between learnable and unlearnable errors on the optimizer. It is possible to modulate prioritization by not treating positive TD-errors the same than negative ones; we can for example invoke the Anna Karenina principle (Diamond, 1994), interpreted to mean that there are many ways in which a transition can be less good than expected, but only one in which can be better, to introduce an asymmetry and prioritize positive TD-errors more than negative ones of equal magnitude, because the former are more likely to be informative. Such an asymmetry in replay frequency was also observed in rat studies (Singer & Frank, 2009). Again, our preliminary experiments with such variants were inconclusive. For the issue of preserving sufficient diversity, there are alternative solutions to our choice of introducing stochasticity, for example, the priorities could be modulated by a novelty measure in observation space. An orthogonal idea is to increase priorities of transitions that have not been replayed for a while, by introducing an explicit staleness bonus that guarantees that every transition is revisited from time to time, with that chance increasing at the same rate as its last-seen TD-error becomes stale. In the simple case where this bonus grows linearly with time, this can be implemented at no additional cost by subtracting a quantity proportional to the global step-count from the new priority on any update. 4 In the particular case of RL with bootstrapping from value functions, it is possible to exploit the sequential structure of the replay memory using the following intuition: a transition that led to a large amount of learning (about its outgoing state) has the potential to change the bootstrapping target for all transitions leading into that state, and thus there is more to be learned about these. Of course we know at least one of these, namely the historic predecessor transition, and so boosting its priority makes it more likely to be revisited soon. Similarly to eligibility traces, this lets information trickle backward from a future outcome to the value estimates of the actions and states that led to it. In practice, we add |δ| of the current transition to predecessor transition’s priority, but only if the predecessor transition is not a terminal one. This idea is related to ‘reverse replay’ observed in rodents Foster & Wilson (2006), and to a recent extension of prioritized sweeping (van Seijen & Sutton, 2013).",
+      "startOffset" : 229,
+      "endOffset" : 2687
+    }, {
+      "referenceID" : 13,
+      "context" : "2 TRAINING SETUP In our experiments we used a 4 layers feedforward neural network with an architecture similar to that of LeNet5 (Lecun et al., 1998).",
+      "startOffset" : 129,
+      "endOffset" : 149
+    }, {
+      "referenceID" : 4,
+      "context" : "The complete architecture is shown in Figure 5, and is implemented using Torch7 (Collobert et al., 2011).",
+      "startOffset" : 80,
+      "endOffset" : 104
+    }, {
+      "referenceID" : 30,
+      "context" : "Baselines and calculation methodology are from van Hasselt et al. (2016).",
+      "startOffset" : 51,
+      "endOffset" : 73
+    }, {
+      "referenceID" : 20,
+      "context" : "Human and random scores are taken from Nair et al. (2015), with scores for the additional 8 games.",
+      "startOffset" : 39,
+      "endOffset" : 58
+    }, {
+      "referenceID" : 20,
+      "context" : "Human and random scores are taken from Nair et al. (2015), with scores for the additional 8 games. DQN and Double DQN scores are from van Hasselt et al. (2016). Note that the Gorila results used much more data and computation, but the other methods are more directly comparable to each other in that respect.",
+      "startOffset" : 39,
+      "endOffset" : 160
+    } ],
+    "year" : 2015,
+    "abstractText" : "Experience replay lets online reinforcement learning agents remember and reuse experiences from the past. In prior work, experience transitions were uniformly sampled from a replay memory. However, this approach simply replays transitions at the same frequency that they were originally experienced, regardless of their significance. In this paper we develop a framework for prioritizing experience, so as to replay important transitions more frequently, and therefore learn more efficiently. We use prioritized experience replay in the Deep Q-Network (DQN) algorithm, which achieved human-level performance in Atari games. DQN with prioritized experience replay achieves a new state-of-the-art, outperforming DQN with uniform replay on 42 out of 57 games.",
+    "creator" : "LaTeX with hyperref package"
+  }
+}

@@ -1,0 +1,497 @@
+{
+  "name" : "1606.02960.pdf",
+  "metadata" : {
+    "source" : "CRF",
+    "title" : "Sequence-to-Sequence Learning as Beam-Search Optimization",
+    "authors" : [ "Sam Wiseman" ],
+    "emails" : [ "swiseman@seas.harvard.edu", "srush@seas.harvard.edu" ],
+    "sections" : [ {
+      "heading" : "1 Introduction",
+      "text" : "Sequence-to-Sequence learning with deep neural networks (herein, seq2seq) (Sutskever et al., 2011; Sutskever et al., 2014) has rapidly become a very useful and surprisingly general-purpose tool for natural language processing. In addition to demonstrating impressive results for machine translation (Sutskever et al., 2014), roughly the same model and training has also proven to be useful for sentence compression (Filippova et al., 2015), parsing (Vinyals et al., 2015), and dialogue systems (Serban et al., 2016), among other tasks.\nThe dominant approach to training a seq2seq system is as a conditional language model, with training maximizing the likelihood of each successive target word conditioned on the input sequence and the gold history of target words. Thus, training uses a strictly word-level loss, usually cross-entropy over the target vocabulary. This approach has proven to be very effective and efficient for training neural language models, and seq2seq models similarly obtain impressive perplexities for word-generation tasks.\nNotably, however, seq2seq models differ from conditional language models at test-time in that seq2seq models must generate fully-formed, discrete word sequences. In practice, generation is accomplished by searching over output sequences greedily or with beam search (Sutskever et al., 2014). In this context, Ranzato et al. (2016) note that the combination of the training and generation scheme just described leads to at least two major issues:\n1. Exposure Bias: the model is never exposed to its own errors during training, and so the inferred histories at test-time do not resemble the gold training histories.\n2. Loss-Evaluation Mismatch: training uses a word-level loss, while at test-time we target improving sequence-level evaluation metrics, such as BLEU (Papineni et al., 2002).\nWe might additionally add the concern of label bias (Lafferty et al., 2001) to the list, since wordprobabilities at each time-step are locally normalized, guaranteeing that successors of incorrect his-\nar X\niv :1\n60 6.\n02 96\n0v 1\n[ cs\n.C L\n] 9\nJ un\n2 01\ntories receive the same mass as do the successors of the true history.\nIn this work we develop a non-probabilistic variant of the seq2seq model that can assign a score to any possible target sequence, and we propose a training procedure, inspired by the learning as search optimization (LaSO) framework of Daumé III and Marcu (2005), that defines a loss function in terms of errors made during beam search. Furthermore, we provide an efficient algorithm to backpropagate through the beam-search procedure during seq2seq training.\nThis approach offers a possible solution to each of the three aforementioned issues, while largely maintaining the model architecture and training efficiency of standard seq2seq learning. Moreover, by scoring sequences rather than words, our approach also allows for enforcing hard-constraints on sequence generation at training time. To test out the effectiveness of the proposed approach, we develop a general-purpose seq2seq system with beam search optimization. We run experiments on three very different problems: word ordering, syntactic parsing, and machine translation, and compare to a highlytuned seq2seq system with attention (Luong et al., 2015). The version with beam search optimization shows significant improvements on all three tasks, and particular improvements on tasks that require difficult search."
+    }, {
+      "heading" : "2 Related Work",
+      "text" : "The issues of exposure bias and label bias have received much attention from authors in the structured prediction community, and we briefly review some of this work here. One prominent approach to combating exposure bias is that of SEARN (Daumé III et al., 2009), a meta-training algorithm that learns a search policy in the form of a cost-sensitive classifier trained on examples generated from an interpolation of an oracle policy and the model’s current (learned) policy. Thus, SEARN explicitly targets the mismatch between oracular training and non-oracular (often greedy) test-time inference by training on the output of the model’s own policy. DAgger (Ross et al., 2011) is a similar approach, which differs in terms of how training examples are generated and aggregated, and there have additionally been impor-\ntant refinements to this style of training over the past several years (Chang et al., 2015). When it comes to training RNNs, SEARN/DAgger has been applied under the name “scheduled sampling” (Bengio et al., 2015), which involves training an RNN to generate the t+ 1’st token in a target sequence after consuming either the true t’th token, or, with probability that increases throughout training, the predicted t’th token.\nThough technically possible, it is uncommon to use beam search when training with SEARN/DAgger. The early-update (Collins and Roark, 2004) and LaSO (Daumé III and Marcu, 2005) training strategies, however, explicitly account for beam search, and describe strategies for updating parameters when the gold structure becomes unreachable during search. Early update and LaSO differ primarily in that the former discards a training example after the first search error, whereas LaSO resumes searching after an error from a state that includes the gold partial structure. In the context of feed-forward neural network training, early update training has been recently explored in a feedforward setting by Zhou et al. (2015) and Andor et al. (2016). Our work differs in that we adopt a LaSO-like paradigm (with some minor modifications), and apply it to the training of seq2seq RNNs (rather than feed-forward networks). We also note that Watanabe and Sumita (2015) apply maximumviolation training (Huang et al., 2012), which is similar to early-update, to a parsing model with recurrent components, and that Yazdani and Henderson (2015) use beam-search in training a discriminative, locally normalized dependency parser with recurrent components.\nRecently authors have also proposed alleviating exposure bias using techniques from reinforcement learning. Ranzato et al. (2016) follow this approach to train RNN decoders in a seq2seq model, and they obtain consistent improvements in performance, even over models trained with scheduled sampling. As Daumé III and Marcu (2005) note, however, techniques such as LaSO are similar to reinforcement learning, except that they do not require blind “exploration” in the same way. Indeed, since in supervised text-generation we typically know the gold partial sequences at each time-step, it may be unnecessary to resort to full reinforcement-learning\nfor text-generation problems. Whereas exposure bias results from training in a certain way, label bias results from properties of the model itself. In particular, label bias is likely to affect structured models that make sub-structure predictions using locally-normalized scores. Because the neural and non-neural literature on this point has recently been reviewed by Andor et al. (2016), we simply note here that, unlike the feed-forward models dealt with by Andor et al. (2016), RNN models are typically locally normalized, and we are unaware of any specifically seq2seq work with RNNs that does not use locally-normalized scores. The model we introduce here, however, is not locally normalized, and so should not suffer from label bias. We also note that there are some (non-seq2seq) exceptions to the trend of locally normalized RNNs, such as the work of Sak et al. (2014) and Voigtlaender et al. (2015), who train LSTMs in the context of HMMs for speech recognition using sequencelevel objectives; their work does not consider search, however."
+    }, {
+      "heading" : "3 Background and Notation",
+      "text" : "In the simplest seq2seq scenario, we are given a collection of source-target sequence pairs and tasked with learning to generate target sequences from source sequences. For instance, we might view machine translation as a seq2seq problem, wherein we attempt to generate English sentences from (corresponding) French sentences. Seq2seq models are part of the broader class of “encoder-decoder” models, which first use an encoding model to transform a source object into a encoded representation x. Many different sequential (and non-sequential) encoders have proven to be effective for different source domains. In this work we are agnostic to the form of the encoding model, and simply assume an abstract source representation x.\nOnce the input sequence is encoded, seq2seq models generate a target sequence using a decoder. The decoder is tasked with generating a target sequence of words from a target vocabulary V . In particular, words are generated sequentially by conditioning on the input representation x and on the previously generated words or history. We use the notation w1:T to refer to an arbitrary word sequence\nof length T , and the notation y1:T to refer to the gold (i.e., correct) target word sequence for an input x.\nMost seq2seq systems utilize a recurrent neural network (RNN) for the decoder model. Formally, a recurrent neural network is a parameterized nonlinear function RNN that recursively maps a sequence of vectors to a sequence of hidden states. Let m1, . . . ,mT be a sequence of T vectors, and let h0 be some initial state vector. Applying an RNN to any such sequence yields hidden states ht at each time-step t, as follows:\nht ← RNN(mt,ht−1;θ),\nwhere θ is the set of model parameters, which are shared over time. In this work, the vectors mt will always correspond to the embeddings of a target word sequence w1:T , and so we will also write ht ← RNN(wt,ht−1;θ), with wt standing in for its embedding.\nTo back-propagate errors through a recurrent neural network, we accumulate the gradients of each state with respect to subsequent states by running a backward procedure we will refer to as BRNN at each time-step (starting at the penultimate step):\n∇htL ← ∇htL+ BRNN(wt+1,ht,∇ht+1L).\nIn what follows, we will often abbreviate ∇htL as ∇ht . Running this BRNN procedure from t=T to t= 1 is known as back-propagation through time (BPTT).\nRNN decoders are typically trained to act as conditional language models. That is, one attempts to model the probability of the t+ 1’st target word conditioned on x and the target history by stipulating that p(wt+1|w1:t,x) ∝ g(wt+1,ht,x), for some parameterized function g typically computed with an affine layer followed by a softmax. In computing these probabilities, the state ht encodes the target history, and h0 is typically set to be some function of x. The complete model (including encoder) is trained, analogously to a neural language model, to minimize the cross-entropy loss at each time-step while conditioning on the gold history in the training data.\nOnce the decoder is trained, discrete sequence generation can be performed by approximately maximizing the probability of the target sequence under\nthe conditional distribution.\nw∗ = arg max w1:T T−1∏ t=0 p(wt+1|w1:t,x)\nAs the RNN model is non-Markovian, the decoding process requires heuristic search. In practice, a simple beam search procedure that explores K prospective histories at each time-step has proven to be an effective decoding approach. However, as noted above, decoding in this manner after conditional language-model style training potentially suffers from the issues of exposure bias and label bias, which motivates the work of this paper."
+    }, {
+      "heading" : "4 Optimizing for Beam Search",
+      "text" : "We begin by making one small change to the seq2seq modeling framework. Instead of regressing over the probability of the next word, we instead learn to produce (non-probabilistic) scores for ranking sequences. Define the score of a sequence consisting of history w1:t followed by a single word w as\nscore(w1:t, w) , f(w,ht,x), (1)\nwhere f is a parameterized function examining the current hidden-state of the relevant RNN at time t as well as the input representation x. In experiments, our f will have an identical form to g but without the final softmax transformation, which transforms unnormalized scores into probabilities. This scoring change allows the model to avoid issues associated with the label bias problem.\nMore importantly, we will also modify how this model is trained. Ideally we would train by comparing the gold sequence to the highestscoring complete sequence. However, because finding the highest-scoring sequence according to this model is intractable, we propose to adopt a LaSOlike (Daumé III and Marcu, 2005) scheme to train based by optimizing beam search. In particular, we define a loss that penalizes the gold sequence falling off the beam during training.1 The proposed train-\n1Using a non-probabilistic model further allows us to incur no loss (and thus require no update to parameters) when the gold sequence is on the beam; this contrasts with models based on a CRF loss, such as those of Andor et al. (2016) and Zhou et al. (2015), though in training those models are simply not updated when the gold sequence remains on the beam.\ning approach is a simple way to expose the model to incorrect histories and to match the training procedure to test generation. Furthermore we show that it can be implemented efficiently without changing the asymptotic run-time of training, beyond a factor of the beam size K."
+    }, {
+      "heading" : "4.1 Search-Based Loss",
+      "text" : "We now formalize this notion of a search-based loss for RNN training. Assume we have a set St of K candidate sequences of length t. We can calculate a score for each sequence in St using a scoring function f parameterized with an RNN, as in (1), and we define the sequence ŷ(K)1:t ∈St to be the K’th ranked sequence in St according to f . That is, assuming distinct scores,\n|{ŷ(j)1:t ∈St | f(ŷ (j) t , ĥ\n(j) t−1) > f(ŷ (K) t , ĥ (K) t−1)}| = K − 1,\nwhere ŷ(j)t is the t’th token in ŷ (j) 1:t , ĥ\n(j)\nt−1 is the RNN state corresponding to its t− 1’st step, and where we have omitted the x argument to f for brevity.\nWe now define a loss function that gives loss each time the score of the gold prefix y1:t does not exceed that of ŷ(K)1:t by a margin:\nL(f) = T∑ t=1 ∆(ŷ (K) 1:t ) [ 1− f(yt,ht−1) + f(ŷ(K)t , ĥ (K) t−1) ] .\nAbove, the ∆(ŷ(K)1:t ) term denotes a mistake-specific cost-function, which allows us to scale the loss depending on the severity of erroneously predicting ŷ (K) 1:t ; it is assumed to return 0 when the margin requirement is satisfied, and a positive number otherwise. It is this term that allows us to use sequencerather than word- level costs in training. For instance, when training a seq2seq model for machine translation, it may be desirable to have ∆(ŷ(K)1:t ) be inversely related to the sentence-level BLEU score of ŷ(K)1:t with y1:t; we experiment along these lines in Section 5.3.\nFinally, because we want the full gold sequence to be at the top of the beam at the end of search, when t=T we modify the loss to require the score of y1:T to exceed the score of the highest ranked incorrect prediction by a margin.\nWe can optimize the loss L using a two-step process: (1) in a forward pass, we compute candidate sets St and record margin violations (sequences with non-zero loss); (2) in a backward pass, we backpropagate the errors through the seq2seq RNNs. Unlike standard seq2seq training, the first-step requires running search (in our case beam search) to find margin violations. The second step can be done by adapting back-propagation through time (BPTT). We next discuss the details of this process."
+    }, {
+      "heading" : "4.2 Forward: Find Violations",
+      "text" : "In order to minimize this loss, we need to specify a procedure for constructing candidate sequences ŷ (K) 1:t at each time step t so that we find margin violations. We follow LaSO (rather than early-update 2; see Section 2) and build candidates in a recursive manner. If there was no margin violation at t−1, then St is constructed using a standard beam search update. If there was a margin violation, St is constructed as the K best sequences assuming the gold history y1:t−1 through time-step t−1.\nFormally, let the function succ map a sequence w1:t−1 ∈Vt−1 to the set of all valid sequences of length t that can be formed by appending a valid word w∈V onto the end of w1:t−1. In the simplest, unconstrained case, we will have\nsucc(w1:t−1) = {w1:t−1, w | w ∈ V}.\nNote, however, that for some problems it may be preferable to define a succ function which imposes hard constraints on successor sequences. For instance, if we would like to use seq2seq models for parsing (by emitting a constituency or dependency structure encoded into a sequence in some way), we will have hard constraints on the sequences the model can output, namely, that they represent valid parses. While hard constraints such as these would be difficult to add to standard seq2seq at training time, in our framework they can naturally be added to the succ function, allowing us to train with hard constraints; we experiment along these lines in Section 5.3.\n2We found that training with early update rather than (delayed) LaSO did not work well, even after pre-training. Given the success of early update in many NLP tasks this was somewhat surprising. We leave this question to future work.\nHaving defined an appropriate succ function, we can specify the candidate set as:\nSt = topK { succ(y1:t−1) violation at t−1⋃K\nk=1 succ(ŷ (k) 1:t−1) otherwise,\nwhere we have a margin violation at t−1 iff f(yt−1,ht−2) < f(ŷ (k) t−1, ĥ (k)\nt−2)+1, and where topK considers the scores given by f . This search procedure is illustrated in the top portion of Figure 1.\nIn the forward pass of our training algorithm, shown as the first part of Algorithm 1, we run this version of beam search and collect all sequences and their hidden states that lead to losses."
+    }, {
+      "heading" : "4.3 Backward: Merge Sequences",
+      "text" : "Once we have collected margin violations we can run standard back-propagation through time to compute parameter updates. Assume a margin violation occurs at time-step t between the predicted history ŷ(K)1:t and the gold history y1:t. As in standard seq2seq training we must back-propagate this error through the gold history; however, unlike seq2seq we also have a gradient for the wrongly predicted history.\nIn the worst case, there is one violation at each time-step, which could lead to T independent sequences. Since we need to call BRNNO(T ) times for each sequence, naively running this every time there was a violation could lead to an O(T 2) backward pass, rather than the O(T ) time required for the standard seq2seq approach.\nFortunately, our combination of search-strategy and loss make it possible to efficiently share BRNN operations. This shared structure comes naturally from the LaSO update, which resets the beam in a convenient way.\nWe informally illustrate the process in Figure 1. The top of the diagram shows a possible sequence of ŷ(k)1:t formed during search with a beam of size 3 for the target sequence y = “a red dog runs quickly today.” When the gold sequence falls off the beam at t= 4, search resumes with S5 = succ(y1:4), and so all subsequent predicted sequences have y1:4 as a prefix and are thus functions of h4. Moreover, because our loss function only involves the scores of the gold prefix and the violating prefix, we end up with the relatively simple computation tree shown at the bottom of Figure 1. It is evident that we can backpropagate in a single pass, accumulating gradients from sequences that diverge from the gold at the time-step that precedes their divergence. The second half of Algorithm 1 shows this explicitly for a single sequence, though it is straightforward to extend the algorithm to operate in batch.3"
+    }, {
+      "heading" : "5 Data and Methods",
+      "text" : "We run experiments on three different tasks, comparing our approach to the seq2seq baseline, and to other relevant baselines."
+    }, {
+      "heading" : "5.1 Model",
+      "text" : "While the method we describe applies to seq2seq RNNs in general, for all experiments we use the global attention model of Luong et al. (2015) — which consists of an LSTM (Hochreiter and Schmidhuber, 1997) encoder and an LSTM decoder with a global attention model — as both the baseline seq2seq model (i.e., as the model that computes the g in Section 3) and as the model that computes our sequence-scores f . As in Luong et al. (2015), we also use “input feeding,” which involves feeding the attention distribution from the previous time-step into the decoder at the current step. As far as we\n3We also note that because Algorithm 1 does not update the parameters until the entire target sequence has been searched for, our training procedure differs slightly from LaSO (which is online), and in this aspect is essentially equivalent to the “delayed LaSO update” of Björkelund and Kuhn (2014).\nAlgorithm 1 Seq2seq Beam-Search Optimization 1: procedure BSOTRAIN(Ktr) 2: /*FORWARD*/ 3: Init empty ŷ1:T and ĥ1:T ; init S1 4: resets← [0] 5: for t = 1, . . . , T do 6: K =Ktr if t 6=T else argmax\nk:ŷ (k) 1:t 6=y1:t\nf(ŷ (k) 1:t , ĥ\n(k) t−1)\n7: if f(yt,ht−1) < f(ŷt, ĥ (K)\nt−1) + 1 then 8: r ← top(resets) 9: ĥr:t−1 ← ĥ (K)\nr:t−1\n10: ŷr+1:t ← ŷ(K)r+1:t 11: Push t onto resets 12: St+1 ← topK(succ(y1:t)) 13: else 14: St+1 ← topK( ⋃K k=1 succ(ŷ (k) 1:t ))"
+    }, {
+      "heading" : "15: /*BACKWARD*/",
+      "text" : "16: ∇hT ← −∆(ŷ (K) 1:T )×∇htf(y1:T ) 17: ∇ĥT ← ∆(ŷ (K) 1:T )×∇ĥtf(ŷ (K) 1:T ) 18: for t = T − 1, . . . , 1 do 19: ∇ht ← BRNN(yt+1,ht,∇ht+1) 20: −∆(ŷ(K)1:t )×∇htf(y1:t) 21: ∇ĥt ← BRNN(ŷt+1, ĥt,∇ĥt+1) 22: +∆(ŷ(K)1:t )×∇ĥtf(ŷ (K) 1:t ) 23: if t− 1 ∈ resets then 24: ∇ht ← ∇ht +∇ĥt 25: ∇ĥt ← 0 26: Update RNN params based on h,h′, ĥ, ĥ ′\nare aware, this model architecture is the state-of-theart for neural machine translation and other seq2seq tasks.\nTo distinguish the models we refer to our system as BSO (beam search optimization) and to the baseline as seq2seq. When we apply constrained training (as discussed in Section 4.2), we refer to the model as ConBSO. In providing results we also distinguish between the beam size Ktr with which the model is trained, and the beam size Kte which is used at test-time. In general, if we plan on evaluating with a beam of size Kte it makes sense to train with a beam of size Ktr = Kte + 1, since our objective requires the gold sequence to be scored higher than the last sequence on the beam."
+    }, {
+      "heading" : "5.2 Training and Test",
+      "text" : "Here we detail additional techniques we found necessary to ensure the model learned effectively. First,\nwe found that the model failed to learn when trained from a random initialization.4 We therefore found it necessary to pre-train the model using a standard, word-level cross-entropy loss as described in Section 3. The necessity of pre-training in this instance is consistent with the findings of other authors who train non-local neural models (Kingsbury, 2009; Sak et al., 2014; Andor et al., 2016; Ranzato et al., 2016).5\nSimilarly, it is clear that the smaller the beam used in training is, the less room the model has to make erroneous predictions without running afoul of the margin criterion. Accordingly, we also found it useful to use a “curriculum beam” strategy in training, whereby the size of the beam is increased gradually during training. In particular, given a desired training beam size Ktr, we began training with a beam of size 2, and increased it by 1 every 2 epochs until reaching Ktr.\nFinally, it has been established that dropout (Srivastava et al., 2014) regularization improves the performance of LSTMs (Pham et al., 2014; Zaremba et al., 2014), and in our experiments we run beam search under dropout. However, it is important to ensure that the same mask applied at each time-step of the forward search is also applied at the corresponding step of the backward pass. We accomplish this by pre-computing masks for each time-step, and sharing them between the partial sequence LSTMs.\nFor all experiments, we trained both seq2seq and BSO models with mini-batch Adagrad (Duchi et al., 2011) (using batches of size 64), and we renormalized all gradients so they did not exceed 5 before taking the gradient step. We did not extensively tune learning-rates, but we found initial rates of 0.02 for the encoder and decoder LSTMs, and a rate of 0.1 or 0.2 for the final linear layer (i.e., the layer tasked with making word-predictions at each time-step) to work well across all the tasks we considered.\n4This may be because there is relatively little signal in the gradients of our sequence-level objective, since only the gold and margin-violating sequences receive updates. This point requires further investigation, however.\n5Andor et al. (2016) found, however, that pre-training only increased convergence-speed, but was not necessary for obtaining good results."
+    }, {
+      "heading" : "5.3 Tasks and Results",
+      "text" : "Our experiments are primarily intended to evaluate the effectiveness of beam search optimization over standard seq2seq training. As such, we run experiments with the same model across three very different problems: word ordering, dependency parsing, and machine translation. While we do not include all the features and extensions necessary to reach state-of-the-art performance, even the baseline seq2seq model is generally quite performant.\nWord Ordering The task of correctly ordering the words in a shuffled sentence has recently gained some attention as a way to test the (syntactic) capabilities of text-generation systems (Zhang and Clark, 2011; Zhang and Clark, 2015; Liu et al., 2015; Schmaltz et al., 2016). We cast this task as seq2seq problem by viewing a shuffled sentence as a source sentence, and the correctly ordered sentence as the target. While word ordering is a somewhat synthetic task, it has two interesting properties for our purposes. First, it is a task which plausibly requires search (due to the exponentially many possible orderings), and, second, there is a clear hard constraint on output sequences, namely, that they be a permutation of the source sequence. For both the baseline and BSO models we enforce this constraint at testtime. However, we also experiment with constraining the BSO model during training, as described in Section 4.2, by defining the succ function to only allow successor sequences containing un-used words in the source sentence.\nFor experiments, we use the same PTB dataset (with the standard training, development, and test splits) and evaluation procedure as in Zhang and Clark (2015), Liu et al. (2015), and Schmaltz et al. (2016), with performance reported in terms of BLEU score with the correctly ordered sentences. For all word-ordering experiments we use 2-layer encoder and decoder LSTMs, each with 256 hidden units, and dropout with a rate of 0.2 between LSTM layers. We use simple 0/1 costs in defining the ∆ function.\nWe show our test-set results in Table 1. We see that on this task there is a large improvement at each beam size from switching to BSO, and a further improvement from using the constrained model.\nWe further examine the relationship between Ktr\nand Kte (when training under constraints) in Table 2. We see that larger Ktr hurt greedy inference, but that results continue to improve, at least initially, when using a Kte that is (somewhat) bigger than Ktr−1.\nDependency Parsing We next apply our model to dependency parsing, a more realistic task, which also has hard constraints and plausibly benefits from search. We treat dependency parsing with arcstandard transitions as a seq2seq task by attempting to map from a source sentence to a target sequence of source sentence words interleaved with the arcstandard, reduce-actions in its parse. For example, we attempt to map the source sentence\nBut it was the Quotron problems that ...\nto the target sequence\nBut it was @L SBJ @L DEP the Quotron problems @L NMOD @L NMOD that ...\nWe use the standard Penn Treebank dataset splits with Stanford dependency labels, and the standard UAS/LAS evaluation metric (excluding punctuation) following Chen and Manning (2014). All\nmodels thus see only the words in the source and, when decoding, the actions it has emitted so far; no other features are used. We use 2-layer encoder and decoder LSTMs with 300 hidden units per layer and dropout with a rate of 0.3 between LSTM layers. We replace singleton words in the training set with an UNK token, normalize digits to a single symbol, and initialize word embeddings for both source and target words from the publicly available word2vec (Mikolov et al., 2013) embeddings. We use simple 0/1 costs in defining the ∆ function.\nAs in the word-ordering case, we also experiment with modifying the succ function in order to train under hard constraints, namely, that the emitted target sequence be a valid parse. In particular, we constrain the output at each time-step to obey the stack constraint, and we ensure words in the source are emitted in order.\nWe show results on the test-set in Table 3. BSO and ConBSO both show significant improvements over seq2seq, with ConBSO improving most on UAS, and BSO improving most on LAS. We achieve a reasonable final score of 91.57 UAS, which lags behind the state-of-the-art, but is promising for a general-purpose, word-only model.\nTranslation We finally evaluate our model on machine translation, which allows us to experiment with a ∆ function that is not 0/1, and to consider other baselines that attempt to mitigate exposure bias in the seq2seq setting. We evaluate on the machine translation dataset used in Ranzato et al. (2016), which uses data from the German-toEnglish portion of the IWSLT 2014 machine translation evaluation campaign (Cettolo et al., 2014).\nThe data comes from translated TED talks, and the dataset contains roughly 153K training sentences, 7K development sentences, and 7K test sentences. We use the same preprocessing and dataset splits as Ranzato et al. (2016), and like them we also use a single-layer LSTM decoder with 256 units. We also use dropout with a rate of 0.2 between each LSTM layer. We note, however, that while our decoder LSTM is of the same size as that of Ranzato et al. (2016), our results are not directly comparable, because we use an LSTM encoder (rather than a convolutional encoder as they do), a slightly different attention mechanism, and “input feeding.”\nFor our main MT results, we set ∆(ŷ(k)1:t ) to 1−SmoothedSentBLEU(ŷ(K)r+1:t, yr+1:t), where r is the last margin violation and SmoothedSentBLEU is a smoothed, sentencelevel BLEU (Chen and Cherry, 2014). This setting of ∆ should act to penalize erroneous predictions with a relatively low sentence-level BLEU score more than those with a relatively high sentence-level BLEU score. In Table 4 we show our final results and those from Ranzato et al. (2016). While we start with an improved baseline, we see similarly large increases in accuracy as those obtained by DAD and MIXER, in particular when Kte > 1.\nWe further investigate the utility of these sequence-level costs in Table 5, which compares using sentence-level BLEU costs in defining ∆ with\nr+1:t, yr+1:t)\n(right), and Ktr = 6.\nusing 0/1 costs. We see that the more sophisticated sequence-level costs have a moderate effect on BLEU score."
+    }, {
+      "heading" : "6 Conclusion",
+      "text" : "We have introduced a variant of seq2seq and an associated beam search training scheme, which addresses exposure bias as well as label bias, and moreover allows for both training with sequencelevel cost functions as well as with hard constraints. We show that this training method improves over a powerful seq2seq baseline on several NLP tasks."
+    }, {
+      "heading" : "Acknowledgments",
+      "text" : "We thank Yoon Kim for helpful discussions and for providing the initial seq2seq code on which our implementations are based. We also gratefully acknowledge the support of a Google Research Award."
+    } ],
+    "references" : [ {
+      "title" : "Scheduled sampling for sequence prediction with recurrent neural networks",
+      "author" : [ "Bengio et al.2015] Samy Bengio", "Oriol Vinyals", "Navdeep Jaitly", "Noam Shazeer" ],
+      "venue" : "In Advances in Neural Information Processing Systems,",
+      "citeRegEx" : "Bengio et al\\.,? \\Q2015\\E",
+      "shortCiteRegEx" : "Bengio et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "Learning structured perceptrons for coreference Resolution with Latent Antecedents and Non-local Features",
+      "author" : [ "Björkelund", "Kuhn2014] Anders Björkelund", "Jonas Kuhn" ],
+      "venue" : null,
+      "citeRegEx" : "Björkelund et al\\.,? \\Q2014\\E",
+      "shortCiteRegEx" : "Björkelund et al\\.",
+      "year" : 2014
+    }, {
+      "title" : "Efficient programmable learning to search. In Arxiv",
+      "author" : [ "Chang et al.2015] Kai-Wei Chang", "Hal Daumé III", "John Langford", "Stephane Ross" ],
+      "venue" : null,
+      "citeRegEx" : "Chang et al\\.,? \\Q2015\\E",
+      "shortCiteRegEx" : "Chang et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "A systematic comparison of smoothing techniques for sentence-level bleu",
+      "author" : [ "Chen", "Cherry2014] Boxing Chen", "Colin Cherry" ],
+      "venue" : "ACL",
+      "citeRegEx" : "Chen et al\\.,? \\Q2014\\E",
+      "shortCiteRegEx" : "Chen et al\\.",
+      "year" : 2014
+    }, {
+      "title" : "A fast and accurate dependency parser using neural networks",
+      "author" : [ "Chen", "Manning2014] Danqi Chen", "Christopher D Manning" ],
+      "venue" : "In EMNLP,",
+      "citeRegEx" : "Chen et al\\.,? \\Q2014\\E",
+      "shortCiteRegEx" : "Chen et al\\.",
+      "year" : 2014
+    }, {
+      "title" : "Incremental parsing with the perceptron algorithm",
+      "author" : [ "Collins", "Roark2004] Michael Collins", "Brian Roark" ],
+      "venue" : "In Proceedings of the 42nd Annual Meeting on Association for Computational Linguistics,",
+      "citeRegEx" : "Collins et al\\.,? \\Q2004\\E",
+      "shortCiteRegEx" : "Collins et al\\.",
+      "year" : 2004
+    }, {
+      "title" : "Learning as search optimization: approximate large margin methods for structured prediction",
+      "author" : [ "III Daumé", "III Marcu2005] Hal Daumé", "Marcu. Daniel" ],
+      "venue" : "In Proceedings of the Twenty-Second International Conference on Machine Learning (ICML",
+      "citeRegEx" : "Daumé et al\\.,? \\Q2005\\E",
+      "shortCiteRegEx" : "Daumé et al\\.",
+      "year" : 2005
+    }, {
+      "title" : "Search-based structured prediction",
+      "author" : [ "John Langford", "Daniel Marcu" ],
+      "venue" : "Machine Learning,",
+      "citeRegEx" : "III et al\\.,? \\Q2009\\E",
+      "shortCiteRegEx" : "III et al\\.",
+      "year" : 2009
+    }, {
+      "title" : "Adaptive Subgradient Methods for Online Learning and Stochastic Optimization",
+      "author" : [ "Duchi et al.2011] John Duchi", "Elad Hazan", "Yoram Singer" ],
+      "venue" : "The Journal of Machine Learning Research,",
+      "citeRegEx" : "Duchi et al\\.,? \\Q2011\\E",
+      "shortCiteRegEx" : "Duchi et al\\.",
+      "year" : 2011
+    }, {
+      "title" : "Sentence compression by deletion with lstms",
+      "author" : [ "Enrique Alfonseca", "Carlos A Colmenares", "Lukasz Kaiser", "Oriol Vinyals" ],
+      "venue" : "In Proceedings of the 2015 Conference on Empirical Methods in Natural Language Processing,",
+      "citeRegEx" : "Filippova et al\\.,? \\Q2015\\E",
+      "shortCiteRegEx" : "Filippova et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "Long short-term memory",
+      "author" : [ "Hochreiter", "Schmidhuber1997] Sepp Hochreiter", "Jürgen Schmidhuber" ],
+      "venue" : "Neural Comput.,",
+      "citeRegEx" : "Hochreiter et al\\.,? \\Q1997\\E",
+      "shortCiteRegEx" : "Hochreiter et al\\.",
+      "year" : 1997
+    }, {
+      "title" : "Structured perceptron with inexact search",
+      "author" : [ "Huang et al.2012] Liang Huang", "Suphan Fayong", "Yang Guo" ],
+      "venue" : "In Proceedings of the 2012 Conference of the North American Chapter of the Association for Computational Linguistics: Human Language Technolo-",
+      "citeRegEx" : "Huang et al\\.,? \\Q2012\\E",
+      "shortCiteRegEx" : "Huang et al\\.",
+      "year" : 2012
+    }, {
+      "title" : "Lattice-based optimization of sequence classification criteria for neural-network acoustic modeling",
+      "author" : [ "Brian Kingsbury" ],
+      "venue" : "In Acoustics, Speech and Signal Processing,",
+      "citeRegEx" : "Kingsbury.,? \\Q2009\\E",
+      "shortCiteRegEx" : "Kingsbury.",
+      "year" : 2009
+    }, {
+      "title" : "Conditional random fields: Probabilistic models for segmenting and labeling sequence data",
+      "author" : [ "Andrew McCallum", "Fernando C.N. Pereira" ],
+      "venue" : "In Proceedings of the Eighteenth International Conference on Machine",
+      "citeRegEx" : "Lafferty et al\\.,? \\Q2001\\E",
+      "shortCiteRegEx" : "Lafferty et al\\.",
+      "year" : 2001
+    }, {
+      "title" : "Transition-based syntactic linearization",
+      "author" : [ "Liu et al.2015] Yijia Liu", "Yue Zhang", "Wanxiang Che", "Bing Qin" ],
+      "venue" : "In Proceedings of NAACL",
+      "citeRegEx" : "Liu et al\\.,? \\Q2015\\E",
+      "shortCiteRegEx" : "Liu et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "Effective approaches to attention-based neural machine translation",
+      "author" : [ "Luong et al.2015] Thang Luong", "Hieu Pham", "Christopher D. Manning" ],
+      "venue" : "In Proceedings of the 2015 Conference on Empirical Methods in Natural Language Processing,",
+      "citeRegEx" : "Luong et al\\.,? \\Q2015\\E",
+      "shortCiteRegEx" : "Luong et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "Distributed representations of words and phrases and their compositionality",
+      "author" : [ "Ilya Sutskever", "Kai Chen", "Greg S Corrado", "Jeff Dean" ],
+      "venue" : "In Advances in neural information processing systems,",
+      "citeRegEx" : "Mikolov et al\\.,? \\Q2013\\E",
+      "shortCiteRegEx" : "Mikolov et al\\.",
+      "year" : 2013
+    }, {
+      "title" : "Bleu: a method for automatic evaluation of machine translation",
+      "author" : [ "Salim Roukos", "Todd Ward", "Wei-Jing Zhu" ],
+      "venue" : "In Proceedings of the 40th annual meeting on association for computational linguistics,",
+      "citeRegEx" : "Papineni et al\\.,? \\Q2002\\E",
+      "shortCiteRegEx" : "Papineni et al\\.",
+      "year" : 2002
+    }, {
+      "title" : "Dropout improves recurrent neural networks for handwriting recognition",
+      "author" : [ "Pham et al.2014] Vu Pham", "Théodore Bluche", "Christopher Kermorvant", "Jérôme Louradour" ],
+      "venue" : "In Frontiers in Handwriting Recognition (ICFHR),",
+      "citeRegEx" : "Pham et al\\.,? \\Q2014\\E",
+      "shortCiteRegEx" : "Pham et al\\.",
+      "year" : 2014
+    }, {
+      "title" : "Sequence level training with recurrent neural networks. ICLR",
+      "author" : [ "Sumit Chopra", "Michael Auli", "Wojciech Zaremba" ],
+      "venue" : null,
+      "citeRegEx" : "Ranzato et al\\.,? \\Q2016\\E",
+      "shortCiteRegEx" : "Ranzato et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "A reduction of imitation learning and structured prediction to no-regret online learning",
+      "author" : [ "Ross et al.2011] Stéphane Ross", "Geoffrey J. Gordon", "Drew Bagnell" ],
+      "venue" : "In Proceedings of the Fourteenth International Conference on Artificial Intelligence and Statistics,",
+      "citeRegEx" : "Ross et al\\.,? \\Q2011\\E",
+      "shortCiteRegEx" : "Ross et al\\.",
+      "year" : 2011
+    }, {
+      "title" : "Sequence discriminative distributed training of long short-term memory recurrent neural networks",
+      "author" : [ "Sak et al.2014] Hasim Sak", "Oriol Vinyals", "Georg Heigold", "Andrew W. Senior", "Erik McDermott", "Rajat Monga", "Mark Z. Mao" ],
+      "venue" : "INTERSPEECH",
+      "citeRegEx" : "Sak et al\\.,? \\Q2014\\E",
+      "shortCiteRegEx" : "Sak et al\\.",
+      "year" : 2014
+    }, {
+      "title" : "Word ordering without syntax",
+      "author" : [ "Alexander M Rush", "Stuart M Shieber" ],
+      "venue" : "arXiv preprint arXiv:1604.08633",
+      "citeRegEx" : "Schmaltz et al\\.,? \\Q2016\\E",
+      "shortCiteRegEx" : "Schmaltz et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Building end-to-end dialogue systems using generative hierarchical neural network models",
+      "author" : [ "Pineau." ],
+      "venue" : "Proceedings of the Thirtieth AAAI Conference on Artificial Intelligence, pages 3776–3784.",
+      "citeRegEx" : "Pineau.,? 2016",
+      "shortCiteRegEx" : "Pineau.",
+      "year" : 2016
+    }, {
+      "title" : "Dropout: A simple way to prevent neural networks from overfitting",
+      "author" : [ "Geoffrey Hinton", "Alex Krizhevsky", "Ilya Sutskever", "Ruslan Salakhutdinov" ],
+      "venue" : "The Journal of Machine Learning Research,",
+      "citeRegEx" : "Srivastava et al\\.,? \\Q2014\\E",
+      "shortCiteRegEx" : "Srivastava et al\\.",
+      "year" : 2014
+    }, {
+      "title" : "Generating text with recurrent neural networks",
+      "author" : [ "James Martens", "Geoffrey E Hinton" ],
+      "venue" : "In Proceedings of the 28th International Conference on Machine Learning (ICML),",
+      "citeRegEx" : "Sutskever et al\\.,? \\Q2011\\E",
+      "shortCiteRegEx" : "Sutskever et al\\.",
+      "year" : 2011
+    }, {
+      "title" : "Sequence to sequence learning with neural networks",
+      "author" : [ "Oriol Vinyals", "Quoc VV Le" ],
+      "venue" : "In Advances in Neural Information Processing Systems (NIPS),",
+      "citeRegEx" : "Sutskever et al\\.,? \\Q2014\\E",
+      "shortCiteRegEx" : "Sutskever et al\\.",
+      "year" : 2014
+    }, {
+      "title" : "Grammar as a foreign language",
+      "author" : [ "Łukasz Kaiser", "Terry Koo", "Slav Petrov", "Ilya Sutskever", "Geoffrey Hinton" ],
+      "venue" : "In Advances in Neural Information Processing Systems,",
+      "citeRegEx" : "Vinyals et al\\.,? \\Q2015\\E",
+      "shortCiteRegEx" : "Vinyals et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "Sequence-discriminative training of recurrent neural networks",
+      "author" : [ "Patrick Doetsch", "Simon Wiesler", "Ralf Schluter", "Hermann Ney" ],
+      "venue" : "In Acoustics, Speech and Signal Processing (ICASSP),",
+      "citeRegEx" : "Voigtlaender et al\\.,? \\Q2015\\E",
+      "shortCiteRegEx" : "Voigtlaender et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "Transition-based neural constituent parsing",
+      "author" : [ "Watanabe", "Sumita2015] Taro Watanabe", "Eiichiro Sumita" ],
+      "venue" : "Proceedings of ACL-IJCNLP",
+      "citeRegEx" : "Watanabe et al\\.,? \\Q2015\\E",
+      "shortCiteRegEx" : "Watanabe et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "Incremental recurrent neural network dependency parser with search-based discriminative training",
+      "author" : [ "Yazdani", "Henderson2015] Majid Yazdani", "James Henderson" ],
+      "venue" : "In Proceedings of the 19th Conference on Computational Natural Language Learning,",
+      "citeRegEx" : "Yazdani et al\\.,? \\Q2015\\E",
+      "shortCiteRegEx" : "Yazdani et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "Recurrent neural network regularization. CoRR, abs/1409.2329",
+      "author" : [ "Ilya Sutskever", "Oriol Vinyals" ],
+      "venue" : null,
+      "citeRegEx" : "Zaremba et al\\.,? \\Q2014\\E",
+      "shortCiteRegEx" : "Zaremba et al\\.",
+      "year" : 2014
+    }, {
+      "title" : "Syntax-based grammaticality improvement using ccg and guided search",
+      "author" : [ "Zhang", "Clark2011] Yue Zhang", "Stephen Clark" ],
+      "venue" : "In Proceedings of the Conference on Empirical Methods in Natural Language Processing,",
+      "citeRegEx" : "Zhang et al\\.,? \\Q2011\\E",
+      "shortCiteRegEx" : "Zhang et al\\.",
+      "year" : 2011
+    }, {
+      "title" : "Discriminative syntax-based word ordering for text generation",
+      "author" : [ "Zhang", "Clark2015] Yue Zhang", "Stephen Clark" ],
+      "venue" : "Computational Linguistics,",
+      "citeRegEx" : "Zhang et al\\.,? \\Q2015\\E",
+      "shortCiteRegEx" : "Zhang et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "A neural probabilistic structured-prediction",
+      "author" : [ "Zhou et al.2015] Hao Zhou", "Yue Zhang", "Jiajun Chen" ],
+      "venue" : null,
+      "citeRegEx" : "Zhou et al\\.,? \\Q2015\\E",
+      "shortCiteRegEx" : "Zhou et al\\.",
+      "year" : 2015
+    } ],
+    "referenceMentions" : [ {
+      "referenceID" : 25,
+      "context" : "Sequence-to-Sequence learning with deep neural networks (herein, seq2seq) (Sutskever et al., 2011; Sutskever et al., 2014) has rapidly become a very useful and surprisingly general-purpose tool for natural language processing.",
+      "startOffset" : 74,
+      "endOffset" : 122
+    }, {
+      "referenceID" : 26,
+      "context" : "Sequence-to-Sequence learning with deep neural networks (herein, seq2seq) (Sutskever et al., 2011; Sutskever et al., 2014) has rapidly become a very useful and surprisingly general-purpose tool for natural language processing.",
+      "startOffset" : 74,
+      "endOffset" : 122
+    }, {
+      "referenceID" : 26,
+      "context" : "In addition to demonstrating impressive results for machine translation (Sutskever et al., 2014), roughly the same model and training has also proven to be useful for sentence compression (Filippova et al.",
+      "startOffset" : 72,
+      "endOffset" : 96
+    }, {
+      "referenceID" : 9,
+      "context" : ", 2014), roughly the same model and training has also proven to be useful for sentence compression (Filippova et al., 2015), parsing (Vinyals et al.",
+      "startOffset" : 99,
+      "endOffset" : 123
+    }, {
+      "referenceID" : 27,
+      "context" : ", 2015), parsing (Vinyals et al., 2015), and dialogue systems (Serban et al.",
+      "startOffset" : 17,
+      "endOffset" : 39
+    }, {
+      "referenceID" : 26,
+      "context" : "In practice, generation is accomplished by searching over output sequences greedily or with beam search (Sutskever et al., 2014).",
+      "startOffset" : 104,
+      "endOffset" : 128
+    }, {
+      "referenceID" : 19,
+      "context" : "In this context, Ranzato et al. (2016) note",
+      "startOffset" : 17,
+      "endOffset" : 39
+    }, {
+      "referenceID" : 17,
+      "context" : "Loss-Evaluation Mismatch: training uses a word-level loss, while at test-time we target improving sequence-level evaluation metrics, such as BLEU (Papineni et al., 2002).",
+      "startOffset" : 146,
+      "endOffset" : 169
+    }, {
+      "referenceID" : 13,
+      "context" : "We might additionally add the concern of label bias (Lafferty et al., 2001) to the list, since wordprobabilities at each time-step are locally normalized, guaranteeing that successors of incorrect hisar X iv :1 60 6.",
+      "startOffset" : 52,
+      "endOffset" : 75
+    }, {
+      "referenceID" : 15,
+      "context" : "ferent problems: word ordering, syntactic parsing, and machine translation, and compare to a highlytuned seq2seq system with attention (Luong et al., 2015).",
+      "startOffset" : 135,
+      "endOffset" : 155
+    }, {
+      "referenceID" : 20,
+      "context" : "DAgger (Ross et al., 2011) is a similar approach, which differs in terms of how training examples are generated and aggregated, and there have additionally been important refinements to this style of training over the past several years (Chang et al.",
+      "startOffset" : 7,
+      "endOffset" : 26
+    }, {
+      "referenceID" : 2,
+      "context" : ", 2011) is a similar approach, which differs in terms of how training examples are generated and aggregated, and there have additionally been important refinements to this style of training over the past several years (Chang et al., 2015).",
+      "startOffset" : 218,
+      "endOffset" : 238
+    }, {
+      "referenceID" : 0,
+      "context" : "When it comes to training RNNs, SEARN/DAgger has been applied under the name “scheduled sampling” (Bengio et al., 2015), which involves training an RNN to generate the t+ 1’st token in a target sequence after consuming either the true t’th token, or, with probability that increases throughout training, the predicted t’th token.",
+      "startOffset" : 98,
+      "endOffset" : 119
+    }, {
+      "referenceID" : 34,
+      "context" : "forward setting by Zhou et al. (2015) and Andor et al.",
+      "startOffset" : 19,
+      "endOffset" : 38
+    }, {
+      "referenceID" : 34,
+      "context" : "forward setting by Zhou et al. (2015) and Andor et al. (2016). Our work differs in that we adopt a LaSO-like paradigm (with some minor modifications), and apply it to the training of seq2seq RNNs (rather than feed-forward networks).",
+      "startOffset" : 19,
+      "endOffset" : 62
+    }, {
+      "referenceID" : 11,
+      "context" : "that Watanabe and Sumita (2015) apply maximumviolation training (Huang et al., 2012), which is similar to early-update, to a parsing model with recurrent components, and that Yazdani and Henderson (2015) use beam-search in training a discriminative, locally normalized dependency parser with recurrent components.",
+      "startOffset" : 64,
+      "endOffset" : 84
+    }, {
+      "referenceID" : 11,
+      "context" : "that Watanabe and Sumita (2015) apply maximumviolation training (Huang et al., 2012), which is similar to early-update, to a parsing model with recurrent components, and that Yazdani and Henderson (2015) use beam-search in training a discriminative, locally normalized dependency parser with recurrent components.",
+      "startOffset" : 65,
+      "endOffset" : 204
+    }, {
+      "referenceID" : 19,
+      "context" : "Ranzato et al. (2016) follow this approach to train RNN decoders in a seq2seq model, and they obtain consistent improvements in performance, even over models trained with scheduled sampling.",
+      "startOffset" : 0,
+      "endOffset" : 22
+    }, {
+      "referenceID" : 19,
+      "context" : "Ranzato et al. (2016) follow this approach to train RNN decoders in a seq2seq model, and they obtain consistent improvements in performance, even over models trained with scheduled sampling. As Daumé III and Marcu (2005) note, however, techniques such as LaSO are similar to reinforcement learning, except that they do not require blind “exploration” in the same way.",
+      "startOffset" : 0,
+      "endOffset" : 221
+    }, {
+      "referenceID" : 21,
+      "context" : "We also note that there are some (non-seq2seq) exceptions to the trend of locally normalized RNNs, such as the work of Sak et al. (2014) and Voigtlaen-",
+      "startOffset" : 119,
+      "endOffset" : 137
+    }, {
+      "referenceID" : 34,
+      "context" : "(2016) and Zhou et al. (2015), though in training those models are simply not updated when the gold sequence remains on the beam.",
+      "startOffset" : 11,
+      "endOffset" : 30
+    }, {
+      "referenceID" : 15,
+      "context" : "While the method we describe applies to seq2seq RNNs in general, for all experiments we use the global attention model of Luong et al. (2015) — which consists of an LSTM (Hochreiter and Schmidhuber, 1997) encoder and an LSTM decoder with a global attention model — as both the baseline seq2seq model (i.",
+      "startOffset" : 122,
+      "endOffset" : 142
+    }, {
+      "referenceID" : 15,
+      "context" : "While the method we describe applies to seq2seq RNNs in general, for all experiments we use the global attention model of Luong et al. (2015) — which consists of an LSTM (Hochreiter and Schmidhuber, 1997) encoder and an LSTM decoder with a global attention model — as both the baseline seq2seq model (i.e., as the model that computes the g in Section 3) and as the model that computes our sequence-scores f . As in Luong et al. (2015), we also use “input feeding,” which involves feeding the attention distribution from the previous time-step into the decoder at the current step.",
+      "startOffset" : 122,
+      "endOffset" : 435
+    }, {
+      "referenceID" : 12,
+      "context" : "The necessity of pre-training in this instance is consistent with the findings of other authors who train non-local neural models (Kingsbury, 2009; Sak et al., 2014; Andor et al., 2016; Ranzato et al., 2016).",
+      "startOffset" : 130,
+      "endOffset" : 207
+    }, {
+      "referenceID" : 21,
+      "context" : "The necessity of pre-training in this instance is consistent with the findings of other authors who train non-local neural models (Kingsbury, 2009; Sak et al., 2014; Andor et al., 2016; Ranzato et al., 2016).",
+      "startOffset" : 130,
+      "endOffset" : 207
+    }, {
+      "referenceID" : 19,
+      "context" : "The necessity of pre-training in this instance is consistent with the findings of other authors who train non-local neural models (Kingsbury, 2009; Sak et al., 2014; Andor et al., 2016; Ranzato et al., 2016).",
+      "startOffset" : 130,
+      "endOffset" : 207
+    }, {
+      "referenceID" : 24,
+      "context" : "Finally, it has been established that dropout (Srivastava et al., 2014) regularization improves the per-",
+      "startOffset" : 46,
+      "endOffset" : 71
+    }, {
+      "referenceID" : 18,
+      "context" : "formance of LSTMs (Pham et al., 2014; Zaremba et al., 2014), and in our experiments we run beam search under dropout.",
+      "startOffset" : 18,
+      "endOffset" : 59
+    }, {
+      "referenceID" : 31,
+      "context" : "formance of LSTMs (Pham et al., 2014; Zaremba et al., 2014), and in our experiments we run beam search under dropout.",
+      "startOffset" : 18,
+      "endOffset" : 59
+    }, {
+      "referenceID" : 8,
+      "context" : "For all experiments, we trained both seq2seq and BSO models with mini-batch Adagrad (Duchi et al., 2011) (using batches of size 64), and we renormalized all gradients so they did not exceed 5 before taking the gradient step.",
+      "startOffset" : 84,
+      "endOffset" : 104
+    }, {
+      "referenceID" : 14,
+      "context" : "For experiments, we use the same PTB dataset (with the standard training, development, and test splits) and evaluation procedure as in Zhang and Clark (2015), Liu et al. (2015), and Schmaltz et al.",
+      "startOffset" : 159,
+      "endOffset" : 177
+    }, {
+      "referenceID" : 14,
+      "context" : "For experiments, we use the same PTB dataset (with the standard training, development, and test splits) and evaluation procedure as in Zhang and Clark (2015), Liu et al. (2015), and Schmaltz et al. (2016), with performance reported in terms of BLEU score with the correctly ordered sentences.",
+      "startOffset" : 159,
+      "endOffset" : 205
+    }, {
+      "referenceID" : 16,
+      "context" : "We replace singleton words in the training set with an UNK token, normalize digits to a single symbol, and initialize word embeddings for both source and target words from the publicly available word2vec (Mikolov et al., 2013) embeddings.",
+      "startOffset" : 204,
+      "endOffset" : 226
+    }, {
+      "referenceID" : 19,
+      "context" : "We evaluate on the machine translation dataset used in Ranzato et al. (2016), which uses data from the German-toEnglish portion of the IWSLT 2014 machine translation evaluation campaign (Cettolo et al.",
+      "startOffset" : 55,
+      "endOffset" : 77
+    }, {
+      "referenceID" : 0,
+      "context" : "DAD trains seq2seq with scheduled sampling (Bengio et al., 2015).",
+      "startOffset" : 43,
+      "endOffset" : 64
+    }, {
+      "referenceID" : 18,
+      "context" : "Table 4: Machine translation experiments on test set; results below middle line are from MIXER model of Ranzato et al. (2016). SB-∆ indicates sentence BLEU costs are used in defining ∆.",
+      "startOffset" : 104,
+      "endOffset" : 126
+    }, {
+      "referenceID" : 19,
+      "context" : "We use the same preprocessing and dataset splits as Ranzato et al. (2016), and like them we also use a single-layer LSTM decoder with 256 units.",
+      "startOffset" : 52,
+      "endOffset" : 74
+    }, {
+      "referenceID" : 19,
+      "context" : "We note, however, that while our decoder LSTM is of the same size as that of Ranzato et al. (2016), our results are not directly comparable, because we use an LSTM encoder (rather than a convolutional encoder as they do), a slightly different",
+      "startOffset" : 77,
+      "endOffset" : 99
+    }, {
+      "referenceID" : 19,
+      "context" : "In Table 4 we show our final results and those from Ranzato et al. (2016). While we start with an improved baseline, we see similarly large increases in accuracy as those obtained by DAD and MIXER, in particular when Kte > 1.",
+      "startOffset" : 52,
+      "endOffset" : 74
+    } ],
+    "year" : 2016,
+    "abstractText" : "Sequence-to-Sequence (seq2seq) modeling has rapidly become an important generalpurpose NLP tool that has proven effective for many text-generation and sequence-labeling tasks. Seq2seq builds on deep neural language modeling and inherits its remarkable accuracy in estimating local, next-word distributions. In this work, we introduce a model and training scheme, based on the work of Daumé III and Marcu (2005), that extends seq2seq to learn global sequence scores. This structured approach avoids classical biases associated with local training and unifies the training loss with the test-time usage, while preserving the proven model architecture of seq2seq and its efficient training approach. We show that our system outperforms a highlyoptimized attention-based seq2seq system and other baselines on three different sequence to sequence tasks: word ordering, parsing, and machine translation.",
+    "creator" : "LaTeX with hyperref package"
+  }
+}

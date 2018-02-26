@@ -1,0 +1,339 @@
+{
+  "name" : "1704.05021.pdf",
+  "metadata" : {
+    "source" : "CRF",
+    "title" : "Sparse Communication for Distributed Gradient Descent",
+    "authors" : [ "Alham Fikri", "Kenneth Heafield" ],
+    "emails" : [ "a.fikri@ed.ac.uk,", "kheafiel@inf.ed.ac.uk" ],
+    "sections" : [ {
+      "heading" : null,
+      "text" : "We make distributed stochastic gradient descent faster by exchanging sparse updates instead of dense updates. Gradient updates are positively skewed as most updates are near zero, so we map the 99% smallest updates (by absolute value) to zero then exchange sparse matrices. This method can be combined with quantization to further improve the compression. We explore different configurations and apply them to neural machine translation and MNIST image classification tasks. Most configurations work on MNIST, whereas different configurations reduce convergence rate on the more complex translation task. Our experiments show that we can achieve up to 49% speed up on MNIST and 22% on NMT without damaging the final accuracy or BLEU."
+    }, {
+      "heading" : "1 Introduction",
+      "text" : "Distributed computing is essential to train large neural networks on large data sets (Raina et al., 2009). We focus on data parallelism: nodes jointly optimize the same model on different parts of the training data, exchanging gradients and parameters over the network. This network communication is costly, so prior work developed two ways to approximately compress network traffic: 1-bit quantization (Seide et al., 2014) and sending sparse matrices by dropping small updates (Strom, 2015; Dryden et al., 2016). These methods were developed and tested on speech recognition and toy MNIST systems. In porting these approximations to neural machine translation (NMT) (Ñeco and Forcada, 1996; Bahdanau et al., 2014), we find that translation is less tolerant to quantization.\nThroughout this paper, we compare neural machine translation behavior with a toy MNIST system, chosen because prior work used a similar system (Dryden et al., 2016). NMT parameters are dominated by three large embedding matrices: source language input, target language input, and target language output. These matrices deal with vocabulary words, only a small fraction of which are seen in a mini-batch, so we expect skewed gradients. In contrast, MNIST systems exercise every parameter in every mini-batch. Additionally, NMT systems consist of multiple parameters with different scales and sizes, compared to MNIST’s 3-layers network with uniform size. More formally, gradient updates have positive skewness coefficient (Zwillinger and Kokoska, 1999): most are close to zero but a few are large."
+    }, {
+      "heading" : "2 Related Work",
+      "text" : "An orthogonal line of work optimizes the SGD algorithm and communication pattern. Zinkevich et al. (2010) proposed an asynchronous architecture where each node can push and pull the model independently to avoid waiting for the slower node. Chilimbi et al. (2014) and Recht et al. (2011) suggest updating the model without a lock, allowing race conditions. Additionally, Dean et al. (2012) run multiple minibatches before exchanging updates, reducing the communication cost. Our work is a more continuous version, in which the most important updates are sent between minibatches. Zhang et al. (2015) downweight gradients based on stale parameters.\nApproximate gradient compression is not a new idea. 1-Bit SGD (Seide et al., 2014), and later Quantization SGD (Alistarh et al., 2016), work by converting the gradient update into a 1-bit matrix, thus reducing data communication significantly. Strom (2015) proposed threshold quantiza-\nar X\niv :1\n70 4.\n05 02\n1v 2\n[ cs\n.C L\n] 2\n4 Ju\nl 2 01\n7\ntion, which only sends gradient updates that larger than a predefined constant threshold. However, the optimal threshold is not easy to choose and, moreover, it can change over time during optimization. Dryden et al. (2016) set the threshold so as to keep a constant number of gradients each iteration."
+    }, {
+      "heading" : "3 Distributed SGD",
+      "text" : "We used distributed SGD with parameter sharding (Dean et al., 2012), shown in Figure 1. Each of the N workers is both a client and a server. Servers are responsible for 1/N th of the parameters.\nClients have a copy of all parameters, which they use to compute gradients. These gradients are split into N pieces and pushed to the appropriate servers. Similarly, each client pulls parameters from all servers. Each node converses with all N nodes regarding 1/N th of the parameters, so bandwidth per node is constant."
+    }, {
+      "heading" : "4 Sparse Gradient Exchange",
+      "text" : "We sparsify gradient updates by removing the R% smallest gradients by absolute value, dubbing this Gradient Dropping. This approach is slightly different from Dryden et al. (2016) as we used a single threshold based on absolute value, instead of dropping the positive and negative gradients separately. This is simpler to execute and works just as well.\nSmall gradients can accumulate over time and we find that zeroing them damages convergence. Following Seide et al. (2014), we remember residuals (in our case dropped values) locally and add them to the next gradient, before dropping again.\nAlgorithm 1 Gradient dropping algorithm given gradient∇ and dropping rate R.\nfunction GRADDROP(∇, R) ∇+ = residuals Select threshold: R% of |∇| is smaller dropped← 0 dropped[i]← ∇[i]∀i : |∇[i]| > threshold residuals← ∇− dropped return sparse(dropped) end function\nGradient Dropping is shown in Algorithm 1. This function is applied to all data transmissions, including parameter pulls encoded as deltas from the last version pulled by the client. To compute these deltas, we store the last pulled copy serverside. Synchronous SGD has one copy. Asynchronous SGD has a copy per client, but the server is responsible for 1/N th of the parameters for N clients so memory is constant.\nSelection to obtain the threshold is expensive (Alabi et al., 2012). However, this can be approximated. We sample 0.1% of the gradient and obtain the threshold by running selection on the samples.\nParameters and their gradients may not be on comparable scales across different parts of the neural network. We can select a threshold locally to each matrix of parameters or globally for all parameters. In the experiments, we find that layer normalization (Lei Ba et al., 2016) makes a global threshold work, so by default we use layer normalization with one global threshold. Without layer normalization, a global threshold degrades convergence for NMT. Prior work used global thresholds and sometimes column-wise quantization."
+    }, {
+      "heading" : "5 Experiment",
+      "text" : "We experiment with an image classification task based on MNIST dataset (LeCun et al., 1998) and Romanian→English neural machine translation system.\nFor our image classification experiment, we build a fully connected neural network with three 4069-neuron hidden layers. We use AdaGrad with an initial learning rate of 0.005. The mini-batch size of 40 is used. This setup is identical to Dryden et al. (2016).\nOur NMT experiment is based on Sennrich et al. (2016), which won first place in the 2016 Workshop on Machine Translation. It is based on an attentional encoder-decoder LSTM with\n119M parameters. The default batch size is 80. We save and validate every 10000 steps. We pick 4 saved models with the highest validation BLEU and average them into the final model. AmuNMT (Junczys-Dowmunt et al., 2016) is used for decoding with a beam size of 12. Our test system has PCI Express 3.0 x16 for each of 4 NVIDIA Pascal Titan Xs. All experiments used asynchronous SGD, though our method applies to synchronous SGD as well."
+    }, {
+      "heading" : "5.1 Drop Ratio",
+      "text" : "To find an appropriate dropping ratio R%, we tried 90%, 99%, and 99.9% then measured performance in terms of loss and classification accuracy or translation quality approximated by BLEU (Papineni et al., 2002) for image classification and NMT task respectively.\nFigure 3 shows that the model still learns after dropping 99.9% of the gradients, albeit with a worse BLEU score. However, dropping 99% of the gradient has little impact on convergence or BLEU, despite exchanging 50x less data with offset-value encoding. The x-axis in both plots is batches, showing that we are not relying on speed improvement to compensate for convergence.\nDryden et al. (2016) used a fixed dropping ratio of 98.4% without testing other options. Switching to 99% corresponds to more than a 1.5x reduction in network bandwidth.\nFor MNIST, gradient dropping oddly improves accuracy in early batches. The same is not seen for NMT, so we caution against interpreting slight gains on MNIST as regularization."
+    }, {
+      "heading" : "5.2 Local vs Global Threshold",
+      "text" : "Parameters may not be on a comparable scale so, as discussed in Section 4, we experiment with local thresholds for each matrix or a global threshold for all gradients. We also investigate the effect of layer normalization. We use a drop ratio of 99% as suggested previously. Based on the results and\ndue to the complicated interaction with sharding, we did not implement locally thresholded pulling, so only locally thresholded pushing is shown.\nThe results show that layer normalization has no visible impact on MNIST. On the other side, our NMT system performed poorly as, without layer normalization, parameters are on various scales and global thresholding underperforms. Furthermore, our NMT system has more parameter categories compared to MNIST’s 3-layer network."
+    }, {
+      "heading" : "5.3 Convergence Rate",
+      "text" : "While dropping gradients greatly reduces the communication cost, it is shown in Table 1 that overall speed improvement is not significant for our NMT experiment. For our NMT experiment with 4 Titan Xs, communication time is only around 13% of the total training time. Dropping 99% of the gradient leads to 11% speed improvement. Additionally, we added an extra experiment of NMT with batch-size of 32 to give more communication cost ratio. In this scenario, communication is 17%\nof the total training time and we see a 22% average speed improvement. For MNIST, communication is 41% of the total training time and we see a 49% average speed improvement. Computation got faster by reducing multitasking.\nWe investigate the convergence rate: the combination of loss and speed. For MNIST, we train the model for 20 epochs as mentioned in Dryden et al. (2016). For NMT, we tested this with batch sizes of 80 and 32 and trained for 13.5 hours.\nAs shown in Figure 6, our baseline MNIST experiment reached 99.28% final accuracy, and reached 99.42% final accuracy with a 99% drop rate. It also shown that it has better convergence rate in general with gradient dropping.\nOur NMT experiment result is shown in Table 2. Final BLEU scores are essentially unchanged.\nOur algorithm converges 23% faster than the baseline when the batch size is 32, and nearly the same with a batch size of 80. This in a setting with fast communication: 15.75 GB/s theoretical over PCI express 3.0 x16."
+    }, {
+      "heading" : "5.4 1-Bit Quantization",
+      "text" : "We can obtain further compression by applying 1-bit quantization after gradient dropping. Strom (2015) quantized simply by mapping all surviving values to the dropping threshold, effectively the minimum surviving absolute value. Dryden et al. (2016) took the averages of values being quantized, as is more standard. They also quantized at the column level, rather than choosing centers globally. We tested 1-bit quantization with 3 different configurations: threshold, column-wise average, and global average. The quantization is applied after gradient dropping with a 99% drop rate, layer normalization, and a global threshold.\nFigure 8 shows that 1-bit quantization slows down the convergence rate for NMT. This differs from prior work (Seide et al., 2014; Dryden et al., 2016) which reported no impact from 1-bit quantization. Yet, we agree with their experiments: all tested types of quantization work on MNIST. This emphasizes the need for task variety in experiments.\nNMT has more skew in its top 1% gradients, so it makes sense that 1-bit quantization causes more loss. 2-bit quantization is sufficient."
+    }, {
+      "heading" : "6 Conclusion and Future Work",
+      "text" : "Gradient updates are positively skewed: most are close to zero. This can be exploited by keeping 99% of gradient updates locally, reducing communication size to 50x smaller with a coordinatevalue encoding.\nPrior work suggested that 1-bit quantization can be applied to further compress the communication.\nHowever, we found out that this is not true for NMT. We attribute this to skew in the embedding layers. However, 2-bit quantization is likely to be sufficient, separating large movers from small changes. Additionally, our NMT system consists of many parameters with different scales, thus layer normalization or using local threshold perparameter is necessary. On the hand side, MNIST seems to work with any configurations we tried.\nOur experiment with 4 Titan Xs shows that on average only 17% of the time is spent communicating (with batch size 32) and we achieve 22% speed up. Our future work is to test this approach on systems with expensive communication cost, such as multi-node environments."
+    }, {
+      "heading" : "Acknowledgments",
+      "text" : "Alham Fikri Aji is funded by the Indonesia Endowment Fund for Education scholarship scheme. Marcin Junczys-Dowmunt wrote the baseline distributed code and consulted on this implementation. We thank School of Informatics computing and finance staff for working around NVIDIA’s limit of two Pascal Titan Xs per customer. Computing was funded by the Amazon Academic Research Awards program and by Microsoft’s donation of Azure time to the Alan Turing Institute. This work was supported by The Alan Turing In-\nstitute under the EPSRC grant EP/N510129/1."
+    } ],
+    "references" : [ {
+      "title" : "Fast k-selection algorithms for graphics processing units",
+      "author" : [ "Tolu Alabi", "Jeffrey D Blanchard", "Bradley Gordon", "Russel Steinbach." ],
+      "venue" : "Journal of Experimental Algorithmics (JEA) 17:4–2.",
+      "citeRegEx" : "Alabi et al\\.,? 2012",
+      "shortCiteRegEx" : "Alabi et al\\.",
+      "year" : 2012
+    }, {
+      "title" : "QSGD: randomized quantization for communication-optimal stochastic gradient descent",
+      "author" : [ "Dan Alistarh", "Jerry Li", "Ryota Tomioka", "Milan Vojnovic." ],
+      "venue" : "CoRR abs/1610.02132. http://arxiv.org/abs/1610.02132.",
+      "citeRegEx" : "Alistarh et al\\.,? 2016",
+      "shortCiteRegEx" : "Alistarh et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Neural machine translation by jointly learning to align and translate",
+      "author" : [ "Dzmitry Bahdanau", "Kyunghyun Cho", "Yoshua Bengio." ],
+      "venue" : "CoRR abs/1409.0473. http://arxiv.org/abs/1409.0473.",
+      "citeRegEx" : "Bahdanau et al\\.,? 2014",
+      "shortCiteRegEx" : "Bahdanau et al\\.",
+      "year" : 2014
+    }, {
+      "title" : "Project adam: Building an efficient and scalable deep learning training system",
+      "author" : [ "Trishul M Chilimbi", "Yutaka Suzue", "Johnson Apacible", "Karthik Kalyanaraman." ],
+      "venue" : "OSDI. volume 14, pages 571– 582.",
+      "citeRegEx" : "Chilimbi et al\\.,? 2014",
+      "shortCiteRegEx" : "Chilimbi et al\\.",
+      "year" : 2014
+    }, {
+      "title" : "Large scale distributed deep networks. In Advances in neural information processing systems",
+      "author" : [ "Jeffrey Dean", "Greg Corrado", "Rajat Monga", "Kai Chen", "Matthieu Devin", "Mark Mao", "Andrew Senior", "Paul Tucker", "Ke Yang", "Quoc V Le" ],
+      "venue" : null,
+      "citeRegEx" : "Dean et al\\.,? \\Q2012\\E",
+      "shortCiteRegEx" : "Dean et al\\.",
+      "year" : 2012
+    }, {
+      "title" : "Communication quantization for data-parallel training of deep neural networks",
+      "author" : [ "Nikoli Dryden", "Sam Ade Jacobs", "Tim Moon", "Brian Van Essen." ],
+      "venue" : "Proceedings of the Workshop on Machine Learning in High Performance Computing Environments.",
+      "citeRegEx" : "Dryden et al\\.,? 2016",
+      "shortCiteRegEx" : "Dryden et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Is neural machine translation ready for deployment? A case study on 30 translation directions",
+      "author" : [ "Marcin Junczys-Dowmunt", "Tomasz Dwojak", "Hieu Hoang." ],
+      "venue" : "Program of the 13th International Workshop on Spoken Language Translation (IWSLT",
+      "citeRegEx" : "Junczys.Dowmunt et al\\.,? 2016",
+      "shortCiteRegEx" : "Junczys.Dowmunt et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Gradient-based learning applied to document recognition",
+      "author" : [ "Yann LeCun", "Léon Bottou", "Yoshua Bengio", "Patrick Haffner." ],
+      "venue" : "Proceedings of the IEEE 86(11):2278–2324.",
+      "citeRegEx" : "LeCun et al\\.,? 1998",
+      "shortCiteRegEx" : "LeCun et al\\.",
+      "year" : 1998
+    }, {
+      "title" : "Layer Normalization",
+      "author" : [ "J. Lei Ba", "J.R. Kiros", "G.E. Hinton." ],
+      "venue" : "ArXiv e-prints .",
+      "citeRegEx" : "Ba et al\\.,? 2016",
+      "shortCiteRegEx" : "Ba et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Beyond mealy machines: Learning translators with recurrent neural networks",
+      "author" : [ "Ramón P Ñeco", "Mikel L Forcada." ],
+      "venue" : "Proceedings of the 1996 International Neural Network Society Annual Meeting. San Diego, California, USA.",
+      "citeRegEx" : "Ñeco and Forcada.,? 1996",
+      "shortCiteRegEx" : "Ñeco and Forcada.",
+      "year" : 1996
+    }, {
+      "title" : "BLEU: A method for automatic evalution of machine translation",
+      "author" : [ "Kishore Papineni", "Salim Roukos", "Todd Ward", "WeiJing Zhu." ],
+      "venue" : "Proceedings",
+      "citeRegEx" : "Papineni et al\\.,? 2002",
+      "shortCiteRegEx" : "Papineni et al\\.",
+      "year" : 2002
+    }, {
+      "title" : "Large-scale deep unsupervised learning using graphics processors",
+      "author" : [ "Rajat Raina", "Anand Madhavan", "Andrew Y Ng." ],
+      "venue" : "Proceedings of the 26th annual international conference on machine learning. ACM, pages 873–880.",
+      "citeRegEx" : "Raina et al\\.,? 2009",
+      "shortCiteRegEx" : "Raina et al\\.",
+      "year" : 2009
+    }, {
+      "title" : "Hogwild: A lock-free approach to parallelizing stochastic gradient descent",
+      "author" : [ "Benjamin Recht", "Christopher Re", "Stephen Wright", "Feng Niu." ],
+      "venue" : "J. Shawe-Taylor, R. S. Zemel, P. L. Bartlett, F. Pereira, and K. Q. Weinberger, editors,",
+      "citeRegEx" : "Recht et al\\.,? 2011",
+      "shortCiteRegEx" : "Recht et al\\.",
+      "year" : 2011
+    }, {
+      "title" : "1-bit stochastic gradient descent and application to data-parallel distributed training of speech DNNs",
+      "author" : [ "Frank Seide", "Hao Fu", "Jasha Droppo", "Gang Li", "Dong Yu." ],
+      "venue" : "Interspeech. https://www.microsoft.com/en-",
+      "citeRegEx" : "Seide et al\\.,? 2014",
+      "shortCiteRegEx" : "Seide et al\\.",
+      "year" : 2014
+    }, {
+      "title" : "Edinburgh neural machine translation systems for WMT 16",
+      "author" : [ "Rico Sennrich", "Barry Haddow", "Alexandra Birch." ],
+      "venue" : "Proceedings of the ACL 2016 First Conference on Machine Translation (WMT16).",
+      "citeRegEx" : "Sennrich et al\\.,? 2016",
+      "shortCiteRegEx" : "Sennrich et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Scalable distributed dnn training using commodity gpu cloud computing",
+      "author" : [ "Nikko Strom." ],
+      "venue" : "INTERSPEECH. volume 7, page 10.",
+      "citeRegEx" : "Strom.,? 2015",
+      "shortCiteRegEx" : "Strom.",
+      "year" : 2015
+    }, {
+      "title" : "Staleness-aware async-sgd for distributed deep learning",
+      "author" : [ "Wei Zhang", "Suyog Gupta", "Xiangru Lian", "Ji Liu." ],
+      "venue" : "CoRR abs/1511.05950. http://arxiv.org/abs/1511.05950.",
+      "citeRegEx" : "Zhang et al\\.,? 2015",
+      "shortCiteRegEx" : "Zhang et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "Parallelized stochastic gradient descent",
+      "author" : [ "Martin Zinkevich", "Markus Weimer", "Lihong Li", "Alex J Smola." ],
+      "venue" : "Advances in neural information processing systems. pages 2595–2603.",
+      "citeRegEx" : "Zinkevich et al\\.,? 2010",
+      "shortCiteRegEx" : "Zinkevich et al\\.",
+      "year" : 2010
+    }, {
+      "title" : "CRC standard probability and statistics tables and formulae",
+      "author" : [ "Daniel Zwillinger", "Stephen Kokoska." ],
+      "venue" : "CRC Press.",
+      "citeRegEx" : "Zwillinger and Kokoska.,? 1999",
+      "shortCiteRegEx" : "Zwillinger and Kokoska.",
+      "year" : 1999
+    } ],
+    "referenceMentions" : [ {
+      "referenceID" : 11,
+      "context" : "Distributed computing is essential to train large neural networks on large data sets (Raina et al., 2009).",
+      "startOffset" : 85,
+      "endOffset" : 105
+    }, {
+      "referenceID" : 13,
+      "context" : "This network communication is costly, so prior work developed two ways to approximately compress network traffic: 1-bit quantization (Seide et al., 2014) and sending sparse matrices by dropping small updates (Strom, 2015; Dryden et al.",
+      "startOffset" : 133,
+      "endOffset" : 153
+    }, {
+      "referenceID" : 15,
+      "context" : ", 2014) and sending sparse matrices by dropping small updates (Strom, 2015; Dryden et al., 2016).",
+      "startOffset" : 62,
+      "endOffset" : 96
+    }, {
+      "referenceID" : 5,
+      "context" : ", 2014) and sending sparse matrices by dropping small updates (Strom, 2015; Dryden et al., 2016).",
+      "startOffset" : 62,
+      "endOffset" : 96
+    }, {
+      "referenceID" : 9,
+      "context" : "In porting these approximations to neural machine translation (NMT) (Ñeco and Forcada, 1996; Bahdanau et al., 2014), we find that translation is less tolerant to quantization.",
+      "startOffset" : 68,
+      "endOffset" : 115
+    }, {
+      "referenceID" : 2,
+      "context" : "In porting these approximations to neural machine translation (NMT) (Ñeco and Forcada, 1996; Bahdanau et al., 2014), we find that translation is less tolerant to quantization.",
+      "startOffset" : 68,
+      "endOffset" : 115
+    }, {
+      "referenceID" : 5,
+      "context" : "Throughout this paper, we compare neural machine translation behavior with a toy MNIST system, chosen because prior work used a similar system (Dryden et al., 2016).",
+      "startOffset" : 143,
+      "endOffset" : 164
+    }, {
+      "referenceID" : 18,
+      "context" : "More formally, gradient updates have positive skewness coefficient (Zwillinger and Kokoska, 1999): most are close to zero but a few are large.",
+      "startOffset" : 67,
+      "endOffset" : 97
+    }, {
+      "referenceID" : 13,
+      "context" : "Zinkevich et al. (2010) proposed an asynchronous architecture where each node can push and pull the model independently to avoid waiting for the slower node.",
+      "startOffset" : 0,
+      "endOffset" : 24
+    }, {
+      "referenceID" : 3,
+      "context" : "Chilimbi et al. (2014) and Recht et al.",
+      "startOffset" : 0,
+      "endOffset" : 23
+    }, {
+      "referenceID" : 3,
+      "context" : "Chilimbi et al. (2014) and Recht et al. (2011) suggest updating the model without a lock, allowing race conditions.",
+      "startOffset" : 0,
+      "endOffset" : 47
+    }, {
+      "referenceID" : 3,
+      "context" : "Chilimbi et al. (2014) and Recht et al. (2011) suggest updating the model without a lock, allowing race conditions. Additionally, Dean et al. (2012) run multiple minibatches before exchanging updates, reducing the communication cost.",
+      "startOffset" : 0,
+      "endOffset" : 149
+    }, {
+      "referenceID" : 3,
+      "context" : "Chilimbi et al. (2014) and Recht et al. (2011) suggest updating the model without a lock, allowing race conditions. Additionally, Dean et al. (2012) run multiple minibatches before exchanging updates, reducing the communication cost. Our work is a more continuous version, in which the most important updates are sent between minibatches. Zhang et al. (2015) downweight gradients based on stale parameters.",
+      "startOffset" : 0,
+      "endOffset" : 359
+    }, {
+      "referenceID" : 13,
+      "context" : "1-Bit SGD (Seide et al., 2014), and later Quantization SGD (Alistarh et al.",
+      "startOffset" : 10,
+      "endOffset" : 30
+    }, {
+      "referenceID" : 1,
+      "context" : ", 2014), and later Quantization SGD (Alistarh et al., 2016), work by converting the gradient update into a 1-bit matrix, thus reducing data communication significantly.",
+      "startOffset" : 36,
+      "endOffset" : 59
+    }, {
+      "referenceID" : 1,
+      "context" : ", 2014), and later Quantization SGD (Alistarh et al., 2016), work by converting the gradient update into a 1-bit matrix, thus reducing data communication significantly. Strom (2015) proposed threshold quantizaar X iv :1 70 4.",
+      "startOffset" : 37,
+      "endOffset" : 182
+    }, {
+      "referenceID" : 5,
+      "context" : "Dryden et al. (2016) set the threshold so as to keep a constant number of gradients each iteration.",
+      "startOffset" : 0,
+      "endOffset" : 21
+    }, {
+      "referenceID" : 4,
+      "context" : "We used distributed SGD with parameter sharding (Dean et al., 2012), shown in Figure 1.",
+      "startOffset" : 48,
+      "endOffset" : 67
+    }, {
+      "referenceID" : 5,
+      "context" : "This approach is slightly different from Dryden et al. (2016) as we used a single threshold based on absolute value, instead of dropping the positive and negative gradients separately.",
+      "startOffset" : 41,
+      "endOffset" : 62
+    }, {
+      "referenceID" : 13,
+      "context" : "Following Seide et al. (2014), we remember residuals (in our case dropped values) locally and add them to the next gradient, before dropping again.",
+      "startOffset" : 10,
+      "endOffset" : 30
+    }, {
+      "referenceID" : 0,
+      "context" : "Selection to obtain the threshold is expensive (Alabi et al., 2012).",
+      "startOffset" : 47,
+      "endOffset" : 67
+    }, {
+      "referenceID" : 7,
+      "context" : "We experiment with an image classification task based on MNIST dataset (LeCun et al., 1998) and Romanian→English neural machine translation system.",
+      "startOffset" : 71,
+      "endOffset" : 91
+    }, {
+      "referenceID" : 5,
+      "context" : "This setup is identical to Dryden et al. (2016). Our NMT experiment is based on Sennrich et al.",
+      "startOffset" : 27,
+      "endOffset" : 48
+    }, {
+      "referenceID" : 5,
+      "context" : "This setup is identical to Dryden et al. (2016). Our NMT experiment is based on Sennrich et al. (2016), which won first place in the 2016 Workshop on Machine Translation.",
+      "startOffset" : 27,
+      "endOffset" : 103
+    }, {
+      "referenceID" : 6,
+      "context" : "AmuNMT (Junczys-Dowmunt et al., 2016) is used for decoding with a beam size of 12.",
+      "startOffset" : 7,
+      "endOffset" : 37
+    }, {
+      "referenceID" : 10,
+      "context" : "9% then measured performance in terms of loss and classification accuracy or translation quality approximated by BLEU (Papineni et al., 2002) for image classification and NMT task respectively.",
+      "startOffset" : 118,
+      "endOffset" : 141
+    }, {
+      "referenceID" : 5,
+      "context" : "For MNIST, we train the model for 20 epochs as mentioned in Dryden et al. (2016). For NMT, we tested this with batch sizes of 80 and 32 and trained for 13.",
+      "startOffset" : 60,
+      "endOffset" : 81
+    }, {
+      "referenceID" : 14,
+      "context" : "Strom (2015) quantized simply by mapping all surviving values to the dropping threshold, effectively the minimum surviving absolute value.",
+      "startOffset" : 0,
+      "endOffset" : 13
+    }, {
+      "referenceID" : 5,
+      "context" : "Dryden et al. (2016) took the averages of values being quantized, as is more standard.",
+      "startOffset" : 0,
+      "endOffset" : 21
+    }, {
+      "referenceID" : 13,
+      "context" : "This differs from prior work (Seide et al., 2014; Dryden et al., 2016) which reported no impact from 1-bit quantization.",
+      "startOffset" : 29,
+      "endOffset" : 70
+    }, {
+      "referenceID" : 5,
+      "context" : "This differs from prior work (Seide et al., 2014; Dryden et al., 2016) which reported no impact from 1-bit quantization.",
+      "startOffset" : 29,
+      "endOffset" : 70
+    } ],
+    "year" : 2017,
+    "abstractText" : "We make distributed stochastic gradient descent faster by exchanging sparse updates instead of dense updates. Gradient updates are positively skewed as most updates are near zero, so we map the 99% smallest updates (by absolute value) to zero then exchange sparse matrices. This method can be combined with quantization to further improve the compression. We explore different configurations and apply them to neural machine translation and MNIST image classification tasks. Most configurations work on MNIST, whereas different configurations reduce convergence rate on the more complex translation task. Our experiments show that we can achieve up to 49% speed up on MNIST and 22% on NMT without damaging the final accuracy or BLEU.",
+    "creator" : "LaTeX with hyperref package"
+  }
+}

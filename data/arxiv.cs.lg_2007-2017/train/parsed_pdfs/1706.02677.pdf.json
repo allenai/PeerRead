@@ -1,0 +1,860 @@
+{
+  "name" : "1706.02677.pdf",
+  "metadata" : {
+    "source" : "CRF",
+    "title" : "Accurate, Large Minibatch SGD: Training ImageNet in 1 Hour",
+    "authors" : [ "Priya Goyal", "Piotr Dollár", "Ross Girshick", "Pieter Noordhuis", "Lukasz Wesolowski", "Aapo Kyrola", "Andrew Tulloch", "Yangqing Jia", "Kaiming He" ],
+    "emails" : [ ],
+    "sections" : [ {
+      "heading" : "1. Introduction",
+      "text" : "Scale matters. We are in an unprecedented era in AI research history in which the increasing data and model scale is rapidly improving accuracy in computer vision [22, 40, 33, 34, 35, 16], speech [17, 39], and natural language processing [7, 37]. Take the profound impact in computer vision as an example: visual representations learned by deep convolutional neural networks [23, 22] show excellent performance on previously challenging tasks like ImageNet classification [32] and can be transferred to difficult perception problems such as object detection and seg-\nmentation [8, 10, 27]. Moreover, this pattern generalizes: larger datasets and network architectures consistently yield improved accuracy across all tasks that benefit from pretraining [22, 40, 33, 34, 35, 16]. But as model and data scale grow, so does training time; discovering the potential and limits of scaling deep learning requires developing novel techniques to keep training time manageable.\nThe goal of this report is to demonstrate the feasibility of and to communicate a practical guide to large-scale training with distributed synchronous stochastic gradient descent (SGD). As an example, we scale ResNet-50 [16] training, originally performed with a minibatch size of 256 images (using 8 Tesla P100 GPUs, training time is 29 hours), to larger minibatches (see Figure 1). In particular, we show that with a large minibatch size of 8192, using 256 GPUs, we can train ResNet-50 in 1 hour while maintain-\nar X\niv :1\n70 6.\n02 67\n7v 1\n[ cs\n.C V\n] 8\nJ un\n2 01\ning the same level of accuracy as the 256 minibatch baseline. While distributed synchronous SGD is now commonplace, no existing results show that validation accuracy can be maintained with minibatches as large as 8192 or that such high-accuracy models can be trained in such short time.\nTo tackle this unusually large minibatch size, we employ a simple and generalizable linear scaling rule to adjust the learning rate. While this guideline is found in earlier work [21, 4], its empirical limits are not well understood and informally we have found that it is not widely known to the research community. To successfully apply this rule, we present a new warmup strategy, i.e., a strategy of using lower learning rates at the start of training [16], to overcome early optimization difficulties. Importantly, not only does our approach match the baseline validation error, but also yields training error curves that closely match the small minibatch baseline. Details are presented in §2.\nOur comprehensive experiments in §5 show that optimization difficulty is the main issue with large minibatches, rather than poor generalization (at least on ImageNet), in contrast to some recent studies [20]. Additionally, we show that the linear scaling rule and warmup generalize to more complex tasks including object detection and segmentation [9, 30, 14, 27], which we demonstrate via the recently developed Mask R-CNN [14]. We note that a robust and successful guideline for addressing a wide range of minibatch sizes has not been presented in previous work.\nWhile the strategy we deliver is simple, its successful application requires correct implementation with respect to seemingly minor and often not well understood implementation details within deep learning libraries. Subtleties in the implementation of SGD can lead to incorrect solutions that are difficult to discover. To provide more helpful guidance we describe common pitfalls and the relevant implementation details that can trigger these traps in §3.\nOur strategy applies regardless of framework, but achieving efficient linear scaling requires nontrivial communication algorithms. We use the recently open-sourced Caffe21 deep learning framework and Big Basin GPU servers [24], which operates efficiently using standard Ethernet networking (as opposed to specialized network interfaces). We describe the systems algorithms that enable our approach to operate near its full potential in §4.\nThe practical advances described in this report are helpful across a range of domains. In an industrial domain, our system unleashes the potential of training visual models from internet-scale data, enabling training with billions of images per day. In a research domain, we have found it to simplify migrating algorithms from a single-GPU to a multi-GPU implementation without requiring hyperparameter search, e.g. in our experience migrating Faster R-CNN [30] and ResNets [16] from 1 to 8 GPUs.\n1http://www.caffe2.ai"
+    }, {
+      "heading" : "2. Large Minibatch SGD",
+      "text" : "We start by reviewing the formulation of Stochastic Gradient Descent (SGD), which will be the foundation of our discussions in the following sections. We consider supervised learning by minimizing a loss L(w) of the form:\nL(w) = 1 |X| ∑ x∈X l(x,w). (1)\nHere w are the weights of a network, X is a labeled training set, and l(x,w) is the loss computed from samples x ∈ X and their labels y. Typically l consists of a prediction loss (e.g., cross-entropy loss) and a regularization loss on w.\nMinibatch Stochastic Gradient Descent [31], usually referred to as simply as SGD in recent literature even though it operates on minibatches, performs the following update:\nwt+1 = wt − η 1\nn ∑ x∈B ∇l(x,wt). (2)\nHere B is a minibatch sampled from X and n = |B| is the minibatch size. η is the learning rate and t is the iteration index. Note that in practice we use momentum SGD; we return to a discussion of momentum in §3."
+    }, {
+      "heading" : "2.1. Learning Rates for Large Minibatches",
+      "text" : "Our goal is to use large minibatches in place of small minibatches while maintaining training and generalization accuracy. This is of particular interest in distributed learning, because it can allow us to scale to multiple workers2 using simple data parallelism without reducing the per-worker workload and without sacrificing model accuracy.\nAs we will show in comprehensive experiments, we found that the following learning rate scaling rule is surprisingly effective for a broad range of minibatch sizes:\nLinear Scaling Rule: When the minibatch size is multiplied by k, multiply the learning rate by k.\nAll other hyper-parameters (weight decay, momentum, etc.) are kept unchanged. As we will show in §5, the above linear scaling rule can help us to not only match the accuracy between using small and large minibatches, but equally importantly, to largely match their training curves.\nInterpretation. We present an informal discussion of the linear scaling rule and why it may be effective. Consider a network at iteration t with weights wt, and a sequence of k minibatches Bj for 0 ≤ j < k each of size n. We compare the effect of executing k SGD iterations with small minibatches Bj and learning rate η versus a single iteration with a large minibatch ∪jBj of size kn and learning rate η̂.\n2We use the terms ‘worker’ and ‘GPU’ interchangeably in this work, although other implementations of a ‘worker’ are possible. ‘Server’ denotes a set of 8 GPUs that does not require communication over a network.\nAccording to (2), after k iterations of SGD with learning rate η and a minibatch size of n we have:\nwt+k = wt − η 1\nn ∑ j<k ∑ x∈Bj ∇l(x,wt+j). (3)\nOn the other hand, taking a single step with the large minibatch ∪jBj of size kn and learning rate η̂ yields:\nŵt+1 = wt − η̂ 1\nkn ∑ j<k ∑ x∈Bj ∇l(x,wt). (4)\nAs expected, the updates differ, and it is unlikely that under any condition ŵt+1 = wt+k. However, if we could assume ∇l(x,wt) ≈ ∇l(x,wt+j) for j < k, then setting η̂ = kn would yield ŵt+k ≈ wt+k, and the updates from small and large minibatch SGD would be similar. Note that even under this strong assumption, we emphasize that the two updates can be similar only if we set η̂ = kn.\nThe above interpretation gives intuition for one case where we may hope the linear scaling rule to apply. In our experiments with η̂ = kη (and warmup), small and large minibatch SGD not only result in models with the same final accuracy, but also, the training curves match closely. Our empirical results suggest that the above approximation might be valid in large-scale, real-world data.\nThe assumption that ∇l(x,wt) ≈ ∇l(x,wt+j) often may not hold, and in practice we found the rule does not apply in two cases. First, in the initial training epochs when the network is changing rapidly, it does not hold. We address this by using a warmup phase, discussed in §2.2. Second, minibatch size cannot be scaled indefinitely: while results are stable for a large range of sizes, beyond a certain point accuracy degrades rapidly. Interestingly, this point is as large as ∼8k in ImageNet experiments.\nDiscussion. The above linear scaling rule was adopted by Krizhevsky [21], if not earlier. However, Krizhevsky reported a 1% increase of error when increasing the minibatch size from 128 to 1024, whereas we show how to maintain accuracy across a much broader regime of minibatch sizes. Chen et al. [5] presented a comparison of numerous distributed SGD variants, and although their work also employed the linear scaling rule, it did not establish a small minibatch baseline (the most related result is in v1 of [5] which reported a 0.4% increase of error when the minibatch size increases from 1600 to 6400 images using synchronous SGD, but results on smaller minibatches are not available).\nIn their recent review paper, Bottou et al. [4] (section 4.2) discuss the theoretical tradeoffs of minibatching and show that with the linear scaling rule, solvers follow the same training curve when having seen the same number of examples; it also suggests that the learning rate should not exceed a maximum rate that does not depend on the minibatch size (which justifies warmup). Our work empirically tests these theories with unprecedented minibatch sizes."
+    }, {
+      "heading" : "2.2. Warmup",
+      "text" : "As we discussed, for large minibatches (e.g., 8k) the linear scaling rule breaks down when the network is changing rapidly, which commonly occurs in early stages of training. We find that this issue can be alleviated by a properly designed warmup [16], namely, a strategy of using less aggressive learning rates at the start of training.\nConstant warmup. The warmup strategy presented in [16] uses a low constant learning rate for the first few epochs of training. As we will show in §5, we have found constant warmup particularly helpful for prototyping object detection and segmentation methods [9, 30, 25, 14] that fine-tune pre-trained layers together with newly initialized layers.\nIn our ImageNet experiments with a large minibatch of size kn, we have tried to train with the low learning rate of η for the first 5 epochs and then return to the target learning rate of η̂ = kη. However, given a large k, we find that this constant warmup is not sufficient to solve the optimization problem, and a transition out of the low learning rate warmup phase can cause the training error to spike. This leads us to propose the following gradual warmup.\nGradual warmup. We present an alternative warmup that gradually ramps up the learning rate from a small to a large value. This ramp avoids a sudden increase from a small learning rate to a large one, allowing healthy convergence at the start of training. In practice, with a large minibatch of size kn, we start from a learning rate of η and increment it by a constant amount at each iteration such that it reaches η̂ = kη after 5 epochs. After the warmup phase, we go back to the original learning rate schedule."
+    }, {
+      "heading" : "2.3. Batch Normalization with Large Minibatches",
+      "text" : "Batch Normalization (BN) [19] computes statistics along the minibatch dimension: this breaks the independence of each sample’s loss, and changes in minibatch size change the underlying definition of the loss function being optimized. In the following we will show that a commonly used ‘shortcut’, which may appear to be a practical consideration to avoid communication overhead, is actually necessary for preserving the loss function when changing minibatch size.\nWe note that (1) and (2) assume the per-sample loss l(x,w) is independent of all other samples. This is not the case when BN is performed and activations are computed across samples. We write lB(x,w) to denote that the loss of a single sample x depends on the statistics of all samples in its minibatch B. We denote the loss over a single minibatch B of size n as L(B, w) = 1n ∑ x∈B lB(x,w). With BN, the training set can be thought of as containing all distinct subsets of size n drawn from the original training set X , which we denote as Xn. The training loss L(w) then becomes:\nL(w) = 1 |Xn| ∑ B∈Xn L(B, w). (5)\nIf we view B as a ‘single sample’ in Xn, then the loss of each single sample B is computed independently.\nNote that the minibatch size n over which the BN statistics are computed is a key component of the loss: if the perworker minibatch sample size n is changed, it changes the underlying loss function L that is optimized. More specifically, the mean/variance statistics computed by BN with different n exhibit different random levels of variation.\nIn the case of distributed (and multi-GPU) training, if the per-worker sample size n is kept fixed and the total minibatch size is kn, it can be viewed a minibatch of k samples with each sample Bj independently selected from Xn, so the underlying loss function is unchanged and is still defined in Xn. Under this point of view, in the BN setting after seeing k minibatches Bj , (3) and (4) become:\nwt+k = wt − η ∑ j<k ∇L(Bj , wt+j), (6)\nŵt+1 = wt − η̂ 1\nk ∑ j<k ∇L(Bj , wt). (7)\nFollowing similar logic as in §2.1, we set η̂ = kη and we keep the per-worker sample size n constant when we change the number of workers k.\nIn this work, we use n = 32 which has performed well for a wide range of datasets and networks [19, 16]. If n is adjusted, it should be viewed as a hyper-parameter of BN, not of distributed training. We also note that the BN statistics should not be computed across all workers, not only for the sake of reducing communication, but also for maintaining the same underlying loss function being optimized."
+    }, {
+      "heading" : "3. Subtleties and Pitfalls of Distributed SGD",
+      "text" : "In practice a distributed implementation has many subtleties. Many common implementation errors change the definitions of hyper-parameters, leading to models that train but whose error may be higher than expected, and such issues can be difficult to discover. While the remarks below are straightforward, they are important to consider explicitly to faithfully implement the underlying solver.\nWeight decay. Weight decay is actually the outcome of the gradient of an L2-regularization term in the loss function. More formally, the per-sample loss in (1) can be written as l(x,w) = λ2 ‖w‖ 2 + ε(x,w). Here λ2 ‖w‖ 2 is the sampleindependent L2 regularization on the weights and ε(x,w) is a sample-dependent term such as the cross-entropy loss. The SGD update in (2) can be written as:\nwt+1 = wt − ηλwt − η 1\nn ∑ x∈B ∇ε(x,wt). (8)\nIn practice, usually only the sample-dependent term∑ ∇ε(x,wt) is computed by backprop; the term λwt is computed separately and added to the aggregated gradients\ncontributed by ε(x,wt). If there is no weight decay term, there are many equivalent ways of scaling the learning rate, including scaling the term ε(x,wt). However, as can be seen from (8), in general this is not the case. We summarize these observations in the following remark:\nRemark 1: Scaling the cross-entropy loss is not equivalent to scaling the learning rate.\nMomentum correction. Momentum SGD is a commonly adopted modification to the vanilla SGD in (2). A reference implementation of momentum SGD has the following form:\nut+1 = mut + 1\nn ∑ x∈B ∇l(x,wt)\nwt+1 = wt − ηut+1. (9)\nHere m is the momentum decay factor and u is the update tensor. A popular variant absorbs the learning rate η into the update tensor. Substituting vt for ηut in (9) yields:\nvt+1 = mvt + η 1\nn ∑ x∈B ∇l(x,wt)\nwt+1 = wt − vt+1. (10)\nFor a fixed η, the two are equivalent. However, we note that while u only depends on the gradients and is independent of η, v is entangled with η. When η changes, to maintain equivalence with the reference variant in (9), the update for v should be: vt+1 = m\nηt+1 ηt vt + ηt+1 1 n\n∑ ∇l(x,wt). We\nrefer to the factor ηt+1ηt as the momentum correction. We found that this is especially important for stabilizing training when ηt+1 ηt, otherwise the history term vt is too small which leads to instability (for ηt+1 < ηt momentum correction is less critical). This leads to our second remark:\nRemark 2: Apply momentum correction after changing learning rate if using (10).\nGradient aggregation. For k workers each with a perworker minibatch of size n, following (4), gradient aggregation must be performed over the entire set of kn examples according to 1kn ∑ j ∑ x∈Bj l(x,wt). Loss layers are typically implemented to compute an average loss over their local input, which amounts to computing a per-worker loss of∑ l(x,wt)/n. Given this, correct aggregation requires averaging the k gradients in order to recover the missing 1/k factor. However, standard communication primitives like allreduce [11] perform summing, not averaging. Therefore, it is more efficient to absorb the 1/k scaling into the loss, in which case only the loss’s gradient with respect to its input needs to be scaled, removing the need to scale the entire gradient vector. We summarize this as follows:\nRemark 3: Normalize the per-worker loss by total minibatch size kn, not per-worker size n.\nWe also note that it may be incorrect to ‘cancel k’ by setting η̂ = η (not kη) and normalizing the loss by 1/n (not 1/kn), which can lead to incorrect weight decay (see Remark 1).\nData shuffling. SGD is typically analyzed as a process that samples data randomly with replacement. In practice, common SGD implementations apply random shuffling of the training set during each SGD epoch, which can give better results [3, 13]. To provide fair comparisons with baselines that use shuffling (e.g., [16]), we ensure the samples in one epoch done by k workers are from a single consistent random shuffling of the training set. To achieve this, for each epoch we use a random shuffling that is partitioned into k parts, each of which is processed by one of the k workers. Failing to correctly implement random shuffling in multiple workers may lead to noticeably different behavior, which may contaminate results and conclusions. In summary:\nRemark 4: Use a single random shuffling of the training data (per epoch) that is divided amongst all k workers."
+    }, {
+      "heading" : "4. Communication",
+      "text" : "In order to scale beyond the 8 GPUs in a single Big Basin server [24], gradient aggregation has to span across servers on a network. To allow for near perfect linear scaling, the aggregation must be performed in parallel with backprop. This is possible because there is no data dependency between gradients across layers. Therefore, as soon as the gradient for a layer is computed, it is aggregated across workers, while gradient computation for the next layer continues (as discussed in [5]). We give full details next."
+    }, {
+      "heading" : "4.1. Gradient Aggregation",
+      "text" : "For every gradient, aggregation is done using an allreduce operation (similar to the MPI collective operation MPI Allreduce [11]). Before allreduce starts every GPU has its locally computed gradients and after allreduce completes every GPU has the sum of all k gradients. As the number of parameters grows and compute performance of GPUs increases, it becomes harder to hide the cost of aggregation in the backprop phase. Training techniques to overcome these effects are beyond the scope of this work (e.g., quantized gradients [18], Block-Momentum SGD [6]). However, at the scale of this work, collective communication was not a bottleneck, as we were able to achieve near-linear SGD scaling by using an optimized allreduce implementation.\nOur implementation of allreduce consists of three phases for communication within and across servers: (1) buffers from the 8 GPUs within a server are summed into a single buffer for each server, (2) the results buffers are shared and summed across all servers, and finally (3) the results are broadcast onto each GPU. For the local reduction and broadcast in phases (1) and (3) we used NVIDIA Collective Communication Library (NCCL)3 for buffers of size 256 KB or more and a simple implementation consisting of a\n3http://https://developer.nvidia.com/nccl\nnumber of GPU-to-host memory copies and a CPU reduction otherwise. NCCL uses GPU kernels to accelerate intraserver collectives, so this approach dedicates more time on the GPU to backprop while using the CPU resources that would otherwise have been idle to improve throughput.\nFor interserver allreduce, we implemented two of the best algorithms for bandwidth-limited scenarios: the recursive halving and doubling algorithm [29, 36] and the bucket algorithm (also known as the ring algorithm) [2]. For both, each server sends and receives 2p−1p b bytes of data, where b is the buffer size in bytes and p is the number of servers. While the halving/doubling algorithm consists of 2 log2(p) communication steps, the ring algorithm consists of 2(p − 1) steps. This generally makes the halving/doubling algorithm faster in latency-limited scenarios (i.e., for small buffer sizes and/or large server counts). In practice, we found the halving/doubling algorithm to perform much better than the ring algorithm for buffer sizes up to a million elements (and even higher on large server counts). On 32 servers (256 GPUs), using halving/doubling led to a speedup of 3× over the ring algorithm.\nThe halving/doubling algorithm consists of a reducescatter collective followed by an allgather. In the first step of reduce-scatter, servers communicate in pairs (rank 0 with 1, 2 with 3, etc.), sending and receiving for different halves of their input buffers. For example, rank 0 sends the second half of its buffer to 1 and receives the first half of the buffer from 1. A reduction over the received data is performed before proceeding to the next step, where the distance to the destination rank is doubled while the data sent and received is halved. After the reduce-scatter phase is finished, each server has a portion of the final reduced vector.\nThis is followed by the allgather phase, which retraces the communication pattern from the reduce-scatter in reverse, this time simply concatenating portions of the final reduced vector. At each server, the portion of the buffer that was being sent in the reduce-scatter is received in the allgather, and the portion that was being received is now sent.\nTo support non-power-of-two number of servers, we used the binary blocks algorithm [29]. This is a generalized version of the halving/doubling algorithm where servers are partitioned into power-of-two blocks and two additional communication steps are used, one immediately after the intrablock reduce-scatter and one before the intrablock allgather. Non-power-of-two cases have some degree of load imbalance compared to power-of-two, though in our runs we did not see significant performance degradation."
+    }, {
+      "heading" : "4.2. Software",
+      "text" : "The allreduce algorithms described are implemented in Gloo4, a library for collective communication. It supports\n4https://github.com/facebookincubator/gloo\nmultiple communication contexts, which means no additional synchronization is needed to execute multiple allreduce instances in parallel. Local reduction and broadcast (described as phases (1) and (3)) are pipelined with interserver allreduce where possible.\nCaffe2 supports multi-threaded execution of the compute graph that represents a training iteration. Whenever there is no data dependency between subgraphs, multiple threads can execute those subgraphs in parallel. Applying this to backprop, local gradients can be computed in sequence, without dealing with allreduce or weight updates. This means that during backprop, the set of runnable subgraphs may grow faster than we can execute them. For subgraphs that contain an allreduce run, all servers must choose to execute the same subgraph from the set of runnable subgraphs. Otherwise, we risk distributed deadlock where servers are attempting to execute non-intersecting sets of subgraphs. With allreduce being a collective operation, servers would time out waiting. To ensure correct execution we impose a partial order on these subgraphs. This is implemented using a cyclical control input, where completion of the n-th allreduce unblocks execution of the (n + c)-th allreduce, with c being the maximum number of concurrent allreduce runs. Note that this number should be chosen to be lower than the number of threads used to execute the full compute graph."
+    }, {
+      "heading" : "4.3. Hardware",
+      "text" : "We used Facebook’s Big Basin [24] GPU servers for our experiments. Each server contains 8 NVIDIA Tesla P100 GPUs that are interconnected with NVIDIA NVLink. For local storage, each server has 3.2TB of NVMe SSDs. For network connectivity, the servers have a Mellanox ConnectX-4 50Gbit Ethernet network card and are connected to Wedge100 [1] Ethernet switches.\nWe have found 50Gbit of network bandwidth sufficient for distributed synchronous SGD for ResNet-50, per the following analysis. ResNet-50 has approximately 25 million parameters. This means the total size of parameters is 25 · 106 · sizeof(float) = 100MB. Backprop for ResNet-50 on a single NVIDIA Tesla P100 GPU takes 120 ms. Given that allreduce requires ∼2× bytes on the network compared to the value it operates on, this leads to a peak bandwidth requirement of 200MB/0.125s = 1600MB/s, or 12.8 Gbit/s, not taking into account communication overhead. When we add a smudge factor for network overhead, we reach a peak bandwidth requirement for ResNet-50 of ∼15 Gbit/s.\nAs this peak bandwidth requirement only holds during backprop, the network is free to be used for different tasks that are less latency sensitive then aggregation (e.g. reading data or saving network snapshots) during the forward pass."
+    }, {
+      "heading" : "5. Main Results and Analysis",
+      "text" : "Our main result is that we can train ResNet-50 [16] on ImageNet [32] using 256 workers in one hour, while matching the accuracy of small minibatch training. Applying the linear scaling rule along with a warmup strategy allows us to seamlessly scale between small and large minibatches (up to 8k images) without tuning additional hyper-parameters or impacting accuracy. In the following subsections we: (1) describe experimental settings, (2) establish the effectiveness of large minibatch training, (3) perform a deeper experimental analysis, (4) show our findings generalize to object detection/segmentation, and (5) provide timings."
+    }, {
+      "heading" : "5.1. Experimental Settings",
+      "text" : "The 1000-way ImageNet classification task [32] serves as our main experimental benchmark. Models are trained on the ∼1.28 million training images and evaluated by top1 error on the 50,000 validation images.\nWe use the ResNet-50 [16] variant from [12], noting that the stride-2 convolutions are on 3×3 layers instead of on 1×1 layers as in [16]. We use Nesterov momentum [28] with m of 0.9 following [12] but note that standard momentum as was used in [16] is equally effective. We use a weight decay λ of 0.0001 and following [16] we do not apply weight decay on the learnable BN coefficients (namely, γ and β in [19]). In order to keep the training objective fixed, which depends on the BN batch size n as described in §2.3, we use n = 32 throughout, regardless of the overall minibatch size. As in [12], we compute the BN statistics using running average (with momentum 0.9).\nAll models are trained for 90 epochs regardless of minibatch sizes. We apply the linear scaling rule from §2.1 and use a learning rate of η = 0.1 · kn256 that is linear in the minibatch size kn. With k = 8 workers (GPUs) and n = 32 samples per worker, η = 0.1 as in [16]. We call this number (0.1 · kn256 ) the reference learning rate, and reduce it by 1/10 at the 30-th, 60-th, and 80-th epoch, similar to [16].\nWe adopt the initialization of [15] for all convolutional layers. The 1000-way fully-connected layer is initialized by drawing weights from a zero-mean Gaussian with standard deviation of 0.01. We have found that although SGD with a small minibatch is not sensitive to initialization due to BN, this is not the case for a substantially large minibatch. Additionally we require an appropriate warmup strategy to avoid optimization difficulties in early training.\nFor BN layers, the learnable scaling coefficient γ is initialized to be 1, except for each residual block’s last BN where γ is initialized to be 0. Setting γ = 0 in the last BN of each residual block causes the forward/backward signal initially to propagate through the identity shortcut of ResNets, which we found to ease optimization at the start of training. This initialization improves all models but is particularly helpful for large minibatch training as we will show.\nWe use scale and aspect ratio data augmentation [35] as in [12]. The network input image is a 224×224 pixel random crop from an augmented image or its horizontal flip. The input image is normalized by the per-color mean and standard deviation, as in [12].\nHandling random variation. As models are subject to random variation in training, we compute a model’s error rate as the median error of the final 5 epochs. Moreover, we report the mean and standard deviation (std) of the error from 5 independent runs. This gives us more confidence in our results and also provides a measure of model stability.\nThe random variation of ImageNet models has generally not been reported in previous work (largely due to resource limitations). We emphasize that ignoring random variation may cause unreliable conclusions, especially if results are from a single trial, or the best of many.\nBaseline. Under these settings, we establish a ResNet-50 baseline using k = 8 (8 GPUs in one server) and n = 32 images per worker (minibatch size of kn = 256), as in [16]. Our baseline has a top-1 validation error of 23.60% ±0.12. As a reference, ResNet-50 from fb.resnet.torch [12] has 24.01% error, and that of the original ResNet paper [16] has 24.7% under weaker data augmentation."
+    }, {
+      "heading" : "5.2. Optimization or Generalization Issues?",
+      "text" : "We establish our main results on large minibatch training by exploring optimization and generalization behaviors. We will demonstrate that with a proper warmup strategy, large minibatch SGD can both match the training curves of small minibatch SGD and also match the validation error. In other words, in our experiments both optimization and generalization of large minibatch training matches that of small minibatch training. Moreover, in §5.4 we will show that these models exhibit good generalization behavior to the object detection/segmentation transfer tasks, matching the transfer quality of small minibatch models.\nFor the following results, we use k = 256 and n = 32, which results in a minibatch size kn = 8k (we use ‘1k’ to denote 1024). As discussed, our baseline has a minibatch size of kn = 256 and a reference learning rate of η = 0.1. Applying the linear scaling rule gives η = 3.2 as the reference learning rate for our large minibatch runs. We test three warmup strategies as discussed in §2.2: no warmup, constant warmup with η = 0.1 for 5 epochs, and gradual warmup which starts with η = 0.1 and is linearly increased to η = 3.2 over 5 epochs. All models are trained from scratch and all other hyper-parameters are kept fixed. We emphasize that while better results for any particular minibatch size could be obtained by optimizing hyper-parameters for that case; our goal is to match errors across minibatch sizes by using a general strategy that avoids hyper-parameter tuning for each minibatch size.\nTraining error. Training curves are shown in Figure 2. With no warmup (2a), the training curve for large minibatch of kn = 8k is inferior to training with a small minibatch of kn = 256 across all epochs. A constant warmup strategy (2b) actually degrades results: although the small constant learning rate can decrease error during warmup, the error spikes immediately after and training never fully recovers.\nOur main result is that with gradual warmup, large minibatch training error matches the baseline training curve obtained with small minibatches, see Figure 2c. Although the large minibatch curve starts higher due to the low η in the warmup phase, it catches up shortly thereafter. After about 20 epochs, the small and large minibatch training curves match closely. The comparison between no warmup and gradual warmup suggests that large minibatch sizes are challenged by optimization difficulties in early training and if these difficulties are addressed, the training error and its curve can match a small minibatch baseline closely.\nValidation error. Table 1 shows the validation error for the three warmup strategies. The no-warmup variant has ∼1.2% higher validation error than the baseline which is likely caused by the ∼2.1% increase in training error (Figure 2a), rather than overfitting or other causes for poor generalization. This argument is further supported by our gradual warmup experiment. The gradual warmup variant has a validation error within 0.14% of the baseline (noting that std of these estimates is ∼0.1%). Given that the final training errors (Figure 2c) match nicely in this case, it shows that if the optimization issues are addressed, there is no apparent generalization degradation observed using large minibatch training, even if the minibatch size goes from 256 to 8k.\nFinally, Figure 4 shows both the training and validation curves for the large minibatch training with gradual warmup. As can be seen, validation error starts to match the baseline closely after the second learning rate drop; actually, the validation curves can match earlier if BN statistics are recomputed prior to evaluating the error instead of using the running average (see also caption in Figure 4)."
+    }, {
+      "heading" : "5.3. Analysis Experiments",
+      "text" : "Minibatch size vs. error. Figure 1 (page 1) shows top1 validation error for models trained with minibatch sizes ranging from of 64 to 65536 (64k). For all models we used the linear scaling rule and set the reference learning rate as η = 0.1 · kn256 . For models with kn > 256, we used the gradual warmup strategy always starting with η = 0.1 and increasing linearly to the reference learning rate after 5 epochs. Figure 1 illustrates that validation error remains stable across a broad range of minibatch sizes, from 64 to 8k, after which it begins to increase. Beyond 64k training diverges when using the linear learning rate scaling rule.5\nTraining curves for various minibatch sizes. Each of the nine plots in Figure 3 shows the top-1 training error curve for the 256 minibatch baseline (orange) and a second curve corresponding to different size minibatch (blue). Validation errors are shown in the plot legends. As minibatch size increases, all training curves show some divergence from the baseline at the start of training. However, in the cases where the final validation error closely matches the baseline (kn ≤ 8k), the training curves also closely match after the initial epochs. When the validation errors do not match (kn ≥ 16k), there is a noticeable gap in the training curves for all epochs. This suggests that when comparing a new setting, the training curves can be used as a reliable proxy for success well before training finishes.\nAlternative learning rate rules. Table 2a shows results for multiple learning rates. For small minibatches (kn = 256),\n5We note that because of the availability of hardware, we simulated distributed training of very large minibatches (≥12k) on a single server by using multiple gradient accumulation steps between SGD updates. We have thoroughly verified that gradient accumulation on a single server yields equivalent results relative to distributed training.\nη = 0.1 gives best error but slightly smaller or larger η also work well. When applying the linear scaling rule with a minibatch of 8k images, the optimum error is also achieved with η = 0.1 · 32, showing the successful application of the linear scaling rule. However, in this case results are more sensitive to changing η. In practice we suggest to use a minibatch size that is not close to the breaking point.\nFigure 5 shows the training curves of a 256 minibatch using η = 0.1 or 0.2. It shows that changing the learning rate η in general changes the overall shapes of the training curves, even if the final error is similar. Contrasting this result with the success of the linear scaling rule (that can match both the final error and the training curves when minibatch sizes change) may reveal some underlying invariance maintained between small and large minibatches.\nWe also show two alternative strategies: keeping η fixed at 0.1 or using 0.1 · √ 32 according to the square root scaling rule that was justified theoretically in [21] on grounds that it scales η by the inverse amount of the reduction in the gradient estimator’s standard deviation. For fair comparisons we also use gradual warmup for 0.1 · √ 32. Both policies work poorly in practice as the results show.\nBatch Normalization γ initialization. Table 2b controls for the impact of the new BN γ initialization introduced in §5.1. We show results for minibatch sizes 256 and 8k with the standard BN initialization (γ = 1 for all BN layers) and with our initialization (γ = 0 for the final BN layer of each residual block). The results show improved performance with γ = 0 for both minibatch sizes, and the improvement is slightly larger for the 8k minibatch size. This behavior also suggests that large minibatches are more easily affected by optimization difficulties. We expect that improved optimization and initialization methods will help push the boundary of large minibatch training.\nResNet-101. Results for ResNet-101 [16] are shown in Table 2c. Training ResNet-101 with a batch-size of kn = 8k\nkn η top-1 error (%) 256 0.05 23.92 ±0.10 256 0.10 23.60 ±0.12 256 0.20 23.68 ±0.09 8k 0.05 · 32 24.27 ±0.08 8k 0.10 · 32 23.74 ±0.09 8k 0.20 · 32 24.05 ±0.18 8k 0.10 41.67 ±0.10 8k 0.10 · √ 32 26.22 ±0.03\n(a) Comparison of learning rate scaling rules. A reference learning rate of η = 0.1 works best for kn = 256 (23.68% error). The linear scaling rule suggests η = 0.1 · 32 when kn = 8k, which again gives best performance (23.74% error). Other ways of scaling η give worse results.\nkn η γ-init top-1 error (%) 256 0.1 1.0 23.84 ±0.18 256 0.1 0.0 23.60 ±0.12 8k 3.2 1.0 24.11 ±0.07 8k 3.2 0.0 23.74 ±0.09\n(b) Batch normalization γ initialization. Initializing γ = 0 in the last BN layer of each residual block improves results for both small and large minibatches. This initialization leads to better optimization behavior which has a larger positive impact when training with large minibatches.\nand a linearly scaled η = 3.2 results in an error of 22.36% vs. the kn = 256 baseline which achieves 22.08% with η = 0.1. In other words, ResNet-101 trained with minibatch 8k has a small 0.28% increase in error vs. the baseline. It is likely that the minibatch size of 8k lies on the edge of the useful minibatch training regime for ResNet-101, similarly to ResNet-50 (see Figure 1).\nThe training time of ResNet-101 is 92.5 minutes in our implementation using 256 Tesla P100 GPUs and a minibatch size of 8k. We believe this is a compelling result if the speed-accuracy tradeoff of ResNet-101 is preferred.\nImageNet-5k. Observing the sharp increase in validation error between minibatch sizes of 8k and 16k on ImageNet1k (Figure 1), a natural question is if the position of this ‘elbow’ in the error curve is a function of dataset information content. To investigate this question, we adopt the ImageNet-5k dataset suggested by Xie et al. [38] that extends ImageNet-1k to 6.8 million images (roughly 5× larger) by adding 4k additional categories from ImageNet22k [32]. We evaluate the 1k-way classification error on the original ImageNet-1k validation set as in [38].\nThe minibatch size vs. validation error curve for ImageNet-5k is shown in Figure 6. Qualitatively, the curve\nImageNet pre-training COCO kn η top-1 error (%) box AP (%) mask AP (%) 256 0.1 23.60 ±0.12 35.9 ±0.1 33.9 ±0.1 512 0.2 23.48 ±0.09 35.8 ±0.1 33.8 ±0.2 1k 0.4 23.53 ±0.08 35.9 ±0.2 33.9 ±0.2 2k 0.8 23.49 ±0.11 35.9 ±0.1 33.9 ±0.1 4k 1.6 23.56 ±0.12 35.8 ±0.1 33.8 ±0.1 8k 3.2 23.74 ±0.09 35.8 ±0.1 33.9 ±0.2 16k 6.4 24.79 ±0.27 35.1 ±0.3 33.2 ±0.3\n(a) Transfer learning of large minibatch pre-training to Mask R-CNN. Box and mask AP (on COCO minival) are nearly identical for ResNet50 models pre-trained with minibatches from 256 to 8k examples. With a minibatch pre-training size of 16k both ImageNet validation error and COCO AP deteriorate. This indicates that as long as ImageNet error is matched, large minibatches do not degrade transfer learning performance.\n# GPUs kn η · 1000 iterations box AP (%) mask AP (%)"
+    }, {
+      "heading" : "1 2 2.5 1,280,000 35.7 33.6",
+      "text" : ""
+    }, {
+      "heading" : "2 4 5.0 640,000 35.7 33.7",
+      "text" : ""
+    }, {
+      "heading" : "4 8 10.0 320,000 35.7 33.5",
+      "text" : ""
+    }, {
+      "heading" : "8 16 20.0 160,000 35.6 33.6",
+      "text" : "(b) Linear learning rate scaling applied to Mask R-CNN. Using the single ResNet-50 model from [16] (thus no std is reported), we train Mask R-CNN using using from 1 to 8 GPUs following the linear learning rate scaling rule. Box and mask AP are nearly identical across all configurations showing the successful generalization of the rule beyond classification.\nTable 3. Object detection on COCO with Mask R-CNN [14].\nis very similar to the ImageNet-1k curve, showing that for practitioners it is unlikely that even a 5× increase in dataset size will automatically lead to a meaningful increase in useable minibatch size. Quantitatively, using an 8k minibatch increases the validation error by 0.26% from 25.83% for a 256 minibatch to 26.09%. An understanding of the precise relationship between generalization error, minibatch size, and dataset information content is open for future work."
+    }, {
+      "heading" : "5.4. Generalization to Detection and Segmentation",
+      "text" : "A low error rate on ImageNet is not typically an end goal. Instead, the utility of ImageNet training lies in learn-\n256 512 1k 2k 4k 8k 11k\nmini-batch size\n0.2\n0.22\n0.24\n0.26\n0.28\n0.3\nti m\ne p\ne r\nit e ra\nti o n (\ns e c s )\n0.5\n1\n2\n4\n8\n16\nti m\ne p\ne r\ne p o c h (\nm in\ns )\nFigure 7. Distributed synchronous SGD timing. Time per iteration (seconds) and time per ImageNet epoch (minutes) for training with different minibatch sizes. The baseline (kn = 256) uses 8 GPUs in a single server , while all other training runs distribute training over (kn/256) server. With 352 GPUs (44 servers) our implementation completes one pass over all ∼1.28 million ImageNet training images in about 30 seconds.\ning good features that transfer, or generalize well, to related tasks. A question of key importance is if the features learned with large minibatches generalize as well as the features learned with small minibatches?\nTo test this, we adopt the object detection and instance segmentation tasks on COCO [26] as these advanced perception tasks benefit substantially from ImageNet pretraining [10]. We use the recently developed Mask R-CNN [14] system that is capable of learning to detect and segment object instances. We follow all of the hyper-parameter settings used in [14] and only change the ResNet-50 model used to initialize Mask R-CNN training. We train Mask RCNN on the COCO trainval35k split and report results on the 5k image minival split used in [14].\nIt is interesting to note that the concept of minibatch size in Mask R-CNN is different from the classification setting. As an extension of the image-centric Fast/Faster R-CNN [9, 30], Mask R-CNN exhibits different minibatch sizes for different layers: the network backbone uses two images (per GPU), but each image contributes 512 Regionsof-Interest for computing classification (multinomial crossentropy), bounding-box regression (smooth-L1/Huber), and pixel-wise mask (28 × 28 binomial cross-entropy) losses. This diverse set of minibatch sizes and loss functions provides a good test case to the robustness of our approach.\nTransfer learning from large minibatch pre-training. To test how large minibatch pre-training effects Mask RCNN, we take ResNet-50 models trained on ImageNet-1k with 256 to 16k minibatches and use them to initialize Mask R-CNN training. For each minibatch size we pre-train 5 models and then train Mask R-CNN using all 5 models on COCO (35 models total). We report the mean box and mask APs, averaged over the 5 trials, in Table 3a. The results show that as long as ImageNet validation error is kept low, which is true up to 8k batch size, generalization to object de-\ntection matches the AP of the small minibatch baseline. We emphasize that we observed no generalization issues when transferring across datasets (from ImageNet to COCO) and across tasks (from classification to detection/segmentation) using models trained with large minibatches.\nLinear scaling rule applied to Mask R-CNN. We also show evidence of the generality of the linear scaling rule using Mask R-CNN. In fact, this rule was already used without explicit discussion in [16] and was applied effectively as the default Mask R-CNN training scheme when using 8 GPUs. Table 3b provides experimental results showing that when training with 1, 2, 4, or 8 GPUs the linear learning rate rule results in constant box and mask AP. For these experiments, we initialize Mask R-CNN from the released MSRA ResNet-50 model, as was done in [14]."
+    }, {
+      "heading" : "5.5. Run Time",
+      "text" : "Figure 7 shows two visualizations of the run time characteristics of our system. The blue curve is the time per iteration as minibatch size varies from 256 to 11264 (11k). Notably this curve is relatively flat and the time per iteration increases only 12% while scaling the minibatch size by 44×. Visualized another way, the orange curve shows the approximately linear decrease in time per epoch from over 16 minutes to just 30 seconds. Run time performance can also be viewed in terms of throughput (images / second), as shown in Figure 8. Relative to a perfectly efficient extrapolation of the 8 GPU baseline, our implementation achieves ∼90% scaling efficiency.\nAcknowledgements. We would like to thank Leon Bottou for helpful discussions on theoretical background, Jerry Pan and Christian Puhrsch for discussions on efficient data loading, Andrew Dye for help with debugging distributed training, and Kevin Lee, Brian Dodds, Jia Ning, Koh Yew Thoon, Micah Harris, and John Volk for Big Basin and hardware support."
+    } ],
+    "references" : [ {
+      "title" : "Opening designs for 6-pack and Wedge 100",
+      "author" : [ "J. Bagga", "H. Morsy", "Z. Yao" ],
+      "venue" : " https: //code.facebook.com/posts/203733993317833/ opening-designs-for-6-pack-and-wedge-100",
+      "citeRegEx" : "1",
+      "shortCiteRegEx" : null,
+      "year" : 2016
+    }, {
+      "title" : "R",
+      "author" : [ "M. Barnett", "L. Shuler" ],
+      "venue" : "van De Geijn, S. Gupta, D. G. Payne, and J. Watts. Interprocessor collective communication library (intercom). In Scalable High-Performance Computing Conference",
+      "citeRegEx" : "2",
+      "shortCiteRegEx" : null,
+      "year" : 1994
+    }, {
+      "title" : "Curiously fast convergence of some stochastic gradient descent algorithms",
+      "author" : [ "L. Bottou" ],
+      "venue" : "Unpublished open problem offered to the attendance of the SLDS 2009 conference",
+      "citeRegEx" : "3",
+      "shortCiteRegEx" : null,
+      "year" : 2009
+    }, {
+      "title" : "Opt",
+      "author" : [ "L. Bottou", "F.E. Curtis", "J. Nocedal" ],
+      "venue" : "methods for large-scale machine learning. arXiv:1606.04838",
+      "citeRegEx" : "4",
+      "shortCiteRegEx" : null,
+      "year" : 2016
+    }, {
+      "title" : "Revisiting Distributed Synchronous SGD",
+      "author" : [ "J. Chen", "X. Pan", "R. Monga", "S. Bengio", "R. Jozefowicz" ],
+      "venue" : "arXiv:1604.00981",
+      "citeRegEx" : "5",
+      "shortCiteRegEx" : null,
+      "year" : 2016
+    }, {
+      "title" : "Scalable training of deep learning machines by incremental block training with intra-block parallel optimization and blockwise model-update filtering",
+      "author" : [ "K. Chen", "Q. Huo" ],
+      "venue" : "ICASSP",
+      "citeRegEx" : "6",
+      "shortCiteRegEx" : null,
+      "year" : 2016
+    }, {
+      "title" : "Natural language processing (almost) from scratch",
+      "author" : [ "R. Collobert", "J. Weston", "L. Bottou", "M. Karlen", "K. Kavukcuoglu", "P. Kuksa" ],
+      "venue" : "JMLR",
+      "citeRegEx" : "7",
+      "shortCiteRegEx" : null,
+      "year" : 2011
+    }, {
+      "title" : "Decaf: A deep convolutional activation feature for generic visual recognition",
+      "author" : [ "J. Donahue", "Y. Jia", "O. Vinyals", "J. Hoffman", "N. Zhang", "E. Tzeng", "T. Darrell" ],
+      "venue" : "ICML",
+      "citeRegEx" : "8",
+      "shortCiteRegEx" : null,
+      "year" : 2014
+    }, {
+      "title" : "Fast R-CNN",
+      "author" : [ "R. Girshick" ],
+      "venue" : "ICCV",
+      "citeRegEx" : "9",
+      "shortCiteRegEx" : null,
+      "year" : 2015
+    }, {
+      "title" : "Rich feature hierarchies for accurate object detection and semantic segmentation",
+      "author" : [ "R. Girshick", "J. Donahue", "T. Darrell", "J. Malik" ],
+      "venue" : "CVPR",
+      "citeRegEx" : "10",
+      "shortCiteRegEx" : null,
+      "year" : 2014
+    }, {
+      "title" : "Using MPI: Portable Parallel Programming with the Message-Passing Interface",
+      "author" : [ "W. Gropp", "E. Lusk", "A. Skjellum" ],
+      "venue" : "MIT Press, Cambridge, MA",
+      "citeRegEx" : "11",
+      "shortCiteRegEx" : null,
+      "year" : 1999
+    }, {
+      "title" : "Training and investigating Residual Nets",
+      "author" : [ "S. Gross", "M. Wilber" ],
+      "venue" : "https://github.com/facebook/fb. resnet.torch",
+      "citeRegEx" : "12",
+      "shortCiteRegEx" : null,
+      "year" : 2016
+    }, {
+      "title" : "Why random reshuffling beats stochastic gradient descent",
+      "author" : [ "M. Gürbüzbalaban", "A. Ozdaglar", "P. Parrilo" ],
+      "venue" : "arXiv:1510.08560",
+      "citeRegEx" : "13",
+      "shortCiteRegEx" : null,
+      "year" : 2015
+    }, {
+      "title" : "Mask R- CNN",
+      "author" : [ "K. He", "G. Gkioxari", "P. Dollár", "R. Girshick" ],
+      "venue" : "arXiv:1703.06870",
+      "citeRegEx" : "14",
+      "shortCiteRegEx" : null,
+      "year" : 2017
+    }, {
+      "title" : "Delving deep into rectifiers: Surpassing human-level performance on imagenet classification",
+      "author" : [ "K. He", "X. Zhang", "S. Ren", "J. Sun" ],
+      "venue" : "ICCV",
+      "citeRegEx" : "15",
+      "shortCiteRegEx" : null,
+      "year" : 2015
+    }, {
+      "title" : "Deep residual learning for image recognition",
+      "author" : [ "K. He", "X. Zhang", "S. Ren", "J. Sun" ],
+      "venue" : "CVPR",
+      "citeRegEx" : "16",
+      "shortCiteRegEx" : null,
+      "year" : 2016
+    }, {
+      "title" : "G",
+      "author" : [ "G. Hinton", "L. Deng", "D. Yu" ],
+      "venue" : "E. Dahl, A.-r. Mohamed, N. Jaitly, A. Senior, V. Vanhoucke, P. Nguyen, T. N. Sainath, et al. Deep neural networks for acoustic modeling in speech recognition: The shared views of four research groups. IEEE Signal Processing Magazine",
+      "citeRegEx" : "17",
+      "shortCiteRegEx" : null,
+      "year" : 2012
+    }, {
+      "title" : "Quantized neural networks: Training neural networks with low precision weights and activations",
+      "author" : [ "I. Hubara", "M. Courbariaux", "D. Soudry", "R. El-Yaniv", "Y. Bengio" ],
+      "venue" : "arXiv:1510.08560",
+      "citeRegEx" : "18",
+      "shortCiteRegEx" : null,
+      "year" : 2016
+    }, {
+      "title" : "Batch normalization: Accelerating deep network training by reducing internal covariate shift",
+      "author" : [ "S. Ioffe", "C. Szegedy" ],
+      "venue" : "ICML",
+      "citeRegEx" : "19",
+      "shortCiteRegEx" : null,
+      "year" : 2015
+    }, {
+      "title" : "On large-batch training for deep learning: Generalization gap and sharp minima",
+      "author" : [ "N.S. Keskar", "D. Mudigere", "J. Nocedal", "M. Smelyanskiy", "P.T.P. Tang" ],
+      "venue" : "ICLR",
+      "citeRegEx" : "20",
+      "shortCiteRegEx" : null,
+      "year" : 2017
+    }, {
+      "title" : "One weird trick for parallelizing convolutional neural networks",
+      "author" : [ "A. Krizhevsky" ],
+      "venue" : "arXiv:1404.5997",
+      "citeRegEx" : "21",
+      "shortCiteRegEx" : null,
+      "year" : 2014
+    }, {
+      "title" : "ImageNet classification with deep convolutional neural nets",
+      "author" : [ "A. Krizhevsky", "I. Sutskever", "G. Hinton" ],
+      "venue" : "NIPS",
+      "citeRegEx" : "22",
+      "shortCiteRegEx" : null,
+      "year" : 2012
+    }, {
+      "title" : "Backpropagation applied to handwritten zip code recognition",
+      "author" : [ "Y. LeCun", "B. Boser", "J.S. Denker", "D. Henderson", "R.E. Howard", "W. Hubbard", "L.D. Jackel" ],
+      "venue" : "Neural computation",
+      "citeRegEx" : "23",
+      "shortCiteRegEx" : null,
+      "year" : 1989
+    }, {
+      "title" : "Introducing Big Basin: Our next-generation AI hardware",
+      "author" : [ "K. Lee" ],
+      "venue" : " https://code.facebook.com/posts/ 1835166200089399/introducing-big-basin",
+      "citeRegEx" : "24",
+      "shortCiteRegEx" : null,
+      "year" : 2017
+    }, {
+      "title" : "Feature pyramid networks for object detection",
+      "author" : [ "T.-Y. Lin", "P. Dollár", "R. Girshick", "K. He", "B. Hariharan", "S. Belongie" ],
+      "venue" : "CVPR",
+      "citeRegEx" : "25",
+      "shortCiteRegEx" : null,
+      "year" : 2017
+    }, {
+      "title" : "Microsoft COCO: Common objects in context",
+      "author" : [ "T.-Y. Lin", "M. Maire", "S. Belongie", "J. Hays", "P. Perona", "D. Ramanan", "P. Dollár", "C.L. Zitnick" ],
+      "venue" : "In ECCV",
+      "citeRegEx" : "26",
+      "shortCiteRegEx" : "26",
+      "year" : 2014
+    }, {
+      "title" : "Fully convolutional networks for semantic segmentation",
+      "author" : [ "J. Long", "E. Shelhamer", "T. Darrell" ],
+      "venue" : "CVPR",
+      "citeRegEx" : "27",
+      "shortCiteRegEx" : null,
+      "year" : 2015
+    }, {
+      "title" : "Introductory lectures on convex optimization: A basic course",
+      "author" : [ "Y. Nesterov" ],
+      "venue" : "Springer",
+      "citeRegEx" : "28",
+      "shortCiteRegEx" : null,
+      "year" : 2004
+    }, {
+      "title" : "Optimization of collective reduction operations",
+      "author" : [ "R. Rabenseifner" ],
+      "venue" : "ICCS. Springer",
+      "citeRegEx" : "29",
+      "shortCiteRegEx" : null,
+      "year" : 2004
+    }, {
+      "title" : "Faster R-CNN: Towards real-time object detection with region proposal networks",
+      "author" : [ "S. Ren", "K. He", "R. Girshick", "J. Sun" ],
+      "venue" : "NIPS",
+      "citeRegEx" : "30",
+      "shortCiteRegEx" : null,
+      "year" : 2015
+    }, {
+      "title" : "A stochastic approximation method",
+      "author" : [ "H. Robbins", "S. Monro" ],
+      "venue" : "The annals of mathematical statistics",
+      "citeRegEx" : "31",
+      "shortCiteRegEx" : null,
+      "year" : 1951
+    }, {
+      "title" : "ImageNet Large Scale Visual Recognition Challenge",
+      "author" : [ "O. Russakovsky", "J. Deng", "H. Su", "J. Krause", "S. Satheesh", "S. Ma", "Z. Huang", "A. Karpathy", "A. Khosla", "M. Bernstein", "A.C. Berg", "L. Fei-Fei" ],
+      "venue" : "IJCV",
+      "citeRegEx" : "32",
+      "shortCiteRegEx" : null,
+      "year" : 2015
+    }, {
+      "title" : "Overfeat: Integrated recognition",
+      "author" : [ "P. Sermanet", "D. Eigen", "X. Zhang", "M. Mathieu", "R. Fergus", "Y. LeCun" ],
+      "venue" : "localization and detection using convolutional networks. In ICLR",
+      "citeRegEx" : "33",
+      "shortCiteRegEx" : null,
+      "year" : 2014
+    }, {
+      "title" : "Very deep convolutional networks for large-scale image recognition",
+      "author" : [ "K. Simonyan", "A. Zisserman" ],
+      "venue" : "ICLR",
+      "citeRegEx" : "34",
+      "shortCiteRegEx" : null,
+      "year" : 2015
+    }, {
+      "title" : "Going deeper with convolutions",
+      "author" : [ "C. Szegedy", "W. Liu", "Y. Jia", "P. Sermanet", "S. Reed", "D. Anguelov", "D. Erhan", "V. Vanhoucke", "A. Rabinovich" ],
+      "venue" : "CVPR",
+      "citeRegEx" : "35",
+      "shortCiteRegEx" : null,
+      "year" : 2015
+    }, {
+      "title" : "Optimization of collective comm",
+      "author" : [ "R. Thakur", "R. Rabenseifner", "W. Gropp" ],
+      "venue" : "operations in MPICH. IJHPCA",
+      "citeRegEx" : "36",
+      "shortCiteRegEx" : null,
+      "year" : 2005
+    }, {
+      "title" : "et al",
+      "author" : [ "Y. Wu", "M. Schuster", "Z. Chen", "Q.V. Le", "M. Norouzi", "W. Macherey", "M. Krikun", "Y. Cao", "Q. Gao", "K. Macherey" ],
+      "venue" : "Google’s neural machine translation system: Bridging the gap between human and machine translation. arXiv:1609.08144",
+      "citeRegEx" : "37",
+      "shortCiteRegEx" : null,
+      "year" : 2016
+    }, {
+      "title" : "Aggregated residual transformations for deep neural networks",
+      "author" : [ "S. Xie", "R. Girshick", "P. Dollár", "Z. Tu", "K. He" ],
+      "venue" : "CVPR",
+      "citeRegEx" : "38",
+      "shortCiteRegEx" : null,
+      "year" : 2017
+    }, {
+      "title" : "The Microsoft 2016 Conversational Speech Recognition System",
+      "author" : [ "W. Xiong", "J. Droppo", "X. Huang", "F. Seide", "M. Seltzer", "A. Stolcke", "D. Yu", "G. Zweig" ],
+      "venue" : "arXiv:1609.03528",
+      "citeRegEx" : "39",
+      "shortCiteRegEx" : null,
+      "year" : 2016
+    }, {
+      "title" : "Visualizing and understanding convolutional neural networks",
+      "author" : [ "M.D. Zeiler", "R. Fergus" ],
+      "venue" : "ECCV",
+      "citeRegEx" : "40",
+      "shortCiteRegEx" : null,
+      "year" : 2014
+    } ],
+    "referenceMentions" : [ {
+      "referenceID" : 21,
+      "context" : "We are in an unprecedented era in AI research history in which the increasing data and model scale is rapidly improving accuracy in computer vision [22, 40, 33, 34, 35, 16], speech [17, 39], and natural language processing [7, 37].",
+      "startOffset" : 148,
+      "endOffset" : 172
+    }, {
+      "referenceID" : 39,
+      "context" : "We are in an unprecedented era in AI research history in which the increasing data and model scale is rapidly improving accuracy in computer vision [22, 40, 33, 34, 35, 16], speech [17, 39], and natural language processing [7, 37].",
+      "startOffset" : 148,
+      "endOffset" : 172
+    }, {
+      "referenceID" : 32,
+      "context" : "We are in an unprecedented era in AI research history in which the increasing data and model scale is rapidly improving accuracy in computer vision [22, 40, 33, 34, 35, 16], speech [17, 39], and natural language processing [7, 37].",
+      "startOffset" : 148,
+      "endOffset" : 172
+    }, {
+      "referenceID" : 33,
+      "context" : "We are in an unprecedented era in AI research history in which the increasing data and model scale is rapidly improving accuracy in computer vision [22, 40, 33, 34, 35, 16], speech [17, 39], and natural language processing [7, 37].",
+      "startOffset" : 148,
+      "endOffset" : 172
+    }, {
+      "referenceID" : 34,
+      "context" : "We are in an unprecedented era in AI research history in which the increasing data and model scale is rapidly improving accuracy in computer vision [22, 40, 33, 34, 35, 16], speech [17, 39], and natural language processing [7, 37].",
+      "startOffset" : 148,
+      "endOffset" : 172
+    }, {
+      "referenceID" : 15,
+      "context" : "We are in an unprecedented era in AI research history in which the increasing data and model scale is rapidly improving accuracy in computer vision [22, 40, 33, 34, 35, 16], speech [17, 39], and natural language processing [7, 37].",
+      "startOffset" : 148,
+      "endOffset" : 172
+    }, {
+      "referenceID" : 16,
+      "context" : "We are in an unprecedented era in AI research history in which the increasing data and model scale is rapidly improving accuracy in computer vision [22, 40, 33, 34, 35, 16], speech [17, 39], and natural language processing [7, 37].",
+      "startOffset" : 181,
+      "endOffset" : 189
+    }, {
+      "referenceID" : 38,
+      "context" : "We are in an unprecedented era in AI research history in which the increasing data and model scale is rapidly improving accuracy in computer vision [22, 40, 33, 34, 35, 16], speech [17, 39], and natural language processing [7, 37].",
+      "startOffset" : 181,
+      "endOffset" : 189
+    }, {
+      "referenceID" : 6,
+      "context" : "We are in an unprecedented era in AI research history in which the increasing data and model scale is rapidly improving accuracy in computer vision [22, 40, 33, 34, 35, 16], speech [17, 39], and natural language processing [7, 37].",
+      "startOffset" : 223,
+      "endOffset" : 230
+    }, {
+      "referenceID" : 36,
+      "context" : "We are in an unprecedented era in AI research history in which the increasing data and model scale is rapidly improving accuracy in computer vision [22, 40, 33, 34, 35, 16], speech [17, 39], and natural language processing [7, 37].",
+      "startOffset" : 223,
+      "endOffset" : 230
+    }, {
+      "referenceID" : 22,
+      "context" : "Take the profound impact in computer vision as an example: visual representations learned by deep convolutional neural networks [23, 22] show excellent performance on previously challenging tasks like ImageNet classification [32] and can be transferred to difficult perception problems such as object detection and seg64 128 256 512 1k 2k 4k 8k 16k 32k 64k",
+      "startOffset" : 128,
+      "endOffset" : 136
+    }, {
+      "referenceID" : 21,
+      "context" : "Take the profound impact in computer vision as an example: visual representations learned by deep convolutional neural networks [23, 22] show excellent performance on previously challenging tasks like ImageNet classification [32] and can be transferred to difficult perception problems such as object detection and seg64 128 256 512 1k 2k 4k 8k 16k 32k 64k",
+      "startOffset" : 128,
+      "endOffset" : 136
+    }, {
+      "referenceID" : 31,
+      "context" : "Take the profound impact in computer vision as an example: visual representations learned by deep convolutional neural networks [23, 22] show excellent performance on previously challenging tasks like ImageNet classification [32] and can be transferred to difficult perception problems such as object detection and seg64 128 256 512 1k 2k 4k 8k 16k 32k 64k",
+      "startOffset" : 225,
+      "endOffset" : 229
+    }, {
+      "referenceID" : 7,
+      "context" : "mentation [8, 10, 27].",
+      "startOffset" : 10,
+      "endOffset" : 21
+    }, {
+      "referenceID" : 9,
+      "context" : "mentation [8, 10, 27].",
+      "startOffset" : 10,
+      "endOffset" : 21
+    }, {
+      "referenceID" : 26,
+      "context" : "mentation [8, 10, 27].",
+      "startOffset" : 10,
+      "endOffset" : 21
+    }, {
+      "referenceID" : 21,
+      "context" : "Moreover, this pattern generalizes: larger datasets and network architectures consistently yield improved accuracy across all tasks that benefit from pretraining [22, 40, 33, 34, 35, 16].",
+      "startOffset" : 162,
+      "endOffset" : 186
+    }, {
+      "referenceID" : 39,
+      "context" : "Moreover, this pattern generalizes: larger datasets and network architectures consistently yield improved accuracy across all tasks that benefit from pretraining [22, 40, 33, 34, 35, 16].",
+      "startOffset" : 162,
+      "endOffset" : 186
+    }, {
+      "referenceID" : 32,
+      "context" : "Moreover, this pattern generalizes: larger datasets and network architectures consistently yield improved accuracy across all tasks that benefit from pretraining [22, 40, 33, 34, 35, 16].",
+      "startOffset" : 162,
+      "endOffset" : 186
+    }, {
+      "referenceID" : 33,
+      "context" : "Moreover, this pattern generalizes: larger datasets and network architectures consistently yield improved accuracy across all tasks that benefit from pretraining [22, 40, 33, 34, 35, 16].",
+      "startOffset" : 162,
+      "endOffset" : 186
+    }, {
+      "referenceID" : 34,
+      "context" : "Moreover, this pattern generalizes: larger datasets and network architectures consistently yield improved accuracy across all tasks that benefit from pretraining [22, 40, 33, 34, 35, 16].",
+      "startOffset" : 162,
+      "endOffset" : 186
+    }, {
+      "referenceID" : 15,
+      "context" : "Moreover, this pattern generalizes: larger datasets and network architectures consistently yield improved accuracy across all tasks that benefit from pretraining [22, 40, 33, 34, 35, 16].",
+      "startOffset" : 162,
+      "endOffset" : 186
+    }, {
+      "referenceID" : 15,
+      "context" : "As an example, we scale ResNet-50 [16] training, originally performed with a minibatch size of 256 images (using 8 Tesla P100 GPUs, training time is 29 hours), to larger minibatches (see Figure 1).",
+      "startOffset" : 34,
+      "endOffset" : 38
+    }, {
+      "referenceID" : 20,
+      "context" : "While this guideline is found in earlier work [21, 4], its empirical limits are not well understood and informally we have found that it is not widely known to the research community.",
+      "startOffset" : 46,
+      "endOffset" : 53
+    }, {
+      "referenceID" : 3,
+      "context" : "While this guideline is found in earlier work [21, 4], its empirical limits are not well understood and informally we have found that it is not widely known to the research community.",
+      "startOffset" : 46,
+      "endOffset" : 53
+    }, {
+      "referenceID" : 15,
+      "context" : ", a strategy of using lower learning rates at the start of training [16], to overcome early optimization difficulties.",
+      "startOffset" : 68,
+      "endOffset" : 72
+    }, {
+      "referenceID" : 19,
+      "context" : "Our comprehensive experiments in §5 show that optimization difficulty is the main issue with large minibatches, rather than poor generalization (at least on ImageNet), in contrast to some recent studies [20].",
+      "startOffset" : 203,
+      "endOffset" : 207
+    }, {
+      "referenceID" : 8,
+      "context" : "Additionally, we show that the linear scaling rule and warmup generalize to more complex tasks including object detection and segmentation [9, 30, 14, 27], which we demonstrate via the recently developed Mask R-CNN [14].",
+      "startOffset" : 139,
+      "endOffset" : 154
+    }, {
+      "referenceID" : 29,
+      "context" : "Additionally, we show that the linear scaling rule and warmup generalize to more complex tasks including object detection and segmentation [9, 30, 14, 27], which we demonstrate via the recently developed Mask R-CNN [14].",
+      "startOffset" : 139,
+      "endOffset" : 154
+    }, {
+      "referenceID" : 13,
+      "context" : "Additionally, we show that the linear scaling rule and warmup generalize to more complex tasks including object detection and segmentation [9, 30, 14, 27], which we demonstrate via the recently developed Mask R-CNN [14].",
+      "startOffset" : 139,
+      "endOffset" : 154
+    }, {
+      "referenceID" : 26,
+      "context" : "Additionally, we show that the linear scaling rule and warmup generalize to more complex tasks including object detection and segmentation [9, 30, 14, 27], which we demonstrate via the recently developed Mask R-CNN [14].",
+      "startOffset" : 139,
+      "endOffset" : 154
+    }, {
+      "referenceID" : 13,
+      "context" : "Additionally, we show that the linear scaling rule and warmup generalize to more complex tasks including object detection and segmentation [9, 30, 14, 27], which we demonstrate via the recently developed Mask R-CNN [14].",
+      "startOffset" : 215,
+      "endOffset" : 219
+    }, {
+      "referenceID" : 23,
+      "context" : "We use the recently open-sourced Caffe21 deep learning framework and Big Basin GPU servers [24], which operates efficiently using standard Ethernet networking (as opposed to specialized network interfaces).",
+      "startOffset" : 91,
+      "endOffset" : 95
+    }, {
+      "referenceID" : 29,
+      "context" : "in our experience migrating Faster R-CNN [30] and ResNets [16] from 1 to 8 GPUs.",
+      "startOffset" : 41,
+      "endOffset" : 45
+    }, {
+      "referenceID" : 15,
+      "context" : "in our experience migrating Faster R-CNN [30] and ResNets [16] from 1 to 8 GPUs.",
+      "startOffset" : 58,
+      "endOffset" : 62
+    }, {
+      "referenceID" : 30,
+      "context" : "Minibatch Stochastic Gradient Descent [31], usually referred to as simply as SGD in recent literature even though it operates on minibatches, performs the following update:",
+      "startOffset" : 38,
+      "endOffset" : 42
+    }, {
+      "referenceID" : 20,
+      "context" : "The above linear scaling rule was adopted by Krizhevsky [21], if not earlier.",
+      "startOffset" : 56,
+      "endOffset" : 60
+    }, {
+      "referenceID" : 4,
+      "context" : "[5] presented a comparison of numerous distributed SGD variants, and although their work also employed the linear scaling rule, it did not establish a small minibatch baseline (the most related result is in v1 of [5] which reported a 0.",
+      "startOffset" : 0,
+      "endOffset" : 3
+    }, {
+      "referenceID" : 4,
+      "context" : "[5] presented a comparison of numerous distributed SGD variants, and although their work also employed the linear scaling rule, it did not establish a small minibatch baseline (the most related result is in v1 of [5] which reported a 0.",
+      "startOffset" : 213,
+      "endOffset" : 216
+    }, {
+      "referenceID" : 3,
+      "context" : "[4] (section 4.",
+      "startOffset" : 0,
+      "endOffset" : 3
+    }, {
+      "referenceID" : 15,
+      "context" : "We find that this issue can be alleviated by a properly designed warmup [16], namely, a strategy of using less aggressive learning rates at the start of training.",
+      "startOffset" : 72,
+      "endOffset" : 76
+    }, {
+      "referenceID" : 15,
+      "context" : "The warmup strategy presented in [16] uses a low constant learning rate for the first few epochs of training.",
+      "startOffset" : 33,
+      "endOffset" : 37
+    }, {
+      "referenceID" : 8,
+      "context" : "As we will show in §5, we have found constant warmup particularly helpful for prototyping object detection and segmentation methods [9, 30, 25, 14] that fine-tune pre-trained layers together with newly initialized layers.",
+      "startOffset" : 132,
+      "endOffset" : 147
+    }, {
+      "referenceID" : 29,
+      "context" : "As we will show in §5, we have found constant warmup particularly helpful for prototyping object detection and segmentation methods [9, 30, 25, 14] that fine-tune pre-trained layers together with newly initialized layers.",
+      "startOffset" : 132,
+      "endOffset" : 147
+    }, {
+      "referenceID" : 24,
+      "context" : "As we will show in §5, we have found constant warmup particularly helpful for prototyping object detection and segmentation methods [9, 30, 25, 14] that fine-tune pre-trained layers together with newly initialized layers.",
+      "startOffset" : 132,
+      "endOffset" : 147
+    }, {
+      "referenceID" : 13,
+      "context" : "As we will show in §5, we have found constant warmup particularly helpful for prototyping object detection and segmentation methods [9, 30, 25, 14] that fine-tune pre-trained layers together with newly initialized layers.",
+      "startOffset" : 132,
+      "endOffset" : 147
+    }, {
+      "referenceID" : 18,
+      "context" : "Batch Normalization (BN) [19] computes statistics along the minibatch dimension: this breaks the independence of each sample’s loss, and changes in minibatch size change the underlying definition of the loss function being optimized.",
+      "startOffset" : 25,
+      "endOffset" : 29
+    }, {
+      "referenceID" : 18,
+      "context" : "In this work, we use n = 32 which has performed well for a wide range of datasets and networks [19, 16].",
+      "startOffset" : 95,
+      "endOffset" : 103
+    }, {
+      "referenceID" : 15,
+      "context" : "In this work, we use n = 32 which has performed well for a wide range of datasets and networks [19, 16].",
+      "startOffset" : 95,
+      "endOffset" : 103
+    }, {
+      "referenceID" : 10,
+      "context" : "However, standard communication primitives like allreduce [11] perform summing, not averaging.",
+      "startOffset" : 58,
+      "endOffset" : 62
+    }, {
+      "referenceID" : 2,
+      "context" : "In practice, common SGD implementations apply random shuffling of the training set during each SGD epoch, which can give better results [3, 13].",
+      "startOffset" : 136,
+      "endOffset" : 143
+    }, {
+      "referenceID" : 12,
+      "context" : "In practice, common SGD implementations apply random shuffling of the training set during each SGD epoch, which can give better results [3, 13].",
+      "startOffset" : 136,
+      "endOffset" : 143
+    }, {
+      "referenceID" : 15,
+      "context" : ", [16]), we ensure the samples in one epoch done by k workers are from a single consistent random shuffling of the training set.",
+      "startOffset" : 2,
+      "endOffset" : 6
+    }, {
+      "referenceID" : 23,
+      "context" : "In order to scale beyond the 8 GPUs in a single Big Basin server [24], gradient aggregation has to span across servers on a network.",
+      "startOffset" : 65,
+      "endOffset" : 69
+    }, {
+      "referenceID" : 4,
+      "context" : "Therefore, as soon as the gradient for a layer is computed, it is aggregated across workers, while gradient computation for the next layer continues (as discussed in [5]).",
+      "startOffset" : 166,
+      "endOffset" : 169
+    }, {
+      "referenceID" : 10,
+      "context" : "For every gradient, aggregation is done using an allreduce operation (similar to the MPI collective operation MPI Allreduce [11]).",
+      "startOffset" : 124,
+      "endOffset" : 128
+    }, {
+      "referenceID" : 17,
+      "context" : ", quantized gradients [18], Block-Momentum SGD [6]).",
+      "startOffset" : 22,
+      "endOffset" : 26
+    }, {
+      "referenceID" : 5,
+      "context" : ", quantized gradients [18], Block-Momentum SGD [6]).",
+      "startOffset" : 47,
+      "endOffset" : 50
+    }, {
+      "referenceID" : 28,
+      "context" : "For interserver allreduce, we implemented two of the best algorithms for bandwidth-limited scenarios: the recursive halving and doubling algorithm [29, 36] and the bucket algorithm (also known as the ring algorithm) [2].",
+      "startOffset" : 147,
+      "endOffset" : 155
+    }, {
+      "referenceID" : 35,
+      "context" : "For interserver allreduce, we implemented two of the best algorithms for bandwidth-limited scenarios: the recursive halving and doubling algorithm [29, 36] and the bucket algorithm (also known as the ring algorithm) [2].",
+      "startOffset" : 147,
+      "endOffset" : 155
+    }, {
+      "referenceID" : 1,
+      "context" : "For interserver allreduce, we implemented two of the best algorithms for bandwidth-limited scenarios: the recursive halving and doubling algorithm [29, 36] and the bucket algorithm (also known as the ring algorithm) [2].",
+      "startOffset" : 216,
+      "endOffset" : 219
+    }, {
+      "referenceID" : 28,
+      "context" : "To support non-power-of-two number of servers, we used the binary blocks algorithm [29].",
+      "startOffset" : 83,
+      "endOffset" : 87
+    }, {
+      "referenceID" : 23,
+      "context" : "We used Facebook’s Big Basin [24] GPU servers for our experiments.",
+      "startOffset" : 29,
+      "endOffset" : 33
+    }, {
+      "referenceID" : 0,
+      "context" : "For network connectivity, the servers have a Mellanox ConnectX-4 50Gbit Ethernet network card and are connected to Wedge100 [1] Ethernet switches.",
+      "startOffset" : 124,
+      "endOffset" : 127
+    }, {
+      "referenceID" : 15,
+      "context" : "Our main result is that we can train ResNet-50 [16] on ImageNet [32] using 256 workers in one hour, while matching the accuracy of small minibatch training.",
+      "startOffset" : 47,
+      "endOffset" : 51
+    }, {
+      "referenceID" : 31,
+      "context" : "Our main result is that we can train ResNet-50 [16] on ImageNet [32] using 256 workers in one hour, while matching the accuracy of small minibatch training.",
+      "startOffset" : 64,
+      "endOffset" : 68
+    }, {
+      "referenceID" : 31,
+      "context" : "The 1000-way ImageNet classification task [32] serves as our main experimental benchmark.",
+      "startOffset" : 42,
+      "endOffset" : 46
+    }, {
+      "referenceID" : 15,
+      "context" : "We use the ResNet-50 [16] variant from [12], noting that the stride-2 convolutions are on 3×3 layers instead of on 1×1 layers as in [16].",
+      "startOffset" : 21,
+      "endOffset" : 25
+    }, {
+      "referenceID" : 11,
+      "context" : "We use the ResNet-50 [16] variant from [12], noting that the stride-2 convolutions are on 3×3 layers instead of on 1×1 layers as in [16].",
+      "startOffset" : 39,
+      "endOffset" : 43
+    }, {
+      "referenceID" : 15,
+      "context" : "We use the ResNet-50 [16] variant from [12], noting that the stride-2 convolutions are on 3×3 layers instead of on 1×1 layers as in [16].",
+      "startOffset" : 132,
+      "endOffset" : 136
+    }, {
+      "referenceID" : 27,
+      "context" : "We use Nesterov momentum [28] with m of 0.",
+      "startOffset" : 25,
+      "endOffset" : 29
+    }, {
+      "referenceID" : 11,
+      "context" : "9 following [12] but note that standard momentum as was used in [16] is equally effective.",
+      "startOffset" : 12,
+      "endOffset" : 16
+    }, {
+      "referenceID" : 15,
+      "context" : "9 following [12] but note that standard momentum as was used in [16] is equally effective.",
+      "startOffset" : 64,
+      "endOffset" : 68
+    }, {
+      "referenceID" : 15,
+      "context" : "0001 and following [16] we do not apply weight decay on the learnable BN coefficients (namely, γ and β in [19]).",
+      "startOffset" : 19,
+      "endOffset" : 23
+    }, {
+      "referenceID" : 18,
+      "context" : "0001 and following [16] we do not apply weight decay on the learnable BN coefficients (namely, γ and β in [19]).",
+      "startOffset" : 106,
+      "endOffset" : 110
+    }, {
+      "referenceID" : 11,
+      "context" : "As in [12], we compute the BN statistics using running average (with momentum 0.",
+      "startOffset" : 6,
+      "endOffset" : 10
+    }, {
+      "referenceID" : 15,
+      "context" : "1 as in [16].",
+      "startOffset" : 8,
+      "endOffset" : 12
+    }, {
+      "referenceID" : 15,
+      "context" : "1 · kn 256 ) the reference learning rate, and reduce it by 1/10 at the 30-th, 60-th, and 80-th epoch, similar to [16].",
+      "startOffset" : 113,
+      "endOffset" : 117
+    }, {
+      "referenceID" : 14,
+      "context" : "We adopt the initialization of [15] for all convolutional layers.",
+      "startOffset" : 31,
+      "endOffset" : 35
+    }, {
+      "referenceID" : 34,
+      "context" : "We use scale and aspect ratio data augmentation [35] as in [12].",
+      "startOffset" : 48,
+      "endOffset" : 52
+    }, {
+      "referenceID" : 11,
+      "context" : "We use scale and aspect ratio data augmentation [35] as in [12].",
+      "startOffset" : 59,
+      "endOffset" : 63
+    }, {
+      "referenceID" : 11,
+      "context" : "The input image is normalized by the per-color mean and standard deviation, as in [12].",
+      "startOffset" : 82,
+      "endOffset" : 86
+    }, {
+      "referenceID" : 15,
+      "context" : "Under these settings, we establish a ResNet-50 baseline using k = 8 (8 GPUs in one server) and n = 32 images per worker (minibatch size of kn = 256), as in [16].",
+      "startOffset" : 156,
+      "endOffset" : 160
+    }, {
+      "referenceID" : 11,
+      "context" : "torch [12] has 24.",
+      "startOffset" : 6,
+      "endOffset" : 10
+    }, {
+      "referenceID" : 15,
+      "context" : "01% error, and that of the original ResNet paper [16] has 24.",
+      "startOffset" : 49,
+      "endOffset" : 53
+    }, {
+      "referenceID" : 20,
+      "context" : "1 · √ 32 according to the square root scaling rule that was justified theoretically in [21] on grounds that it scales η by the inverse amount of the reduction in the gradient estimator’s standard deviation.",
+      "startOffset" : 87,
+      "endOffset" : 91
+    }, {
+      "referenceID" : 15,
+      "context" : "Results for ResNet-101 [16] are shown in Table 2c.",
+      "startOffset" : 23,
+      "endOffset" : 27
+    }, {
+      "referenceID" : 37,
+      "context" : "[38] that extends ImageNet-1k to 6.",
+      "startOffset" : 0,
+      "endOffset" : 4
+    }, {
+      "referenceID" : 31,
+      "context" : "8 million images (roughly 5× larger) by adding 4k additional categories from ImageNet22k [32].",
+      "startOffset" : 89,
+      "endOffset" : 93
+    }, {
+      "referenceID" : 37,
+      "context" : "We evaluate the 1k-way classification error on the original ImageNet-1k validation set as in [38].",
+      "startOffset" : 93,
+      "endOffset" : 97
+    }, {
+      "referenceID" : 15,
+      "context" : "Using the single ResNet-50 model from [16] (thus no std is reported), we train Mask R-CNN using using from 1 to 8 GPUs following the linear learning rate scaling rule.",
+      "startOffset" : 38,
+      "endOffset" : 42
+    }, {
+      "referenceID" : 13,
+      "context" : "Object detection on COCO with Mask R-CNN [14].",
+      "startOffset" : 41,
+      "endOffset" : 45
+    }, {
+      "referenceID" : 25,
+      "context" : "A question of key importance is if the features learned with large minibatches generalize as well as the features learned with small minibatches? To test this, we adopt the object detection and instance segmentation tasks on COCO [26] as these advanced perception tasks benefit substantially from ImageNet pretraining [10].",
+      "startOffset" : 230,
+      "endOffset" : 234
+    }, {
+      "referenceID" : 9,
+      "context" : "A question of key importance is if the features learned with large minibatches generalize as well as the features learned with small minibatches? To test this, we adopt the object detection and instance segmentation tasks on COCO [26] as these advanced perception tasks benefit substantially from ImageNet pretraining [10].",
+      "startOffset" : 318,
+      "endOffset" : 322
+    }, {
+      "referenceID" : 13,
+      "context" : "We use the recently developed Mask R-CNN [14] system that is capable of learning to detect and segment object instances.",
+      "startOffset" : 41,
+      "endOffset" : 45
+    }, {
+      "referenceID" : 13,
+      "context" : "We follow all of the hyper-parameter settings used in [14] and only change the ResNet-50 model used to initialize Mask R-CNN training.",
+      "startOffset" : 54,
+      "endOffset" : 58
+    }, {
+      "referenceID" : 13,
+      "context" : "We train Mask RCNN on the COCO trainval35k split and report results on the 5k image minival split used in [14].",
+      "startOffset" : 106,
+      "endOffset" : 110
+    }, {
+      "referenceID" : 8,
+      "context" : "As an extension of the image-centric Fast/Faster R-CNN [9, 30], Mask R-CNN exhibits different minibatch sizes for different layers: the network backbone uses two images (per GPU), but each image contributes 512 Regionsof-Interest for computing classification (multinomial crossentropy), bounding-box regression (smooth-L1/Huber), and pixel-wise mask (28 × 28 binomial cross-entropy) losses.",
+      "startOffset" : 55,
+      "endOffset" : 62
+    }, {
+      "referenceID" : 29,
+      "context" : "As an extension of the image-centric Fast/Faster R-CNN [9, 30], Mask R-CNN exhibits different minibatch sizes for different layers: the network backbone uses two images (per GPU), but each image contributes 512 Regionsof-Interest for computing classification (multinomial crossentropy), bounding-box regression (smooth-L1/Huber), and pixel-wise mask (28 × 28 binomial cross-entropy) losses.",
+      "startOffset" : 55,
+      "endOffset" : 62
+    }, {
+      "referenceID" : 15,
+      "context" : "In fact, this rule was already used without explicit discussion in [16] and was applied effectively as the default Mask R-CNN training scheme when using 8 GPUs.",
+      "startOffset" : 67,
+      "endOffset" : 71
+    }, {
+      "referenceID" : 13,
+      "context" : "For these experiments, we initialize Mask R-CNN from the released MSRA ResNet-50 model, as was done in [14].",
+      "startOffset" : 103,
+      "endOffset" : 107
+    } ],
+    "year" : 2017,
+    "abstractText" : "Deep learning thrives with large neural networks and large datasets. However, larger networks and larger datasets result in longer training times that impede research and development progress. Distributed synchronous SGD offers a potential solution to this problem by dividing SGD minibatches over a pool of parallel workers. Yet to make this scheme efficient, the per-worker workload must be large, which implies nontrivial growth in the SGD minibatch size. In this paper, we empirically show that on the ImageNet dataset large minibatches cause optimization difficulties, but when these are addressed the trained networks exhibit good generalization. Specifically, we show no loss of accuracy when training with large minibatch sizes up to 8192 images. To achieve this result, we adopt a linear scaling rule for adjusting learning rates as a function of minibatch size and develop a new warmup scheme that overcomes optimization challenges early in training. With these simple techniques, our Caffe2-based system trains ResNet50 with a minibatch size of 8192 on 256 GPUs in one hour, while matching small minibatch accuracy. Using commodity hardware, our implementation achieves ∼90% scaling efficiency when moving from 8 to 256 GPUs. This system enables us to train visual recognition models on internetscale data with high efficiency.",
+    "creator" : "LaTeX with hyperref package"
+  }
+}

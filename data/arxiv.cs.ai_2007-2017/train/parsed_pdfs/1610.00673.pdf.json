@@ -1,0 +1,509 @@
+{
+  "name" : "1610.00673.pdf",
+  "metadata" : {
+    "source" : "CRF",
+    "title" : "Collective Robot Reinforcement Learning with Distributed Asynchronous Guided Policy Search",
+    "authors" : [ "Ali Yahya", "Adrian Li", "Mrinal Kalakrishnan", "Yevgen Chebotar", "Sergey Levine" ],
+    "emails" : [ "alive@x.team", "alhli@x.team", "kalakris@x.team" ],
+    "sections" : [ {
+      "heading" : null,
+      "text" : "I. INTRODUCTION\nPolicy search techniques show promising ability to learn feedback control policies for robotic tasks with highdimensional sensory inputs through trial and error [1, 2, 3, 4]. Most successful applications of policy search, however, rely on considerable manual engineering of suitable policy representations, perception pipelines, and low-level controllers to support the learned policy. Recently, deep reinforcement learning (RL) methods have been used to show that policies for complex tasks can be trained end-to-end, directly from raw sensory inputs (like images [5, 6]) to actions. Such methods are difficult to apply to real-world robotic applications because of their high sample complexity. Methods based on Guided Policy Search (GPS) [7], which convert the policy search problem into a supervised learning problem, with a local trajectory-centric RL algorithm acting as a teacher, reduce sample complexity and thereby help make said applications tractable. However, training such a policy to generalize well across a wide variety of real-world conditions requires far greater quantity and diversity of experience than is practical to collect with a single robot.\nFortunately, it is possible for multiple robots to share their experience with one another, and thereby, learn a policy collectively. In this work, we explore distributed and asynchronous policy learning (also known hereafter in this work as collective policy learning) as a means to achieve generalization and improved training times on challenging,\n1Ali Yahya, Adrian Li, and Mrinal Kalakrishnan are with X, Mountain View, CA 94043, USA. {alive,alhli,kalakris}@x.team\n2Yevgen Chebotar is with the Department of Computer Science, University of Southern California, Los Angeles, CA 90089, USA. This research was conducted during Yevgen’s internship at X.\n3Sergey Levine is with Google Brain, Mountain View, CA 94043, USA.\nreal-world manipulation tasks. Collective policy learning presents a number of unique challenges. These challenges can be broadly categorized as utilization challenges and synchronization challenges. On one hand, we would like to maximize robot utilization — the fraction of time that the robots spend collecting experience for learning. On the other hand, each robot must allocate compute and bandwidth to process and communicate its experience to other robots, and the system as a whole needs to synchronize the assimilation of each robot’s experience into the collective policy.\nThe main contribution of this work is a system for collective policy learning. We address the aforementioned utilization and synchronization challenges with a novel distributed and asynchronous variant of Guided Policy Search. In our system, multiple robots practice the task simultaneously, each on a distinct instance of the task, and jointly train a single policy whose parameters are maintained centrally by a parameter server. To maximize utilization, each robot continues to practice and optimize its own local policy while the single global policy is trained from a buffer of previously collected experience. For high-dimensional policies such as those based on neural networks, the increase in utilization that is conferred by asynchronous training is significant. Consequently, this approach dramatically brings down the total amount of time required to learn complex visuomotor policies using GPS, and makes this technique scalable to more realistic applications which require greater data diversity.\nWe evaluate our approach in simulation and on a realworld door opening task (shown in Figure 1), where both the pose and the appearance of the door vary across task instances. We show that our system achieves better generalization, utilization, and training times than the single robot alternative."
+    }, {
+      "heading" : "II. RELATED WORK",
+      "text" : "Robotic motor skill learning has shown considerable promise for enabling robots to autonomously learn complex\nar X\niv :1\n61 0.\n00 67\n3v 1\n[ cs\n.L G\n] 3\nO ct\n2 01\n6\nmotion skills [1, 2, 3, 4]. However, most successes in robotic motor skill learning have involved significant manual design of representations in order to enable policies to generalize effectively. For example, the well-known dynamic movement primitive representation [8] has been widely used to generalize learned skills by adapting the goal state, but it inherently restricts the learning process to trajectory-centric behaviors.\nEnabling robotic learning with more expressive policy classes that can represent more complex strategies has the potential of eliminating the need for the manual design of representations. Recent years have seen improvement in the generalizability of passive perception systems, in domains such as computer vision, natural language processing, and speech recognition through the use of deep learning techniques [9]. These methods combine deep neural networks with large datasets to achieve remarkable results on a diverse range of real-world tasks. However, the requirement of large labeled datasets has limited the application of such methods to robotic learning problems. While several works have extended deep learning methods to simulated [5, 6] and real-world [7, 10] robotic tasks, the kind of generalization exhibited by deep learning in passive perception domains has not yet been demonstrated for robotic skill learning. This may be due to the fact that robotic learning experiments tend to use relatively small amounts of data in constrained domains, with a few hours of experience collected from a single robot in each experiment.\nA central motivation behind our work is the ability to apply deep learning to robotic manipulation by making it feasible to collect large amounts of on-policy experience with real physical platforms. While this may seem impractical for small-scale laboratory experiments, it becomes much more realistic when we consider a possible future where robots are deployed in the real-world to perform a wide variety of skills. The challenges of asynchrony, utilization, and parallelism, which we aim to address in this work, are central for such real-world deployments. The ability of robotic systems to learn more quickly and effectively by pooling their collective experience has long been recognized in the domain of cloud robotics, where it is typically referred to as collective robotic learning [11, 12, 13, 14]. Our work therefore represents a step toward more practical and powerful collective learning with distributed, asynchronous data collection.\nDistributed systems have long been an important subject in deep learning [15]. While distributed asynchronous architectures have previously been used to optimize controllers for simulated characters [16], our work is, to the best of our knowledge, the first to experimentally explore distributed asynchronous training of deep neural network policies for real-world robotic control. In our work, we parallelize both data collection and neural network policy training across multiple machines."
+    }, {
+      "heading" : "III. PRELIMINARIES ON GUIDED POLICY SEARCH",
+      "text" : "In this section, we define the problem formulation and briefly summarize theb guided policy search (GPS) algorithm, specifically pointing out computational bottlenecks\nthat can be alleviated through asynchrony and parallelism. A more complete description of the theoretical underpinnings of the method can be found in prior work [7]. The goal of policy search methods is to optimize the parameters θ of a policy πθ(ut|xt), which defines a probability distribution over robot actions ut conditioned on the system state xt at each time step t of a task execution. Let τ = (x1,u1, . . . ,xT ,uT ) be a trajectory of states and actions. Given a task cost function l(xt,ut), we define the trajectory cost l(τ) = ∑T t=1 l(xt,ut). Policy optimization is performed with respect to the expected cost of the policy:\nJ(θ) = Eπθ [l(τ)] = ∫ l(τ)pπθ (τ)dτ,\nwhere pπθ (τ) is the policy trajectory distribution given the system dynamics p (xt+1|xt,ut):\npπθ (τ) = p(x1) T∏ t=1 p (xt+1|xt,ut)πθ(ut|xt).\nMost standard policy search methods aim to directly optimize this objective, for example by estimating the gradient ∇θJ(θ). However, this kind of direct model-free method can quickly become intractable for very high-dimensional policies, such as the large neural network policies considered in this work [4]. An alternative approach is to train the deep neural network with supervised learning, using a simpler local policy optimization method to produce supervision. To that end, guided policy search introduces a two-step approach for learning high-dimensional policies by combining the benefits of simple, efficient trajectory-centric RL and supervised learning of high-dimensional, nonlinear policies. Instead of directly learning the policy parameters with reinforcement learning, a trajectory-centric algorithm is first used to learn simple local controllers pi(ut|xt) for trajectories with various initial conditions, which might correspond, for instance, to different poses of a door for a door opening task. We refer to these controllers as local policies. In this work, we employ time-varying linear-Gaussian controllers of the form pi(ut|xt) = N (Ktxt+kt,Ct) to represent these local policies, following prior work [7].\nAfter optimizing local policies, the controls from these policies are used to create a training set for learning a complex high-dimensional global policy in a supervised manner. Hence, the final global policy generalizes to the initial conditions of multiple local policies and can contain thousands of parameters, which can be efficiently learned with supervised learning. Furthermore, while trajectory optimization might require the full state xt of the system to be known, it is possible to only use the observations ot of the full state for training a global policy πθ(ut|ot). This allows the global policy to predict actions from raw observations at test time [7].\nIn this work, we will examine a general asynchronous framework for guided policy search algorithms, and we will show how this framework can be instantiated to extend two prior guided policy search methods: BADMM-based guided policy search [7] and mirror descent guided policy search\n(MDGPS) [17]. Both algorithms share the same overall structure, with alternating optimization of the local policies via trajectory-centric RL, which in the case of our system is either a model-based algorithm based on LQR [18] or a model-free algorithm based on PI2 [3], and optimization of the global policy via supervised learning through stochastic gradient descent (SGD). The adaptation of PI2 to guided policy search is described in detail in a companion paper [19]. The difference between the two methods is the mechanism that is used to keep the local policies close to the global policy. This is extremely important, since in general not all local policies can be reproduced effectively by a single global policy.\na) BADMM-based GPS: In BADMM-based guided policy search [7], the alternating optimization is formalized as a constrained optimization of the form\nmin θ,p1,...,pN N∑ i=1 Eτ∼pi [l(τ)] s.t. pi(ut|xt)=πθ(ut|xt)∀xt,ut, i. This is equivalent in expectation to optimizing J(θ), since∑N i=1Eτ∼pi [l(τ)] = ∑N i=1Eτ∼πθ [l(τ)] when the constraint\nis satisfied, and ∑N i=1Eτ∼πθ [l(τ)] ≈ Ex1∼p(x1),τ∼πθ [l(τ)] when the initial states xi1 are sampled from p(x1). The constrained optimization is then solved using the Bregman ADMM algorithm [20], which augments the objective for both the local and global policies with Lagrange multipliers that keep them similar in terms of KL-divergence. These terms are denoted φi(τ, θ, τ) and φθ(pi, θ, τ) for the local and global policies, respectively, so that the global policy is optimized with respect to the objective\nmin θ N∑ i=1 Eτ∼pi [ T∑ t=1 DKL(πθ(ut|xt)‖pi(ut|xt))+φθ(pi, θ, τ) ] , (1) and the local policies are optimized with respect to\nmin pi Eτ∼pi(τ)[l(τ)] s.t. DKL(pi(τ)‖p̄i(τ)) < , (2)\nwhere p̄i is the local policy at the previous iteration. The constraint ensures that the local policies only change by a small amount at each iteration, to prevent divergence of the trajectory-centric RL algorithm, analogously to other recent RL methods [2, 21]. The derivations of φi(τ, θ,xt) and φθ(pi, θ,xt) are provided in prior work [7].\nb) MDGPS: In MDGPS [17], the local policies are optimized with respect to\nmin pi Eτ∼pi(τ)[l(τ)] s.t. DKL(pi(τ)‖πθ(τ)) < , (3)\nwhere the constraint directly limits the deviation of the local policies from the global policies. This can be interpreted as the generalized gradient step in mirror descent, which improves the policy with respect to the objective. The supervised learning step simply minimizes the deviation from the local policies, without any additional augmentation terms:\nmin θ N∑ i=1 Eτ∼pi [ T∑ t=1 DKL(πθ(ut|xt)‖pi(ut|xt)) ] . (4)\nAlgorithm 1 Standard synchronous guided policy search 1: for iteration k ∈ {1, . . . ,K} do 2: Generate sample trajectories starting from each xi1 by\nexecuting pi(ut|xt) or πθ(ut|xt) on the robot. 3: Use samples to optimize each of the local policies\npi(ut|xt) from each xi1 with respect to Equation (2) or (3), using either LQR or PI2.\n4: Optimize the global policy πθ(ut|xt) according to Equation (1) or (4) with SGD. 5: end for\nThis can be interpreted as the projection step in mirror descent, such that the overall algorithm optimizes the global policy subject to the constraint that the policy should lie within the manifold defined by the policy class, which in our case corresponds to neural networks.\nBoth GPS algorithms are summarized in Algorithm 1, and consist of two alternating phases: optimization of the local policies with trajectory-centric RL, and optimization of the global policy with supervised learning. Several different trajectory-centric RL algorithms may be used, and we summarize the ones used in our experiments below."
+    }, {
+      "heading" : "A. Local Policy Optimization",
+      "text" : "The GPS framework is generic with respect to the choice of local policy optimizer. In this work, we consider two possible methods for local policy optimization:\nc) LQR with local models: To take a model-based approach to optimization of time-varying linear-Gaussian local policies, we can observe that, under time-varying linearGaussian dynamics, the local policies can be optimized analytically using the LQR method, or the iterative LQR method in the case of non-quadratic costs [22]. However, this approach requires a linearization of the system dynamics, which are generally not known for complex robotic manipulation tasks. As described in prior work [18], we can still use LQR if we fit a time-varying linear-Gaussian model to the samples using linear regression. In this approach, the samples generated on line 1 of Algorithm 1 are used to fit a time-varying linear-Gaussian dynamics model of the form p(xt+1|xt,ut) = N (Fx,txt + Fu,tut + ft,Nt). As suggested in prior work, we can use a Gaussian mixture model (GMM) prior to reduce the sample complexity of this linear regression fit, and we can accommodate the constraints in Equation (2) or (3) with a simple modification that uses LQR within a dual gradient descent loop [18].\nd) PI2: Policy Improvement with Path Integrals (PI2) is a model-free policy search method based on the principles of stochastic optimal control [3]. It does not require fitting of linear dynamics and can be applied to tasks with highly discontinuous dynamics or non-differentiable costs. In this work, we employ PI2 to learn feedforward commands kt of time-varying linear-Gaussian controllers as described in [19].\nThe controls at each time step are updated according to\nthe soft-max probabilities Pi,t based on their cost-to-go Si,t:\nSi,t = S(τi,t) = T∑ j=t l(xi,j ,ui,j), Pi,t = e− 1 ηSi,t∑N i=1 e − 1ηSi,t ,\nwhere l(xi,j ,ui,j) is the cost of sample i at time j. In this way, trajectories with lower costs become more probable after the policy update. For learning feedforward commands, the policy update corresponds to a weighted maximum likelihood estimation of the new mean kt and the noise covariance Ct. In this work, we use relative entropy optimization [2] to determine the temperature η at each time step independently, based on a KL-divergence constraint between policy updates.\nBoth the LQR model-based method and the PI2 modelfree algorithm require samples in order to improve the local policies. In the BADMM variant of GPS, these samples are always generated from the corresponding local policies. However, in the case of MDGPS, the samples can in fact be generated directly by the global policy, with the local policies only existing temporarily within each iteration for the purpose of policy improvement. In this case, new initial states can be sampled at each iteration of the algorithm, with new local policies instantiated for each one [17]. We make use of this capability in our experiments to train the global policy on a wider range of initial states in order to improve generalization."
+    }, {
+      "heading" : "IV. ASYNCHRONOUS DISTRIBUTED GUIDED POLICY SEARCH",
+      "text" : "In synchronous GPS, rollout execution and policy optimization occur sequentially (see Figure 2). This training regime presents two challenges: (1) there is considerable downtime for the robot while the policies are being optimized, and (2) there are synchronization issues when extending the global policy optimization to use data collected across multiple robots.\nTo overcome these challenges, we propose a modification to GPS which is both asynchronous and distributed (see Figure 3). In our asynchronous distributed GPS method (ADGPS), the algorithm is decoupled into global and local worker threads. The global workers are responsible for continuously optimizing the global policy using a buffer of experience data, which we call the replay memory. The local workers execute the current controllers on their respective robots, adding the collected data to the replay memory. The\nlocal workers are also responsible for updating the local policies. Note, however, that updating the local policies is very quick when compared to global policy updates, since the local policy update requires either a small number of LQR backward passes, or simply a weighted average of the sample controls, if using the PI2 method. This operation can be completed in just a few seconds, while global policy training requires stochastic gradient descent (SGD) optimization of a deep neural network, and can take hours.\nThe local and global worker threads communicate through the replay memory, which stores the rollouts and optimized trajectories from each local worker. Since the rollouts in this memory are not guaranteed to come from the latest policy, they are reweighted at every iteration using importance sampling. The global workers asynchronously read from the replay memory and apply updates to the global policy. By decoupling the local and global work, the robots can now continuously collect data by executing rollouts, while the global policy is optimized in the background. This system also makes it easy to add multiple robots into the training process, by adding additional local workers for every robot.\nThe global policy itself can be represented with any function approximator, but in our work, as in prior GPS methods, we use a deep neural network representation trained with stochastic gradient descent (SGD), which can itself be trained in a distributed manner. The global policy is stored on a parameter server [23], allowing multiple robots to concurrently collect data while multiple machines concurrently apply updates to the same global policy. By utilizing more robots, we are able to achieve much greater data diversity than would otherwise be realized with only a single robot, and by using multiple global worker threads, we can accelerate global policy training.\nThe replay memory may be either centralized or dis-\nAlgorithm 2 Asynchronous distributed guided policy search (local worker)\n1: for iteration k ∈ {1, . . . ,K} do 2: Generate sample trajectories starting from each xi1\nassigned to this worker, by executing either pi(ut|xt) or πθ(ut|xt) on the robot.\n3: Use samples to optimize each of the local policies pi(ut|xt) from each xi1 with respect to Equation (2) or (3), using either LQR or PI2. 4: Append optimized trajectories pi(ut|xt) to replay memory D. 5: end for\nAlgorithm 3 Asynchronous distributed guided policy search (global worker)\n1: for step n ∈ {1, . . . , N} do 2: Randomly sample a mini-batch {xjt} from the replay\nmemory D, with corresponding labels obtained from the corresponding local policies pi(ut|xjt ), where i is the instance from which sample j was obtained.\n3: Optimize the global policy πθ(ut|xt) on this minibatch for one step of SGD with respect to Equation (1) or (4). 4: end for\ntributed. In our implementation of this system, each physical machine connected to each physical robot maintains its own replay memory. This is particularly convenient if we also run a single global worker thread on each physical machine, since it removes the need to transmit the high-bandwidth rollout data between machines during training. Instead, the machines only need to communicate model parameter updates to the centralized parameter server, which are typically much smaller than images or high-frequency joint angle and torque trajectories. In this case, the only centralized element of this system is the parameter server. Furthermore, since mini-batch gradient descent assumes uncorrelated examples within each batch, we found that distributed training actually improved stability when aggregating gradients across multiple robots and machines [24].\nThis entire system, which we call asynchronous distributed guided policy search (ADGPS), was implemented in the distributed machine learning framework TensorFlow [25], and is summarized in Algorithms 2 and 3. In our implementation, rollout execution and local policy optimization are still performed sequentially on the local worker as the optimization is a relatively cheap step; however, this is not strictly necessary and both steps could also be performed asynchronously. It is also possible to instantiate this system with varying numbers of global and local workers, or even a single centralized global worker. However, as discussed above, associating a single global worker with each local worker allows us to avoid transmitting the rollout data between machines, leading to a particularly efficient and convenient implementation."
+    }, {
+      "heading" : "V. EXPERIMENTAL EVALUATION",
+      "text" : "Our experimental evaluation aims to answer two questions about our proposed asynchronous learning system: (1) does distributed asynchronous learning accelerate the training of complex, nonlinear neural network policies, and (2) does training across an ensemble of multiple robots improve the generalization of the resulting policies. The answers to these questions are not trivial: although it may seem natural that parallelizing experience collection should accelerate learning, it is not at all clear whether the additional bias introduced by asynchronous training would not outweigh the benefit of greater dataset size, nor that the amount of data is indeed the limiting factor."
+    }, {
+      "heading" : "A. Simulated Evaluation",
+      "text" : "In simulation, we can systematically vary the number of robots to evaluate how training times scale with worker count, as well as study the effect of asynchronous training. We simulated multiple 7-DoF arms with parallelized simulators that each run in real time, in order to mimic rollout execution times that would be observed on real robots. The arms are controlled with torque control in order to perform a simple Cartesian reaching task that requires placing the endeffector at a commanded position. The robot state vector consists of joint angles and velocities, as well as its endeffector pose and velocity. We use a 9-DoF parameterization of pose, containing the positions of three points rigidly attached to the robot end-effector represented in the base frame. The Cartesian goal pose uses the same representation, and is fed to the global policy along with the robot state. The global policy must be able to place the end-effector at a variety of different target positions, with each instance of the task corresponding to a different target. We train the policy using 8 instances of the task, using 4 additional instances as a validation set for hyperparameter tuning, and finally test the global policy on 4 held-out instances. These experiments use the LQR variant of BADMM-based GPS.\nWe ran guided policy search with and without asynchrony, and with increasing numbers of workers from 1 to 8. Figure 4 shows the average costs across four test instances for each setting of the algorithm, plotted against the number of trials and wall-clock time, respectively. ADGPS-4 and ADGPS-8 denote 4 and 8 pairs of local and global workers, respectively, while AGPS is an asynchronous run with a single pair of workers. Note that asynchronous training does slightly reduce the improvement in cost per iteration, since the local policies are updated against an older version of the global policy, and the global policy is trained on older data. However, the iterations themselves take less time, since the global policy training is parallelized with data collection and local policy updates. This substantially improves the learning rate in terms of wall clock time. This is illustrated in Figure 5, which shows the relative improvement in wallclock time (labeled as “speedup”) compared to standard GPS, as well as the relative increase in sample complexity (labeled as “sample count”) due to the slightly reduced policy improvement per iteration."
+    }, {
+      "heading" : "B. Real-World Evaluation",
+      "text" : "Our real-world evaluation is aimed at determining whether our distributed asynchronous system can effectively learn complex, nonlinear neural network policies, using visual inputs, and whether the resulting policies can generalize more effectively than policies learned on a single robot platform using the standard synchronous variant of GPS. To that end, we tackle a challenging real-world door opening task (Figure 6), where the goal is to train a single visuomotor policy that can open a range of doors with visual and mechanical differences in the handle (Figure 7), while also\ndealing with variations in the pose of the door with respect to the robot, variations in camera calibration, and mechanical variations between robots themselves.\nWe use four lightweight torque-controlled 7-DoF robotic arms, each of which is equipped with a two finger gripper, and a camera mounted behind the arm looking over the shoulder. The poses of these cameras are not precisely calibrated with respect to each robot. The input to the policy consists of monocular RGB images and the robot state vector as described in Section V-A. The robots are controlled at a frequency of 20Hz by directly sending torque commands to all seven joints. Each robot is assigned a specific door for policy training. The cost function is computed based on an IMU sensor attached to the door handle on the reverse side of the door. The desired IMU readings, which correspond to a successfully opened door, are recorded during kinesthetic teaching of the opening motion from human demonstration. We additionally add quadratic terms on joint velocities and commanded torques multiplied by a small constant to encourage smooth motions.\nThe architecture of the neural network policy we use is shown in Figure 8. Our architecture resembles prior work [7], with the visual features represented by feature points produced via a spatial softmax applied to the last convolutional response maps. Unlike in [7], our convolutional network includes multiple stages of pooling and skip connections, which allows the visual features to incorporate information at various scales: low-level, high-resolution, local features as well as higher-level features with larger spatial context. This allows the network to generate high resolution features while limiting the amount of computation performed at high resolutions, enabling evaluation of this deep model at camera frame rates.\n1) Policy pre-training: We train the above neural network policy in two stages. First, the convolutional layers are pretrained with a proxy pose detection objective. To create data for this pretraining phase, we collect camera images while manually moving each of the training doors into various poses, and automatically label each image by using a geometry-based pose estimator based on the point pair feature (PPF) algorithm [27]. We also collect images of each robot learning the task with PI2 (without vision), and label these images with the pose of the robot end-effector obtained from forward kinematics. Each pose is represented as a 9-DoF vector, containing the positions of three points rigidly attached to the object (or robot), represented in the world frame. The door poses are all labeled in the camera frame, which allows us to pool this data across robots into\na single dataset. However, since the robot endeffector poses are labeled in the base frame of each robot with an unknown camera offset, we cannot trivially train a single network to predict the pose label of any robot from the camera image alone. Hence, the pose of each robot is predicted using a separate output using a linear mapping from the feature points. This ensures that the 2-D image features learnt to predict the robot and door poses can be shared across all robots, while the 3-D robot pose predictions are allowed to vary across robots. The convolutional layers are trained using stochastic gradient descent (SGD) with momentum to predict the robot and door poses, using a standard Euclidean loss.\n2) Policy learning: The local policy for each robot is initialized from its provided kinesthetic demonstration. We bootstrap the fully connected layers of the network by running four iterations of BADMM-based ADGPS with the PI2 local policy optimizer. The pose of each door is kept fixed during bootstrapping. Next, we run 16 iterations of asynchronous distributed MDGPS with PI2, where we randomly perturb each door pose at the start of every iteration. This sampling procedure allows us to train the global policy on a greater diversity of initial conditions, resulting in better generalization. The weights of the convolutional layers are kept frozen during all runs of GPS. In future work, it would be straightforward to also fine-tune the convolutional layers end-to-end with guided policy search as in prior work [7], but we found that we could obtain satisfactory performance without end-to-end training of the vision layers on this task.\n3) Results: The trained policy was evaluated on a test door not seen during training time, by executing 50 trials per robot over a grid of translations and orientations. Figure 9 shows the results obtained using the policy after training. We find that all four robots are able to open the test door in most configurations using a single global policy, showing generalization over appearance and mechanical properties of\ndoor handles, door position and orientation, camera calibration, and variations in robot dynamics. The lack of precise camera calibration per robot implies that the policy needs to visually track the pose of the door handle and the robot gripper, servoing it to the grasp pose. This is evident when watching the robot execute the learned policy (see video attachment): the initial motion of the robot brings the gripper into the view of the camera, after which the robot is able to translate and orient the gripper to grasp the handle before opening the door.\nFurthermore, the trained policy was also evaluated with two test camera positions on the test door. The first camera position was arrived at by displacing the camera of one of the robots towards the ground by 5cm. The second position was arrived at by displacement that same camera away from the door by 4cm. The trained policy had success rates of 52% and 54% respectively with these two camera positions.\nIn comparison, a successful policy that was trained on only a single robot and a single door using GPS with PI2 as in [19] fails to generalize to either an unseen door or different camera positions."
+    }, {
+      "heading" : "VI. DISCUSSION AND FUTURE WORK",
+      "text" : "We presented a system for distributed asynchronous policy learning across multiple robots that can collaborate to learn a single generalizable motor skill, represented by a deep neural network. Our method extends the guided policy search algorithm to the asynchronous setting, where maximal robot utilization is achieved by parallelizing policy training with experience collection. The robots continuously collect new experience and add it to a replay buffer that is used to train the global neural network policy. At the same time, each robot individually improves its local policy to succeed on its own particular instance of the task. Our simulated experiments demonstrate that this approach can reduce training times, while our real-world evaluation shows that a policy trained on multiple instances of different doors can improve the generalization capability of a vision-based door opening policy.\nOur method also assumes that each robot can execute the same policy, which implicitly involves the assumption that the robots are physically similar or identical. An interesting future extension of our work is to handle the case where there is a systematic discrepancy between robotic platforms, necessitating a public and private component to each policy. In this case, the private components would be learned locally, while the public components would be trained using shared experience and pooled across robots. This could allow distributed asynchronous training to extend even to heterogeneous populations of robots, where highly dissimilar robots might share globally useful experience, such as the statistics of natural images, while robot-specific knowledge about, for example, the details of low-level motor control, would be shared only with physically similar platforms."
+    }, {
+      "heading" : "ACKNOWLEDGEMENTS",
+      "text" : "We would like to thank Peter Pastor and Kurt Konolige for additional engineering, robot maintenance, and technical discussions, and Ryan Walker and Gary Vosters for designing custom hardware for this project."
+    } ],
+    "references" : [ {
+      "title" : "Stochastic policy gradient reinforcement learning on a simple 3d biped",
+      "author" : [ "R. Tedrake", "T.W. Zhang", "H.S. Seung" ],
+      "venue" : "In IROS,",
+      "citeRegEx" : "1",
+      "shortCiteRegEx" : "1",
+      "year" : 2004
+    }, {
+      "title" : "Relative entropy policy search",
+      "author" : [ "J. Peters", "K. Mülling", "Y. Altun" ],
+      "venue" : "In AAAI,",
+      "citeRegEx" : "2",
+      "shortCiteRegEx" : "2",
+      "year" : 2010
+    }, {
+      "title" : "A generalized path integral control approach to reinforcement learning",
+      "author" : [ "E. Theodorou", "J. Buchli", "S. Schaal" ],
+      "venue" : "Journal of Machine Learning Research,",
+      "citeRegEx" : "3",
+      "shortCiteRegEx" : "3",
+      "year" : 2010
+    }, {
+      "title" : "A survey on policy search for robotics",
+      "author" : [ "M.P. Deisenroth", "G. Neumann", "J. Peters" ],
+      "venue" : "Foundations and Trends in Robotics,",
+      "citeRegEx" : "4",
+      "shortCiteRegEx" : "4",
+      "year" : 2013
+    }, {
+      "title" : "Trust region policy optimization",
+      "author" : [ "J. Schulman", "S. Levine", "P. Moritz", "M. Jordan", "P. Abbeel" ],
+      "venue" : "In ICML,",
+      "citeRegEx" : "5",
+      "shortCiteRegEx" : "5",
+      "year" : 2015
+    }, {
+      "title" : "Continuous control with deep reinforcement learning",
+      "author" : [ "T.P. Lillicrap", "J.J. Hunt", "A. Pritzel", "N. Heess", "T. Erez", "Y. Tassa", "D. Silver", "D. Wierstra" ],
+      "venue" : "In International Conference on Learning Representations (ICLR),",
+      "citeRegEx" : "6",
+      "shortCiteRegEx" : "6",
+      "year" : 2016
+    }, {
+      "title" : "End-to-end training of deep visuomotor policies",
+      "author" : [ "S. Levine", "C. Finn", "T. Darrell", "P. Abbeel" ],
+      "venue" : "Journal of Machine Learning Research,",
+      "citeRegEx" : "7",
+      "shortCiteRegEx" : "7",
+      "year" : 2016
+    }, {
+      "title" : "Movement imitation with nonlinear dynamical systems in humanoid robots",
+      "author" : [ "J.A. Ijspeert", "J. Nakanishi", "S. Schaal" ],
+      "venue" : "In ICRA,",
+      "citeRegEx" : "8",
+      "shortCiteRegEx" : "8",
+      "year" : 2002
+    }, {
+      "title" : "Deep learning",
+      "author" : [ "Yann Lecun", "Yoshua Bengio", "Geoffrey Hinton" ],
+      "venue" : "Nature, 521(7553):436–444,",
+      "citeRegEx" : "9",
+      "shortCiteRegEx" : "9",
+      "year" : 2015
+    }, {
+      "title" : "Acquiring visual servoing reaching and grasping skills using neural reinforcement learning",
+      "author" : [ "Thomas Lampe", "Martin Riedmiller" ],
+      "venue" : "In IEEE International Joint Conference on Neural Networks (IJCNN",
+      "citeRegEx" : "10",
+      "shortCiteRegEx" : "10",
+      "year" : 2013
+    }, {
+      "title" : "A platform for robotics research based on the remote-brained robot approach",
+      "author" : [ "M. Inaba", "S. Kagami", "F. Kanehiro", "Y. Hoshino" ],
+      "venue" : "International Journal of Robotics Research,",
+      "citeRegEx" : "11",
+      "shortCiteRegEx" : "11",
+      "year" : 2000
+    }, {
+      "title" : "Cloud-enabled humanoid robots",
+      "author" : [ "J. Kuffner" ],
+      "venue" : "In IEEE-RAS International Conference on Humanoid Robotics,",
+      "citeRegEx" : "12",
+      "shortCiteRegEx" : "12",
+      "year" : 2010
+    }, {
+      "title" : "Cloud-based robot grasping with the google object recognition engine",
+      "author" : [ "B. Kehoe", "A. Matsukawa", "S. Candido", "J. Kuffner", "K. Goldberg" ],
+      "venue" : "In IEEE International Conference on Robotics and Automation,",
+      "citeRegEx" : "13",
+      "shortCiteRegEx" : "13",
+      "year" : 2013
+    }, {
+      "title" : "A survey of research on cloud robotics and automation",
+      "author" : [ "B. Kehoe", "S. Patil", "P. Abbeel", "K. Goldberg" ],
+      "venue" : "IEEE Transactions on Automation Science and Engineering,",
+      "citeRegEx" : "14",
+      "shortCiteRegEx" : "14",
+      "year" : 2015
+    }, {
+      "title" : "Parallelized stochastic gradient descent",
+      "author" : [ "Martin Zinkevich", "Markus Weimer", "Lihong Li", "Alex J. Smola" ],
+      "venue" : "In Neural Information Processing Systems (NIPS),",
+      "citeRegEx" : "15",
+      "shortCiteRegEx" : "15",
+      "year" : 2010
+    }, {
+      "title" : "Interactive control of diverse complex characters with neural networks",
+      "author" : [ "Igor Mordatch", "Kendall Lowrey", "Galen Andrew", "Zoran Popovic", "Emanuel V Todorov" ],
+      "venue" : "In Advances in Neural Information Processing Systems,",
+      "citeRegEx" : "16",
+      "shortCiteRegEx" : "16",
+      "year" : 2015
+    }, {
+      "title" : "Guided policy search as approximate mirror descent",
+      "author" : [ "W. Montgomery", "S. Levine" ],
+      "venue" : "In NIPS,",
+      "citeRegEx" : "17",
+      "shortCiteRegEx" : "17",
+      "year" : 2016
+    }, {
+      "title" : "Learning neural network policies with guided policy search under unknown dynamics",
+      "author" : [ "S. Levine", "P. Abbeel" ],
+      "venue" : "In NIPS,",
+      "citeRegEx" : "18",
+      "shortCiteRegEx" : "18",
+      "year" : 2014
+    }, {
+      "title" : "Path integral guided policy search",
+      "author" : [ "Y. Chebotar", "M. Kalakrishnan", "A. Yahya", "A. Li", "S. Schaal", "S. Levine" ],
+      "venue" : "Technical Report,",
+      "citeRegEx" : "19",
+      "shortCiteRegEx" : "19",
+      "year" : 2017
+    }, {
+      "title" : "Bregman alternating direction method of multipliers",
+      "author" : [ "H. Wang", "A. Banerjee" ],
+      "venue" : "In NIPS,",
+      "citeRegEx" : "20",
+      "shortCiteRegEx" : "20",
+      "year" : 2014
+    }, {
+      "title" : "Hierarchical relative entropy policy search",
+      "author" : [ "Christian Daniel", "Gerhard Neumann", "Jan Peters" ],
+      "venue" : "In AISTATS,",
+      "citeRegEx" : "21",
+      "shortCiteRegEx" : "21",
+      "year" : 2012
+    }, {
+      "title" : "Iterative linear quadratic regulator design for nonlinear biological movement systems",
+      "author" : [ "W. Li", "E. Todorov" ],
+      "venue" : "In ICINCO,",
+      "citeRegEx" : "22",
+      "shortCiteRegEx" : "22",
+      "year" : 2004
+    }, {
+      "title" : "Large scale distributed deep networks",
+      "author" : [ "Jeffrey Dean", "Greg Corrado", "Rajat Monga", "Kai Chen", "Matthieu Devin", "Mark Mao", "Andrew Senior", "Paul Tucker", "Ke Yang", "Quoc V Le" ],
+      "venue" : "In Advances in neural information processing systems,",
+      "citeRegEx" : "23",
+      "shortCiteRegEx" : "23",
+      "year" : 2012
+    }, {
+      "title" : "Revisiting distributed synchronous sgd",
+      "author" : [ "Jianmin Chen", "Rajat Monga", "Samy Bengio", "Rafal Jozefowicz" ],
+      "venue" : "In International Conference on Learning Representations Workshop Track,",
+      "citeRegEx" : "24",
+      "shortCiteRegEx" : "24",
+      "year" : 2016
+    }, {
+      "title" : "TensorFlow: Large-scale machine learning on heterogeneous distributed systems, 2015. URL http:// tensorflow.org",
+      "author" : [ "Martı́n Abadi", "Ashish Agarwal", "Paul Barham", "Eugene Brevdo", "Zhifeng Chen", "Craig Citro", "Greg S. Corrado", "Andy Davis", "Jeffrey Dean", "Matthieu Devin", "Sanjay Ghemawat", "Ian Goodfellow", "Andrew Harp", "Geoffrey Irving", "Michael Isard", "Yangqing Jia", "Rafal Jozefowicz", "Lukasz Kaiser", "Manjunath Kudlur", "Josh Levenberg", "Dan Mané", "Rajat Monga", "Sherry Moore", "Derek Murray", "Chris Olah", "Mike Schuster", "Jonathon Shlens", "Benoit Steiner", "Ilya Sutskever", "Kunal Talwar", "Paul Tucker", "Vincent Vanhoucke", "Vijay Vasudevan", "Fernanda Viégas", "Oriol Vinyals", "Pete Warden", "Martin Wattenberg", "Martin Wicke", "Yuan Yu", "Xiaoqiang Zheng" ],
+      "venue" : null,
+      "citeRegEx" : "25",
+      "shortCiteRegEx" : "25",
+      "year" : 2015
+    }, {
+      "title" : "Joint training of a convolutional network and a graphical model for human pose estimation",
+      "author" : [ "J. Tompson", "A. Jain", "Y. LeCun", "C. Bregler" ],
+      "venue" : "In NIPS,",
+      "citeRegEx" : "26",
+      "shortCiteRegEx" : "26",
+      "year" : 2014
+    }, {
+      "title" : "Going further with point pair features",
+      "author" : [ "S. Hinterstoisser", "V. Lepetit", "N. Rajkumar", "K. Konolige" ],
+      "venue" : "In ECCV,",
+      "citeRegEx" : "27",
+      "shortCiteRegEx" : "27",
+      "year" : 2016
+    } ],
+    "referenceMentions" : [ {
+      "referenceID" : 0,
+      "context" : "Policy search techniques show promising ability to learn feedback control policies for robotic tasks with highdimensional sensory inputs through trial and error [1, 2, 3, 4].",
+      "startOffset" : 161,
+      "endOffset" : 173
+    }, {
+      "referenceID" : 1,
+      "context" : "Policy search techniques show promising ability to learn feedback control policies for robotic tasks with highdimensional sensory inputs through trial and error [1, 2, 3, 4].",
+      "startOffset" : 161,
+      "endOffset" : 173
+    }, {
+      "referenceID" : 2,
+      "context" : "Policy search techniques show promising ability to learn feedback control policies for robotic tasks with highdimensional sensory inputs through trial and error [1, 2, 3, 4].",
+      "startOffset" : 161,
+      "endOffset" : 173
+    }, {
+      "referenceID" : 3,
+      "context" : "Policy search techniques show promising ability to learn feedback control policies for robotic tasks with highdimensional sensory inputs through trial and error [1, 2, 3, 4].",
+      "startOffset" : 161,
+      "endOffset" : 173
+    }, {
+      "referenceID" : 4,
+      "context" : "Recently, deep reinforcement learning (RL) methods have been used to show that policies for complex tasks can be trained end-to-end, directly from raw sensory inputs (like images [5, 6]) to actions.",
+      "startOffset" : 179,
+      "endOffset" : 185
+    }, {
+      "referenceID" : 5,
+      "context" : "Recently, deep reinforcement learning (RL) methods have been used to show that policies for complex tasks can be trained end-to-end, directly from raw sensory inputs (like images [5, 6]) to actions.",
+      "startOffset" : 179,
+      "endOffset" : 185
+    }, {
+      "referenceID" : 6,
+      "context" : "Methods based on Guided Policy Search (GPS) [7], which convert the policy search problem into a supervised learning problem, with a local trajectory-centric RL algorithm acting as a teacher, reduce sample complexity and thereby help make said applications tractable.",
+      "startOffset" : 44,
+      "endOffset" : 47
+    }, {
+      "referenceID" : 0,
+      "context" : "motion skills [1, 2, 3, 4].",
+      "startOffset" : 14,
+      "endOffset" : 26
+    }, {
+      "referenceID" : 1,
+      "context" : "motion skills [1, 2, 3, 4].",
+      "startOffset" : 14,
+      "endOffset" : 26
+    }, {
+      "referenceID" : 2,
+      "context" : "motion skills [1, 2, 3, 4].",
+      "startOffset" : 14,
+      "endOffset" : 26
+    }, {
+      "referenceID" : 3,
+      "context" : "motion skills [1, 2, 3, 4].",
+      "startOffset" : 14,
+      "endOffset" : 26
+    }, {
+      "referenceID" : 7,
+      "context" : "For example, the well-known dynamic movement primitive representation [8] has been widely used to generalize learned skills by adapting the goal state, but it inherently restricts the learning process to trajectory-centric behaviors.",
+      "startOffset" : 70,
+      "endOffset" : 73
+    }, {
+      "referenceID" : 8,
+      "context" : "Recent years have seen improvement in the generalizability of passive perception systems, in domains such as computer vision, natural language processing, and speech recognition through the use of deep learning techniques [9].",
+      "startOffset" : 222,
+      "endOffset" : 225
+    }, {
+      "referenceID" : 4,
+      "context" : "While several works have extended deep learning methods to simulated [5, 6] and real-world [7, 10] robotic tasks, the kind of generalization exhibited by deep learning in passive perception domains has not yet been demonstrated for robotic skill learning.",
+      "startOffset" : 69,
+      "endOffset" : 75
+    }, {
+      "referenceID" : 5,
+      "context" : "While several works have extended deep learning methods to simulated [5, 6] and real-world [7, 10] robotic tasks, the kind of generalization exhibited by deep learning in passive perception domains has not yet been demonstrated for robotic skill learning.",
+      "startOffset" : 69,
+      "endOffset" : 75
+    }, {
+      "referenceID" : 6,
+      "context" : "While several works have extended deep learning methods to simulated [5, 6] and real-world [7, 10] robotic tasks, the kind of generalization exhibited by deep learning in passive perception domains has not yet been demonstrated for robotic skill learning.",
+      "startOffset" : 91,
+      "endOffset" : 98
+    }, {
+      "referenceID" : 9,
+      "context" : "While several works have extended deep learning methods to simulated [5, 6] and real-world [7, 10] robotic tasks, the kind of generalization exhibited by deep learning in passive perception domains has not yet been demonstrated for robotic skill learning.",
+      "startOffset" : 91,
+      "endOffset" : 98
+    }, {
+      "referenceID" : 10,
+      "context" : "The ability of robotic systems to learn more quickly and effectively by pooling their collective experience has long been recognized in the domain of cloud robotics, where it is typically referred to as collective robotic learning [11, 12, 13, 14].",
+      "startOffset" : 231,
+      "endOffset" : 247
+    }, {
+      "referenceID" : 11,
+      "context" : "The ability of robotic systems to learn more quickly and effectively by pooling their collective experience has long been recognized in the domain of cloud robotics, where it is typically referred to as collective robotic learning [11, 12, 13, 14].",
+      "startOffset" : 231,
+      "endOffset" : 247
+    }, {
+      "referenceID" : 12,
+      "context" : "The ability of robotic systems to learn more quickly and effectively by pooling their collective experience has long been recognized in the domain of cloud robotics, where it is typically referred to as collective robotic learning [11, 12, 13, 14].",
+      "startOffset" : 231,
+      "endOffset" : 247
+    }, {
+      "referenceID" : 13,
+      "context" : "The ability of robotic systems to learn more quickly and effectively by pooling their collective experience has long been recognized in the domain of cloud robotics, where it is typically referred to as collective robotic learning [11, 12, 13, 14].",
+      "startOffset" : 231,
+      "endOffset" : 247
+    }, {
+      "referenceID" : 14,
+      "context" : "Distributed systems have long been an important subject in deep learning [15].",
+      "startOffset" : 73,
+      "endOffset" : 77
+    }, {
+      "referenceID" : 15,
+      "context" : "While distributed asynchronous architectures have previously been used to optimize controllers for simulated characters [16], our work is, to the best of our knowledge, the first to experimentally explore distributed asynchronous training of deep neural network policies for real-world robotic control.",
+      "startOffset" : 120,
+      "endOffset" : 124
+    }, {
+      "referenceID" : 6,
+      "context" : "A more complete description of the theoretical underpinnings of the method can be found in prior work [7].",
+      "startOffset" : 102,
+      "endOffset" : 105
+    }, {
+      "referenceID" : 3,
+      "context" : "However, this kind of direct model-free method can quickly become intractable for very high-dimensional policies, such as the large neural network policies considered in this work [4].",
+      "startOffset" : 180,
+      "endOffset" : 183
+    }, {
+      "referenceID" : 6,
+      "context" : "In this work, we employ time-varying linear-Gaussian controllers of the form pi(ut|xt) = N (Ktxt+kt,Ct) to represent these local policies, following prior work [7].",
+      "startOffset" : 160,
+      "endOffset" : 163
+    }, {
+      "referenceID" : 6,
+      "context" : "This allows the global policy to predict actions from raw observations at test time [7].",
+      "startOffset" : 84,
+      "endOffset" : 87
+    }, {
+      "referenceID" : 6,
+      "context" : "In this work, we will examine a general asynchronous framework for guided policy search algorithms, and we will show how this framework can be instantiated to extend two prior guided policy search methods: BADMM-based guided policy search [7] and mirror descent guided policy search",
+      "startOffset" : 239,
+      "endOffset" : 242
+    }, {
+      "referenceID" : 16,
+      "context" : "(MDGPS) [17].",
+      "startOffset" : 8,
+      "endOffset" : 12
+    }, {
+      "referenceID" : 17,
+      "context" : "structure, with alternating optimization of the local policies via trajectory-centric RL, which in the case of our system is either a model-based algorithm based on LQR [18] or a model-free algorithm based on PI [3], and optimization of the global policy via supervised learning through stochastic gradient descent (SGD).",
+      "startOffset" : 169,
+      "endOffset" : 173
+    }, {
+      "referenceID" : 2,
+      "context" : "structure, with alternating optimization of the local policies via trajectory-centric RL, which in the case of our system is either a model-based algorithm based on LQR [18] or a model-free algorithm based on PI [3], and optimization of the global policy via supervised learning through stochastic gradient descent (SGD).",
+      "startOffset" : 212,
+      "endOffset" : 215
+    }, {
+      "referenceID" : 18,
+      "context" : "The adaptation of PI to guided policy search is described in detail in a companion paper [19].",
+      "startOffset" : 89,
+      "endOffset" : 93
+    }, {
+      "referenceID" : 6,
+      "context" : "a) BADMM-based GPS: In BADMM-based guided policy search [7], the alternating optimization is formalized as a constrained optimization of the form",
+      "startOffset" : 56,
+      "endOffset" : 59
+    }, {
+      "referenceID" : 19,
+      "context" : "The constrained optimization is then solved using the Bregman ADMM algorithm [20], which augments the objective for both the local and global policies with Lagrange multipliers that keep them similar in terms of KL-divergence.",
+      "startOffset" : 77,
+      "endOffset" : 81
+    }, {
+      "referenceID" : 1,
+      "context" : "The constraint ensures that the local policies only change by a small amount at each iteration, to prevent divergence of the trajectory-centric RL algorithm, analogously to other recent RL methods [2, 21].",
+      "startOffset" : 197,
+      "endOffset" : 204
+    }, {
+      "referenceID" : 20,
+      "context" : "The constraint ensures that the local policies only change by a small amount at each iteration, to prevent divergence of the trajectory-centric RL algorithm, analogously to other recent RL methods [2, 21].",
+      "startOffset" : 197,
+      "endOffset" : 204
+    }, {
+      "referenceID" : 6,
+      "context" : "The derivations of φi(τ, θ,xt) and φθ(pi, θ,xt) are provided in prior work [7].",
+      "startOffset" : 75,
+      "endOffset" : 78
+    }, {
+      "referenceID" : 16,
+      "context" : "b) MDGPS: In MDGPS [17], the local policies are optimized with respect to",
+      "startOffset" : 19,
+      "endOffset" : 23
+    }, {
+      "referenceID" : 21,
+      "context" : "c) LQR with local models: To take a model-based approach to optimization of time-varying linear-Gaussian local policies, we can observe that, under time-varying linearGaussian dynamics, the local policies can be optimized analytically using the LQR method, or the iterative LQR method in the case of non-quadratic costs [22].",
+      "startOffset" : 320,
+      "endOffset" : 324
+    }, {
+      "referenceID" : 17,
+      "context" : "As described in prior work [18], we can still use LQR if we fit a time-varying linear-Gaussian model to the samples using linear regression.",
+      "startOffset" : 27,
+      "endOffset" : 31
+    }, {
+      "referenceID" : 17,
+      "context" : "in Equation (2) or (3) with a simple modification that uses LQR within a dual gradient descent loop [18].",
+      "startOffset" : 100,
+      "endOffset" : 104
+    }, {
+      "referenceID" : 2,
+      "context" : "d) PI: Policy Improvement with Path Integrals (PI) is a model-free policy search method based on the principles of stochastic optimal control [3].",
+      "startOffset" : 142,
+      "endOffset" : 145
+    }, {
+      "referenceID" : 18,
+      "context" : "In this work, we employ PI to learn feedforward commands kt of time-varying linear-Gaussian controllers as described in [19].",
+      "startOffset" : 120,
+      "endOffset" : 124
+    }, {
+      "referenceID" : 1,
+      "context" : "In this work, we use relative entropy optimization [2] to determine the temperature η at each time step independently, based on a KL-divergence constraint between policy updates.",
+      "startOffset" : 51,
+      "endOffset" : 54
+    }, {
+      "referenceID" : 16,
+      "context" : "In this case, new initial states can be sampled at each iteration of the algorithm, with new local policies instantiated for each one [17].",
+      "startOffset" : 134,
+      "endOffset" : 138
+    }, {
+      "referenceID" : 22,
+      "context" : "stored on a parameter server [23], allowing multiple robots to concurrently collect data while multiple machines concurrently apply updates to the same global policy.",
+      "startOffset" : 29,
+      "endOffset" : 33
+    }, {
+      "referenceID" : 23,
+      "context" : "batch, we found that distributed training actually improved stability when aggregating gradients across multiple robots and machines [24].",
+      "startOffset" : 133,
+      "endOffset" : 137
+    }, {
+      "referenceID" : 24,
+      "context" : "This entire system, which we call asynchronous distributed guided policy search (ADGPS), was implemented in the distributed machine learning framework TensorFlow [25], and is summarized in Algorithms 2 and 3.",
+      "startOffset" : 162,
+      "endOffset" : 166
+    }, {
+      "referenceID" : 6,
+      "context" : "Our architecture resembles prior work [7], with the visual features represented by feature points produced via a spatial softmax applied to the last convolutional response maps.",
+      "startOffset" : 38,
+      "endOffset" : 41
+    }, {
+      "referenceID" : 6,
+      "context" : "Unlike in [7], our convolutional network includes multiple stages of pooling and skip connections, which allows the visual features to incorporate information at various scales: low-level, high-resolution, local features as well as higher-level features with larger spatial context.",
+      "startOffset" : 10,
+      "endOffset" : 13
+    }, {
+      "referenceID" : 26,
+      "context" : "a geometry-based pose estimator based on the point pair feature (PPF) algorithm [27].",
+      "startOffset" : 80,
+      "endOffset" : 84
+    }, {
+      "referenceID" : 25,
+      "context" : "The outputs of these 5 layers are recombined by passing each of them into a 1x1 convolution, converting them to a size of 125x157 by using nearest-neighbor upscaling, and summation (similar to [26]).",
+      "startOffset" : 193,
+      "endOffset" : 197
+    }, {
+      "referenceID" : 6,
+      "context" : "The spatial soft-argmax operator [7] computes the expected 2D image coordinates of each feature.",
+      "startOffset" : 33,
+      "endOffset" : 36
+    }, {
+      "referenceID" : 6,
+      "context" : "In future work, it would be straightforward to also fine-tune the convolutional layers end-to-end with guided policy search as in prior work [7], but we found that we could obtain satisfactory performance without end-to-end training of the vision layers on this task.",
+      "startOffset" : 141,
+      "endOffset" : 144
+    }, {
+      "referenceID" : 18,
+      "context" : "In comparison, a successful policy that was trained on only a single robot and a single door using GPS with PI as in [19] fails to generalize to either an unseen door or different camera positions.",
+      "startOffset" : 117,
+      "endOffset" : 121
+    } ],
+    "year" : 2016,
+    "abstractText" : "In principle, reinforcement learning and policy search methods can enable robots to learn highly complex and general skills that may allow them to function amid the complexity and diversity of the real world. However, training a policy that generalizes well across a wide range of realworld conditions requires far greater quantity and diversity of experience than is practical to collect with a single robot. Fortunately, it is possible for multiple robots to share their experience with one another, and thereby, learn a policy collectively. In this work, we explore distributed and asynchronous policy learning as a means to achieve generalization and improved training times on challenging, real-world manipulation tasks. We propose a distributed and asynchronous version of Guided Policy Search and use it to demonstrate collective policy learning on a vision-based door opening task using four robots. We show that it achieves better generalization, utilization, and training times than the single robot alternative.",
+    "creator" : "LaTeX with hyperref package"
+  }
+}

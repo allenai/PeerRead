@@ -1,0 +1,708 @@
+{
+  "name" : "1506.07552.pdf",
+  "metadata" : {
+    "source" : "CRF",
+    "title" : "Splash: User-friendly Programming Interface for Parallelizing Stochastic Algorithms",
+    "authors" : [ "Yuchen Zhang", "Michael I. Jordan" ],
+    "emails" : [ "yuczhang@eecs.berkeley.edu", "jordan@eecs.berkeley.edu" ],
+    "sections" : [ {
+      "heading" : null,
+      "text" : "ar X\niv :1\n50 6.\n07 55\n2v 1\n[ cs\n.L G\n] 2\n4 Ju"
+    }, {
+      "heading" : "1 Introduction",
+      "text" : "Stochastic optimization algorithms process a large-scale dataset by sequentially processing random subsamples. This processing scheme makes the per-iteration cost of the algorithm much cheaper than that of batch processing algorithms while still yielding effective descent. Indeed, for convex optimization, the efficiency of stochastic gradient descent (SGD) and its variants has been established both in theory and in practice [29, 3, 26, 5, 23, 12]. For non-convex optimization, stochastic methods achieve state-of-the-art performance on a broad class of problems, including matrix factorization [13], neural networks [14] and representation learning [25]. Stochastic algorithms are also widely used in the Bayesian setting for finding approximations to posterior distributions; examples include Markov chain Monte Carlo, expectation propagation [18] and stochastic variational inference [10].\nAlthough classical stochastic approximation procedures are sequential, it is clear that they also present opportunities for parallel and distributed implementations that may yield significant additional speedups. One active line of research studies asynchronous parallel updating schemes in the setting of a lock-free shared memory [21, 6, 17, 31, 9, 27]. When the time delay of concurrent updates are bounded, it is known that such updates preserve statistical correctness [1, 17]. Such asynchronous algorithms yield significant speedups on multi-core machines. On distributed\nsystems connected by commodity networks, however, the communication requirements of such algorithms can be overly expensive. If messages are frequently exchanged across the network, the communication cost will easily dominate the computation cost.\nThere has also been a flurry of research studying the implementation of stochastic algorithms in the fully distributed setting [32, 30, 19, 7, 16, 11]. Although promising results have been reported, the implementations proposed to date have their limitations—they have been designed for specific algorithms, or they require careful partitioning of the data to avoid inconsistency.\nIn this paper, we propose a general framework for parallelizing stochastic algorithms on multinode distributed systems. Our framework is called Splash (System for Parallelizing Learning Algorithms with Stochastic Methods). Splash consists of a programming interface and an execution engine. Using the programming interface, the user develops sequential stochastic algorithms without thinking about issues of distributed computing. The algorithm is then automatically parallelized by the execution engine. The parallelization is communication efficient, meaning that its separate threads don’t communicate with each other until all of them have processed a large bulk of data. Thus, the inter-node communication need not be a performance bottleneck.\nTo ensure parallelizability, we ask the user to implement a slightly stronger version of the base sequential algorithm: it needs to be capable of processing weighted samples. Many stochastic algorithms can be generalized to the processing weighted samples without sacrificing computational efficiency. Since the processing of a weighted sample can be carried out within a sequential paradigm, this requirement does not force the user to think about a distributed implementation.\nSplash converts a distributed processing task into a sequential processing task using distributed versions of averaging and reweighting. During the execution of the algorithm, we let every thread sequentially process its local data. The local updates are iteratively averaged to construct the global update. Critically, however, although averaging reduces the variance of the local updates, it doesn’t reduce their bias. In contrast to the sequential case in which a thread processes a full sequence of random samples, in the distributed setting every individual thread touches only a small subset of samples, resulting in a significant bias relative to the full update. Our reweighting scheme addresses this problem by feeding the algorithm with weighted samples, ensuring that the total weight processed by each thread is equal to the number of samples in the full sequence. This helps individual threads to generate nearly-unbiased estimates of the full update. Using this approach, Splash automatically detects the best degree of parallelism for the algorithm.\nTheoretically, we prove that Splash achieves the optimal rate of convergence for parallelizing SGD, assuming that the objective function is smooth and strongly convex. We conduct extensive experiments on a variety of stochastic algorithms, including algorithms for logistic regression, topic modeling and personalized recommendation. The experiments verify that Splash can yield orders-of-magnitude speedups over single-thread stochastic algorithms and over parallelized batch algorithms.\nBesides its performance, Splash is a contribution on the distributed computing systems front, providing a flexible interface for the implementation of stochastic algorithms. We build Splash on top of Apache Spark [28], a popular distributed data-processing framework for batch algorithms. Splash takes the standard Resilient Distributed Dataset (RDD) of Spark as input and generates an RDD as output. The data structure also supports default RDD operators such as Map and Reduce, ensuring convenient interaction with Spark. Because of this integration, Splash works seamlessly with other data analytics tools in the Spark ecosystem, enabling a single system to address the entire analytics pipeline."
+    }, {
+      "heading" : "2 Background",
+      "text" : "In this paper, we focus on the stochastic algorithms which take the following general form. At step t, the algorithm receives a data element zt and a vector of shared variables vt. Based on these values the algorithm performs an incremental update ∆(zt, vt) on the shared variable: vt+1 ← vt +∆(zt, vt) (1) For example, stochastic gradient descent (SGD) fits this general framework. Letting x denote a random data element x and letting w denote a parameter vector, SGD performs the update:\nt ← t+ 1 and w ← w − ηt∇ℓ(w;x) (2) where ℓ(·;x) is the loss function associated with the element and ηt is the stepsize at time t. In this case both w and t are shared variables. In Appendix A, we discuss additional stochastic algorithms and their implementations via Splash, including the collapsed Gibbs sampling, stochastic variational inference and a stochastic algorithm for collaborative filtering.\nThere are several stochastic algorithms using local variables in their computation. Any local variables is associated with a specific data element. For example, the collapsed Gibbs sampling algorithm for LDA [8] maintains a topic assignment for each word, which is stored as a local variable. The stochastic dual coordinate ascent (SDCA) algorithm [24] maintains a dual variable for each data element, which is also stored as a local variable. To support the development of such algorithms, Splash allows creating and updating local variables during the algorithm execution. Nevertheless, since the system carries out automatic reweighting and rescaling (refer to Section 4.2), any improper usage of the local variable may cause weight mismatching issues. The system thus provides a user-friendly interface called “delayed operator” which substitutes the functionality of local variables in many situations. In particular, the user can declare a variable operation and suspend its execution to the next time when the same element is processed. Both collapsed Gibbs sampling and SDCA can be implemented via a delayed operation. See Appendix A for a concrete example. The consistency of this operation is always guaranteed.\nShared variables and local variables are stored separately. In particular, shared variables are replicated on every data partition. Their values are iteratively synchronized. The local variables, in contrast, are stored with the associated data elements and will never be synchronized. This storage scheme optimizes the communication efficiency and allows for convenient element-wise operations."
+    }, {
+      "heading" : "3 Programming with Splash",
+      "text" : "Splash allows the user to write self-contained Scala applications using its programming interface. The goal of the programming interface is to make distributed computing transparent to the user. Splash extends Apache Spark to provide an abstraction called a Parametrized RDD for storing and maintaining the distributed dataset. The Parametrized RDD is based on the Resilient Distributed Dataset (RDD) [28] used by Apache Spark. It can be created from a standard RDD object:\nval paramRdd = new ParametrizedRDD(rdd).\nWe provide a rich collection of interfaces to convert the components of Parametrized RDD to standard RDDs, facilitating the interaction between Splash and Spark. To run algorithms on the Parametrized RDD, the user creates a data processing function called process which implements\nthe stochastic algorithm, then calls the method\nparamRdd.run(process)\nto start running the algorithm. In the default setting, the execution engine takes a full pass over the dataset by calling run() once. This is called one iteration of the algorithm execution. The inter-node communication occurs only at the end of the iteration. The user may call run() multiple times to take multiple passes over the dataset.\nThe process function is implemented using the following format:\ndef process(elem : Any, weight : Int, sharedVar : VarSet, localVar : VarSet){. . . } It takes four arguments as input: a single element elem, the weight of the element, the shared variable sharedVar and the local variable localVar associated with the element. The goal is to update sharedVar and localVar according to the input. Splash provides multiple ways to manipulate these variables. Both local and shared variables are manipulated as key-value pairs. The key must be a string; the value can be either a real number or an array of real numbers. Inside the process implementation, the value of local or shared variables can be accessed by localVar.get(key) or sharedVar.get(key). The local variable can be updated by setting a new value for it: localVar.set(key, value). The shared variable is updated by operators. For example, using the add operator, the expression\nsharedVar.add(key, delta)\nadds a scalar delta to the variable. The SGD updates (2) can be implemented via several add operators. Other operators supported by the programming interface, including delayed add and multiply, are introduced in Section 4.2. Similar to the standard RDD, the user can perform map and reduce operations directly on the Parametrized RDD. For example, after the algorithm terminates, the expression\nval loss = paramRdd.map(evalLoss).sum()\nevaluates the element-wise losses and aggregates them across the dataset."
+    }, {
+      "heading" : "4 Strategy for Parallelization",
+      "text" : "In this section, we first discuss two naive strategies for parallelizing a stochastic algorithm and their respective limitations. These limitations motivate the strategy that Splash employs."
+    }, {
+      "heading" : "4.1 Two naive strategies",
+      "text" : "We denote by ∆(S) the incremental update on variable v after processing the set of samples S. Suppose that there are m threads and each thread processes a subset Si of S. If the i-th thread increments the shared variable by ∆(Si), then the accumulation scheme constructs a global update by accumulating local updates:\nvnew = vold +\nm∑\ni=1\n∆(Si). (3)\nThe scheme (3) provides a good approximation to the full update if the batch size |Di| is sufficiently small [1]. However, frequent communication is necessary to ensure a small batch size. For\ndistributed systems connected by commodity networks, frequent communication is prohibitively expensive, even if the communication is asynchronous.\nApplying scheme (3) on a large batch may easily lead to divergence. Taking SGD as an example: if all threads starts from the same vector wold, then after processing a large batch, the new vector on each thread will be close to the optimal solution w∗. If the variable is updated by formula (3), then we have\nwnew − w∗ = wold − w∗ + m∑\ni=1\n∆(Si) ≈ wold −w∗ + m∑\ni=1\n(w∗ − wold) = (m− 1)(w∗ − wold).\nClearly SGD will diverge if m ≥ 3. One way to avoid divergence is to multiply the incremental change by a small coefficient. When the coefficient is 1/m, the variable is updated by\nvnew = vold + 1\nm\nm∑\ni=1\n∆(Si). (4)\nThis averaging scheme usually avoids divergence. However, since the local updates are computed on 1/mth of S, they make little progress comparing to the full sequential update. Thus the algorithm converges substantially slower than its sequential counterpart after processing the same amount of data. See Appendix D for the evidence of this phenomenon on simulated data and see Appendix H.5 for evidence on real data."
+    }, {
+      "heading" : "4.2 Our strategy",
+      "text" : "We now turn to describe the Splash strategy for combining parallel updates. First we introduce the operators that Splash supports for manipulating shared variables. Then we illustrate how conflicting updates are combined by the reweighting scheme.\nOperators The programming interface allows the user to manipulate shared variables inside their algorithm implementation via operators. An operator is a function that maps a real number to another real number. Splash supports three types of operators: add, delayed add and multiply. The system employs different strategies for parallelizing different types of operators.\nThe add operator is the the most commonly used operator. When the operation is performed on variable v, the variable is updated by v ← v + δ where δ is a user-specified scalar. The SGD update (2) can be implemented using this operator. The delayed add operator performs the same mapping v ← v+ δ; however, the operation will not be executed until the next time that the same element is processed by the system. Delayed operations are useful in implementing sampling-based stochastic algorithms. In particular, before the new value is sampled, the old value should be removed. This “reverse” operation can be declared as a delayed operator when the old value was sampled, and executed before the new value is sampled. See Appendix A for a concrete example with the collapsed Gibbs sampling implementation.\nThe multiply operator scales the variable by v ← γ · v where γ is a user-specified scalar. The multiply operator is especially efficient for scaling high-dimensional arrays. The array multiplication costs O(1) computation time, independent of the dimension of the array. See Appendix A for a more detailed discussion of the multiply operator.\nReweighting Suppose that there arem thread running in parallel. Note that all Splash operators are linear transformations. When these operators are applied sequentially, they merge into a single linear transformation. Taking a variable v, we write thread i’s transformation of v by\nv ← Γ(Si) · v +∆(Si) + T (Si), (5) where Si is the sequence of samples processed by thread i. Γ(Si) is the scale factor resulting from the multiply operators, ∆(Si) is the term resulting from the add operators, and T (Si) is the term resulting from the delayed add operators executed in the current iteration. A detailed discussion of the construction of these transformations is given in Appendix B.\nAs discussed in Section 4.1, directly combining these transformations leads to divergence or slow convergence (or both). The reweighting scheme addresses this dilemma by assigning weights to the samples. Since the update (5) is constructed on a fraction 1/m of the full sequence S, we reweight every element by m in the local sequence. After reweighting, the data distribution of Si will approximate the data distribution of S, making update (5) a nearly-unbiased estimate of the full sequential update.\nMore concretely, the algorithm manipulates the variable by taking sample weights into account. Anm-weighted sample tells the algorithm that it appearsm times consecutively in the sequence. We rename the transformations by Γ(mSi), ∆(mSi) and T (mSi), emphasizing that they are constructed by processing m-weighted samples. Then we redefine the transformation of thread i by\nv ← Γ(mSi) · v +∆(mSi) + T (mSi) (6) and define the global update by\nvnew = 1\nm\nm∑\ni=1\n( Γ(mGi) · vold +∆(mSi) ) + m∑\ni=1\nT (mSi). (7)\nEquation (7) combines the transformations of all threads. The terms Γ(mSi) and ∆(mSi) are scaled by a factor 1/m because they were constructed on m times the amount of data. The term T (mSi) is not scaled, because the delayed operators were declared in earlier iterations, independent of the reweighting. Finally, the coefficient 1/m should multiply all delayed operators declared in the current iteration since these delayed operators were constructed on m times the amount of data. Appendix D presents a concrete example illustrating the consequence of reweighting.\nDetermining the degree of parallelism To determine the thread number m, the execution engine partitions the available cores into different-sized groups. Suppose that group i contains mi cores. These cores will execute the algorithm tentatively on mi parallel threads. The best thread number is then determined by cross-validation and is dynamically updated. See Appendix E for a detailed description. To find the best degree of parallelism, the base algorithm needs to be robust in terms of processing a wide range of sample weights.\nGeneralizing stochastic algorithms Many stochastic algorithms can be generalized to processing weighted samples without sacrificing computational efficiency. The most straightforward generalization is to repeat the single-element update m times. For example, we can generalize the SGD updates (2) by\nt ← t+m and w ← w −mηt∇ℓ(w;x) (8)\nassuming that the sample weight is m. In Appendix C, we demonstrate how to generalize the collapsed Gibbs sampling method, the stochastic variational inference method and the stochastic collaborative filtering algorithm to processing weighted data."
+    }, {
+      "heading" : "5 Convergence Analysis",
+      "text" : "In this section, we study the SGD convergence when it is parallelized by Splash. The goal of SGD is to minimize an empirical risk function\nL(w) = 1 |S| ∑\nx∈S\nℓ(w;x),\nwhere S is a fixed dataset and w ∈ Rd is the vector to be minimized over. Suppose that there are m threads running in parallel. At every iteration, thread i randomly draws (with replacement) a subset of samples Si of length n from the dataset S. The thread sequentially processes Si by SGD. The per-iteration update is\nt ← t+m and w ← w + ( ΠW (w −mηt∇ℓ(w;x)) − w ) , (9)\nwhere the sample weight is equal to m. We have generalized the update (8) by introducing ΠW (·) as a projector to a feasible set W of the vector space. Projecting to the feasible set is a standard post-processing step for an SGD iterate. At the end of the iteration, updates are synchronized by equation (7). This is equivalent to computing:\ntnew = told +mn and wnew = 1\nm\nm∑\ni=1\n( wold +∆(mDi) ) . (10)\nWe denote by w∗ := argminw∈W L(w) the minimizer of the objective function, and denote by w T the combined vector after the T -th iteration.\nGeneral convex function For general convex functions, we start by introducing three additional terms. Let wki,j be the value of vector w at iteration k, when thread i is processing the j-th element of Si. Let η k i,j be the stepsize associated with that update. We define a weighted average vector:\nwT =\n∑T k=1 ∑m i=1 ∑n j=1 η k i,jw\nk i,j∑T\nk=1 ∑m i=1 ∑n j=1 η k i,j .\nNote that wT can be computed together with wT . For general convex L, the function value L(wT ) converges to L(w∗). See Appendix F for the proof.\nTheorem 1. Assume that ‖∇ℓ(w;x)‖2 is bounded for all (w, x) ∈ W × S. Also assume that ηt is a monotonically decreasing function of t such that ∑∞ t=1 ηt = ∞ and ∑∞ t=1 η 2 t < ∞. Then we have\nlim T→∞\nE[L(wT )− L(w∗)] = 0.\nSmooth and strongly convex function We now turn to study smooth and strongly convex objective functions. We make three assumptions on the objective function. Assumption A restricts the optimization problem in a bounded convex set. Assumption B and Assumption C require the objective function to be sufficiently smooth and strongly convex in that set.\nAssumption A. The feasible set W ⊂ Rd is a compact convex set of finite diameter R. Moreover, w∗ is an interior point of W ; i.e., there is a set Uρ := {w ∈ Rd : ‖w − w∗‖2 < ρ} such that Uρ ⊂ W .\nAssumption B. There are finite constants L, G and H such that ‖∇2L(w;x) −∇2ℓ(w∗;x)‖2 ≤ L‖w − w∗‖2, ‖∇ℓ(w;x)‖2 ≤ G and ‖∇2ℓ(w;x)‖2 ≤ H for all (w, x) ∈ W × S.\nAssumption C. The objective function L is λ-strongly convex over the space W , meaning that ∇2L(w) λId×d for all w ∈ W .\nAs a preprocessing step, we construct an Euclidean ball B of diameter D := λ 4(L+G/ρ2) which contains the optimal solution w∗. The ball center can be found by running the sequential SGD for a constant number of steps. During the Splash execution, if the combined vector wT /∈ B, then we project it to B, ensuring that the distance between wT and w∗ is bounded by D. Introducing this projection step simplifies the theoretical analysis, but it may not be necessary in practice.\nUnder these assumptions, we provide an upper bound on the mean-squared error of wT . The following theorem shows that the mean-square error decays as 1/(Tmn), inversely proportionally to the total number of processed samples. It is the optimal rate of convergence among all optimization algorithms which relies on noisy gradients [20]. See Appendix G for the proof.\nTheorem 2. Under Assumptions A-C, if we choose the stepsize ηt = 2 λt , then the output w T has mean-squared error:\nE [ ‖wT − w∗‖22 ] ≤ 4G 2\nλ2Tmn + C1 Tm1/2n3/2 + C2 Tn2 , (11)\nwhere C1 and C2 are constants independent of T , m and n.\nWhen the local sample size n is sufficiently larger than the thread number m (which is typically true), the last two terms on the right-hand side of bound (11) are negligibly small. Thus, the mean-squared error is dominated by the first term, which scales as 1/(Tmn)."
+    }, {
+      "heading" : "6 Experiments",
+      "text" : "In this section, we report the empirical performance of Splash. We solve three machine learning problems: logistic regression, topic modelling and movie recommendation. Our implementation of Splash runs on an Amazon EC2 cluster with eight nodes. Each node is powered by an eight-core Intel Xeon E5-2665 with 30GB of memory and was connected to a commodity 1GB network, so that the cluster contains 64 cores. For all applications, the system chooses 64 threads as the best degree of parallelism.\nDatasets For logistic regression, we use the Covtype, RCV1 and MNIST 8M datasets from the LIBSVM Data website [4]. Among the three datasets, Covtype and MNIST have dense features, RCV1 has sparse features. For topic modelling, we use the NIPS, Enron and NYtimes datasets from the UCI Machine Learning Repository [15], which are represented by bag-or-word histograms. For movie recommendation, we use the movie rental dataset of Netflix. This dataset contains 100M movie ratings made by 480K users on 17K movies.\nAlgorithms For logistic regression, we compare batch gradient descent (GD), stochastic gradient descent (SGD) and the parallel version of SGD under Splash. For learning topic models, we consider two classes of algorithms. The first class are sampling-based algorithms, where we compare collapsed Gibbs sampling [8] and its parallel version under Splash. The second class are variational inference based algorithms, where we compare batch variational inference (VI) [2], stochastic variational inference (SVI) [10] and the parallel version of SVI under Splash. For movie recommendation, we compare the batch algorithm based on alternating loss minimization, the stochastic algorithm called Bayesian Personalized Ranking (BPR) [22] and the parallel version of BPR under Splash.\nEvaluation Metrics To evaluate the performance of the algorithms, we plot the running time of different algorithms for achieving the same learning accuracy. For logistic regression, the accuracy is measured by the logistic loss. For sampling-based algorithms, the accuracy is measured by the perplexity score on the held-out data. For variational-inference-based algorithms, the accuracy is\nmeasure by the predictive log-likelihood. For movie recommendation, the accuracy is measured by the Area Under Curve (AUC) score on the test set.\nExperimental results Figure 1 compares the running time of different algorithms for achieving the same learning accuracy. For logistic regression, the single-thread SGD converges substantially faster than the 64-thread batch GD (see Appendix H.1 for the plot). Figure 1(a) shows that Splash yields 16x, 37x and 28x speedups over the single-thread SGD, thus is orders-of-magnitude faster than the batch GD. To the best of our knowledge, no existing machine learning system achieves the same efficiency in parallelizing SGD on commodity multi-node clusters.\nFor learning topic models, Figure 1(b) shows that Splash yields 38x, 149x and 30x speedups over the single-thread collapsed Gibbs sampling algorithm. Interestingly, the speedup rate is greater than 64x on the Enron dataset, suggesting that parallelization accelerates the convergence. For parallelizing stochastic variational inference (SVI), the speedup rates are 19x, 20x and 16x. Figure 1(c) shows that Splash is also faster than the 64-thread VI algorithm. In particular, Splash is 3.2x, 5.4x and 17.5x faster than the 64-thread VI on the three dataset. The speedup rate increases as the dataset gets bigger.\nFor movie recommendation, Figure 1(d) shows that the 64-thread batch algorithm converges faster than the single-thread stochastic algorithm. The sparsity of the Netflix dataset helps the batch algorithm to achieve good performance. Nevertheless, if we parallelize the stochastic algorithm via Splash, then we get further speedups. Depending on the accuracy we want, Splash is 12x-40x faster than the single-thread stochastic algorithm, and 3x-5.5x faster than the batch algorithm.\nFigure 2 plots the parallel/sequential time ratio for a thread processing the same amount of data. This ratio is computed between the running time of Splash and the running time of the single-thread stochastic algorithm. On most datasets, the time delay due to the parallelization is not significant. The exceptions are the collapsed Gibbs sampling algorithm on all datasets and the SVI algorithm on the Enron dataset. Indeed, the topic model has a large collection of parameters to synchronize which increases the communication cost. Since the Enron dataset consists of short emails, processing this dataset requires less computation, further increasing the ratio of communication overhead.\nWe report more experiments in Appendix H, including the implementation details, the convergence plots for all algorithms that we have tested and a detailed discussion on the relative\nperformance. We also compare Splash with other parallelization schemes. Overall our experimental results show that Splash outperforms the parallelization schemes that we tested in terms of efficiency and robustness."
+    }, {
+      "heading" : "Appendix",
+      "text" : ""
+    }, {
+      "heading" : "A More Examples of Stochastic Algorithm",
+      "text" : "In this section, we describe three additional stochastic algorithms: the collapsed Gibbs sampling algorithm, the stochastic variational inference algorithm and the stochastic collaborative filtering algorithm."
+    }, {
+      "heading" : "A.1 Collapsed Gibbs sampling",
+      "text" : "Latent Dirichelet Allocation [2] (LDA) is an unsupervised model for learning topics from documents. The goal of LDA is to infer the topic at each word in each document. The Collapsed Gibbs sampling algorithm for LDA iteratively takes a word w from document d, and sample the topic of w by\nP (topic = k|d,w) ∝ (nk|d + α)(nw|k + β)\nnk + βW . (12)\nHere, W is the size of the vocabulary; nk|d is the number of words in document d that has been assigned to topic k; nw|k is the total number of times that word w is assigned to topic k and nk := ∑ w nw|k. All counts exclude the current word w. The constants α and β are hyperparameters of the LDA model. The counts nk|d, nw|k and nk are shared variables. Suppose that the topic of the word has been changed from k to k′, then the algorithm performs the incremental updates:\nnk|d ← nk|d − 1, nw|k ← nw|k − 1, nk ← nk − 1 and (13) nk′|d ← nk′|d + 1, nw|k′ ← nw|k′ + 1, n′k ← n′k + 1. (14)\nThe algorithm terminates when the shared variables converge.\nSplash implementation The collapsed Gibbs sampling algorithm can be implemented via several add operations. Note that the update (13) reverses the word count increment that has been performed earlier. Thus, it can be implemented via the delayed add operator. More precisely, whenever the word count is incremented by one, the stochastic algorithm declares a delayed operator which decreases the word count by one. This operator will be executed at the next time when the same word is processed."
+    }, {
+      "heading" : "A.2 Stochastic Variational Inference",
+      "text" : "Stochastic variational inference (SVI) is another efficient approach to learning the LDA model [10]. SVI models a word w in document d as follow: the probability that the word belongs to topic k is proportional to a parameter γdk; the probability that the topic k generates word d is proportional to another parameter λkw. At iteration t, a document d is randomly drawn from the corpus, and the parameters γdk and λkw are recomputed using variational inference (See e.g.[10, Figure 6] for algorithm details). Let the recomputed parameters denoted by γ̃dk and λ̃kw, SVI performs the update\nγdk ← γ̃dk, λkw ← (1− ρt)λkw + ρtDλ̃kw and t ← t+ 1. (15)\nwhere D is the total number of documents. The coefficient ρt is a user-specified learning rate decreasing with time t. For SVI, λkw and t are shared variables. The document-topic parameter γdk is not a shared variable since its value won’t be used by other documents. It is not necessary to store γdk, since its value will be recomputed once the same document is processed in the next iteration. Nevertheless, storing it to initialize the local variational inference will make the it converging faster, thus improving the algorithm’s efficiency.\nSplash implementation Splash provides both the add operator and the multiply operator for updating shared variables (See, e.g. Section 4.2). We use the SVI update (15) as an example to illustrate how a combination of the add operator and the multiply operator could be useful. The update (15) on λkw can be written as:\nMultiply : λkw ← γ · λkw where γ = 1− ρt and (16) Add : λkw ← λkw + δ where δ = ρtDλ̃kw. (17)\nEquivalently, we can implement the update (15) by a single add operator:\nλkw ← λkw + δ where δ = ρt(Dλ̃kw − λkw). (18) If the variables {λkw} are stored in an array named by λ, then the step (16) can be declared as an array multiplication λ ← γ · λ. This operator has O(1) computation cost in Splash, which is independent of the dimension of the array. The computation cost of step (17) is proportional to the number of non-zero entries of {λ̃kw}. In contrast, the computation cost of update (18) depends on the dimension of λ, which might be much greater than that of steps (16)-(17). The user is thus encouraged to use the multiply operator to scale high-dimensional arrays."
+    }, {
+      "heading" : "A.3 Stochastic Collaborative Filtering",
+      "text" : "Collaborative filtering has wide applications in personalized ranking and recommender systems. Suppose that we have a set U of users and a set I of items. There are historical record showing that the user u ∈ U has chosen a subset of the items. The goal is to predict the user’s choice in the future. Collaborative filtering assumes that there is a latent vector vu ∈ Rd associated with each user and a latent vector vi associated with each item. The affinity between a user and an item, or the likelihood that the user will choose the item in the future, is measured by the inner product of their latent vectors. There is a successful stochastic algorithm for learning the latent vectors given implicit user feedbacks. The algorithm is called Bayesian Personalized Ranking (BPR) [22]. Given a user-item pair (u, i) where the user has chosen the item, the algorithm randomly sample another item j that has not been chosen, and update the latent vectors of u, i, j by\nvu ← (1− ηuλ)vu + ηuσ(〈vu, vi − vj))(vi − vj) (19) vi ← (1− ηiλ)vi + ηiσ(〈vu, vi − vj))vu (20) vj ← (1− ηjλ)vj − ηjσ(〈vu, vi − vj))vu (21)\nwhere λ is a hyper-parameters of the algorithm. The learning rates ηu, ηi and ηj are associated with the respective variables. They are determined and updated using the AdaGrad algorithm by Duchi et al. [5]. The function σ(·) is defined by σ(t) = 11+et . Intuitively, the updates (19)-(21) attract the latent vector of item i towards the user vector and push the latent vector of item j away from the user vector. For this algorithm, both (vu, vi, vj) and (ηu, ηi, ηj) are shared variables.\nSplash implementation Similar to the implementation of stochastic variational inference, the updates (19)-(21) can be implemented via a combination of the add operator and the multiply operator. They can also be implemented by only using the add operator."
+    }, {
+      "heading" : "B Constructing Linear Transformation on a Thread",
+      "text" : "When element-wise operators are sequentially applied, they merge into a single linear transformation. Assume that after processing a local subset S, the resulting transformation can be represented by v ← Γ(S) · v +∆(S) + T (S) where Γ(S) is the scale factor, ∆(S) is the term resulting from the element-wise add operators, and T (S) is the term resulting from the element-wise delayed add operators declared before the last synchronization.\nWe construct Γ(S), ∆(S) and T (S) incrementally. Let P be the set of processed elements. At the beginning, the set of processed elements is empty, so that we initialize them by\nΓ(P ) = 1, ∆(P ) = 0 and ξ(P ) = 0 for P = ∅.\nAfter processing element z, we assume that the user has performed all types of operations, resulting in a transformation taking the form\nv ← γ(v + t) + δ (22)\nwhere the scalars γ and δ result from instant operators and t results from the delayed operator. Concatenating transformation (22) with the transformation constructed on set P , we have\nv ← γ · ( Γ(P ) · v +∆(P ) + T (P ) + t ) + δ\n= γ · Γ(P ) · v + ( γ ·∆(P ) + δ ) + ( γ · T (P ) + γt ) .\nAccordingly, we update the terms Γ, ∆ and T by\nΓ(P ∪ {z}) = γ · Γ(P ), ∆(P ∪ {z}) = γ ·∆(P ) + δ and T (P ∪ {z}) = γ · T (P ) + γt (23)\nand update the set of processed elements by S ∪ {z}. After processing the entire local subset, the set P will be equal to S, so that we obtain Γ(S), ∆(S) and T (S)."
+    }, {
+      "heading" : "C Generalizing Stochastic Algorithms",
+      "text" : "In this section, we illustrate how to generalize the collapsed Gibbs sampling method, the stochastic variational inference method and the Bayesian personalized ranking algorithm to processing weighted samples. Suppose that the sample weight ism. The collapsed Gibbs sampling updates (13) and (14) are generalized by\nnk|d ← nk|d −m, nw|k ← nw|k −m, nk ← nk −m and (24) nk′|d ← nk′|d +m, nw|k′ ← nw|k′ +m, n′k ← n′k +m. (25)\nNote that the update (24) should be implemented as a delayed operator — it was declared in the last iteration but executed in the current iteration.\nFor stochastic variational inference, we generalize its updates (15) by\nγdk ← γ̃dk, λkw ← (1− ρt,m)λkw + ρt,mλ̃kw and t ← t+ k (26)\nwhere γ̃dk, λ̃kw and ρt has the same meaning as in formula (15). The coefficient ρt,m is defined by\n1− ρt,m := t+m−1∏\ni=t\n(1− ρi).\nIn fact, formula (26) is the result of repeatedly applying formula (15) for m times. For stochastic collaborative filtering, we generalize the BPR updates (19)-(21) by\nvu ← ( 1− ηuλ ) vu + ηuσ(〈vu, vi − vj))(vi − vj) (27)\nvi ← ( 1− ηjλ ) vi + ηiσ(〈vu, vi − vj))vu (28) vj ← ( 1− ηjλ ) vj − ηjσ(〈vu, vi − vj))vu (29)\nwhere the learning rates ηu, ηi and ηj are defined by\nηu := min(1,mηu), ηi := min(1,mηi) and ηj := min(1,mηj).\nBy this definition, the stepsize has been multiplied by the sample weight, but we force the stepsize to be bounded by one. This is because that in stochastic collaborative filtering, having a stepsize greater than one will easily cause divergence."
+    }, {
+      "heading" : "D Example: Reweighting in Parallelized SGD",
+      "text" : "We present a simple example illustrating how the strategy described in Section 4.2 benefits parallelization. Consider the following convex optimization problem: there are N = 3, 000 twodimensional vectors, represented by x1, . . . , xN , such that xi is randomly and independently drawn from the normal distribution x ∼ N(0, I2×2). The goal is to find a two-dimensional vector w which minimizes the weighted distance to all samples. More precisely, the loss function on sample xi is defined by\nℓ(w;xi) := (xi −w)T (\n1 0 0 1100\n) (xi − w)\nand the overall objective function is L(w) := 1N ∑N\ni=1 ℓ(w;xi). We want to find the vector that minimizes the objective function L(w).\nWe use the SGD update (8) to solve the problem. The algorithm is initialized by w0 = (−1,−1)T and the stepsize is chosen by ηt = 1/ √ t. For parallel execution, the dataset is evenly partitioned into m = 30 disjoint subsets, such that each thread accesses to a single subset, containing 1/30 faction of data. The sequential implementation and the parallel implementations are compared in Figure 3. Specifically, we compare seven types of implementations defined by different strategies:\n(a) The exact minimizer of L(w).\n(b) The solution of SGD achieved by taking a full pass over the dataset. The dataset contains N = 3, 000 samples.\n(c) The local solutions by 30 parallel threads. Each thread runs SGD by taking one pass over its local data. The local dataset contains 100 samples.\n(d) Averaging local solutions in (c). This is the averaging scheme described by formula (4).\n(e) Aggregating local solutions in (c). This is the accumulation scheme described by formula (3).\n(f) The local solution by 30 parallel threads processing weighted data. Each element is weighted by 30. Each thread runs SGD by taking one pass over its local data.\n(g) Combining parallel updates by formula (7), setting sample weight m = 30. Under this setting, formula (7) is equivalent to averaging local solutions in (f).\nIn Figure 3, we observe that solution (b) and solution (g) achieve the best performance. Solution (b) is obtained by a sequential implementation of SGD: it is the baseline that parallel algorithms target at approaching. Solution (g) is obtained by Splash with the reweighting scheme. The\nsolutions obtained by other parallelization schemes, namely solution (d) and (e), have poor performances. In particular, the averaging scheme (d) has a large bias relative to the optimal solution. The accumulation scheme (e) diverges far apart from the optimal solution.\nTo see why Splash is better, we compare local solutions (c) and (f). They correspond to the unweighted SGD and the weighted SGD respectively. We find that solutions (c) have a significant bias but relatively small variance. In contrast, solutions (f) have greater variance but much smaller bias. It verifies our intuition that reweighting helps to reduce the bias by enlarging the local dataset. Note that averaging reduces the variance but doesn’t change the bias. It explains why averaging works better with reweighting."
+    }, {
+      "heading" : "E Determining Thread Number",
+      "text" : "Suppose that there are M available cores in the cluster. The execution engine partitions these cores into several groups. Suppose that the i-th group contains mi cores. The group sizes are determined by the following allocation scheme:\n• Let 4m0 be the thread number adopted by the last iteration. Let 4m0 := 1 at the first iteration. • For i = 1, 2, . . . , if 8mi−1 ≤ M − ∑i−1 j=1mj , the let mi := 4mi−1. Otherwise, let mi :=\nM −∑i−1j=1mj . Terminate when ∑i j=1mj = M .\nIt can be easily verified that the candidate thread numbers (which are the group sizes) in the current iteration are at least as large as that of the last iteration. The candidate thread numbers are 4m0, 16m0, . . . until they consume all of the available cores.\nThe i-th group is randomly allocated with mi Parametrized RDD partitions for training, and allocated with another mi Parametrized RDD partitions for testing. In the training phase, they execute the algorithm on mi parallel threads, following the parallelization strategy described in Section 4.2. In the testing phase, the training results are broadcast to all the partitions. The thread number associated with the smallest testing loss will be chosen. The user is asked to provide an evaluation function ℓ : W × S → R which maps a variable-sample pair to a loss value. This function, for example, can be chosen as the element-wise loss for optimization problems, or the negative log-likelihood of probabilistic models. If the user doesn’t specify an evaluation function, then the largest mi will be chosen by the system.\nOnce a thread number is chosen, its training result will be applied to all Parametrized RDD partitions. The allocation scheme ensures that the largest thread number is at least 3/4 of M . Thus, in case that M is the best degree of parallelism, the computation power will not be badly wasted. The allocation scheme also ensures that M will be the only candidate of parallelism if the last iteration’s thread number is greater than M/2. Thus, the degree of parallelism will quickly converge to M if it outperforms other degrees. Finally, the thread number is not updated in every iteration. If the same thread number has been chosen by multiple consecutive tests, then the system will continue using it for a long time, until some retesting criterion is satisfied."
+    }, {
+      "heading" : "F Proof of Theorem 1",
+      "text" : "We assume that ‖∇ℓ(w;x)‖2 ≤ G for any (w, x) ∈ W × S. The theorem will be established if the following inequality holds:\nT∑\nk=1\nm∑\ni=1\nn∑\nj=1\n2ηki,jE[L(w k i,j)− L(w∗)] ≤ mE[‖w0 − w∗‖2 − ‖wT − w∗‖2] +G2\nT∑\nk=1\nm∑\ni=1\nn∑\nj=1\n(ηki,j) 2 (30)\nTo see how inequality (30) proves the theorem, notice that the convexity of function L yields\nE[L(wj)− L(w∗)] ≤ ∑T k=1 ∑m i=1 ∑n j=1 η k i,jE[L(w k i,j)− L(w∗)]∑T\nk=1 ∑m i=1 ∑n j=1 η k i,j\n.\nThus, inequality (30) implies\nE[L(wj)− L(w∗)] ≤ mE[‖w0 − w∗‖2 − ‖wT − w∗‖2] +G2\n∑T k=1 ∑m i=1 ∑n j=1(η k i,j) 2\n2 ∑T\nk=1 ∑m i=1 ∑n j=1 η k i,j\n.\nBy the assumptions on ηt, it is easy to see that the numerator of right-hand side is bounded, but the denominator is unbounded. Thus, the fraction converges to zero as T → ∞.\nIt remains to prove inequality (30). We prove it by induction. The inequality trivially holds for T = 0. For any integer k > 0, we assume that the inequality holds for T = k − 1. At iteration k, every thread starts from the shared vector wk−1, so that wki,1 ≡ wk−1. For any j ∈ {1, . . . , n}, let gki,j be a shorthand for ∇ℓ(wki,j ;x). A bit of algebraric transformation yields:\n‖wki,j+1 − w∗‖22 = ‖ΠW (wki,j − ηki,jgki,j)− w∗‖22 ≤ ‖wki,j − ηki,jgki,j − w∗‖22 = ‖wki,j −w∗‖22 + (ηki,j)2‖gki,j‖22 − 2ηki,j〈wki,j − w∗, gki,j〉,\nwhere the inequality holds since w∗ ∈ W and ΠW is the projection onto W . Taking expectation on both sides of the inequality and using the assumption that ‖gki,j‖2 ≤ G, we have\nE[‖wki,j+1 − w∗‖22] ≤ E[‖wki,j − w∗‖22] +G2(ηki,j)2 − 2ηki,jE[〈wki,j −w∗,∇L(wki,j)〉]. By the convexity of function L, we have 〈wki,j − w∗,∇L(wki,j)〉 ≥ L(wki,j)− L(w∗). Plugging in this inequality, we have\n2ηki,jE[L(w k i,j)− L(w∗)] ≤ E[‖wki,j − w∗‖22]− E[‖wki,j+1 − w∗‖22] +G2(ηki,j)2. (31)\nSumming up inequality (31) for i = 1, . . . ,m and j = 1, . . . , n, we obtain m∑\ni=1\nn∑\nj=1\n2ηki,jE[L(w k i,j)− L(w∗)] ≤ mE[‖wk−1 −w∗‖22]−\nm∑\ni=1\nE[‖wki,n+1 −w∗‖22]\n+\nm∑\ni=1\nn∑\nj=1\nG2(ηki,j) 2. (32)\nNotice that wk = 1mw k i,n+1. Thus, Jensen’s inequality implies ∑m i=1 ‖wki,n+1 − w∗‖22 ≥ m‖wk − w∗‖2. Plugging this inequality to upper bound (32) yields m∑\ni=1\nn∑\nj=1\n2ηki,jE[L(w k i,j)− L(w∗)] ≤ mE[‖wk−1 −w∗‖22 − ‖wk − w∗‖22] +\nm∑\ni=1\nn∑\nj=1\nG2(ηki,j) 2. (33)\nThe induction is complete by combining upper bound (33) with the inductive hypothesis."
+    }, {
+      "heading" : "G Proof of Theorem 2",
+      "text" : "Recall that wk is the value of vector w after iteration k. Let wki be the output of thread i at the end of iteration k. According to the update formula, we have wk = ΠB( 1 m ∑m i=1 w k i ), where ΠB(·) is the projector to the set B. The set B contains the optimal solution w∗. Since projecting to a convex set doesn’t increase the point’s distance to the elements in the set, and because that wki (i = 1, . . . ,m) are mutually independent conditioning on wk−1, we have\nE[‖wk − w∗‖22] ≤ E [ E [∥∥∥ 1\nm\nm∑\ni=1\nwki − w∗ ∥∥∥ 2\n2\n∣∣∣wk−1 ]]\n= 1\nm2\nm∑\ni=1\nE[E[‖wki −w∗‖22|wk−1]] + 1\nm2\n∑\ni 6=j\nE[E[〈wki − w∗, wkj − w∗〉|wk−1]]\n= 1\nm E[‖wk1 − w∗‖22] + m− 1 m E[‖E[wk1 |wk−1]− w∗‖22] (34)\nEquation (34) implies that we could upper bound the two terms on the right-hand side respectively. To this end, we introduce three shorthand notations:\nak := E[‖wk − w∗‖22], bk := E[‖wk1 − w∗‖22], ck := E[‖E[wk1 |wk−1]− w∗‖22].\nEssentially, equation (34) implies ak ≤ 1mbk + m−1m ck. Let a0 := ‖w0 − w∗‖2 where w0 is the initial vector. The following two lemmas upper bounds bk+1 and ck+1 as functions of ak. We defer their proofs to the end of this section.\nLemma 1. For any integer k ≥ 0, we have\nbk+1 ≤ k2\n(k + 1)2 ak + β1 (k + 1)2n where β1 := 4G 2/λ2.\nLemma 2. We have c1 ≤ β22/n2 and for any integer k ≥ 1,\nck+1 ≤ k2\n(k + 1)2 ak +\n2β2 √ ak + β 2 2/n\n(k + 1)2n where β2 := max\n{ ⌈2H/λ⌉R, 8G 2(L+G/ρ2)\nλ3\n} .\nCombining equation (34) with the results of Lemma (1) and Lemma (2), we obtain an upper bound on a1:\na1 ≤ β1 mn + β22 n2 := β3. (35)\nFurthermore, Lemma (1) and Lemma (2) upper bound ak+1 as a function of ak:\nak+1 ≤ k2\n(k + 1)2 ak +\nβ3 + 2β2 √ ak/n\n(k + 1)2 . (36)\nUsing upper bounds (35) and (36), we claim that\nak ≤ β3 + 2β2\n√ β3/n\nk for k = 1, 2, . . . (37)\nBy inequality (35), the claim is true for k = 1. We assume that the claim holds for k and prove it for k + 1. Using the inductive hypothesis, we have ak ≤ β3. Thus, inequality (36) implies\nak+1 ≤ k2 (k + 1)2 · β3 + 2β2\n√ β3/n\nk +\nβ3 + 2β2 √ β3/n\n(k + 1)2 =\nβ3 + 2β2 √ β3/n\n(k + 1)n\nwhich completes the induction. Note that both β1 and β2 are constants that are independent of k, m and n. Plugging the definition of β3, we can rewrite inequality (37) as\nak ≤ 4G2\nλ2kmn +\nC1\nkm1/2n3/2 + C2 kn2 .\nwhere C1 and C2 are constants that are independent of k, m and n. This completes the proof of the theorem."
+    }, {
+      "heading" : "G.1 Proof of Lemma 1",
+      "text" : "In this proof, we use wj as a shorthand to denote the value of vector w at iteration k + 1 when the first thread is processing the j-th element. We drop the notation’s dependence on the iteration number and on the thread index since they are explicit from the context. Let gj = ∇ℓ(wj ;xj) be the gradient of loss function ℓ with respect to wj on the j-th element. Let ηj be the stepsize parameter when wj is updated. It is easy to verify that ηj = 2 λ(kn+j) .\nWe start by upper bounding the expectation of ‖wk+11 − w∗‖22 conditioning on wk. By the strong convexity of L and the fact that w∗ minimizes L, we have\n〈E[gj ], wj − w∗〉 ≥ L(wj)− L(w∗) + λ\n2 ‖wj −w∗‖22 .\nas well as\nL(wj)− L(w∗) ≥ λ\n2 ‖wj − w∗‖22 .\nHence, we have\n〈E[gj ], wj − w∗〉 ≥ λ ‖wj − w∗‖22 (38)\nRecall that ΠW (·) denotes the projection onto setW . By the convexity ofW , we have ‖ΠW (u)− v‖2 ≤ ‖u− v‖2 for any u, v ∈ W . Using these inequalities, we have the following:\nE[‖wj+1 −w∗‖22|wk] = E[‖ΠW (wj − ηjgj)− w∗‖22|wk] ≤ E[‖wj − ηjgj − w∗‖22|wk] = E[‖wj − w∗‖22|wk]− 2ηjE [ 〈gj , wj − w∗〉|wk ] + η2jE[‖gj‖22|wk].\nNote that the gradient gj is independent of wj conditioning on w k−1. Thus, we have\nE [ 〈gj , wj − w∗〉|wk ] = E[〈E[gj ], wj − w∗〉|wk] ≥ λE[‖wj − w∗‖22 |wk].\nwhere the last inequality follows from inequality (38). As a consequence, we have\nE[‖wj+1 − w∗‖22|wk] ≤ (1− 2ηjλ)E[‖wj − w∗‖22|wk] + η2jG2.\nPlugging in ηj = 2\nλ(kn+j) , we obtain\nE[‖wj+1 − w∗‖22|wk] ≤ ( 1− 4\nkn+ j\n) E[‖wj − w∗‖22|wk] +\n4G2\nλ2(kn+ j)2 . (39)\nCase k = 0: We claim that any j ≥ 1,\nE[‖wj − w∗‖22] ≤ 4G2\nλ2j (40)\nSince w11 = wn+1, the claim establishes the lemma. We prove the claim by induction. The claim holds for j = 1 because inequality (38) yields\n‖w1 − w∗‖22 ≤ 〈E[g1], w1 −w∗〉 λ ≤ G‖w1 − w ∗‖2 λ\n⇒ ‖w1 − w∗‖2 ≤ G/λ.\nOtherwise, we assume that the claim holds for j. Then inequality (39) yields\nE[‖wj+1 − w∗‖22] ≤ ( 1− 4\nj\n) 4G2\nλ2j +\n4G2 λ2j2\n= 4G2 λ2 j − 4 + 1 j2 ≤ 4G 2 λ2(j + 1) ,\nwhich completes the induction.\nCase k > 0: We claim that for any j ≥ 1,\nE[‖wj − w∗‖22|wk] ≤ 1 (kn + j − 1)2 ( (kn)2‖wk − w∗‖22 + 4G2(j − 1) λ2 ) (41)\nWe prove (41) by induction. The claim is obviously true for j = 1. Otherwise, we assume that the claim holds for j and prove it for j + 1. Since 1− 4kn+j ≤ ( kn+j−1 kn+j )\n2, combining the inductive hypothesis and inequality (39), we have\nE[‖wj+1 − w∗‖22|wk]\n≤ 1 (kn + j)2\n( (kn)2‖wk − w∗‖22 +\n4G2(j − 1) λ2\n) +\n4G2\nλ2(kn+ j)2\n= 1\n(kn + j)2\n( (kn)2‖wk − w∗‖22 + 4G2j\nλ2\n) .\nwhich completes the induction. Note that claim (41) establishes the lemma since wk1 = wn+1."
+    }, {
+      "heading" : "G.2 Proof of Lemma 2",
+      "text" : "In this proof, we use wj as a shorthand to denote the value of vector w at iteration k + 1 when the first thread is processing the j-th element. We drop the notation’s dependence on the iteration number and on the thread index since they are explicit from the context. Let gj = ∇ℓ(wj ;xj) be the gradient of loss function ℓ with respect to wj on the j-th element. Let ηj be the stepsize parameter when wj is updated. It is easy to verify that ηj = 2 λ(kn+j) .\nRecall the neighborhood Uρ ⊂ W in Assumption A, and note that\nwj+1 − w∗ = ΠW (wj − ηjgj − w∗) = wj − ηjgj − w∗ + I(wj+1 6∈ Uρ) (ΠW (wj − ηjgj)− (wj − ηjgj))\nsince when w ∈ Uρ, we have ΠW (w) = w. Consequently, an application of the triangle inequality and Jensen’s inequality gives\n‖E[wj+1 − w∗|wk]‖2 ≤ ‖E[wj − ηjgj − w∗|wk]‖2 + E [ ‖(ΠW (wj − ηjgj)− (wj − ηjgj))1(wj+1 /∈ Uρ)‖2 |wk ] .\nBy the definition of the projection and the fact that wj ∈ W , we additionally have\n‖ΠW (wj − ηjgj)− (wj − ηjgj)‖2 ≤ ‖wj − (wj − ηjgj))‖2 ≤ ηj ‖gj‖2 .\nThus, by combining the above two inequalities, and applying Assumption B, we have\n‖E[wj+1 − w∗|wk]‖2 ≤ ‖E[wj − ηjgj − w∗|wk]‖2 + ηjE[‖gj‖2 1(wj+1 6∈Uρ)|wk] ≤ ‖E[wj − ηjgj − w∗|wk]‖2 + ηjG · P (wj 6∈ Uρ|wk)\n≤ ‖E[wj − ηjgj − w∗|wk]‖2 + ηjG · E[‖wj+1 − w∗‖22|wk]\nρ2 , (42)\nwhere the last inequality follows from the Markov’s inequality. Now we turn to controlling the rate at which wj − ηj − gj goes to zero. Let ℓj(·) = ℓ(·;xj) be a shorthand for the loss evaluated on the j-th data element. By defining\nrj := gj −∇ℓj(w∗)−∇2ℓj(w∗)(wj − w∗),\na bit of algebra yields gj = ∇ℓj(w∗) +∇2ℓj(w∗)(wj − w∗) + rj .\nFirst, we note that E[∇ℓj(w∗)|wk] = ∇L(w∗) = 0. Second, the Hessian ∇2ℓj(w∗) is independent of wj . Hence we have\nE[gj|wk] = E[∇ℓj(w∗)] + E[∇2ℓj(w∗)|wk] · E[wj −w∗|wk] + E[rj |wk] = ∇2L(w∗)E[wj − w∗|wk] + E[rj |wk]. (43)\nTaylor’s theorem implies that rj is the Lagrange remainder\nrj = (∇2ℓj(w′)−∇2ℓj(w∗))(w′ − w∗),\nwhere w′ = αwj + (1− α)w∗ for some α ∈ [0, 1]. Applying Assumption B, we find that\nE[‖rj‖2|wk] ≤ E[‖∇2ℓj(w′)−∇2ℓj(w∗)‖2 ‖wj −w∗‖2 |wk] ≤ LE[‖wj − w∗‖22|wk]. (44)\nBy combining the expansion (43) with the bound (44), we find that\n‖E[wj − ηjgj − w∗|wk]‖2 = ∥∥∥E[(I − ηj∇2F0(w∗))(wj − w∗) + ηjrj|wk] ∥∥∥ 2\n≤ ‖(I − ηj∇2L(w∗))E[wj − w∗|wk]‖2 + ηjLE[‖wj − w∗‖22|wk].\nUsing the earlier bound (42) and plugging in the assignment ηj = 2\nλ(kn+j) , this inequality then yields\n‖E[wj+1 − w∗|wk]‖2 ≤ ∥∥I − ηj∇2L(w∗) ∥∥ 2 ‖E[wj − w∗|wk]‖2\n+ 2\nλ(kn+ j)\n( LE[‖wj − w∗‖22|wk] +\nGE[‖wj+1 − w∗‖22|wk] ρ2\n) . (45)\nNext, we split the proof into two cases when k = 1 and k > 1.\nCase k = 0: Note that by strong convexity and our condition that ‖∇2L(w∗)‖2 ≤ H, whenever ηjH ≤ 1 we have ‖I − ηj∇2L(w∗)‖2 = 1− ηjλmin(∇2L(w∗)) ≤ 1− ηjλ Define τ0 = ⌈2H/λ⌉; then for j ≥ τ0, we have ηjH ≤ 1. As a consequence, inequality (40) (in the proof of Lemma 1) and inequality (45) yield that for any j ≥ τ0,\n‖E[wj+1 − w∗]‖2 ≤ (1− 2/j) ‖E[wj − w∗]‖2 + 8G2 λ3j2 ( L+G/ρ2 ) . (46)\nAs shorthand notations, we define two intermediate variables\nut = ‖E(wj − w∗)‖2 and b1 = 8G2 λ3 ( L+G/ρ2 ) .\nInequality (46) then implies the inductive relation\nuj+1 ≤ (1− 2/j)uj + b1/j2 for any j ≥ τ0.\nNow we claim that by defining b2 := max{τ0R, b1}, we have uj ≤ β/j. Indeed, it is clear that uj ≤ τ0R/j for j = 1, 2, . . . , τ0. For t > τ0, using the inductive hypothesis, we have\nuj+1 ≤ (1− 2/j)b2\nj + b1 j2 ≤ b2j − 2b2 + b2 j2 = b2(j − 1) j2 ≤ b2 j + 1 .\nThis completes the induction and establishes the lemma for k = 0.\nCase k > 0: Let uj = ‖E[wj −w∗|wk]‖2 and δ = ‖wk − w∗‖2 as shorthands. Combining inequality (41) (in the proof of Lemma 1) and inequality (45) yield\nuj+1 ≤ ( 1− 2\nkn+ j\n) uj +\n2(L+G/ρ2) λ(kn+ j)(kn + j − 1)2 ( (kn)2δ2 + 4G2j λ2 )\n≤ ( 1− 2\nkn+ j\n) uj +\n2(L+G/ρ2)\nλ(kn+ j)(kn + j − 1)kn\n( (kn)2δ2 + 4G2n\nλ2\n)\n= (kn+ j − 2)(kn + j − 1) (kn + j − 1)(kn + j) uj +\nb1knδ 2 + b2/k\n(kn + j − 1)(kn + j) (47)\nwhere we have introduced shorthand notations b1 := 2(L+G/ρ2) λ and b2 := 8G2(L+G/ρ2)\nλ3 . With these notations, we claim that\nuj ≤ (kn − 1)knδ + (j − 1)(b1knδ2 + b2/k)\n(kn + j − 2)(kn + j − 1) . (48)\nWe prove the claim by induction. Indeed, since u1 = δ, the claim obviously holds for j = 1. Otherwise, we assume that the claim holds for j, then inequality (47) yields\nuj+1 ≤ (kn− 1)knδ + (j − 1)(b1knδ2 + b2/k) (kn + j − 1)(kn + j) + b1knδ 2 + b2/k (kn+ j − 1)(kn + j)\n= (kn− 1)knδ + j(b1knδ2 + b2/k)\n(kn+ j − 1)(kn + j) ,\nwhich completes the induction. As a consequence, a bit of algebraic transformation yields\n‖E[wk+11 − w∗|wk]‖2 = un+1 ≤ (kn− 1)knδ + n(b1knδ2 + b2/k)\n((k + 1)n− 1)(k + 1)n\n≤ k 2n2δ\n(k + 1)2n2 +\nnb1knδ 2\nkn(k + 1)n +\nnb2/k\nkn(k + 1)n\n≤ ( k\nk + 1\n)2 δ + b1δ 2\nk + 1 + b2 k(k + 1)n\n= k\nk + 1\n( kδ + k+1k b1δ 2\nk + 1 + b2 k2n\n) (49)\nBy the fact that wk ∈ B, we have k+1k b1δ ≤ k+1k b1D ≤ 1. Thus, inequality (49) implies\n‖E[wk+11 − w∗|wk]‖22 ≤ ( k\nk + 1\n)2( δ +\nb2 k2n\n)2\nTaking expectation on both sides of the inequality, then applying Jensen’s inequality, we obtain\nE[‖E[wk+11 − w∗|wk]‖22] ≤ k2E[δ2]\n(k + 1)2 +\n2b2 √ E[δ2] + b22/n\n(k + 1)2n .\nHence, the lemma is established."
+    }, {
+      "heading" : "H More Experiments",
+      "text" : "In this section, we report more details on the experiment."
+    }, {
+      "heading" : "H.1 Stochastic Gradient Descent",
+      "text" : "We solve binary classification problems using logistic regression. The goal is to minimize the following objective function\nL(w) = 1\nn\nn∑\nj=1\nlog(1 + exp(−yi〈wi, xi〉)) + λ\n2 ‖w‖22\nwhere xi ∈ Rd is the feature vector of the i-th element and yi ∈ {−1, 1} is its binary label. We choose the regularization coefficient λ = 10−6.\nThe datasets for this task are summarized in Table 1. Among the three datasets, Covtype and MNIST have dense features. The RCV1 dataset has sparse features. For the MNIST dataset, we extract digits “3” and “8” and solve the binary classification problem of distinguishing these two digits.\nWe employ the SGD algorithm in formula (8). In each step, a data entry (xi, yi) is fed into the processing function. The algorithm is initialized at the origin and the stepsize is chosen by ηt = η/ √ t. We manually tune the learning rate η to optimize the single-thread SGD performance. In particular, we set η = 20 for the Covtype dataset and η = 100 for the RCV1 and the MNIST 8M dataset. Between two rounds of communication, the execution engine takes a full pass over the MNIST dataset. Since the Covtype and the RCV1 datasets are relatively small, we let the execution engine taking 16 passes on Covtype and taking 8 passes on RCV1 instead.\nWe compare Splash with the standard single-thread SGD and the 64-thread gradient descent. Figure 4 plots the convergence curve of the three algorithms. The convergence is measured by the optimality gap ℓ(w)− ℓ(w∗), where w is the output of the algorithm and w∗ is the vector that minimizes the objective function. We observe that stochastic algorithms have superior performance over batch gradient descent. Even the single-thread SGD is much faster than the 64-thread gradient descent. It highlights the benefit of employing stochastic algorithm for solving convex optimization problems. Furthermore, the Splash implementation significantly outperforms the single-thread SGD. We find that Splash works well on both low dimensional datasets (Covtype and MNIST) and the high-dimensional dataset (RCV1).\nTable 2 lists the running time of single-thread SGD and Splash for achieving the same loss function value. These loss values are achieved by the single-thread SGD taking 30 passes over the dataset. On the Covtype, RCV1 and MNIST dataset, Splash is 16x, 37x and 28x faster than the single-thread SGD."
+    }, {
+      "heading" : "H.2 Collapsed Gibbs Sampling",
+      "text" : "We turn to train the Latent Dirichelet Allocation (LDA) model using collapsed Gibbs sampling (24) – (25). We conduct experiments on three datasets: the smaller NIPS paper and Enron email dataset and the larger New York Times article dataset. The detailed descriptions of the datasets are summarized in Table 3.\nThe number of topics is set to be K = 20. The hyper-parameters are chosen α = 50/K and β = 0.01. We randomly partition the words in each document, so that half of them is for training and the remaining is for testing. Before the program starts, the word topics are randomly initialized. For both datasets, Splash takes one pass over the dataset between two rounds of communication.\nThe learning accuracy is measured by the perplexity on the testing set. Let p(wd) be the probability of testing words in document d under the LDA model, then the perplexity is equal to\nperplexity = exp ( − ∑D\nd=1 log(p(wd))∑D d=1 Nd\n)\nwhere Nd is the number of testing words in document d. A smaller perplexity score indicates a better predictive performance of the model.\nFigure 5 shows that the perplexity score of Splash converges faster than the single-thread Gibbs sampling. In Table 4, we compare the running time of single-thread Gibbs sampling and its parallel version implemented by Splash to achieve the same perplexity score. Splash is 38x, 149x and 30x faster than the single-thread algorithm on the NIPS, Enron and NYTimes dataset, respectively."
+    }, {
+      "heading" : "H.3 Stochastic Variational Inference",
+      "text" : "Variational inference [2] and stochastic variational inference [10] are alternative efficient approaches to learning the LDA model. In this experiment, we compare the parallel variational inference (VI) algorithm, the single-thread stochastic variational inference (SVI) algorithm and the parallel SVI implemented by Splash. Note that the VI algorithm is easily parallelizable. To parallelize VI, the dataset is partitioned into m subsets according to the document indices. Each thread updates the document-topic parameter γdk for documents in its own subset, then all threads perform a reduce operation to compute the new topic-word parameter λkw. Since VI is a batch algorithm, there is no conflict in parallelization.\nWe test the three algorithms on the three datasets described in Table 3. We choose the topic number K = 20 and choose the same hyper-parameters α, β as in collapsed Gibbs sampling. The learning rate ρt is chosen to be ρt = (t+1)\n−0.7 which optimizes the performance of the single-thread algorithm. Following the paper by Hoffman et al. [10], we organize documents into mini-batches, so that SVI processes a mini-batch like processing a document. Using mini-batche training has been shown improving the SVI performance. On the NIPS, Enron and NYTimes dataset, the mini-batch\nsize is set to be 8, 24 and 128, respectively. We let Splash synchronize once per processing a single mini-batch.\nTo evaluate the algorithm’s performance, we resort to the predictive log-likelihood metric used by Hoffman et al. [10] for evaluating the SVI algorithm. In particular, we partition the dataset evenly into a training set S and a test set T . For each test document in T , we partition its words into a set of observed words wobs and held-out words who, keeping the sets of unique words in wobs and who disjoint. We approximate the posterior distribution of the topic-word parameter λkw implied by the training data S, and then use that approximate posterior and the word set wobs to estimate the document-topic parameter γdk for the test document. Finally, the predictive log-likelihood of the held-out words, namely log p(wnew|wobs,S), are computed. The performance of the algorithm is measured by the average predictive log-likelihood per held-out word.\nFigure 6 plots the predictive log-likelihood as a function of the running time. Again, we find that Splash converges faster than the single-thread SVI algorithm on all datasets. The running time of SVI and Splash to achieve the same predictive log-likelihood are summarized in Table 5. More precisely, Splash achieves 19x, 20x and 16x speedups over the single-thread SVI on the three dataset.\nThe pairwise comparison between VI, SVI and Splash are quite interesting. For small dataset like NIPS, the parallel batch algorithm (VI) is more efficient than the single-thread stochastic algorithm (SVI). For medium sized Enron dataset, the parallel batch algorithm is comparable to the single-thread stochastic algorithm. For large dataset (NYTimes), the single-thread stochastic algorithm is faster than the parallel batch algorithm. It verifies the advantage of using stochastic\nalgorithms to processing large datasets. On all of the three datasets, Splash is faster than the parallel batch algorithm. In particular, Splash is nearly 18x faster than the parallel variational inference algorithm on the NYTimes dataset."
+    }, {
+      "heading" : "H.4 Stochastic Collaborative Filtering",
+      "text" : "We use stochastic collaborative filtering to solve the Netflix movie recommendation problem. The Netflix dataset contains 100 million movie ratings made by 480,000 users on 17,000 movies. We split the dataset evenly into a training set and a testing set. In the language of personalized recommendation, we say that a user chooses a movie if the user rates the movie. The goal is to predict the set of movies that the user chooses in the testing set. To perform collaborative filtering, users and movies are associated with d-dimensional latent vectors, where d = 10. The latent vectors are learnt through the Bayesian personalized ranking (BPR) algorithm described by equation (27) – (29). We choose learning parameters λ = η = 0.01. Splash takes one pass over the dataset between two rounds of communication.\nThe performance is measured by the AUC (Area under the ROC curve) metric. Given a user u, we assume that Tu is the set of movies that she rates in the testing set, and I is the set of all movies. The AUC score for this user is computed by\nAUCu = 1 |Tu||I\\Tu| ∑\ni∈Tu, j∈I\\Tu\nI(〈vu, vi〉 > 〈vu, vj〉),\nwhere I(·) is the indicator function which returns 1 if the inner statement is true and returns 0 otherwise. A higher AUC score indicates a better prediction accuracy. The AUC on the overall testing set is the average individual users’ AUC weighted by the number of the rated movies.\nAs an alternative baseline, we compare the stochastic algorithm with a batch alternating minimization method for minimizing the loss function:\nL(v) := ∑\nu∈U\n∑\ni∈Tu\n( E[log ( 1 + exp(−〈vu, vi − vj〉) ) ] + λ‖vu‖22 + λ‖vi‖22 ) ,\nwhere U is the set of all users and Tu is the set of movies that the user chooses. The movie index j for vector vj is drawn uniformly at random from the movies that the user has not chosen. It is easy to verify that BPR is a stochastic algorithm for minimizing function L(v). Thus, the batch method which minimizes the same function is a natural baseline. We parallelize the alternating minimization method and compare its convergence rate with BPR and Splash.\nFigure 7 plots the AUC scores as function of the running time. Splash attains a high AUC score in one iteration. The single-thread BPR takes much longer time to achieve the same accuracy. More specifically, Splash achieves the AUC score around 0.91 in 9 seconds. For the single-thread BPR algorithm, it takes 355 seconds to achieve the same score. Splash also converges faster than the\nparallel gradient descent. Table 6 compares the running time of the three algorithms. To achieve AUC = 0.91, Splash is 3x faster than the parallel gradient descent and 40x faster than the singlethread BPR. To achieve a higher accuracy AUC = 0.94, Splash is 5.5x faster than the parallel gradient descent and 12x faster than the single-thread BPR.\nThe experiment verifies the usefulness of Splash in learning collaborative filtering models, but the speedup rate over the single-thread algorithm is not as high as in solving convex optimization. We conjecture that it is partially due to the non-convexity nature of the problem. In addition, the AUC score is a combinatoric metric that cannot be directly optimized. Thus, it is not the objective function that the algorithm explicitly maximizes. As a consequence, even if Splash converges very fast to the optimal objective value, it doesn’t imply that it converges as fast to the best AUC score.\nH.5 Comparing with other parallelization schemes\nFinally, we compare the Splash’s parallelization strategy with two alternative schemes: accumulation and averaging. The accumulation scheme is defined in formula (3), which constructs the global update by summing up local updates. The averaging scheme is defined in formula (4), which averages local updates.\nIn the context of SGD, the accumulation scheme resembles the HOGWILD! update scheme [21]. Figure 8(a) compares the convergence of the three strategies on the RCV1 dataset. We find that the accumulation scheme leads to divergence at the very beginning, then slowly converges in later iterations. The averaging scheme coverages in a much slower rate than that of Splash. By comparing Figure 4(a) and Figure 8(a), we find that the convergence of the averaging scheme is very similar to that of the single-thread SGD. It suggests that averaging doesn’t yield convergence speedup.\nFor LDA trained by collapsed Gibbs sampling, parallelizing with the accumulation scheme is equivalent to the AD-LDA algorithm by Newman et al. [19]. Figure 8(b) shows that the accumulation scheme converges slower Splash. Although Splash is a general-purpose system, it outperforms the algorithm specifically designed for LDA. In contrast, the averaging scheme performs poorly by converging to a sub-optimal solution.\nFor LDA trained by SVI, a straightforward application of the accumulation scheme is problem-\natic, because the accumulation scheme may assign negative values to parameter λkw. Recall that λkw represents the probability that topic k generates word w, thus a negative probability is not allowed. We address the problem by a heuristic: setting λkw to be a small positive number when it is negative. Figure 8(c) compares Splash with the modified accumulation scheme and the averaging scheme. Although all strategies eventually converge, the accumulation scheme oscillates at early iterations and converges to a sub-optimal solution. The averaging scheme’s convergence is slightly slower than Splash.\nFor stochastic collaborative filtering, Figure 8(d) compares Splash with the accumulation scheme and the averaging scheme on the Netflix dataset. The observation is similar to that of SGD: the accumulation scheme causes divergence at the very beginning, then it slowly converges to a better solution. The averaging scheme converges in a much slower rate than that of Splash."
+    } ],
+    "references" : [ {
+      "title" : "Distributed delayed stochastic optimization",
+      "author" : [ "A. Agarwal", "J.C. Duchi" ],
+      "venue" : "NIPS, pages 873–881,",
+      "citeRegEx" : "1",
+      "shortCiteRegEx" : null,
+      "year" : 2011
+    }, {
+      "title" : "Latent Dirichlet allocation",
+      "author" : [ "D.M. Blei", "A.Y. Ng", "M.I. Jordan" ],
+      "venue" : "the Journal of machine Learning research, 3:993–1022,",
+      "citeRegEx" : "2",
+      "shortCiteRegEx" : null,
+      "year" : 2003
+    }, {
+      "title" : "Large-scale machine learning with stochastic gradient descent",
+      "author" : [ "L. Bottou" ],
+      "venue" : "Proceedings of COMP- STAT’2010, pages 177–186. Springer,",
+      "citeRegEx" : "3",
+      "shortCiteRegEx" : null,
+      "year" : 2010
+    }, {
+      "title" : "Libsvm: a library for support vector machines",
+      "author" : [ "C.-C. Chang", "C.-J. Lin" ],
+      "venue" : "ACM Transactions on Intelligent Systems and Technology (TIST), 2(3):27,",
+      "citeRegEx" : "4",
+      "shortCiteRegEx" : null,
+      "year" : 2011
+    }, {
+      "title" : "Adaptive subgradient methods for online learning and stochastic optimization",
+      "author" : [ "J. Duchi", "E. Hazan", "Y. Singer" ],
+      "venue" : "The Journal of Machine Learning Research, 12:2121–2159,",
+      "citeRegEx" : "5",
+      "shortCiteRegEx" : null,
+      "year" : 2011
+    }, {
+      "title" : "Dual averaging for distributed optimization: convergence analysis and network scaling",
+      "author" : [ "J.C. Duchi", "A. Agarwal", "M.J. Wainwright" ],
+      "venue" : "Automatic Control, IEEE Transactions on, 57(3):592–606,",
+      "citeRegEx" : "6",
+      "shortCiteRegEx" : null,
+      "year" : 2012
+    }, {
+      "title" : "Large-scale matrix factorization with distributed stochastic gradient descent",
+      "author" : [ "R. Gemulla", "E. Nijkamp", "P.J. Haas", "Y. Sismanis" ],
+      "venue" : "SIGKDD, pages 69–77. ACM,",
+      "citeRegEx" : "7",
+      "shortCiteRegEx" : null,
+      "year" : 2011
+    }, {
+      "title" : "Finding scientific topics",
+      "author" : [ "T.L. Griffiths", "M. Steyvers" ],
+      "venue" : "Proceedings of the National Academy of Sciences, 101(suppl 1):5228–5235,",
+      "citeRegEx" : "8",
+      "shortCiteRegEx" : null,
+      "year" : 2004
+    }, {
+      "title" : "More effective distributed ML via a stale synchronous parallel parameter server",
+      "author" : [ "Q. Ho", "J. Cipar", "H. Cui", "S. Lee", "J.K. Kim", "P.B. Gibbons", "G.A. Gibson", "G. Ganger", "E.P. Xing" ],
+      "venue" : "NIPS, pages 1223–1231,",
+      "citeRegEx" : "9",
+      "shortCiteRegEx" : null,
+      "year" : 2013
+    }, {
+      "title" : "Stochastic variational inference",
+      "author" : [ "M.D. Hoffman", "D.M. Blei", "C. Wang", "J. Paisley" ],
+      "venue" : "The Journal of Machine Learning Research, 14(1):1303–1347,",
+      "citeRegEx" : "10",
+      "shortCiteRegEx" : null,
+      "year" : 2013
+    }, {
+      "title" : "Communicationefficient distributed dual coordinate ascent",
+      "author" : [ "M. Jaggi", "V. Smith", "M. Takác", "J. Terhorst", "S. Krishnan", "T. Hofmann", "M.I. Jordan" ],
+      "venue" : "NIPS, pages 3068–3076,",
+      "citeRegEx" : "11",
+      "shortCiteRegEx" : null,
+      "year" : 2014
+    }, {
+      "title" : "Accelerating stochastic gradient descent using predictive variance reduction",
+      "author" : [ "R. Johnson", "T. Zhang" ],
+      "venue" : "NIPS, pages 315–323,",
+      "citeRegEx" : "12",
+      "shortCiteRegEx" : null,
+      "year" : 2013
+    }, {
+      "title" : "Matrix factorization techniques for recommender systems",
+      "author" : [ "Y. Koren", "R. Bell", "C. Volinsky" ],
+      "venue" : "Computer, (8):30–37,",
+      "citeRegEx" : "13",
+      "shortCiteRegEx" : null,
+      "year" : 2009
+    }, {
+      "title" : "Imagenet classification with deep convolutional neural networks",
+      "author" : [ "A. Krizhevsky", "I. Sutskever", "G.E. Hinton" ],
+      "venue" : "NIPS, pages 1097–1105,",
+      "citeRegEx" : "14",
+      "shortCiteRegEx" : null,
+      "year" : 2012
+    }, {
+      "title" : "Distributed nonnegative matrix factorization for web-scale dyadic data analysis on mapreduce",
+      "author" : [ "C. Liu", "H.-c. Yang", "J. Fan", "L.-W. He", "Y.-M. Wang" ],
+      "venue" : "In WWW,",
+      "citeRegEx" : "16",
+      "shortCiteRegEx" : "16",
+      "year" : 2010
+    }, {
+      "title" : "An asynchronous parallel stochastic coordinate descent algorithm",
+      "author" : [ "J. Liu", "S.J. Wright", "C. Ré", "V. Bittorf", "S. Sridhar" ],
+      "venue" : "arXiv preprint arXiv:1311.1873,",
+      "citeRegEx" : "17",
+      "shortCiteRegEx" : null,
+      "year" : 2013
+    }, {
+      "title" : "Expectation propagation for approximate Bayesian inference",
+      "author" : [ "T.P. Minka" ],
+      "venue" : "UAI, pages 362–369. Morgan Kaufmann Publishers Inc.,",
+      "citeRegEx" : "18",
+      "shortCiteRegEx" : null,
+      "year" : 2001
+    }, {
+      "title" : "Distributed inference for latent Dirichlet allocation",
+      "author" : [ "D. Newman", "P. Smyth", "M. Welling", "A.U. Asuncion" ],
+      "venue" : "NIPS, pages 1081–1088,",
+      "citeRegEx" : "19",
+      "shortCiteRegEx" : null,
+      "year" : 2007
+    }, {
+      "title" : "Making gradient descent optimal for strongly convex stochastic optimization",
+      "author" : [ "A. Rakhlin", "O. Shamir", "K. Sridharan" ],
+      "venue" : "arXiv preprint arXiv:1109.5647,",
+      "citeRegEx" : "20",
+      "shortCiteRegEx" : null,
+      "year" : 2011
+    }, {
+      "title" : "Hogwild: A lock-free approach to parallelizing stochastic gradient descent",
+      "author" : [ "B. Recht", "C. Re", "S. Wright", "F. Niu" ],
+      "venue" : "NIPS, pages 693–701,",
+      "citeRegEx" : "21",
+      "shortCiteRegEx" : null,
+      "year" : 2011
+    }, {
+      "title" : "BPR: Bayesian personalized ranking from implicit feedback",
+      "author" : [ "S. Rendle", "C. Freudenthaler", "Z. Gantner", "L. Schmidt-Thieme" ],
+      "venue" : "UAI, pages 452–461. AUAI Press,",
+      "citeRegEx" : "22",
+      "shortCiteRegEx" : null,
+      "year" : 2009
+    }, {
+      "title" : "Minimizing finite sums with the stochastic average gradient",
+      "author" : [ "M. Schmidt", "N.L. Roux", "F. Bach" ],
+      "venue" : "arXiv preprint arXiv:1309.2388,",
+      "citeRegEx" : "23",
+      "shortCiteRegEx" : null,
+      "year" : 2013
+    }, {
+      "title" : "Stochastic dual coordinate ascent methods for regularized loss",
+      "author" : [ "S. Shalev-Shwartz", "T. Zhang" ],
+      "venue" : "The Journal of Machine Learning Research, 14(1):567–599,",
+      "citeRegEx" : "24",
+      "shortCiteRegEx" : null,
+      "year" : 2013
+    }, {
+      "title" : "Extracting and composing robust features with denoising autoencoders",
+      "author" : [ "P. Vincent", "H. Larochelle", "Y. Bengio", "P.-A. Manzagol" ],
+      "venue" : "ICML, pages 1096–1103. ACM,",
+      "citeRegEx" : "25",
+      "shortCiteRegEx" : null,
+      "year" : 2008
+    }, {
+      "title" : "Dual averaging method for regularized stochastic learning and online optimization",
+      "author" : [ "L. Xiao" ],
+      "venue" : "NIPS, pages 2116–2124,",
+      "citeRegEx" : "26",
+      "shortCiteRegEx" : null,
+      "year" : 2009
+    }, {
+      "title" : "Petuum: A new platform for distributed machine learning on big data",
+      "author" : [ "E.P. Xing", "Q. Ho", "W. Dai", "J.K. Kim", "J. Wei", "S. Lee", "X. Zheng", "P. Xie", "A. Kumar", "Y. Yu" ],
+      "venue" : "arXiv preprint arXiv:1312.7651,",
+      "citeRegEx" : "27",
+      "shortCiteRegEx" : null,
+      "year" : 2013
+    }, {
+      "title" : "Resilient distributed datasets: A fault-tolerant abstraction for in-memory cluster computing",
+      "author" : [ "M. Zaharia", "M. Chowdhury", "T. Das", "A. Dave", "J. Ma", "M. McCauley", "M.J. Franklin", "S. Shenker", "I. Stoica" ],
+      "venue" : "NSDI. USENIX Association,",
+      "citeRegEx" : "28",
+      "shortCiteRegEx" : null,
+      "year" : 2012
+    }, {
+      "title" : "Solving large scale linear prediction problems using stochastic gradient descent algorithms",
+      "author" : [ "T. Zhang" ],
+      "venue" : "ICML, page 116. ACM,",
+      "citeRegEx" : "29",
+      "shortCiteRegEx" : null,
+      "year" : 2004
+    }, {
+      "title" : "Communication-efficient algorithms for statistical optimization",
+      "author" : [ "Y. Zhang", "M.J. Wainwright", "J.C. Duchi" ],
+      "venue" : "NIPS, pages 1502–1510,",
+      "citeRegEx" : "30",
+      "shortCiteRegEx" : null,
+      "year" : 2012
+    }, {
+      "title" : "A fast parallel SGD for matrix factorization in shared memory systems",
+      "author" : [ "Y. Zhuang", "W.-S. Chin", "Y.-C. Juan", "C.-J. Lin" ],
+      "venue" : "RecSys, pages 249–256. ACM,",
+      "citeRegEx" : "31",
+      "shortCiteRegEx" : null,
+      "year" : 2013
+    }, {
+      "title" : "Parallelized stochastic gradient descent",
+      "author" : [ "M. Zinkevich", "M. Weimer", "L. Li", "A.J. Smola" ],
+      "venue" : "NIPS, pages 2595–2603,",
+      "citeRegEx" : "32",
+      "shortCiteRegEx" : null,
+      "year" : 2010
+    } ],
+    "referenceMentions" : [ {
+      "referenceID" : 27,
+      "context" : "Indeed, for convex optimization, the efficiency of stochastic gradient descent (SGD) and its variants has been established both in theory and in practice [29, 3, 26, 5, 23, 12].",
+      "startOffset" : 154,
+      "endOffset" : 176
+    }, {
+      "referenceID" : 2,
+      "context" : "Indeed, for convex optimization, the efficiency of stochastic gradient descent (SGD) and its variants has been established both in theory and in practice [29, 3, 26, 5, 23, 12].",
+      "startOffset" : 154,
+      "endOffset" : 176
+    }, {
+      "referenceID" : 24,
+      "context" : "Indeed, for convex optimization, the efficiency of stochastic gradient descent (SGD) and its variants has been established both in theory and in practice [29, 3, 26, 5, 23, 12].",
+      "startOffset" : 154,
+      "endOffset" : 176
+    }, {
+      "referenceID" : 4,
+      "context" : "Indeed, for convex optimization, the efficiency of stochastic gradient descent (SGD) and its variants has been established both in theory and in practice [29, 3, 26, 5, 23, 12].",
+      "startOffset" : 154,
+      "endOffset" : 176
+    }, {
+      "referenceID" : 21,
+      "context" : "Indeed, for convex optimization, the efficiency of stochastic gradient descent (SGD) and its variants has been established both in theory and in practice [29, 3, 26, 5, 23, 12].",
+      "startOffset" : 154,
+      "endOffset" : 176
+    }, {
+      "referenceID" : 11,
+      "context" : "Indeed, for convex optimization, the efficiency of stochastic gradient descent (SGD) and its variants has been established both in theory and in practice [29, 3, 26, 5, 23, 12].",
+      "startOffset" : 154,
+      "endOffset" : 176
+    }, {
+      "referenceID" : 12,
+      "context" : "For non-convex optimization, stochastic methods achieve state-of-the-art performance on a broad class of problems, including matrix factorization [13], neural networks [14] and representation learning [25].",
+      "startOffset" : 146,
+      "endOffset" : 150
+    }, {
+      "referenceID" : 13,
+      "context" : "For non-convex optimization, stochastic methods achieve state-of-the-art performance on a broad class of problems, including matrix factorization [13], neural networks [14] and representation learning [25].",
+      "startOffset" : 168,
+      "endOffset" : 172
+    }, {
+      "referenceID" : 23,
+      "context" : "For non-convex optimization, stochastic methods achieve state-of-the-art performance on a broad class of problems, including matrix factorization [13], neural networks [14] and representation learning [25].",
+      "startOffset" : 201,
+      "endOffset" : 205
+    }, {
+      "referenceID" : 16,
+      "context" : "Stochastic algorithms are also widely used in the Bayesian setting for finding approximations to posterior distributions; examples include Markov chain Monte Carlo, expectation propagation [18] and stochastic variational inference [10].",
+      "startOffset" : 189,
+      "endOffset" : 193
+    }, {
+      "referenceID" : 9,
+      "context" : "Stochastic algorithms are also widely used in the Bayesian setting for finding approximations to posterior distributions; examples include Markov chain Monte Carlo, expectation propagation [18] and stochastic variational inference [10].",
+      "startOffset" : 231,
+      "endOffset" : 235
+    }, {
+      "referenceID" : 19,
+      "context" : "One active line of research studies asynchronous parallel updating schemes in the setting of a lock-free shared memory [21, 6, 17, 31, 9, 27].",
+      "startOffset" : 119,
+      "endOffset" : 141
+    }, {
+      "referenceID" : 5,
+      "context" : "One active line of research studies asynchronous parallel updating schemes in the setting of a lock-free shared memory [21, 6, 17, 31, 9, 27].",
+      "startOffset" : 119,
+      "endOffset" : 141
+    }, {
+      "referenceID" : 15,
+      "context" : "One active line of research studies asynchronous parallel updating schemes in the setting of a lock-free shared memory [21, 6, 17, 31, 9, 27].",
+      "startOffset" : 119,
+      "endOffset" : 141
+    }, {
+      "referenceID" : 29,
+      "context" : "One active line of research studies asynchronous parallel updating schemes in the setting of a lock-free shared memory [21, 6, 17, 31, 9, 27].",
+      "startOffset" : 119,
+      "endOffset" : 141
+    }, {
+      "referenceID" : 8,
+      "context" : "One active line of research studies asynchronous parallel updating schemes in the setting of a lock-free shared memory [21, 6, 17, 31, 9, 27].",
+      "startOffset" : 119,
+      "endOffset" : 141
+    }, {
+      "referenceID" : 25,
+      "context" : "One active line of research studies asynchronous parallel updating schemes in the setting of a lock-free shared memory [21, 6, 17, 31, 9, 27].",
+      "startOffset" : 119,
+      "endOffset" : 141
+    }, {
+      "referenceID" : 0,
+      "context" : "When the time delay of concurrent updates are bounded, it is known that such updates preserve statistical correctness [1, 17].",
+      "startOffset" : 118,
+      "endOffset" : 125
+    }, {
+      "referenceID" : 15,
+      "context" : "When the time delay of concurrent updates are bounded, it is known that such updates preserve statistical correctness [1, 17].",
+      "startOffset" : 118,
+      "endOffset" : 125
+    }, {
+      "referenceID" : 30,
+      "context" : "There has also been a flurry of research studying the implementation of stochastic algorithms in the fully distributed setting [32, 30, 19, 7, 16, 11].",
+      "startOffset" : 127,
+      "endOffset" : 150
+    }, {
+      "referenceID" : 28,
+      "context" : "There has also been a flurry of research studying the implementation of stochastic algorithms in the fully distributed setting [32, 30, 19, 7, 16, 11].",
+      "startOffset" : 127,
+      "endOffset" : 150
+    }, {
+      "referenceID" : 17,
+      "context" : "There has also been a flurry of research studying the implementation of stochastic algorithms in the fully distributed setting [32, 30, 19, 7, 16, 11].",
+      "startOffset" : 127,
+      "endOffset" : 150
+    }, {
+      "referenceID" : 6,
+      "context" : "There has also been a flurry of research studying the implementation of stochastic algorithms in the fully distributed setting [32, 30, 19, 7, 16, 11].",
+      "startOffset" : 127,
+      "endOffset" : 150
+    }, {
+      "referenceID" : 14,
+      "context" : "There has also been a flurry of research studying the implementation of stochastic algorithms in the fully distributed setting [32, 30, 19, 7, 16, 11].",
+      "startOffset" : 127,
+      "endOffset" : 150
+    }, {
+      "referenceID" : 10,
+      "context" : "There has also been a flurry of research studying the implementation of stochastic algorithms in the fully distributed setting [32, 30, 19, 7, 16, 11].",
+      "startOffset" : 127,
+      "endOffset" : 150
+    }, {
+      "referenceID" : 26,
+      "context" : "We build Splash on top of Apache Spark [28], a popular distributed data-processing framework for batch algorithms.",
+      "startOffset" : 39,
+      "endOffset" : 43
+    }, {
+      "referenceID" : 7,
+      "context" : "For example, the collapsed Gibbs sampling algorithm for LDA [8] maintains a topic assignment for each word, which is stored as a local variable.",
+      "startOffset" : 60,
+      "endOffset" : 63
+    }, {
+      "referenceID" : 22,
+      "context" : "The stochastic dual coordinate ascent (SDCA) algorithm [24] maintains a dual variable for each data element, which is also stored as a local variable.",
+      "startOffset" : 55,
+      "endOffset" : 59
+    }, {
+      "referenceID" : 26,
+      "context" : "The Parametrized RDD is based on the Resilient Distributed Dataset (RDD) [28] used by Apache Spark.",
+      "startOffset" : 73,
+      "endOffset" : 77
+    }, {
+      "referenceID" : 0,
+      "context" : "The scheme (3) provides a good approximation to the full update if the batch size |Di| is sufficiently small [1].",
+      "startOffset" : 109,
+      "endOffset" : 112
+    }, {
+      "referenceID" : 18,
+      "context" : "It is the optimal rate of convergence among all optimization algorithms which relies on noisy gradients [20].",
+      "startOffset" : 104,
+      "endOffset" : 108
+    }, {
+      "referenceID" : 3,
+      "context" : "Datasets For logistic regression, we use the Covtype, RCV1 and MNIST 8M datasets from the LIBSVM Data website [4].",
+      "startOffset" : 110,
+      "endOffset" : 113
+    }, {
+      "referenceID" : 7,
+      "context" : "The first class are sampling-based algorithms, where we compare collapsed Gibbs sampling [8] and its parallel version under Splash.",
+      "startOffset" : 89,
+      "endOffset" : 92
+    }, {
+      "referenceID" : 1,
+      "context" : "The second class are variational inference based algorithms, where we compare batch variational inference (VI) [2], stochastic variational inference (SVI) [10] and the parallel version of SVI under Splash.",
+      "startOffset" : 111,
+      "endOffset" : 114
+    }, {
+      "referenceID" : 9,
+      "context" : "The second class are variational inference based algorithms, where we compare batch variational inference (VI) [2], stochastic variational inference (SVI) [10] and the parallel version of SVI under Splash.",
+      "startOffset" : 155,
+      "endOffset" : 159
+    }, {
+      "referenceID" : 20,
+      "context" : "For movie recommendation, we compare the batch algorithm based on alternating loss minimization, the stochastic algorithm called Bayesian Personalized Ranking (BPR) [22] and the parallel version of BPR under Splash.",
+      "startOffset" : 165,
+      "endOffset" : 169
+    }, {
+      "referenceID" : 0,
+      "context" : "[1] A.",
+      "startOffset" : 0,
+      "endOffset" : 3
+    }, {
+      "referenceID" : 1,
+      "context" : "[2] D.",
+      "startOffset" : 0,
+      "endOffset" : 3
+    }, {
+      "referenceID" : 2,
+      "context" : "[3] L.",
+      "startOffset" : 0,
+      "endOffset" : 3
+    }, {
+      "referenceID" : 3,
+      "context" : "[4] C.",
+      "startOffset" : 0,
+      "endOffset" : 3
+    }, {
+      "referenceID" : 4,
+      "context" : "[5] J.",
+      "startOffset" : 0,
+      "endOffset" : 3
+    }, {
+      "referenceID" : 5,
+      "context" : "[6] J.",
+      "startOffset" : 0,
+      "endOffset" : 3
+    }, {
+      "referenceID" : 6,
+      "context" : "[7] R.",
+      "startOffset" : 0,
+      "endOffset" : 3
+    }, {
+      "referenceID" : 7,
+      "context" : "[8] T.",
+      "startOffset" : 0,
+      "endOffset" : 3
+    }, {
+      "referenceID" : 8,
+      "context" : "[9] Q.",
+      "startOffset" : 0,
+      "endOffset" : 3
+    }, {
+      "referenceID" : 9,
+      "context" : "[10] M.",
+      "startOffset" : 0,
+      "endOffset" : 4
+    }, {
+      "referenceID" : 10,
+      "context" : "[11] M.",
+      "startOffset" : 0,
+      "endOffset" : 4
+    }, {
+      "referenceID" : 11,
+      "context" : "[12] R.",
+      "startOffset" : 0,
+      "endOffset" : 4
+    }, {
+      "referenceID" : 12,
+      "context" : "[13] Y.",
+      "startOffset" : 0,
+      "endOffset" : 4
+    }, {
+      "referenceID" : 13,
+      "context" : "[14] A.",
+      "startOffset" : 0,
+      "endOffset" : 4
+    }, {
+      "referenceID" : 14,
+      "context" : "[16] C.",
+      "startOffset" : 0,
+      "endOffset" : 4
+    }, {
+      "referenceID" : 15,
+      "context" : "[17] J.",
+      "startOffset" : 0,
+      "endOffset" : 4
+    }, {
+      "referenceID" : 16,
+      "context" : "[18] T.",
+      "startOffset" : 0,
+      "endOffset" : 4
+    }, {
+      "referenceID" : 17,
+      "context" : "[19] D.",
+      "startOffset" : 0,
+      "endOffset" : 4
+    }, {
+      "referenceID" : 18,
+      "context" : "[20] A.",
+      "startOffset" : 0,
+      "endOffset" : 4
+    }, {
+      "referenceID" : 19,
+      "context" : "[21] B.",
+      "startOffset" : 0,
+      "endOffset" : 4
+    }, {
+      "referenceID" : 20,
+      "context" : "[22] S.",
+      "startOffset" : 0,
+      "endOffset" : 4
+    }, {
+      "referenceID" : 21,
+      "context" : "[23] M.",
+      "startOffset" : 0,
+      "endOffset" : 4
+    }, {
+      "referenceID" : 22,
+      "context" : "[24] S.",
+      "startOffset" : 0,
+      "endOffset" : 4
+    }, {
+      "referenceID" : 23,
+      "context" : "[25] P.",
+      "startOffset" : 0,
+      "endOffset" : 4
+    }, {
+      "referenceID" : 24,
+      "context" : "[26] L.",
+      "startOffset" : 0,
+      "endOffset" : 4
+    }, {
+      "referenceID" : 25,
+      "context" : "[27] E.",
+      "startOffset" : 0,
+      "endOffset" : 4
+    }, {
+      "referenceID" : 26,
+      "context" : "[28] M.",
+      "startOffset" : 0,
+      "endOffset" : 4
+    }, {
+      "referenceID" : 27,
+      "context" : "[29] T.",
+      "startOffset" : 0,
+      "endOffset" : 4
+    }, {
+      "referenceID" : 28,
+      "context" : "[30] Y.",
+      "startOffset" : 0,
+      "endOffset" : 4
+    }, {
+      "referenceID" : 29,
+      "context" : "[31] Y.",
+      "startOffset" : 0,
+      "endOffset" : 4
+    }, {
+      "referenceID" : 30,
+      "context" : "[32] M.",
+      "startOffset" : 0,
+      "endOffset" : 4
+    }, {
+      "referenceID" : 1,
+      "context" : "1 Collapsed Gibbs sampling Latent Dirichelet Allocation [2] (LDA) is an unsupervised model for learning topics from documents.",
+      "startOffset" : 56,
+      "endOffset" : 59
+    }, {
+      "referenceID" : 9,
+      "context" : "2 Stochastic Variational Inference Stochastic variational inference (SVI) is another efficient approach to learning the LDA model [10].",
+      "startOffset" : 130,
+      "endOffset" : 134
+    }, {
+      "referenceID" : 20,
+      "context" : "The algorithm is called Bayesian Personalized Ranking (BPR) [22].",
+      "startOffset" : 60,
+      "endOffset" : 64
+    }, {
+      "referenceID" : 4,
+      "context" : "[5].",
+      "startOffset" : 0,
+      "endOffset" : 3
+    }, {
+      "referenceID" : 0,
+      "context" : "where w′ = αwj + (1− α)w∗ for some α ∈ [0, 1].",
+      "startOffset" : 39,
+      "endOffset" : 45
+    }, {
+      "referenceID" : 3,
+      "context" : "These datasets are obtained from the LIBSVM Data website [4].",
+      "startOffset" : 57,
+      "endOffset" : 60
+    }, {
+      "referenceID" : 1,
+      "context" : "3 Stochastic Variational Inference Variational inference [2] and stochastic variational inference [10] are alternative efficient approaches to learning the LDA model.",
+      "startOffset" : 57,
+      "endOffset" : 60
+    }, {
+      "referenceID" : 9,
+      "context" : "3 Stochastic Variational Inference Variational inference [2] and stochastic variational inference [10] are alternative efficient approaches to learning the LDA model.",
+      "startOffset" : 98,
+      "endOffset" : 102
+    }, {
+      "referenceID" : 9,
+      "context" : "[10], we organize documents into mini-batches, so that SVI processes a mini-batch like processing a document.",
+      "startOffset" : 0,
+      "endOffset" : 4
+    }, {
+      "referenceID" : 9,
+      "context" : "[10] for evaluating the SVI algorithm.",
+      "startOffset" : 0,
+      "endOffset" : 4
+    }, {
+      "referenceID" : 19,
+      "context" : "In the context of SGD, the accumulation scheme resembles the HOGWILD! update scheme [21].",
+      "startOffset" : 84,
+      "endOffset" : 88
+    }, {
+      "referenceID" : 17,
+      "context" : "[19].",
+      "startOffset" : 0,
+      "endOffset" : 4
+    } ],
+    "year" : 2017,
+    "abstractText" : "Stochastic algorithms are efficient approaches to solving machine learning and optimization problems. In this paper, we propose a general framework called Splash for parallelizing stochastic algorithms on multi-node distributed systems. Splash consists of a programming interface and an execution engine. Using the programming interface, the user develops sequential stochastic algorithms without concerning any detail about distributed computing. The algorithm is then automatically parallelized by a communication-efficient execution engine. We provide theoretical justifications on the optimal rate of convergence for parallelizing stochastic gradient descent. The real-data experiments with stochastic gradient descent, collapsed Gibbs sampling, stochastic variational inference and stochastic collaborative filtering verify that Splash yields order-of-magnitude speedup over single-thread stochastic algorithms and over parallelized batch algorithms. Besides its efficiency, Splash provides a rich collection of interfaces for algorithm implementation. It is built on Apache Spark and is closely integrated with the Spark ecosystem.",
+    "creator" : "LaTeX with hyperref package"
+  }
+}

@@ -1,0 +1,266 @@
+{
+  "name" : "1709.02878.pdf",
+  "metadata" : {
+    "source" : "CRF",
+    "title" : "TensorFlow Agents: Efficient Batched Reinforcement Learning in TensorFlow",
+    "authors" : [ "Danijar Hafner", "James Davidson", "Vincent Vanhoucke" ],
+    "emails" : [ "mail@danijar.com,", "jcdavidson@google.com,", "vanhoucke@google.com" ],
+    "sections" : [ {
+      "heading" : "1 Introduction",
+      "text" : "We introduce a unified interface for reinforcement learning agents with accompanying infrastructure integrating with TensorFlow [1] that allows to efficiently develop new algorithms. Defining a standard algorithm interface for reinforcement learning allows us to reuse common infrastructure between all algorithms, and to change the algorithm as easily as the environment. We aim to accelerate future reinforcement learning research by releasing this project to the public.1\nThe most important goals of this project are to make it easy to implement new algorithms and to train them fast. Many reinforcement learning methods spend most of their time interacting with the environment, as compared to the time required to compute and apply gradient updates. There are two bottlenecks during the simulation of the algorithm and the environment: The forward pass of the neural network and progressing the environment. We address both limitations by\n∗Work done during an internship with Google Brain. 1https://github.com/tensorflow/agents\nar X\niv :1\n70 9.\n02 87\n8v 1\n[ cs\n.L G\n] 8\nS ep\nsimulating many environments in parallel, and by combining their observations for the algorithm to operate on batches of data.\nTo simulate multiple environments in parallel, we extend the OpenAI Gym interface [2] to batched environments that are stepped in parallel. We use separate processes for every environment, so that environments implemented in Python can run freely without being limited by the global interpreter lock. By integrating the batched environment into the TensorFlow graph, we can combine it with the reinforcement learning algorithm leaving just a single operation to call within the training loop.\nWe release the TensorFlow Agents project to the open source community together with BatchPPO, an optimized implementation of the recently introduced proximal policy gradient algorithm [10], a simple and powerful reinforcement learning baseline that showed impressive results in locomotion tasks [6]. We believe that releasing this project can speed up the progress of reinforcement learning research."
+    }, {
+      "heading" : "2 Related Work",
+      "text" : "We present a unified agent interface together with and efficient TensorFlow framework for parallel reinforcement learning and an implementation of the recently introduced proximal policy gradient algorithm [10].\nWith OpenAI Gym, Brockman et al. [2] introduced an standardized interface for environments that has since then gained wide adoption. We extend this work by providing an interface that allows to combine multiple Gym environments and step them together. Moreover, we introduce a common interface for learning algorithms implemented in TensorFlow. Our aim is that this will allow to make both environments and algorithms easily exchangeable part in a research project.\nDuan et al. [4] released the Rllab framework that implements several reinforcement learning algorithms and provides a common infrastructure for training and evaluation. Numerical computations are mainly implemented in Numpy and Theano. Our work also provides tools for training and evaluation, but is optimized for parallel simulation, resulting in significantly accelerated training.\nOpenAI Baselines [11] aims to provide high-quality implementations of reinforcement learning algorithms. Among other algorithms, it includes an implementation of PPO using TensorFlow for the neural network computation. This implementation relies on Python for most of the algorithm logic which is accelerated using Mpi4py [3]. TensorFlow Agents has a similar goal, but provides reusable infrastructure for future vectorized implementations of reinforcement learning algorithms.\nSchulman [9] provides an implementation of PPO written in Numpy and Keras. In addition to the gradient-based variant described in this paper, it includes a version of PPO that uses LBFGS for updating the neural networks. This project served as a reference for the algorithmic part of our BatchPPO implementation. We build upon this work by parallelizing the experience collection and providing TensorFlow infrastructure that is reusable for further research projects."
+    }, {
+      "heading" : "3 Background",
+      "text" : "In this section we summarize the background required to understand the proximal optimization optimization algorithm [10], of which we provide an efficient implementation that we call BatchPPO.\nWe consider the standard reinforcement learning setting defined as a Partially Observable Markov Decision Process POMDP = 〈S,Ω, A, P,R,O, γ, s0 〉 that defines a stochastic sequence of states st ∈ S, observations xt ∈ Ω, actions at ∈ A, and rewards rt ∈ R. Starting from the initial state s0, we draw observations xt ∼ O(st), actions at ∼ π(at|x1:t) from the policy, rewards rt ∼ R(rt|st, at) from the reward function, and the following state st+1 ∼ P (st+1|st, at) from the transition function. The objective is to find a policy π to maximize the expectation of the return V π(st) = Eπ [∑∞ i=0 γ irt+i ] .\nWe mainly consider the case where S and A are continuous. In this case, it is natural to parameterize the policy by a neural network and learn its weights to maximize the empirical objective Rt = ∑∞ i=0 γ\nirt+i at each time step. The objective for training the neural network is given by Williams [14] as:\nLPG(θ) = Eπθ [ lnπθ(at|x0:t)Rt ] . (1)\nWe can estimate the expectation by collecting multiple episodes from the environment. To use the collected episodes for multiple gradient steps, we need to correct for the changing action distribution of the updated policy πθ from the data collecting policy π′ using importance sampling:\nLIS(θ) = Eπ′ [ πθ(at|x0:t) π′(at|x0:t) Rt ] . (2)\nDue to stochasticity in the transition function, reward function, and our policy, we would need to collect many episodes for a sufficient estimate of this expectation. We can reduce the variance of our estimate without introducing bias by subtracting the state values V π ′ (st) = Eπ′ [ ∑∞ i=0 γ\nirt+i] from the returns Rt. This effectively removes the stochastic influences of the following time steps from the estimate:\nLV B(θ) = Eπ′ [ πθ(at|x0:t) π′(at|x0:t) ( Rt − V π ′ θ (st) )] . (3)\nFinally, we need to prevent updates from changing the action distribution too much at once. To accomplish this, PPO penalizes the KL change between the policy before the update π′, and the policy at the current update step πθ. The penalty weight β is adjusted based on the observed change in KL divergence after performing all updates on the collected batch of episodes. The final objective reads: LKL(θ) = Eπ′ [ πθ(at|x0:t) π′(at|x0:t) ( Rt − V π ′ (st) )] + β Eπ′ [ DKL ( π′(at|x0:t)||πθ(at|x0:t) )] .\n(4) In practice, we collect a small number of episodes, perform several updates of full-batch gradient descent on it, and then discard the collected data and repeat this process. Schulman et al. [10] also proposed an alternative objective that clips the importance sampling ratio, but we found the objective using the KL penalty to work very well in practice and did not explore this option."
+    }, {
+      "heading" : "4 Parallelism",
+      "text" : "In many cases, the bottleneck of reinforcement learning algorithms is collecting episodes from the environment. There are two time consuming computations in this process: The forward pass of the neural network and stepping the environments. Fortunately, we can parallelize both processes by using multiple environments at the same time. Previous implementations use asynchronous workers for this [8], but we can fully utilize the system with a simpler architecture while saving communication overhead. Our implementation is completely defined within the TensorFlow graph.\nFirst, we parallelize the forward pass of the neural network by vectorizing the agent computation to produce a batch of actions from a batch of observations. This is similar to Facebook’s ELF [12], where agents also process multiple observations at each step. Using a batch size during inference allows us to leverage the internal thread pool of the TensorFlow session, or hardware accelerators such as GPUs and TPUs.\nSecond, we simulate environments in parallel. Relying on the TensorFlow session is not sufficient for this purpose, since many environments are implemented in Python and are restricted by the Global Interpreter Lock (GIL). Instead, we spawn a separate process for each environment, so that all available CPU cores can step environments in parallel. Communication between the main process and the environment processes introduces a constant overhead, but this is alleviated by the ability to run many environments in parallel.\nWhile we parallelize the forward passes of the neural network and the environment stepping, we do not allow environments to step faster than others and get out of sync. This makes algorithm implementations conceptually simple yet efficient. When training on CPUs, this implementation fully utilizes the available resources. When using GPUs, the system switches between full load for the CPUs and the GPUs. This process could potentially be parallelized by introducing an action lag so that the environments can step together with the algorithm."
+    }, {
+      "heading" : "5 Implementation",
+      "text" : "We introduce an interface and infrastructure for algorithms for efficiently interacting with parallel environments. We first describe the algorithm interface, followed by the batched environment interface, and the simulation operation combining the two."
+    }, {
+      "heading" : "5.1 Algorithm",
+      "text" : "A TensorFlow Agents algorithm defines the inference and learning computation for of a batch of agents. It implements the following functions that define the computation graph of the algorithm:\n• begin_episodes(agent_indices) is called with a list of the agents that start a new episode at the current time step. The agents are represented as indices into the batch dimension.\n• perform(observation) defines the batched inference computation of the algorithm, and returns an actions as a tensor with batch dimension.\n• experience(observation, action, reward, done, next_obs) lets the algorithm process the batch of transition tuples after the environments have been stepped.\n• end_episodes(agent_indices) is called for each batch index that finished an episode at the current time step.\nThese operations additionally return string tensors containing TensorFlow summaries. Our infrastructure combines these summaries and writes them jointly. If these tensors are empty strings, no summaries will be written at the current step.\nWe provide the BatchPPO implementation defined in ppo.PPOAlgorithm(envs , step, is_training, should_log, config) as an example implementation of this interface. The constructor expects an in-graph batch environment, a tensor of the global step, a tensor flag indicating whether to compute summaries at the current time step, and a configuration object.\nThe neural networks used by BatchPPO are implemented as tf.contrib.rnn .RNNCell() classes, and are specified in the configuration object. Custom neural network structures can be defined by implementing the tf.contrib.rnn.RNNCell () interface, returning a tuple containing tensors for the action mean, log action standard deviation, and state value. We chose this interface as it integrates nicely into the existing TensorFlow ecosystem, while providing freedom in the model optimized by the algorithm. We provide example implementations for a feed forward policy and a recurrent policy."
+    }, {
+      "heading" : "5.2 Environments",
+      "text" : "To efficiently simulate environments in parallel, we provide the agents.tools. wrappers.ExternalProcess(constructor) environment wrapper. This wrapper constructs an OpenAI Gym environment inside of an external process. Calls to step () and reset(), as well as attribute accesses, are forwarded to the environment and wait for the result. This environment wrapper is compatible with all existing Python environments that comply to the OpenAI Gym interface [2], as long as they do not rely on shared global state.\nThe agents.tools.BatchEnv(envs, blocking) class extends the OpenAI Gym interface to vectorized environments. It combines multiple OpenAI Gym environments, with step() accepting a batch of actions and returning batches of observations, rewards, done flags, and info objects. If the individual environments live in external processes, they will be stepped in parallel. The observation and action spaces of the combined environments must all match and can be accessed without modification. In addition, the batch environment allows to access individual environments via index. Alternatively, custom environments can be implemented in vectorized format directly.\nWe integrate both the environment and algorithm into the TensorFlow graph. This allows us to prevent copying data and to perform simulation with a small number of TensorFlow session runs. The class agents.tools.InGraphBatchEnv( batch_env) integrates a batch environment into the TensorFlow graph and makes its step() and reset() functions accessible as operations. The current batch of observations, last actions, rewards, and done flags is stored in variables and made\navailable as tensors. All observations and rewards are converted to 32-bit data types, as these are expected by most neural network implementations."
+    }, {
+      "heading" : "5.3 Simulation",
+      "text" : "The TensorFlow operation tools.simulate(envs, algo, log, reset) fuses together an in-graph batch environment and an algorithm. The optional log and reset tensors indicate whether the algorithm should compute TensorFlow summaries at the current step, and whether all environments should be reset so that all agent indices start new episodes. This is used when the training protocol switches between training and evaluation phases to discontinue the ongoing episodes. This operation provides a way to run a single TensorFlow session call inside the training loop, so that the training loop resembles the case of supervised learning."
+    }, {
+      "heading" : "6 Experiments",
+      "text" : "To demonstrate the performance of our infrastructure and implementation, we train the BatchPPO algorithm on control tasks in the MuJoCo [13] domain. Our agent uses two neural networks, one to compute a mean action from the current observation, and one to provide an estimate of the state value. We also experimented with recurrent neural networks but generally observed slower learning and similar final performance.\nThe log standard deviation of the action elements is learned as an independent parameter vector. The actions are then sampled from Gaussian distribution that is parameterized by the predicted mean, and the log standard deviation used to define the diagonal elements of the covariance matrix. The elements that constitute an action vector are therefore independent. During evaluation, we use the policy’s mean action, rather than sampling from the distribution.\nWe used the same hyper parameter configuration for the considered tasks. Specifically, we collect batches of 25 episodes before each update, and perform 25 gradient steps each for the policy and value networks using Adam optimizers [7] with fixed learning rates of 10−4 and 10−3 respectively. Both networks use two layers of 200\nand 100 units with ReLU non-linearities [5]. We apply tanh to the action mean to fix its range. Following Schulman et al. [10] and Heess et al. [6], we use streaming statistics of the observations and rewards to normalize them. We further adopt their additional cut-off penalty that we enable when overshooting the desired change in KL divergence by a factor of 2.\nThe results of our BatchPPO implementation are shown in Figures 1 and 2 by environment steps and hours of training time using 6 CPU cores, respectively. The blue line shows evaluation performance when acting using the mean action, while the red line shows the training performance when sampling from the policy’s action distribution. Shaded areas indicate the 25 th to 75 th percentile over three seeds. We observe reliably high performance that is on par or better than published results from existing PPO implementations [10, 6]."
+    }, {
+      "heading" : "7 Discussion",
+      "text" : "We introduced an infrastructure paradigm and implementation using TensorFlow for parallel reinforcement learning algorithms, including BatchPPO, an efficient implementation of the proximal policy optimization algorithm. We lay out our reasoning for the design choices that result in a simple and extendable yet performant implementation. We hope that providing our infrastructure to the public can accelerate further research in reinforcement learning, and provides a powerful framework for new algorithm implementations. In the future, custom environments could be implemented in a vectorized way, possibly within TensorFlow, to leverage parallel hardware without introducing inter-process communication overhead."
+    }, {
+      "heading" : "8 Acknowledgements",
+      "text" : "We thank Nicolas Heess and Josh Merel from DeepMind for insightful discussions. Furthermore, we thank the TensorFlow team and community for developing TensorFlow and thus making this project possible."
+    } ],
+    "references" : [ {
+      "title" : "et al",
+      "author" : [ "M. Abadi", "A. Agarwal", "P. Barham", "E. Brevdo", "Z. Chen", "C. Citro", "G.S. Corrado", "A. Davis", "J. Dean", "M. Devin" ],
+      "venue" : "Tensorflow: Large-scale machine learning on heterogeneous distributed systems. arXiv preprint arXiv:1603.04467",
+      "citeRegEx" : "1",
+      "shortCiteRegEx" : null,
+      "year" : 2016
+    }, {
+      "title" : "and W",
+      "author" : [ "G. Brockman", "V. Cheung", "L. Pettersson", "J. Schneider", "J. Schulman", "J. Tang" ],
+      "venue" : "Zaremba. Openai gym",
+      "citeRegEx" : "2",
+      "shortCiteRegEx" : null,
+      "year" : 2016
+    }, {
+      "title" : "Mpi for python: Python bindings for mpi",
+      "author" : [ "L. Dalcin" ],
+      "venue" : "https://github.com/ mpi4py/mpi4py",
+      "citeRegEx" : "3",
+      "shortCiteRegEx" : null,
+      "year" : 2017
+    }, {
+      "title" : "Benchmarking deep reinforcement learning for continuous control",
+      "author" : [ "Y. Duan", "X. Chen", "R. Houthooft", "J. Schulman", "P. Abbeel" ],
+      "venue" : "International Conference on Machine Learning, pages 1329–1338",
+      "citeRegEx" : "4",
+      "shortCiteRegEx" : null,
+      "year" : 2016
+    }, {
+      "title" : "Digital selection and analogue amplification coexist in a cortex-inspired silicon circuit",
+      "author" : [ "R.H. Hahnloser", "R. Sarpeshkar", "M.A. Mahowald", "R.J. Douglas", "H.S. Seung" ],
+      "venue" : "Nature, 405(6789):947",
+      "citeRegEx" : "5",
+      "shortCiteRegEx" : null,
+      "year" : 2000
+    }, {
+      "title" : "et al",
+      "author" : [ "N. Heess", "S. Sriram", "J. Lemmon", "J. Merel", "G. Wayne", "Y. Tassa", "T. Erez", "Z. Wang", "A. Eslami", "M. Riedmiller" ],
+      "venue" : "Emergence of locomotion behaviours in rich environments. arXiv preprint arXiv:1707.02286",
+      "citeRegEx" : "6",
+      "shortCiteRegEx" : null,
+      "year" : 2017
+    }, {
+      "title" : "Adam: A method for stochastic optimization",
+      "author" : [ "D. Kingma", "J. Ba" ],
+      "venue" : "arXiv preprint arXiv:1412.6980",
+      "citeRegEx" : "7",
+      "shortCiteRegEx" : null,
+      "year" : 2014
+    }, {
+      "title" : "Asynchronous methods for deep reinforcement learning",
+      "author" : [ "V. Mnih", "A.P. Badia", "M. Mirza", "A. Graves", "T. Lillicrap", "T. Harley", "D. Silver", "K. Kavukcuoglu" ],
+      "venue" : "International Conference on Machine Learning, pages 1928–1937",
+      "citeRegEx" : "8",
+      "shortCiteRegEx" : null,
+      "year" : 2016
+    }, {
+      "title" : "Modular rl: Implementation of trpo and related algorithms",
+      "author" : [ "J. Schulman" ],
+      "venue" : "https://github.com/joshu/modular_rl",
+      "citeRegEx" : "9",
+      "shortCiteRegEx" : null,
+      "year" : 2017
+    }, {
+      "title" : "Proximal policy optimization algorithms",
+      "author" : [ "J. Schulman", "F. Wolski", "P. Dhariwal", "A. Radford", "O. Klimov" ],
+      "venue" : "arXiv preprint arXiv:1707.06347",
+      "citeRegEx" : "10",
+      "shortCiteRegEx" : null,
+      "year" : 2017
+    }, {
+      "title" : "and contributors",
+      "author" : [ "S. Sidor", "J. Schulman", "M. Plappert" ],
+      "venue" : "Openai baselines: High-quality implementations of reinforcement learning algorithms. https: //github.com/openai/baselines",
+      "citeRegEx" : "11",
+      "shortCiteRegEx" : null,
+      "year" : 2017
+    }, {
+      "title" : "Elf: An extensive",
+      "author" : [ "Y. Tian", "Q. Gong", "W. Shang", "Y. Wu", "L. Zitnick" ],
+      "venue" : "lightweight and flexible research platform for real-time strategy games. arXiv preprint arXiv:1707.01067",
+      "citeRegEx" : "12",
+      "shortCiteRegEx" : null,
+      "year" : 2017
+    }, {
+      "title" : "Mujoco: A physics engine for modelbased control",
+      "author" : [ "E. Todorov", "T. Erez", "Y. Tassa" ],
+      "venue" : "Intelligent Robots and Systems (IROS), 2012 IEEE/RSJ International Conference on, pages 5026–5033. IEEE",
+      "citeRegEx" : "13",
+      "shortCiteRegEx" : null,
+      "year" : 2012
+    }, {
+      "title" : "Simple statistical gradient-following algorithms for connectionist reinforcement learning",
+      "author" : [ "R.J. Williams" ],
+      "venue" : "Machine learning, 8(3-4):229–256",
+      "citeRegEx" : "14",
+      "shortCiteRegEx" : null,
+      "year" : 1992
+    } ],
+    "referenceMentions" : [ {
+      "referenceID" : 0,
+      "context" : "We introduce a unified interface for reinforcement learning agents with accompanying infrastructure integrating with TensorFlow [1] that allows to efficiently develop new algorithms.",
+      "startOffset" : 128,
+      "endOffset" : 131
+    }, {
+      "referenceID" : 1,
+      "context" : "To simulate multiple environments in parallel, we extend the OpenAI Gym interface [2] to batched environments that are stepped in parallel.",
+      "startOffset" : 82,
+      "endOffset" : 85
+    }, {
+      "referenceID" : 9,
+      "context" : "We release the TensorFlow Agents project to the open source community together with BatchPPO, an optimized implementation of the recently introduced proximal policy gradient algorithm [10], a simple and powerful reinforcement learning baseline that showed impressive results in locomotion tasks [6].",
+      "startOffset" : 184,
+      "endOffset" : 188
+    }, {
+      "referenceID" : 5,
+      "context" : "We release the TensorFlow Agents project to the open source community together with BatchPPO, an optimized implementation of the recently introduced proximal policy gradient algorithm [10], a simple and powerful reinforcement learning baseline that showed impressive results in locomotion tasks [6].",
+      "startOffset" : 295,
+      "endOffset" : 298
+    }, {
+      "referenceID" : 9,
+      "context" : "We present a unified agent interface together with and efficient TensorFlow framework for parallel reinforcement learning and an implementation of the recently introduced proximal policy gradient algorithm [10].",
+      "startOffset" : 206,
+      "endOffset" : 210
+    }, {
+      "referenceID" : 1,
+      "context" : "[2] introduced an standardized interface for environments that has since then gained wide adoption.",
+      "startOffset" : 0,
+      "endOffset" : 3
+    }, {
+      "referenceID" : 3,
+      "context" : "[4] released the Rllab framework that implements several reinforcement learning algorithms and provides a common infrastructure for training and evaluation.",
+      "startOffset" : 0,
+      "endOffset" : 3
+    }, {
+      "referenceID" : 10,
+      "context" : "OpenAI Baselines [11] aims to provide high-quality implementations of reinforcement learning algorithms.",
+      "startOffset" : 17,
+      "endOffset" : 21
+    }, {
+      "referenceID" : 2,
+      "context" : "This implementation relies on Python for most of the algorithm logic which is accelerated using Mpi4py [3].",
+      "startOffset" : 103,
+      "endOffset" : 106
+    }, {
+      "referenceID" : 8,
+      "context" : "Schulman [9] provides an implementation of PPO written in Numpy and Keras.",
+      "startOffset" : 9,
+      "endOffset" : 12
+    }, {
+      "referenceID" : 9,
+      "context" : "In this section we summarize the background required to understand the proximal optimization optimization algorithm [10], of which we provide an efficient implementation that we call BatchPPO.",
+      "startOffset" : 116,
+      "endOffset" : 120
+    }, {
+      "referenceID" : 13,
+      "context" : "The objective for training the neural network is given by Williams [14] as:",
+      "startOffset" : 67,
+      "endOffset" : 71
+    }, {
+      "referenceID" : 9,
+      "context" : "[10] also proposed an alternative objective that clips the importance sampling ratio, but we found the objective using the KL penalty to work very well in practice and did not explore this option.",
+      "startOffset" : 0,
+      "endOffset" : 4
+    }, {
+      "referenceID" : 7,
+      "context" : "Previous implementations use asynchronous workers for this [8], but we can fully utilize the system with a simpler architecture while saving communication overhead.",
+      "startOffset" : 59,
+      "endOffset" : 62
+    }, {
+      "referenceID" : 11,
+      "context" : "This is similar to Facebook’s ELF [12], where agents also process multiple observations at each step.",
+      "startOffset" : 34,
+      "endOffset" : 38
+    }, {
+      "referenceID" : 1,
+      "context" : "This environment wrapper is compatible with all existing Python environments that comply to the OpenAI Gym interface [2], as long as they do not rely on shared global state.",
+      "startOffset" : 117,
+      "endOffset" : 120
+    }, {
+      "referenceID" : 9,
+      "context" : "Our results are on par or better than published results using the PPO algorithm [10].",
+      "startOffset" : 80,
+      "endOffset" : 84
+    }, {
+      "referenceID" : 12,
+      "context" : "To demonstrate the performance of our infrastructure and implementation, we train the BatchPPO algorithm on control tasks in the MuJoCo [13] domain.",
+      "startOffset" : 136,
+      "endOffset" : 140
+    }, {
+      "referenceID" : 6,
+      "context" : "Specifically, we collect batches of 25 episodes before each update, and perform 25 gradient steps each for the policy and value networks using Adam optimizers [7] with fixed learning rates of 10−4 and 10−3 respectively.",
+      "startOffset" : 159,
+      "endOffset" : 162
+    }, {
+      "referenceID" : 4,
+      "context" : "and 100 units with ReLU non-linearities [5].",
+      "startOffset" : 40,
+      "endOffset" : 43
+    }, {
+      "referenceID" : 9,
+      "context" : "[10] and Heess et al.",
+      "startOffset" : 0,
+      "endOffset" : 4
+    }, {
+      "referenceID" : 5,
+      "context" : "[6], we use streaming statistics of the observations and rewards to normalize them.",
+      "startOffset" : 0,
+      "endOffset" : 3
+    }, {
+      "referenceID" : 9,
+      "context" : "We observe reliably high performance that is on par or better than published results from existing PPO implementations [10, 6].",
+      "startOffset" : 119,
+      "endOffset" : 126
+    }, {
+      "referenceID" : 5,
+      "context" : "We observe reliably high performance that is on par or better than published results from existing PPO implementations [10, 6].",
+      "startOffset" : 119,
+      "endOffset" : 126
+    } ],
+    "year" : 2017,
+    "abstractText" : "We introduce TensorFlow Agents, an efficient infrastructure paradigm for building parallel reinforcement learning algorithms in TensorFlow. We simulate multiple environments in parallel, and group them to perform the neural network computation on a batch rather than individual observations. This allows the TensorFlow execution engine to parallelize computation, without the need for manual synchronization. Environments are stepped in separate Python processes to progress them in parallel without interference of the global interpreter lock. As part of this project, we introduce BatchPPO, an efficient implementation of the proximal policy optimization algorithm. By open sourcing TensorFlow Agents, we hope to provide a flexible starting point for future projects that accelerates future research in the field.",
+    "creator" : "LaTeX with hyperref package"
+  }
+}

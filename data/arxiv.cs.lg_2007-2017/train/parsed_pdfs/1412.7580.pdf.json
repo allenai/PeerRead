@@ -1,0 +1,304 @@
+{
+  "name" : "1412.7580.pdf",
+  "metadata" : {
+    "source" : "CRF",
+    "title" : "FAST CONVOLUTIONAL NETS WITH fbfft : A GPU PERFORMANCE EVALUATION",
+    "authors" : [ "Nicolas Vasilache", "Jeff Johnson", "Michael Mathieu" ],
+    "emails" : [ "ntv@fb.com", "jhj@fb.com", "myrhev@fb.com", "soumith@fb.com", "spiantino@fb.com", "yann@fb.com" ],
+    "sections" : [ {
+      "heading" : null,
+      "text" : "ar X\niv :1\n41 2.\n75 80\nv1 [\ncs .L\nG ]\n2 4\nD ec\n2 01\nWe examine the performance profile of Convolutional Neural Network (CNN) training on the current generation of NVIDIA Graphics Processing Units (GPUs). We introduce two new Fast Fourier Transform convolution implementations: one based on NVIDIA’s cuFFT library, and another based on a Facebook authored FFT implementation,fbfft, that provides significant speedups over cuFFT (over 1.5×) for whole CNNs. Both of these convolution implementations are available in open source, and are faster than NVIDIA’s cuDNN implementation for many common convolutional layers (up to 23.5× for a synthetic kernel configuration). We discuss different performance regimes of convolutions, comparing areas where straightforward time domain convolutions outperform Fourier frequency domain convolutions. Details on algorithmic applications of NVIDIA GPU hardware specifics in the implementation of fbfft are also provided."
+    }, {
+      "heading" : "1 INTRODUCTION",
+      "text" : "Deep convolutional neural networks (CNNs) have emerged as one of the most promising techniques to tackle large scale learning problems, whether in image and face recognition, audio and speech processing or natural language understanding. A convolutional layer within these networks provides useful properties such as translation equivariance of activations. A limiting factor for use of convolutional nets on large data sets was, until recently, their computational expense.\nKrizhevsky et al. (2012) demonstrated that training of large CNNs with millions of weights and massive data sets is tractable when graphics processing units (GPUs) are properly put to use. Since then, renewed interest in CNNs insufflated a fresh breath in various frameworks and implementations, including Torch (Collobert et al. (2011a)), Theano (Bergstra et al. (2010)), cuda-convnet (Krizhevsky (2014)) and Caffe (Jia et al. (2014)). Many of these frameworks are based around codes for NVIDIA GPUs using CUDA (Garland et al. (2008)).\nWe discuss our contributions to convolution performance on these GPUs, namely using Fast Fourier Transform (FFT) implementations within the Torch framework. We summarize the theory behind training convolutional layers both in the time and frequency domain in Section 2. We then detail our implementations. The first is based on NVIDIA’s cuFFT and cuBLAS libraries (Section 3). We evaluate our relative performance to NVIDIA’s cuDNN library (Chetlur et al. (2014)) on over 8, 000 different configurations (Section 4). We significantly outperform cuDNN and other time domain convolution implementations for a wide range of problem sizes.\nOur second implementation is motivated by limitations in using a black box library such as cuFFT in our application domain, which we describe. In reaction, we implemented a from-scratch opensource implementation of batched 1-D FFT and batched 2-D FFT, called Facebook FFT (fbfft), which achieves over 1.5× speedup over cuFFT for the sizes of interest in our application domain. This implementation achieves GPU efficiency ratios of over 75% in certain cases. We describe an ongoing effort to further improve the performance of our solution based on algorithmic tiling (Section 6) before we conclude. Our implementation is released as part of the fbcuda and fbcunn opensource libraries at http://github.com/facebook."
+    }, {
+      "heading" : "2 CONVOLUTION",
+      "text" : "Discrete convolution and cross-correlation are used in CNNs. We quickly summarize these and their implementation, with a formulation mirroring Mathieu et al. (2013). Forward propagation (fprop) inputs are a set f of input feature planes xi, i ∈ f . These are cross-correlated1 with f ′ × f different filter kernel weights w(j,i), j ∈ f ′, i ∈ f , producing output feature planes yj, j ∈ f ′. Each input and output feature can be part of a minibatch S, so we have x(s,i) and y(s,j), i ∈ f, j ∈ f ′, s ∈ S:\ny(s,j) = ∑\ni∈f\nx(s,i) ⋆ w(j,i)\nThe feature planes f are reduced (summed) pointwise. For back-propagation (bprop), the gradient of the loss with respect to outputs are convolved with the kernels:\n∂L\n∂x(s,i) =\n∑\nj∈f ′\n∂L\n∂y(s,j) ∗ w(j,i)\nReduction is over f ′ here. Finally, the kernel weights are updated using the gradient of the loss with respect to the weights (accGrad):\n∂L\n∂w(j,i) =\n∑\ns∈S\n∂L\n∂y(s,j) ⋆ x(s,i)\nReduction is over S here. For purposes of this paper, we use set symbols interchangeably to refer to their size: each input plane is a 2-D matrix of size h × w, and each filter kernel is a 2-D matrix of size kh × kw2. The output planes y(s,i) are of size (h − kh + 1) × (w − kw + 1), and implement valid-only convolution, as per MATLAB terminology. Input zero padding and input mirror padding around the margins of the input (ph, pw) can be optionally added.3\nA popular convolution implementation is to unroll the data until the computation is in the form of a large matrix multiplication (Chellapilla et al. (2006)). This is the strategy followed by many implementors, since matrix multiplication is a well-tuned linear algebra primitive available on virtually any platform. While it is possible to provide instances of direct calculation that are faster than matrix unrolling (e.g., for large S, Krizhevsky (2014)), it is challenging to provide an implementation that is faster for more than just a small subset of possible convolution problems.\nIntroducing strides in this form of convolution (i.e., performing the convolution at every dh, dw-th offset) is a popular way to reduce the computational cost at the expense of precision. The memory accesses required are very similar but with fewer reuse opportunities. On the other hand, by the convolution theorem, a convolution of two discrete signals can be performed with lower asymptotic complexity by performing the multiplication in the frequency domain. Applied to the forward pass, it becomes:\ny(s,j) = ∑\ni∈f\nx(s,i) ⋆ w(j,i) = ∑\ni∈f\nF−1 ( F(x(s,i)) ◦ F(w(j,i)) ∗ )\nwhere ∗ denotes complex conjugation and ◦ is the pointwise product. The discrete Fourier basis used is the largest of the two components convolved and the output.4 Linearity of the DFT allows one to perform the sum above in the Fourier domain if desired. Applying the FFT then yields a O(Sff ′n2 + (Sf + ff ′ + Sf ′)n2 logn) procedure in lieu of the original O(Sff ′n2k2), n = h = w, k = kh = kw. Similar transformations apply for the other two passes. We call this a frequency domain convolution, in contrast to time domain convolution via direct computation.\n1Torch practice is that the forward pass is cross-correlation, hence the ⋆. 22-D can be extended to n-D, n ≥ 1. 3Input size (h+ ph)× (w + pw), output size (h+ ph − kh + 1) × (w + pw − kw + 1). 4(h×w)-dimensional or even bigger for performance (Section 3.2).\nStrided convolutions via FFT are impractical to implement, but the reduced computational cost of the FFT alleviates their need, since convolution in the frequency domain is asymptotically independent of kernel size. We do not consider those in this paper."
+    }, {
+      "heading" : "3 CUFFT CONVOLUTION IMPLEMENTATION",
+      "text" : "In this section we discuss implementation strategies using the NVIDIA cuFFT libraries and their efficiency."
+    }, {
+      "heading" : "3.1 FFT CONVOLUTION DETAILS",
+      "text" : "We described the general formulation for the three types of convolutions in section 2. Here, we borrow the Torch naming convention: input for x(s,i); weight forw(j,i); output for y(s,j); gradOutput for ∂L/∂y(s,j); gradInput for ∂L/∂x(s,i); and gradWeight for ∂L/∂w(j,i). All are stored as singleprecision floating point 4-D tensors in row-major layout, and are stored in memory using the socalled BDHW format. This is explicit in the expression InS×f×h×w, with input image row data as the innermost or most varying dimension.\nTable 1 describes the in-order operations for FFT computation of the forward pass, using the FFT 2D and IFFT 2D operators and Cgemm matrix multiplication. Similar implementations follow for the other two passes. The G prefix denotes gradients. The F suffix denotes C-valued frequency domain tensors; the rest are over R. The T suffix denotes transposed tensors.\nExact tensor dimensions are also given above. By taking advantage of the Hermitian symmetry property of the 2-D DFT for R-valued inputs we only store about half the complex entries; the remaining can be obtained by complex conjugation. This results in array sizes such as ⌊w+pw2 ⌋+ 1. We also perform interpolation by zero-padding, which serves multiple purposes. First, it is necessary to handle boundary conditions.5 Second, it is required to interpolate all operands over the same Fourier basis.6 Finally, padding has an impact on the FFT algorithm used in practice, as well as on the floating point operation count of non-FFT operations (Section 3.2).\nFollowing the conversion into frequency domain, we perform transpositions to prepare the tensors for Cgemm matrix multiplication library calls. The transposition converts the BDHW layout into HWBD. The transposition is currently out-of-place and implemented using the Cgeam routine; we are also considering our own, in-place transposition routine. Cgemm library calls are performed on transposed tensors in the frequency domain. Casting the operation as a Cgemm call allows us to benefit from the heavily tuned cuBLAS routine. Eventually, we transpose the result back into the BDHW format and perform a 2-D inverse FFT. At this point, the resulting real tensor, always\n5In this case, we typically have ph = ⌊ kh 2 ⌋ and pw = ⌊ kw 2 ⌋. 6All tensors are zero-padded to (h+ ph)× (w + pw) before FFT2D.\n(h+ ph)× (w+ pw), is clipped to the appropriate final size: (h− kh+1)× (w− kw+1) for fprop, h× w for bprop, kh × kw for accGrad."
+    }, {
+      "heading" : "3.2 CUFFT DESIGN SPACE",
+      "text" : "We now discuss implementation aspects we explored. Multiple factors influence the computational efficiency of FFTs: transform size n, n’s prime factor decomposition, and whether batched or iterated single transforms are applied. In the deep learning domain, it is commonplace to deal with small sizes, n 6= 2k. If n has undesirable properties, efficiency can drop by an order of magnitude.7\ncuFFT implements FFTs with the ubiquitous Cooley-Tukey algorithm (Cooley & Tukey (1965)) which takes advantage of trigonometric equalities to recursively decompose and reuse computations. This is further discussed in the Supplement. Decomposition is built on specialized kernels of fixed sizes which correspond to the prime factor decomposition of n. cuFFT implements specialized building blocks for radix sizes 2, 3, 5, 7, and for sizes n where 4|n, it can use more efficient kernels exploiting the conjugate symmetry property. When n does not admit a prime factor decomposition using those radices only, the expensive Bluestein algorithm is used (Bluestein (1970)). Because our results are used in the time domain, we can in fact zero-pad the image and kernel to perform the FFT at any larger size that may be handled more efficiently. Exploiting more efficient, larger sizes should be balanced against the extra cost introduced in the subsequent transposition and matrix multiplication steps. Table 4’s last case is one in which the best tradeoff is not easily guessed. cuFFT also has batched mode optimizations when multiple FFTs of the same size are being performed."
+    }, {
+      "heading" : "3.3 CUBLAS DESIGN SPACE",
+      "text" : "The cuBLAS library also comes with different implementations for batched and single operation modes. We had the choice between 3 implementation options:\n• for larger batches over small matrices, the cublasCgemmBatched library call;\n• for smaller batches over larger matrices, multiple cublasCgemm calls from the host;\n• for intermediate batch and matrix sizes, devices of compute capability 3.5 and higher support dynamic parallelism which allows CUDA kernels to launch other kernels. This can be beneficial for many launches over small matrices.\nNote that the discussion above applies to multiplications after transposition. So the matrix size is either S×f , S×f ′ or f ×f ′ and the number of such matrices is h×w. Vendor libraries are usually optimized for throughput and not latency, so we expect it to be more efficient for larger sizes along critical dimensions (i.e., image size for the batch case and S × f , S × f ′ or f × f ′ for the multiple kernel case). Due to build system limitations we were not able to experiment with the dynamic parallelism strategy; we leave this for future work.\nAt the system level, we use CUDA streams and buffering of all CUDA resources and intermediate buffers to remove synchronization points across convolutions. We are mindful of memory consumption; to address this we keep one single buffered copy of each type of tensor involved. This behavior is tailored for a bulk synchronous execution of layers on a GPU and is not adapted for multiple asynchronous convolutions on the same GPU. The buffers are automatically expanded as required and reused as much as possible."
+    }, {
+      "heading" : "3.4 AUTOTUNING",
+      "text" : "We combine the above implementation with a simple autotuning strategy. We devise a strategy selection mechanism that runs once for each problem size and caches the fastest strategy out of a few dozen for later reuse. The autotuning strategy explores different possible Fourier basis sizes that can be decomposed in powers for which cuFFT has an efficient implementation. In other words, for an FFT dimension of size n, we explore the sizes i ∈ [n, 2⌊log2 n⌋] where i = 2\na3b5c7d. When the input size is a power of 2, the search space is reduced to a single point. In addition to Fourier basis sizes, we weigh in various cuBLAS calls and asynchronous modes.\n7http://docs.nvidia.com/cuda/cufft/index.html#accuracy-and-performance"
+    }, {
+      "heading" : "4 CUFFT CONVOLUTION PERFORMANCE",
+      "text" : ""
+    }, {
+      "heading" : "4.1 PERFORMANCE VERSUS CUDNN: 8,232 CONFIGURATIONS",
+      "text" : "We compare our cuFFT convolution results against NVIDIA’s cuDNN 1.0 library (Chetlur et al. (2014)), which contains one of the fastest, general purpose convolution methods for the GPU, using matrix unrolling. It has decent performance for many problem sizes thanks to heavy autotuning of cuBLAS codes for different problems. It is a strong baseline for this reason.\nImage CNNs to date have for the most part used square input images and filters, though rectangular filters are valid for other problems (notably text CNNs, Collobert et al. (2011b)). Thus, we restrict ourselves to a 5-D problem domain {S, f, f ′, n(= h = w), k(= kh = kw)}. Much of this space is not used in practice. Some areas are perhaps over-emphasized (large S, small k) due to current engineering concerns. We evaluate cuDNN vs cuFFT-based convolution for Table 2’s 8, 232 configurations.8\nTable 2: Configuration elements evaluated\nDIMENSION SIZES EVALUATED\nMinibatch size (S) 1, 16, 64, 128 Input filters (f ) 1, 4, 16, 64, 96, 128, 256 Output filters (f ′) 1, 4, 16, 64, 96, 128, 256 Kernel h/w (k = kh = kw) 3, 5, 7, 9, 11, 13 Output h/w (y = h− kh + 1 = w − kw + 1) 1, 2, 4, 8, 16, 32, 64\nFigures 1-6 are performance summaries of cuFFT convolution versus cuDNN on a NVIDIA Tesla K40m, averaged across all three passes. The y-axis problem size corresponds to the minibatch size multiplied by number of input and output planes (Sff ′); each one of these is a pass reduction dimension. Many possible combinations of S, f, f ′ may map to the same problem size. cuDNN performance varies to a greater degree than cuFFT across passes. This is due to the asymmetry of convolution sizes in each pass, and the fact that a larger convolution kernel (as seen with gradient accumulation) is essentially free in the Fourier domain. Averaging the three passes together provides a proxy for overall performance. The x-axis corresponds to output height/width. For deeper layers in image CNNs, output size will decrease while f, f ′ will increase, so depth corresponds to moving from the upper right to the lower left of the graph. Black areas in the chart are due to failed cuFFT runs, due to memory pressure or undetermined potential cuFFT 6.5 issues.\nFFT convolutions make large kernel sizes inexpensive, which make the performance of all three passes roughly equal (Table 4). On the other hand, zero-padding kh×kw to h×w penalizes smaller kernels compared to cuDNN. For 3 × 3 kernels (Figure 1), cuFFT performance is poor compared to cuDNN. The overhead of multiple kernel launches, streaming memory in and out multiple times, and zero-padding to the input size often outweigh the algorithmic advantage of FFT. However, for the largest problem sizes, 3×3 convolution via FFT can still be advantageous, with top speed 1.84× faster than cuDNN. 5×5 kernels (Figure 2) show an increasing dominance of the FFT strategy, with top speed 5.33× faster. The tendency is confirmed for larger kernel sizes: at 13 × 13, maximum speedup is 23.54× over cuDNN.\n8Parameterized on output rather than input size h, w because the implied h = y+ kh − 1, w = y+ kw − 1 will be valid for any choice of kh, kw.\n1 2 4 8 16 3 2\noutput size\n1/16x 16x\nspeedup\nFigure 1: 3× 3 kernel (K40m)\n1 2 4 8 16 3 2\n6 4\n8388608 4194304 3145728 2097152 1572864 1179648 1048576 786432 589824 524288 393216 262144 196608 147456 131072 98304 65536 49152 32768 12288 4096 512 96 1\noutput size\np ro\nb le\nm s\niz e\nFigure 3: 7× 7 kernel (K40m)\n1 2 4 8 16 3 2\n6 4\n8388608 4194304 3145728 2097152 1572864 1179648 1048576 786432 589824 524288 393216 262144 196608 147456 131072 98304 65536 49152 32768 12288 4096 512 96 1\noutput size p\nro b\nle m\ns iz\ne\nFigure 4: 9× 9 kernel (K40m)\n1 2 4 8 16 3 2\n6 4\noutput size"
+    }, {
+      "heading" : "4.2 CNN PERFORMANCE",
+      "text" : "In table 3, we show performance for real CNNs, AlexNet (Krizhevsky et al. (2012)) and OverFeat fast (Sermanet et al. (2014)), comparing against cuDNN and cuda-convnet2 (ccn2) kernels in Torch. The first layer uses cuDNN for the cuFFT runs because it is strided, but all other layers use cuFFT. The timings include all convolutional layers of the network.\n5 fbfft IMPLEMENTATION\nThis section presumes familiarity with GPU architecture. Refer to the Supplement for details.\nWhen designing high-performance libraries, multiple objectives must be balanced against each other: memory latency/bandwidth tradeoffs, maximizing locality without sacrificing too much parallelism, good instruction mix, register usage and mapping strategy of computation and data to memories and compute elements. A key principle is to design a set of leaf kernels with well-tuned in-register performance and reduce the larger problem to a combination of these kernels by data and loop tiling (Irigoin & Triolet (1988)) and recursive decompositions (Gunnels et al. (2001)). Since vendors have to sustain high performance for a large class of application domains, there exist parameter configurations for which a carefully tuned approach significantly outperforms vendor-tuned libraries (Shin et al. (2010)). For common deep learning use, convolutional layers consist of many batched small 2-D convolutions. These are tiny relative to DSP and HPC standards and put us in a regime where (a) we fall outside of the highly tuned regime, (b) feature dimensions are often smaller than GPU warp sizes and can often fit exclusively in registers rather than in shared memory (SMEM), and (c) we are very sensitive to latencies. We determined that it is possible to obtain better efficiency than the existing batched cuFFT mode for CNNs."
+    }, {
+      "heading" : "5.1 LIMITATIONS OF CUFFT",
+      "text" : "Because the cuFFT library is a black box, zero-padding9 has to be explicitly embedded in the input and output arrays. The consequence is that one may need to allocate a duplicate, larger memory\n9This is different from the FFTW compatibility padding mode for in-place transforms.\nregion (only once) and copy data from non-padded tensors to padded tensors. This memory consumption and spurious copies affect latency significantly. Instead, we devised an implementation for batched 1-D FFT and 2-D FFT of sizes 2-256 and reaches up to 78% efficiency at 97.5% occupancy. We also implemented an IFFT kernel based on our FFT kernel.\nIn our implementation we use clipping to conditionally load a value if reading within bounds or a constant (0) otherwise. This is an approach used in automatic code generation tools such as Halide (Ragan-Kelley et al. (2013)) and relies on aggressive if-conversion properties of the CUDA compiler. It allows for more efficient control flow rather than using explicit loop prologues and epilogues. This mechanism does not require any additional memory allocation and is zero-copy; this is particularly desirable in the latency sensitive mode.\nAdditionally, since cuFFT and cuBLAS are closed source, it is impossible to take advantage of algorithmic simplifications that may be available. For instance, in the forward pass of our computation as shown in Table 1, the result of the first cuFFT call is of the form S×f×(h+ph)×(⌊(w+pw)/2⌋+1). With fbfft we return it in the form S × f × (⌊(w+ pw)/2⌋+1)× (h+ ph) where the two innermost data dimensions are transposed. This allows us to remove a full data transposition from each of the FFT kernels. Another domain-specific optimization we have yet to explore is eliminating bit reversal portions of the FFT and IFFT. This can be done by performing the FFT with decimation in frequency (DIF) and the IFFT with decimation in time (DIT), discussed in the Supplement.\n5.2 WARP-LEVEL 1-D FFT AND 2-D FFT FOR SIZE n ≤ 32\nFor batched FFT of power of two sizes we view a single warp as a small distributed system with lockstep collective communication capabilities and we program it in a bulk-synchronous fashion (Valiant (1990)). We implement DIF and enforce the following invariants for the log2 n steps:\n• each warp thread originally loads one real element of the input vector and locally computes one complex twiddle factor (i.e. a root of unity);\n• at each step, all warp threads exchange data with another thread in the warp in parallel and produce a new value;\n• then, all warp threads exchange twiddle factors with another thread in the warp in parallel, and produce a new value.\nThe two bulk-synchronous exchanges can be written each with one warp-wide instruction. After the log2 n steps, the FFT is computed and stored in a distributed and bit reversed manner within 1 register across a warp. For sizes n ≤ 32, bit reversal can be implemented with a single warp shuffle.\nWe either load twiddle factors from device memory or compute them with the sincosf function only once, and subsequently swap them within registers. This greatly reduces the reliance on either memory bandwidth or on the special functional unit at the expense of a few additional registers. The decision between explicitly loading twiddle factors from device memory or computing them is a tradeoff between arithmetic intensity and memory bandwidth. For sizes 16 and 32 the arithmetic pipeline is the bottleneck. Loading twiddle factors from memory for these two special sizes results in a performance increase of 15% and 20% respectively.\nThe discussion above applies to 1-D FFT and to each independent FFT within a larger 2-D FFT. A n-D Fourier transform is separable and can be implemented with sets of multiple 1-D FFT with transpositions between each of these sets. In 2-D FFT R-to-C, the first set comprises n FFTs and the second set comprises n/2+1 FFTs by Hermitian symmetry. The extra 1 term in the quantity n/2+1 makes the computation ill-balanced and can bring down performance by lowering occupancy. We chose to dimension our kernels to have size n×(n/2) and introduce additional control flow to handle the border case. This results in 30% additional performance. We implement the transposition in SMEM across warps following Ruetsch & Micikevicius (2009). Data is already resident in registers so our main concerns are limiting SMEM usage to keep occupancy high, and limiting load/stores by using vector instructions to avoid saturating the load-store unit (LSU).\n5.3 1-D FFT AND 2-D FFT FOR SIZE 32 < n ≤ 256\nWith size 32 as our building block, we extend our strategy to larger sizes. We use the same single warp approach to compute a full 1-D FFT. The main difference is that the computation is now distributed across multiple registers across threads in a warp (⌈n/32⌉ Fourier coefficients and twiddle factors in registers per thread). Because we perform a full FFT per warp, a performance cross-over where cuFFT wins happens after register usage limits occupancy too much. We outperform 1-D cuFFT for n ≤ 256, with a hard register limit at n = 512 (128 and 256 similarly for 2-D FFT). This is still well within our application domain. The following modifications handle multiple registers per thread:\n• Hermitian symmetry allows us to perform half the computation. There is a tradeoff between adding control-flow divergence and performing less work. At n ≥ 64, benefits from reduced computations dominate divergence losses;\n• we take advantage of trigonometric symmetries and twiddle factor distribution to compute only a fraction of the roots of unity needed for each FFT, distributed with register to register copies;\n• twiddle factor re-balancing across a warp and across registers requires a different implementation. We managed to implement it fully within registers;\n• bit reversal occurs across registers and across warps. The high-order bits represent the register while the low-order bits represent the warp. Without a sophisticated implementation, this results in indirect addressing of registers which is costly. We implement a simple bit reversal in SMEM, which is an occupancy bottleneck at n ≥ 256 for 1-D FFT.\nIn the 2-D FFT case, the intermediate transpose becomes significantly more expensive. We experimented with various strategies to keep occupancy high, including partial transpositions within a warp to use minimal amounts of SMEM."
+    }, {
+      "heading" : "5.4 DISCUSSION",
+      "text" : "We report the relative performance of our implementation fbfft compared to cuFFT for various batch and input sizes of interest. The number of batches to consider depends on the dimension of CNN layers as well as any multi-GPU parallelization strategy that may be involved. At typical sizes\nof interest, fbfft is between 1.5× and 5× faster. We tried up to 4 million batches and at larger sizes gains stabilize around 1.4× but efficiency goes down as more and more memory is used.\nFigure 7 shows the performance in the 1-D case. These numbers do not exercise our implicit zerocopy padding, so we expect additional gains when we incorporate our FFT in the convolution. Our implementation outperforms cuFFT for all cases of interest, more dramatically so for smaller batch sizes. Small batch sizes also correspond to the latency sensitive regime in Figures 1-6 for which the cuFFT based implementation performs quite worse than cuDNN. We achieve 78% efficiency at 97.5% occupancy for size 64 at batch size 16, 384, as reported by nvvp.\nFigure 8 shows the performance in the 2-D case. Relative performance gains for sizes 64 are more modest than in the 1-D case, even losing to cuFFT at size 128 and small batch sizes. The magnitude of the relative gains at various batch sizes drops faster than in the 1-D case. Looking at the performance of the 32 × 32 FFT, we obtain 1.6× speedup over cuFFT at 1, 024 batches. The same ratio is not obtained until 16, 384 batches in 1-D FFT.10 The 8 × 8 case is an implementation anomaly that we will fix. In the 1-D FFT case, we coalesce 4 FFTs of size 8 in a single warp to increase efficiency. This mechanism has not been translated to 2-D FFT. When coupled with the tiling strategy in Section 6, we emphasize that the sizes of interest are actually 8-64, and depend on kh, kw but not input h,w. Batch sizes can vary on the whole spectrum.\nWe interfaced fbfft into our convolution module and ran experiments with 3 × 3 kernels for the 3 different convolution passes over inputs of sizes x = h = w, x ∈ {13, 16, 27, 32, 57, 64}. For problem size, we used p = S = f = f ′, p ∈ {16, 32, 64, 128}. By swapping our FFT implementation we observed an overall mean speedup of 1.51× with standard deviation 0.21 and geometric\n10This is not unexpected because these two computations perform the same number of flops when accounting for Hermitian symmetry, plus the fact that the efficiency of cuFFT increases while fbfft remains high but almost constant.\nmean 1.49×. The minimum speedup was 1.21×, despite sometimes performing more computations with fbfft which can only interpolate to a power of 2. These experiments exercise the zero-copy padding and lower memory footprints of fbfft compared to cuFFT but do not yet reflect additional optimizations such as tiling and bit twiddling elision."
+    }, {
+      "heading" : "6 FUTURE WORK",
+      "text" : "fbfft provides the most gains over cuFFT at sizes 8-64. A tiling strategy for the input can be used to exploit this advantage. When the kernel is significantly smaller than the input, we can decompose a large convolution into several smaller ones. For simplicity, we consider 1D convolution on a single input plane, as it can trivially be extended. Let x be an input of size n, c a kernel of size w and y = x ⋆ c. We write x[i,j] for the vector formed by contiguous elements of x: {xi, xi+1, ..., xj−1}. Let d ≤ n. From the definition of the convolution, we have:\ny[i,i+d] = x[i,i+d+w] ⋆ c\nSo the convolution of the input of size n can be computed with ⌊n/d⌋ convolutions with inputs of size d + w. The cost of the convolution goes down from O(n log(n)) to O(⌊n/d⌋(d + w) log(d + w)) = O((n + w/d) log(d + w)). From this formula, we see that the optimal d is of the order of w, to get the complexity O(n log(w)). This strategy allows us to speed up forward and backward propagation. Tiling can also be used to reduce memory cost for temporary storage by not running all the tiles in parallel (just the tiles which do run in parallel need their scratch space), at the potential expense of parallelism or efficiency.\nFor the gradient accumulation, we cannot reuse this strategy, since it involves a larger convolution between an input x of size n and a kernel z = ∂L∂y of size n − w + 1. However, we have a similar formula:\n(\n∂L\n∂c\n)\nj\n=\nn−1 ∑\ni=0\nxj+i · zi =\n⌊n/d⌋−1 ∑\nk=0\nd−1 ∑\ni=0\nxj+i+kd · zi+kd +\nn−1 ∑\ni=d⌊n/d⌋\nxj+i · zi\nAnd so (\n∂L\n∂c\n)\n=\n⌊n/d⌋−1 ∑\nk=0\nx[dk,(d+1)k+w−1] ⋆ z[dk,(d+1)k] + x[d⌊n/d⌋,n] ⋆ z[d⌊n/d⌋,n−w+1]\nWe have a few other optimizations that are planned as well. Since much of the data we have is already available in registers or in shared memory, we are implementing our own in-place, in-register transpose via recursive decomposition. The pointwise multiplications in the Fourier domain, especially with tiling, are rather small, so our own matrix multiplication routines integrated with the rest of the convolution kernel code might win over cuBLAS, and prevent the need for multiple CUDA kernel launches and their associated overhead. Finally, as mentioned earlier, bit reversal portions can be eliminated with the FFT using DIF and the IFFT using DIT."
+    }, {
+      "heading" : "7 CONCLUSION",
+      "text" : "To summarize, we achieve significant gains in CNNs using FFTs, with a cuFFT convolution implementation achieving 1.4 × −14.5× speedups over cuDNN for common sizes. In reaction to cuFFT and cuBLAS limitations in the context of our specific application domain, we developed our own FFT implementation, fbfft, which is more suited to deep learning problem sizes (large batches, small feature planes). fbfft itself is ≥ 1.4× faster than cuFFT transforms for these problems of interest. For convolution, it is faster than the cuFFT as well, with a mean of 1.51× for sizes that we wish to exploit.\nGiven our new efficient primitive for size 8-64 convolution, we are continuing work on bit twiddling, transposition and pointwise multiplication optimizations, and continuing work on tiling to make the computational advantage at that size apply to larger convolution problems. These will all allow for reduced training time and use of ever larger and deeper CNNs."
+    }, {
+      "heading" : "8 SUPPLEMENT",
+      "text" : ""
+    }, {
+      "heading" : "8.1 CUFFT CONVOLUTION PERFORMANCE BREAKDOWN",
+      "text" : "We show a breakdown of cuFFT convolution performance for the steps indicated in Table 1. The timings do not add up to 100% of the reported performance in the previous table because we do not report additional copies needed for zero-padding here. We also enforce force extra synchronizations to isolate the contribution of each operation. Abstracting from these details, the FFT and IFFT take up a significant amount of compute resources, which we address in Section 5.\nTable 5: cuFFT convolution performance breakdown (K40m, ms)\nLAYER FFT A TRANS. A FFT B TRANS. B CGEMM TRANS. C IFFT C\nL1 fprop 0.86 0.24 1.13 0.32 15.13 12.67 36.46 bprop 0.86 0.24 34.55 10.26 12.62 0.39 1.19 accGrad 1.14 0.32 34.60 10.26 12.37 0.26 0.91 L2 fprop 2.99 0.98 5.91 2.03 8.92 1.67 6.24 bprop 2.99 0.98 5.92 2.03 8.85 1.67 6.23 accGrad 5.94 2.04 5.93 2.02 8.38 0.83 3.15 L3 fprop 3.07 0.89 3.08 0.89 4.40 0.87 3.49 bprop 3.08 0.89 3.07 0.90 4.05 0.86 3.48 accGrad 3.07 0.89 3.06 0.89 4.03 0.87 3.48 L4 fprop 0.84 0.24 0.83 0.24 1.21 0.24 0.95 bprop 0.83 0.24 0.83 0.24 1.13 0.23 0.94 accGrad 0.84 0.24 0.82 0.24 1.10 0.24 0.95 L5 fprop 7.07 1.58 2.39 0.51 6.23 0.50 2.54 bprop 7.07 1.59 2.40 0.51 5.59 0.51 2.54 accGrad 2.40 0.51 2.38 0.52 6.18 1.54 7.51\nIn the particular case of L1, the FFTs take more than 50% of the runtime. This is due to the wasteful interpolation of the kernel tensor from a 11 × 11 up to 128 × 128, which is the minimal size to compute the FFT of the input array without interpolation loss. In such cases, the tiling strategy we are developing (see section 6) will result in large additional performance gains."
+    }, {
+      "heading" : "8.2 FFT : DECIMATION IN TIME VS FREQUENCY",
+      "text" : "A Fourier transform projects R and C-valued functions onto a harmonic orthogonal basis. The discrete Fourier transform of a vector {xk}, k ∈ [0, n− 1] is the vector:\n{Xk} =\n\n\nn−1 ∑\nj=0\nxjw kj n\n\n , k ∈ [0, n− 1]\nwhere wjn = e −2πij/n is the jth n-root of unity. The traditional radix-2 Cooley-Tukey algorithm recursively decomposes the computation between an odd and even part:\n{Xk} =\n\n\n(n−1)/2 ∑\nj=0\nxjw k(2j) n +\n(n−1)/2 ∑\nj=0\nx2j+1w k(2j+1) n\n\n , k ∈ [1, n]\nThis decomposition is called decimation in time (DIT). An alternate decomposition performs decimation in frequency (DIF):\n{Xk} =\n\n\n(n−1)/2 ∑\nj=0\nxjw kj n +\nn ∑\nj=(n−1)/2\nxjw kj n\n\n , k ∈ [1, n]\nWhen n is a power of 2, both decimations recursively decompose into a perfectly balanced tree and take advantage of the symmetry properties of the roots of unity. The dataflow graph for the radix-2 FFT has a butterfly shape and is a good way of visualizing the computations. There is a symmetry between DIT and DIF in both the order of operations applied and in whether the input or the output order is shuffled (Figure 9)."
+    }, {
+      "heading" : "8.3 GPU PROGRAMMING",
+      "text" : "There are a variety of references available that describe CUDA and NVIDIA’s various GPU architectures (Garland et al. (2008)) which we won’t discuss in detail, but the implementation of fbfft very much depends upon specifics of the Kepler GPU architecture.\nNVIDIA GPUs execute code at the granularity of a warp which is defined as a set of 32 threads in all existing architectures; each thread is assigned a lane within the warp. These threads execute in a SIMT (single instruction, multiple thread) fashion, meaning that a warp is an atomic unit of execution. It holds a single program counter (PC) and can thus only execute a single instruction at a time across all of its threads. Collections of warps are brought together in blocks or CTAs, which together share a region of fast shared memory resident on chip. Blocks themselves can only exchange data via much slower global memory, resident on the GPU or in the host CPU’s address space.\nIndividual threads within a warp are free to take divergent paths, but since a single PC is present, each branch in the execution will be serialized. Threads that aren’t participating in the branch in question are disabled. In other words, if all 32 threads were to take divergent code paths, we would obtain only 1/32× of the computational efficiency.\nDivergent code paths are hard to avoid, but the NVIDIA instruction set has means to reduce their cost (Giles (2014)). One is with predicated instructions, which are used for small branches, in which all warp threads execute both parts of the branch, with non-participating threads having no side effects.\nBlock threads have access to a register file, with up to 255 registers per thread for Kepler. Registers are allocated statically by the CUDA compiler. An important performance factor when writing CUDA kernels is that data should be kept in registers as much as possible to avoid communications.\nRegisters in CUDA are “addressable”: it is possible to declare a static array within registers and operate on its elements. The limitation is that all addressing should be performed using statically determined constants so the compiler can translate these accesses to a register number known at compile time. Indirect addressing is also supported but results in copies to a local region within global memory, which essentially constitutes register spilling. Even with the presence of caches, using local memory usually comes with a performance hit.11 As a consequence, we design our kernels using aggressive inlining, template parameters and unrolling directives to make all register accesses statically addressable.\nThe Kepler architecture introduced specialized shuffle instructions to exchange data between registers within a warp synchronously, which avoids round-trips to shared or global memory. Interestingly, these shuffle instructions allow the dynamic indexing of an array held in registers, as long as the array is distributed in a cyclic fashion across registers in each thread within a warp.\nfloat arr[3]; ... // This simulates a linear array float realArr[96]: // arr[0] holds elements 0-31 (lane i holds element i) // arr[1] holds elements 32-63 (lane i holds element 32 + i) // arr[2] holds elements 64-95 (lane i holds element 64 + i) // Example: all warp threads read value held at realArr[34] float val = __shfl(arr[1], 2); // ‘1‘ must be statically known\n// ‘2‘ can be dynamic\nMany warps run in parallel and can be switched by the GPU hardware at each cycle. When enough parallelism is available (measured in occupancy of the GPU as a first approximation), long latency operations are hidden thanks to fast context switching. Registers and shared memory come in finite quantities on each GPU compute multiprocessor. These limited resources are partitioned by the compiler and the hardware amongst computations at the level of a CUDA kernel. Increased usage of registers or of shared memory can reduce GPU occupancy, which limits the ability to hide long latency operations. Reduced occupancy does not necessarily result in performance loss (Volkov (2010)). There are often non-obvious performance tradeoffs in increasing or decreasing threads per block, shared memory per block or registers per thread that are hard to discover. This problem is one of the many reasons why designing a one-size-fits-all implementation that aims to be efficient for any problem is difficult.\n11There are bleeding edge cases where a little local memory consumption helps performance; for instance, when restricting the number of registers per thread to increase occupancy."
+    } ],
+    "references" : [ {
+      "title" : "Theano: a CPU and GPU math expression compiler",
+      "author" : [ "Bergstra", "James", "Breuleux", "Olivier", "Bastien", "Frédéric", "Lamblin", "Pascal", "Pascanu", "Razvan", "Desjardins", "Guillaume", "Turian", "Joseph", "Warde-Farley", "David", "Bengio", "Yoshua" ],
+      "venue" : "In Proceedings of the Python for Scientific Computing Conference (SciPy),",
+      "citeRegEx" : "Bergstra et al\\.,? \\Q2010\\E",
+      "shortCiteRegEx" : "Bergstra et al\\.",
+      "year" : 2010
+    }, {
+      "title" : "A linear filtering approach to the computation of discrete Fourier transform",
+      "author" : [ "Bluestein", "Leo I" ],
+      "venue" : "Audio and Electroacoustics, IEEE Transactions on,",
+      "citeRegEx" : "Bluestein and I.,? \\Q1970\\E",
+      "shortCiteRegEx" : "Bluestein and I.",
+      "year" : 1970
+    }, {
+      "title" : "Fast fourier transforms, 2008. URL http://cnx.org/contents/ 16e8e5e8-4f22-4b53-9cd6-a15b14f01ce4@5.6:16/Fast_Fourier_ Transforms_(6x9_V",
+      "author" : [ "Burrus", "C. Sidney" ],
+      "venue" : null,
+      "citeRegEx" : "Burrus and Sidney.,? \\Q2008\\E",
+      "shortCiteRegEx" : "Burrus and Sidney.",
+      "year" : 2008
+    }, {
+      "title" : "High Performance Convolutional Neural Networks for Document Processing",
+      "author" : [ "Chellapilla", "Kumar", "Puri", "Sidd", "Simard", "Patrice" ],
+      "venue" : "Tenth International Workshop on Frontiers in Handwriting Recognition, La Baule (France),",
+      "citeRegEx" : "Chellapilla et al\\.,? \\Q2006\\E",
+      "shortCiteRegEx" : "Chellapilla et al\\.",
+      "year" : 2006
+    }, {
+      "title" : "cudnn: Efficient primitives for deep learning",
+      "author" : [ "Chetlur", "Sharan", "Woolley", "Cliff", "Vandermersch", "Philippe", "Cohen", "Jonathan", "Tran", "John", "Catanzaro", "Bryan", "Shelhamer", "Evan" ],
+      "venue" : "CoRR, abs/1410.0759,",
+      "citeRegEx" : "Chetlur et al\\.,? \\Q2014\\E",
+      "shortCiteRegEx" : "Chetlur et al\\.",
+      "year" : 2014
+    }, {
+      "title" : "Torch7: A matlab-like environment for machine learning",
+      "author" : [ "R. Collobert", "K. Kavukcuoglu", "C. Farabet" ],
+      "venue" : "In BigLearn, NIPS Workshop,",
+      "citeRegEx" : "Collobert et al\\.,? \\Q2011\\E",
+      "shortCiteRegEx" : "Collobert et al\\.",
+      "year" : 2011
+    }, {
+      "title" : "Natural language processing (almost) from scratch",
+      "author" : [ "Collobert", "Ronan", "Weston", "Jason", "Bottou", "Léon", "Karlen", "Michael", "Kavukcuoglu", "Koray", "Kuksa", "Pavel" ],
+      "venue" : "J. Mach. Learn. Res.,",
+      "citeRegEx" : "Collobert et al\\.,? \\Q2011\\E",
+      "shortCiteRegEx" : "Collobert et al\\.",
+      "year" : 2011
+    }, {
+      "title" : "An algorithm for the machine calculation of complex fourier series",
+      "author" : [ "Cooley", "James W", "Tukey", "John W" ],
+      "venue" : "Mathematics of computation,",
+      "citeRegEx" : "Cooley et al\\.,? \\Q1965\\E",
+      "shortCiteRegEx" : "Cooley et al\\.",
+      "year" : 1965
+    }, {
+      "title" : "Parallel computing experiences with cuda",
+      "author" : [ "Garland", "Michael", "Le Grand", "Scott", "Nickolls", "John", "Anderson", "Joshua", "Hardwick", "Jim", "Morton", "Phillips", "Everett", "Zhang", "Yao", "Volkov", "Vasily" ],
+      "venue" : "IEEE Micro,",
+      "citeRegEx" : "Garland et al\\.,? \\Q2008\\E",
+      "shortCiteRegEx" : "Garland et al\\.",
+      "year" : 2008
+    }, {
+      "title" : "Course on cuda programming on nvidia gpus, lecture",
+      "author" : [ "Giles", "Mike" ],
+      "venue" : "URL http: //people.maths.ox.ac.uk/gilesm/cuda/lecs/lec3.pdf",
+      "citeRegEx" : "Giles and Mike.,? \\Q2014\\E",
+      "shortCiteRegEx" : "Giles and Mike.",
+      "year" : 2014
+    }, {
+      "title" : "FLAME: formal linear algebra methods environment",
+      "author" : [ "Gunnels", "John A", "Gustavson", "Fred G", "Henry", "Greg", "van de Geijn", "Robert A" ],
+      "venue" : "ACM Trans. Math. Softw.,",
+      "citeRegEx" : "Gunnels et al\\.,? \\Q2001\\E",
+      "shortCiteRegEx" : "Gunnels et al\\.",
+      "year" : 2001
+    }, {
+      "title" : "Caffe: Convolutional architecture for fast feature embedding",
+      "author" : [ "Jia", "Yangqing", "Shelhamer", "Evan", "Donahue", "Jeff", "Karayev", "Sergey", "Long", "Jonathan", "Girshick", "Ross", "Guadarrama", "Sergio", "Darrell", "Trevor" ],
+      "venue" : "arXiv preprint arXiv:1408.5093,",
+      "citeRegEx" : "Jia et al\\.,? \\Q2014\\E",
+      "shortCiteRegEx" : "Jia et al\\.",
+      "year" : 2014
+    }, {
+      "title" : "Imagenet classification with deep convolutional neural networks",
+      "author" : [ "Krizhevsky", "Alex", "Sutskever", "Ilya", "Hinton", "Geoffrey E" ],
+      "venue" : "Advances in Neural Information Processing Systems",
+      "citeRegEx" : "Krizhevsky et al\\.,? \\Q2012\\E",
+      "shortCiteRegEx" : "Krizhevsky et al\\.",
+      "year" : 2012
+    }, {
+      "title" : "Fast training of convolutional networks through ffts",
+      "author" : [ "Mathieu", "Michaël", "Henaff", "Mikael", "LeCun", "Yann" ],
+      "venue" : "CoRR, abs/1312.5851,",
+      "citeRegEx" : "Mathieu et al\\.,? \\Q2013\\E",
+      "shortCiteRegEx" : "Mathieu et al\\.",
+      "year" : 2013
+    }, {
+      "title" : "Halide: a language and compiler for optimizing parallelism, locality, and recomputation in image processing pipelines",
+      "author" : [ "Ragan-Kelley", "Jonathan", "Barnes", "Connelly", "Adams", "Andrew", "Paris", "Sylvain", "Durand", "Frédo", "Amarasinghe", "Saman P" ],
+      "venue" : "In ACM SIGPLAN Conference on Programming Language Design and Implementation,",
+      "citeRegEx" : "Ragan.Kelley et al\\.,? \\Q2013\\E",
+      "shortCiteRegEx" : "Ragan.Kelley et al\\.",
+      "year" : 2013
+    }, {
+      "title" : "Optimizing matrix transpose in cuda",
+      "author" : [ "Ruetsch", "Greg", "Micikevicius", "Paulius" ],
+      "venue" : null,
+      "citeRegEx" : "Ruetsch et al\\.,? \\Q2009\\E",
+      "shortCiteRegEx" : "Ruetsch et al\\.",
+      "year" : 2009
+    }, {
+      "title" : "Overfeat: Integrated recognition, localization and detection using convolutional networks",
+      "author" : [ "Sermanet", "Pierre", "Eigen", "David", "Zhang", "Xiang", "Mathieu", "Michael", "Fergus", "Rob", "LeCun", "Yann" ],
+      "venue" : "In International Conference on Learning Representations (ICLR",
+      "citeRegEx" : "Sermanet et al\\.,? \\Q2014\\E",
+      "shortCiteRegEx" : "Sermanet et al\\.",
+      "year" : 2014
+    }, {
+      "title" : "Speeding up nek5000 with autotuning and specialization",
+      "author" : [ "Shin", "Jaewook", "Hall", "Mary W", "Chame", "Jacqueline", "Chen", "Chun", "Fischer", "Paul F", "Hovland", "Paul D" ],
+      "venue" : "In Proceedings of the 24th ACM International Conference on Supercomputing,",
+      "citeRegEx" : "Shin et al\\.,? \\Q2010\\E",
+      "shortCiteRegEx" : "Shin et al\\.",
+      "year" : 2010
+    }, {
+      "title" : "A bridging model for parallel computation",
+      "author" : [ "Valiant", "Leslie G" ],
+      "venue" : "Commun. ACM,",
+      "citeRegEx" : "Valiant and G.,? \\Q1990\\E",
+      "shortCiteRegEx" : "Valiant and G.",
+      "year" : 1990
+    }, {
+      "title" : "Better performance at lower occupancy",
+      "author" : [ "V. Volkov" ],
+      "venue" : "In GPU Technology Conference,",
+      "citeRegEx" : "Volkov,? \\Q2010\\E",
+      "shortCiteRegEx" : "Volkov",
+      "year" : 2010
+    }, {
+      "title" : "2008)) which we won’t discuss in detail, but the implementation of fbfft",
+      "author" : [ "tures (Garland" ],
+      "venue" : null,
+      "citeRegEx" : ".Garland,? \\Q2008\\E",
+      "shortCiteRegEx" : ".Garland",
+      "year" : 2008
+    } ],
+    "referenceMentions" : [ {
+      "referenceID" : 6,
+      "context" : "Krizhevsky et al. (2012) demonstrated that training of large CNNs with millions of weights and massive data sets is tractable when graphics processing units (GPUs) are properly put to use.",
+      "startOffset" : 0,
+      "endOffset" : 25
+    }, {
+      "referenceID" : 3,
+      "context" : "Since then, renewed interest in CNNs insufflated a fresh breath in various frameworks and implementations, including Torch (Collobert et al. (2011a)), Theano (Bergstra et al.",
+      "startOffset" : 124,
+      "endOffset" : 149
+    }, {
+      "referenceID" : 0,
+      "context" : "(2011a)), Theano (Bergstra et al. (2010)), cuda-convnet (Krizhevsky (2014)) and Caffe (Jia et al.",
+      "startOffset" : 18,
+      "endOffset" : 41
+    }, {
+      "referenceID" : 0,
+      "context" : "(2011a)), Theano (Bergstra et al. (2010)), cuda-convnet (Krizhevsky (2014)) and Caffe (Jia et al.",
+      "startOffset" : 18,
+      "endOffset" : 75
+    }, {
+      "referenceID" : 0,
+      "context" : "(2011a)), Theano (Bergstra et al. (2010)), cuda-convnet (Krizhevsky (2014)) and Caffe (Jia et al. (2014)).",
+      "startOffset" : 18,
+      "endOffset" : 105
+    }, {
+      "referenceID" : 0,
+      "context" : "(2011a)), Theano (Bergstra et al. (2010)), cuda-convnet (Krizhevsky (2014)) and Caffe (Jia et al. (2014)). Many of these frameworks are based around codes for NVIDIA GPUs using CUDA (Garland et al. (2008)).",
+      "startOffset" : 18,
+      "endOffset" : 205
+    }, {
+      "referenceID" : 0,
+      "context" : "(2011a)), Theano (Bergstra et al. (2010)), cuda-convnet (Krizhevsky (2014)) and Caffe (Jia et al. (2014)). Many of these frameworks are based around codes for NVIDIA GPUs using CUDA (Garland et al. (2008)). We discuss our contributions to convolution performance on these GPUs, namely using Fast Fourier Transform (FFT) implementations within the Torch framework. We summarize the theory behind training convolutional layers both in the time and frequency domain in Section 2. We then detail our implementations. The first is based on NVIDIA’s cuFFT and cuBLAS libraries (Section 3). We evaluate our relative performance to NVIDIA’s cuDNN library (Chetlur et al. (2014)) on over 8, 000 different configurations (Section 4).",
+      "startOffset" : 18,
+      "endOffset" : 670
+    }, {
+      "referenceID" : 13,
+      "context" : "We quickly summarize these and their implementation, with a formulation mirroring Mathieu et al. (2013). Forward propagation (fprop) inputs are a set f of input feature planes xi, i ∈ f .",
+      "startOffset" : 82,
+      "endOffset" : 104
+    }, {
+      "referenceID" : 3,
+      "context" : "3 A popular convolution implementation is to unroll the data until the computation is in the form of a large matrix multiplication (Chellapilla et al. (2006)).",
+      "startOffset" : 132,
+      "endOffset" : 158
+    }, {
+      "referenceID" : 3,
+      "context" : "3 A popular convolution implementation is to unroll the data until the computation is in the form of a large matrix multiplication (Chellapilla et al. (2006)). This is the strategy followed by many implementors, since matrix multiplication is a well-tuned linear algebra primitive available on virtually any platform. While it is possible to provide instances of direct calculation that are faster than matrix unrolling (e.g., for large S, Krizhevsky (2014)), it is challenging to provide an implementation that is faster for more than just a small subset of possible convolution problems.",
+      "startOffset" : 132,
+      "endOffset" : 458
+    }, {
+      "referenceID" : 4,
+      "context" : "0 library (Chetlur et al. (2014)), which contains one of the fastest, general purpose convolution methods for the GPU, using matrix unrolling.",
+      "startOffset" : 11,
+      "endOffset" : 33
+    }, {
+      "referenceID" : 4,
+      "context" : "0 library (Chetlur et al. (2014)), which contains one of the fastest, general purpose convolution methods for the GPU, using matrix unrolling. It has decent performance for many problem sizes thanks to heavy autotuning of cuBLAS codes for different problems. It is a strong baseline for this reason. Image CNNs to date have for the most part used square input images and filters, though rectangular filters are valid for other problems (notably text CNNs, Collobert et al. (2011b)).",
+      "startOffset" : 11,
+      "endOffset" : 481
+    }, {
+      "referenceID" : 12,
+      "context" : "2 CNN PERFORMANCE In table 3, we show performance for real CNNs, AlexNet (Krizhevsky et al. (2012)) and OverFeat fast (Sermanet et al.",
+      "startOffset" : 74,
+      "endOffset" : 99
+    }, {
+      "referenceID" : 12,
+      "context" : "2 CNN PERFORMANCE In table 3, we show performance for real CNNs, AlexNet (Krizhevsky et al. (2012)) and OverFeat fast (Sermanet et al. (2014)), comparing against cuDNN and cuda-convnet2 (ccn2) kernels in Torch.",
+      "startOffset" : 74,
+      "endOffset" : 142
+    }, {
+      "referenceID" : 10,
+      "context" : "A key principle is to design a set of leaf kernels with well-tuned in-register performance and reduce the larger problem to a combination of these kernels by data and loop tiling (Irigoin & Triolet (1988)) and recursive decompositions (Gunnels et al. (2001)).",
+      "startOffset" : 236,
+      "endOffset" : 258
+    }, {
+      "referenceID" : 10,
+      "context" : "A key principle is to design a set of leaf kernels with well-tuned in-register performance and reduce the larger problem to a combination of these kernels by data and loop tiling (Irigoin & Triolet (1988)) and recursive decompositions (Gunnels et al. (2001)). Since vendors have to sustain high performance for a large class of application domains, there exist parameter configurations for which a carefully tuned approach significantly outperforms vendor-tuned libraries (Shin et al. (2010)).",
+      "startOffset" : 236,
+      "endOffset" : 492
+    }, {
+      "referenceID" : 14,
+      "context" : "This is an approach used in automatic code generation tools such as Halide (Ragan-Kelley et al. (2013)) and relies on aggressive if-conversion properties of the CUDA compiler.",
+      "startOffset" : 76,
+      "endOffset" : 103
+    } ],
+    "year" : 2014,
+    "abstractText" : "We examine the performance profile of Convolutional Neural Network (CNN) training on the current generation of NVIDIA Graphics Processing Units (GPUs). We introduce two new Fast Fourier Transform convolution implementations: one based on NVIDIA’s cuFFT library, and another based on a Facebook authored FFT implementation,fbfft, that provides significant speedups over cuFFT (over 1.5×) for whole CNNs. Both of these convolution implementations are available in open source, and are faster than NVIDIA’s cuDNN implementation for many common convolutional layers (up to 23.5× for a synthetic kernel configuration). We discuss different performance regimes of convolutions, comparing areas where straightforward time domain convolutions outperform Fourier frequency domain convolutions. Details on algorithmic applications of NVIDIA GPU hardware specifics in the implementation of fbfft are also provided.",
+    "creator" : "dvips(k) 5.991 Copyright 2011 Radical Eye Software"
+  }
+}

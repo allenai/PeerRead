@@ -1,0 +1,242 @@
+{
+  "name" : "1511.08915.pdf",
+  "metadata" : {
+    "source" : "META",
+    "title" : "Column-Oriented Datalog Materialization for Large Knowledge Graphs",
+    "authors" : [ "Jacopo Urbani", "Ceriel Jacobs", "Markus Krötzsch" ],
+    "emails" : [ "jacopo@cs.vu.nl", "c.j.h.jacobs@vu.nl", "markus.kroetzsch@tu-dresden.de" ],
+    "sections" : [ {
+      "heading" : "Introduction",
+      "text" : "Knowledge graphs (KGs) are widely used in industry and academia to represent large collections of structured knowledge. While many types of graphs are in use, they all rely on simple, highly-normalized data models that can be used to uniformly represent information from many diverse sources. On the Web, the most prominent such format is RDF (Cyganiak, Wood, and Lanthaler 2014), and large KGs such as Bio2RDF (Callahan, Cruz-Toledo, and Dumontier 2013), DBpedia (Bizer et al. 2009), Wikidata (Vrandečić and Krötzsch 2014), and YAGO (Hoffart et al. 2013) are published in this format.\nThe great potential in KGs is their ability to make connections – in a literal sense – between heterogeneous and often incomplete data sources. Inferring implicit information from KGs is therefore essential in many applications, such as ontological reasoning, data integration, and information extraction. The rule-based language Datalog offers a common foundation for specifying such inferences (Abiteboul, Hull, and Vianu 1995). While Datalog rules are rather simple types of if-then rules, their recursive nature is making them powerful. Many inference tasks can be captured in this framework, including many types of ontological reasoning commonly used with RDF. Datalog thus provides an excellent basis for exploiting KGs to the full.\nUnfortunately, the implementation of Datalog inferencing on large KGs remains very challenging. The task is worst-case time-polynomial in the size of the KG, and hence tractable in principle, but huge KGs are difficult to manage. A preferred approach is therefore to materialize (i.e., precompute) inferences. Modern DBMS such as Oracle 11g and\nThis is the extended version of the eponymous paper published at the AAAI 2016 (Urbani, Jacobs, and Krötzsch 2016).\nOWLIM materialize KGs of 100M–1B edges in times ranging from half an hour to several days (Kolovski, Wu, and Eadon 2010; Bishop et al. 2011). Research prototypes such as Marvin (Oren et al. 2009), C/MPI (Weaver and Hendler 2009), WebPIE (Urbani et al. 2012), and DynamiTE (Urbani et al. 2013) achieve scalability by using parallel or distributed computing, but often require significant hardware resources. Urbani et al., e.g., used up to 64 high-end machines to materialize a KG with 100B edges in 14 hours (2012). In addition, all the above systems only support (fragments of) the OWL RL ontology language, which is subsumed by Datalog but significantly simpler.\nMotik et al. have recently presented a completely new approach to this problem (2014). Their system RDFox exploits fast main-memory computation and parallel processing. A groundbreaking insight of this work is that this approach allows processing mid-sized KGs on commodity machines. This has opened up a new research field for in-memory Datalog systems, and Motik et al. have presented several advancements (2015a; 2015b; 2015c).\nInspired by this line of research, we present a new approach to in-memory Datalog materialization. Our goal is to further reduce memory consumption to enable even larger KGs to be processed on even simpler computers. To do so, we propose to maintain inferences in an ad-hoc columnbased storage layout. In contrast to traditional row-based layouts, where a data table is represented as a list of tuples (rows), column-based approaches use a tuple of columns (value lists) instead. This enables more efficient joins (Idreos et al. 2012) and effective, yet simple data compression schemes (Abadi, Madden, and Ferreira 2006). However, these advantages are set off by the comparatively high cost of updating column-based data structures (Abadi et al. 2009). This is a key challenge for using this technology during Datalog materialization, where frequent insertions of large numbers of newly derived inferences need to be processed. Indeed, to the best of our knowledge, no materialization approach has yet made use of columnar data structures. Our main contributions are as follows:\n• We design novel column-based data structures for inmemory Datalog materialization. Our memory-efficient design organizes inferences by rule and inference step.\n• We develop novel optimization techniques that reduce the\nar X\niv :1\n51 1.\n08 91\n5v 2\n[ cs\n.D B\n] 1\n1 Fe\nb 20\n16\namount of data that is considered during materialization.\n• We introduce a new memoization method (Russell and Norvig 2003) that caches results of selected subqueries proactively, improving the performance of our procedure and optimizations.\n• We evaluate a prototype implementation or our approach. Evaluation results show that our approach can significantly reduce the amount of main memory needed for materialization, while maintaining competitive runtimes. This allowed us to materialize fairly large graphs on commodity hardware. Evaluations also show that our optimizations contribute significantly to this result.\nProofs for the claims in this paper can be found in the appendix."
+    }, {
+      "heading" : "Preliminaries",
+      "text" : "We define Datalog in the usual way; details can be found in the textbook by Abiteboul, Hull, and Vianu (1995). We assume a fixed signature consisting of an infinite set C of constant symbols, an infinite set P of predicate symbols, and an infinite set V of variable symbols. Each predicate p ∈ P is associated with an arity ar(p) ≥ 0. A term is a variable x ∈ V or a constant c ∈ C. We use symbols s, t for terms; x, y, z, v, w for variables; and a, b, c for constants. Expressions like t, x, and a denote finite lists of such entities. An atom is an expression p(t) with p ∈ P and |t| = ar(p). A fact is a variable-free atom. A database instance is a finite set I of facts. A rule r is an expression of the form\nH ← B1, . . . , Bn (1)\nwhere H and B1, . . . , Bn are head and body atoms, respectively. We assume rules to be safe: every variable in H must also occur in some Bi. A program is a finite set P of rules.\nPredicates that occur in the head of a rule are called intensional (IDB) predicates; all other predicates are extensional (EDB). IDB predicates must not appear in databases. Rules with at most one IDB predicate in their body are linear.\nA substitution σ is a partial mapping V → C ∪ V. Its application to atoms and rules is defined as usual. For a set of facts I and a rule r as in (1), we define r(I) B {Hσ | Hσ is a fact, and Biσ ∈ I for all 1 ≤ i ≤ n}. For a program P, we define P(I) B ⋃r∈P r(I), and shortcuts P0(I) B I and Pi+1(I) B P(Pi(I)). The set P∞(I) B ⋃i≥0 Pi(I) is the materialization of I with P. This materialization is finite, and contains all facts that are logical consequences of I∪P.\nKnowledge graphs are often encoded in the RDF data model (Cyganiak, Wood, and Lanthaler 2014), which represents labelled graphs as sets of triples of the form 〈subject, property, object〉. Technical details are not relevant here. Schema information for RDF graphs can be expressed using the W3C OWL Web Ontology Language. Since OWL reasoning is complex in general, the standard offers three lightweight profiles that simplify this task. In particular, OWL reasoning can be captured with Datalog in all three cases, as shown by Krötzsch (2011; 2012) and (implicitly by translation to path queries) by Bischoff et al. (2014).\nThe simplest encoding of RDF data for Datalog is to use a ternary EDB predicate triple to represent triples. We use a simple Datalog program as a running example:\nT(x, v, y)← triple(x, v, y) (2) Inverse(v,w)← T(v, owl:inverseOf,w) (3)\nT(y,w, x)← Inverse(v,w), T(x, v, y) (4) T(y, v, x)← Inverse(v,w), T(x,w, y) (5)\nT(x, hasPart, z)← T(x, hasPart, y), T(y, hasPart, z) (6) To infer new triples, we need an IDB predicate T, initialised in rule (2). Rule (3) “extracts” an RDF-encoded OWL statement that declares a property to be the inverse of another. Rules (4) and (5) apply this information to derive inverted triples. Finally, rule (6) is a typical transitivity rule for the RDF property hasPart.\nWe abbreviate hasPart, partOf and owl:inverseOf by hP, pO and iO, respectively. Now consider a database I = {triple(a, hP, b), triple(b, hP, c), triple(hP, iO, pO)}. Iteratively applying rules (2)–(6) to I, we obtain the following new derivations in each step, where superscripts indicate the rule used to produce each fact: P1(I) : T(hP, iO, pO)(2) T(a, hP, b)(2) T(b, hP, c)(2) P2(I) : Inverse(hP, pO)(3) T(a, hP, c)(6) P3(I) : T(b, pO, a)(4) T(c, pO, b)(4) T(c, pO, a)(4)\nNo further facts can be inferred. For example, applying rule (5) to P3(I) only yields duplicates of previous inferences."
+    }, {
+      "heading" : "Semi-Naive Evaluation",
+      "text" : "Our goal is to compute the materialization P∞(I). For this we use a variant of the well-known technique of semi-naive evaluation (SNE) (Abiteboul, Hull, and Vianu 1995) that is based on a more fine-grained notion of derivation step.\nIn each step of the algorithm, we apply one rule r ∈ P to the facts derived so far. We do this fairly, so that each rule will be applied arbitrarily often. This differs from standard SNE where all rules are applied in parallel in each step. We write rule[i] for the rule applied in step i, and ∆ip for the set of new facts with predicate p derived in step i. Note that ∆ip = ∅ if p is not the head predicate of rule[i]. Moreover, for numbers 0 ≤ i ≤ j, we define the set ∆[i, j]p B ⋃ j k=i ∆ k p of all p-facts derived between steps i and j. Consider a rule r = p(t)← e1(t1), . . . , en(tn), q1(s1), . . . , qm(sm) (7)\nwhere p, q1, . . . , qm are IDB predicates and e1, . . . , en are EDB predicates. The naive way to apply r in step i + 1 to compute ∆i+1p is to evaluate the following “rule” 1\ntmpp(t)← e1(t1), . . . , en(tn),∆[0,i]q1 (s1), . . . ,∆ [0,i] qm (sm) (8) and to set ∆i+1p B tmpp \\ ∆[0,i]p . However, this would recompute all previous inferences of r in each step where r is applied. Assume that rule r has last been evaluated in step j < i + 1. We can restrict to evaluating the following rules:\ntmpp(t)← e1(t1), . . . , en(tn),∆[0,i]q1 (s1), . . . ,∆ [0,i] q`−1 (s`−1),\n∆ [ j,i] q` (s`),∆ [0, j−1] q`+1 (s`+1), . . . ,∆ [0, j−1] qm (sm)\n(9)\n1Treating sets of facts like predicates is a common abuse of notation for explaining SNE (Abiteboul, Hull, and Vianu 1995).\nfor all ` ∈ {1, . . . ,m}. With tmpp the union of all sets of facts derived from these m rules, we can define ∆i+1p B tmpp \\ ∆ [0,i] p as before. It is not hard to see that the rules of form (9) consider all combinations of facts that are considered in rule (8). We call this procedure the one-rule-per-step variant of SNE. The procedure terminates if all rules in P have been applied in the last |P| steps without deriving any new facts. Theorem 1 For every input database instance I, and for every fair application strategy of rules, the one-rule-perstep variant of SNE terminates in some step i with the result⋃\np ∆ [0,i] p = P ∞(I). SNE is still far from avoiding all redundant computations. For example, any strategy of applying rules (2)– (6) above will lead to T(b, pO, a) being derived by rule (4). This new inference will be considered in the next application of the second SNE variant tmpT(y, v, x) ← ∆\n[0,i] Inverse(v,w),∆ [ j,i] T (x,w, y) of rule (5), leading to the derivation of T(a, hP, b). However, this fact must be a duplicate since it is necessary to derive T(b, pO, a) in the first place."
+    }, {
+      "heading" : "Column-Oriented Datalog Materialization",
+      "text" : "Our variant of SNE provides us with a high-level materialization procedure. To turn this into an efficient algorithm, we use a column-based storage layout described next.\nOur algorithms distinguish the data structures used for storing the initial knowledge graph (EDB layer) from those used to store derivations (IDB layer), as illustrated in Fig. 1. The materialization process accesses the KG by asking conjunctive queries to the EDB layer. There are well-known ways to implement this efficiently, such as (Neumann and Weikum 2010), and hence we focus on the IDB layer here.\nOur work is inspired by column-based databases (Idreos et al. 2012), an alternative to traditional row-based databases for efficiently storing large data volumes. Their superior performance on analytical queries is compensated for by lower performance for data updates. Hence, we structure the IDB layer using a column-based layout in a way that avoids the need for frequent updates. To achieve this, we store each of the sets of inferences ∆ip that are produced during the derivation in a separate column-oriented table. The table for ∆ip is created when applying rule[i] in step i and never modified thereafter. We store the data for each rule application (step number, rule, and table) in one block, and keep a separate list of blocks for each IDB predicate. The set of facts derived for\none IDB predicate p is the union of the contents of all tables in the list of blocks for p. Figure 1 illustrates this scheme, and shows the data computed for the running example.\nThe columnar tables for ∆ip are sorted by extending the order of integer indices used for constants to tuples of integers in the natural way (lexicographic order of tuples). Therefore, the first column is fully sorted, the second column is a concatenation of sorted lists for each interval of tuples that agree on the first component, and so on. Each column is compressed using run-length encoding (RLE), where maximal sequences of n repeated constants c are represented by pairs 〈a, n〉 (Abadi, Madden, and Ferreira 2006).\nOur approach enables valuable space savings for inmemory computation. Ordering tables improves compression rates, and rules with constants in their heads (e.g., (6)) lead to constant columns, which occupy almost no memory. Furthermore, columns of EDB relations can be represented by queries that retrieve their values from the EDB layer, rather than by a copy of these values. Finally, many inference rules simply “copy” data from one predicate to another, e.g., to define a subclass relationship, so we can often share column-objects in memory rather than allocating new space.\nWe also obtain valuable time savings. Sorting tables means they can be used in merge joins, the most efficient type of join, where two sorted relations are compared in a single pass. This also enables efficient, set-at-a-time duplicate elimination, which we implement by performing outer merge joins between a newly derived result tmpp and all previously derived tables ∆ip. The use of separate tables for each ∆ip eliminates the cost of insertions, and at the same time enables efficient bookkeeping to record the derivation step and rule used to produce each inference. Step information is needed to implement SNE, but the separation of inferences by rule enables further optimizations (see next section).\nThere is also an obvious difficulty for using our approach. To evaluate a SNE rule (9), we need to find all answers to the rule’s body, viewed as a conjunctive query. This can be achieved by computing the following join:(\ne1(t1) ./ . . . ./ en(tn) ) ./ ∆[0,i]q1 (s1) ./ . . . ./ ∆ [0,i] q`−1 (s`−1)\n./ ∆ [ j,i] q` (s`) ./ ∆ [0, j−1] q`+1 (s`+1) ./ . . . ./ ∆ [0, j−1] qm (sm)\n(10)\nThe join of the EDB predicates ek can be computed efficiently by the EDB layer; let REDB denote the resulting relation. Proceeding from left to right, we now need to compute REDB ./ ∆ [0,i] q1 (s1). However, our storage scheme stores the second relation in many blocks, so that we actually must compute REDB ./ ( ⋃i k=0 ∆ k q1 )(s1), which could be expensive if there are many non-empty q1 blocks in the range [0, i]. We reduce this cost by performing on-demand concatenation of tables: before computing the join, we consolidate ∆kq1 (k = 0, . . . , i) in a single data structure. This structure is either a hash table or a fully sorted table – the rule engine decides heuristically to use a hash or a merge join. In either case, we take advantage of our columnar layout and concatenate only columns needed in the join, often just a single column. The join performance gained with such a tailor-made data structure justifies the cost of on-demand concatenation. We delete the auxiliary structures after the join.\nThis approach is used whenever the union of many IDB tables is needed in a join. However, especially the expression ∆[ j,i]q` may often refer to only one (non-empty) block, in which case we can work directly on its data. We use several optimizations that aim to exclude some non-empty blocks from a join so as to make this more likely, as described next."
+    }, {
+      "heading" : "Dynamic Optimization",
+      "text" : "Our storage layout is most effective when only a few blocks of fact tables ∆ip must be considered for applying a rule, as this will make on-demand concatenation simpler or completely obsolete. An important advantage of our approach is that we can exclude individual blocks when applying a rule, based on any information that is available at this time.\nWe now present three different optimization techniques whose goal is precisely this. In each case, assume that we have performed i derivation steps and want to apply rule r of the form (7) in step i + 1, and that j < i + 1 was the last step in which r has been applied. We consider each of the m versions of the SNE rule (9) in separation. We start by gathering, for each IDB atom qk(sk) in the body of r, the relevant range of non-empty tables ∆oqk . We also record which rule rule[o] was used to create this table in step o."
+    }, {
+      "heading" : "Mismatching Rules",
+      "text" : "An immediate reason for excluding ∆oqk from the join is that the head of rule[o] does not unify with qk(sk). This occurs when there are distinct constant symbols in the two atoms. In such a case, it is clear that none of the IDB facts in ∆oqk can contribute to matches of qk(sk), so we can safely remove o from the list of blocks considered for this body atom. For example, rule (3) can always ignore inferences of rule (6), since the constants hasPart and owl:inverseOf do not match.\nWe can even apply this optimization if the head of rule[o] unifies with the body atom qk(sk), by exploiting the information contained in partial results obtained when computing the join (10) from left to right. Simplifying notation, we can write (10) as follows:\nREDB ./ ∆[l1,u1]q1 ./ . . . ./ ∆ [lm,um] qm (11)\nwhere REDB denotes the relation obtained by joining the EDB atoms. We compute this m-ary join by applying m binary joins from left to right. Thus, the decision about the blocks to include for ∆[lk ,uk]qk only needs to be made when we have already computed the relation Rk B REDB ./ ∆\n[l1,u1] q1 ./ . . . ./ ∆ [lk−1,uk−1] qk−1 . This relation yields all possible instantiations for the variables that occur in the terms t1, . . . , tn, s1, . . . , sk−1, and we can thus view Rk as a set of possible partial substitutions that may lead to a match of the rule. Using this notation, we obtain the following result.\nTheorem 2 If, for all σ ∈ Rk, the atom qk(sk)σ does not unify with the head of rule[o], then the result of (10) remains the same when replacing the relation ∆[lk ,uk]qk by (∆ [lk ,uk] qk \\∆oqk ).\nThis turns a static optimization technique into a dynamic, data-driven optimization. While the static approach required a mismatch of rules under all possible instantiations, the dynamic version considers only a subset of those, which is\nguaranteed to contain all actual matches. This idea can be applied to other optimizations as well. In any case, implementations must decide if the cost of checking a potentially large number of partial instantiations in Rk is worth paying in the light of the potential savings."
+    }, {
+      "heading" : "Redundant Rules",
+      "text" : "A rule is trivially redundant if its head atom occurs in its body. Such rules do not need to be applied, as they can only produce duplicate inferences. While trivially redundant rules are unlikely to occur in practice, the combination of two rules frequently has this form. Namely, if the head of rule[o] unifies with qk(sk), then we can resolve rule r with rule[o], i.e., apply backward chaining, to obtain a rule of the form:\nro = p(t)← e1(t1), . . . , en(tn), q1(s1), . . . , qk−1(sk−1), Bodyrule[o], qk+1(sk+1), . . . , qm(sm). (12)\nwhere Bodyrule[o] is a variant of the body of rule[o] to which a most general unifier has been applied. If rule ro is trivially redundant, we can again ignore ∆oqk . Moreover, we can again turn this into a dynamic optimization method by using partially computed joins as above.\nTheorem 3 If, for all σ ∈ Rk, the rule roσ is trivially redundant, then the result of (10) remains the same when replacing the relation ∆[lk ,uk]qk by (∆ [lk ,uk] qk \\ ∆oqk ).\nFor example, assume we want to apply rule (5) of our initial example, and ∆oT was derived by rule (4). Using backward chaining, we obtain ro = T(y,w, x) ← Inverse(v,w), Inverse(v,w′), T(y,w′, x), which is not trivially redundant. However, evaluating the first part of the body Inverse(v,w), Inverse(v,w′) for our initial example data, we obtain just a single substitution σ = {v 7→ hP,w 7→ pO, w′ 7→ pO}. Now roσ = T(y, pO, x) ← Inverse(hP, pO), Inverse(hP, pO), T(y, pO, x) is trivially redundant. This optimization depends on the data, and cannot be found by considering rules alone."
+    }, {
+      "heading" : "Subsumed Rules",
+      "text" : "Many further optimizations can be realized using our novel storage layout. As a final example, we present an optimization that we have not implemented yet, but which we think is worth mentioning as it is theoretically sound and may show a promising direction for future works. Namely, we consider the case where some of the inferences of rule r were already produced by another rule since the last application of r in step j. We say that rule r1 is subsumed by rule r2 if, for all sets of facts I, r1(I) ⊆ r2(I). It is easy to compute this, based on the well-known method of checking subsumption of conjunctive queries (Abiteboul, Hull, and Vianu 1995). If this case is detected, r1 can be ignored during materialization, leading to another form of static optimization. However, this is rare in practice. A more common case is that one specific way of applying r1 is subsumed by r2.\nNamely, when considering whether to use ∆oqk when applying rule r, we can check if the resolved rule ro shown in (12) is subsumed by a rule r′ that has already been applied\nafter step o. If yes, then ∆oqk can again be ignored. For example, consider the rules (2)–(6) and an additional rule\nCompound(x)← T(x, hasPart, y), (13) which is a typical way to declare the domain of a property. Then we never need to apply rule (13) to inferences of rule (6), since the combination of these rules Compound(x) ← T(x, hasPart, y′), T(y′, hasPart, y) is subsumed by rule (13).\nOne can pre-compute these relationships statically, resulting in statements of the form “r1 does not need to be applied to inferences produced by r2 in step o if r3 has already been applied to all facts up until step o.” This information can then be used dynamically during materialization to eliminate further blocks. The special case r1 = r3 was illustrated in the example. It is safe for a rule to subsume part of its own application in this way."
+    }, {
+      "heading" : "Memoization",
+      "text" : "The application of a rule with m IDB body atoms requires the evaluation of m SNE rules of the form (9). Most of the joined relations ∆[lk ,uk]qk range over (almost) all inferences of the respective IDB atom, starting from lk = 0. Even if optimizations can eliminate many blocks in this range, the algorithm may spend considerable resources on computing these optimizations and the remaining on-demand concatenations, which may still be required. This cost occurs for each application of the rule, even if there were no new inferences for qk since the last computation.\nTherefore, rules with fewer IDB body atoms can be evaluated faster. Especially rules with only one IDB body atom require only a single SNE rule using the limited range of blocks ∆[ j,i]q1 . To make this favorable situation more common, we can pre-compute the extensions of selected IDB atoms, and then treat these atoms as part of the EDB layer. We say that the pre-computed IDB atom is memoized. For example, we could memoize the atom T(v, owl:inverseOf,w) in (3). Note that we might memoize an atom without precomputing all instantiations of its predicate. A similar approach was used for OWL RL reasoning by Urbani et al. (2014), who proved the correctness of this transformation.\nSNE is not efficient for selective pre-computations, since it would compute large parts of the materialization. Goaldirected methods, such as QSQ-R or Magic Sets, focus on inferences needed to answer a given query and hence are more suitable (Abiteboul, Hull, and Vianu 1995). We found QSQ-R to perform best in our setting.\nWhich IDB atoms should be memoized? For specific inferencing tasks, this choice is often fixed. For example, it is very common to pre-compute the sub-property hierarchy. We cannot rely on such prior domain knowledge for general Datalog, and we therefore apply a heuristic: we attempt precomputation for all most general body atoms with QSQ-R, but set a timeout (default 1 sec). Memoization is only performed for atoms where pre-computation completes before this time. This turns out to be highly effective in some cases."
+    }, {
+      "heading" : "Evaluation",
+      "text" : "In this section, we evaluate our approach based on a prototype implementation called VLog. As our main goal is to\nsupport KG materialization under limited resources, we perform all evaluations on a laptop computer. Our source code and a short tutorial is found at https://github.com/jrbn/vlog. Experimental Setup The computer used in all experiments is a Macbook Pro with a 2.2GHz Intel Core i7 processor, 512GB SDD, and 16GB RAM running on MacOS Yosemite OS v10.10.5. All software (ours and competitors) was compiled from C++ sources using Apple CLang/LLVM v6.1.0.\nWe used largely the same data that was also used to evaluate RDFox (Motik et al. 2014). Datasets and Datalog programs are available online.2 The datasets we used are the cultural-heritage ontology Claros (Motik et al. 2014), the DBpedia KG extracted from Wikipedia (Bizer et al. 2009), and two differently sized graphs generated with the LUBM benchmark (Guo, Pan, and Heflin 2005). In addition, we created a random sample of Claros that we call Claros-S. Statistics on these datasets are given in Table 1.\nAll of these datasets come with OWL ontologies that can be used for inferencing. Motik et al. used a custom translation of these ontologies into Datalog. There are several types of rule sets: “L” denotes the custom translation of the original ontology; “U” is an (upper) approximation of OWL ontologies that cannot be fully captured in Datalog; “LE” is an extension of the “L” version with additional rules to make inferencing harder. All of these rules operate on a Datalog translation of the input graph, e.g., a triple 〈entity:5593, rdf:type, a3:Image〉 might be represented by a fact a3:Image(entity:5593). We added rules to translate EDB triples to IDB atoms. The W3C standard also defines another set of derivation rules for OWL RL that can work directly on triples (Motik et al. 2009). We use “O” to refer to 66 of those rules, where we omitted the rules for datatypes and equality reasoning (Motik et al. 2009, Tables 4 and 8).\nVLog combines an on-disk EDB layer with an in-memory columnar IDB layer to achieve a good memory/runtime balance on limited hardware. The specifically developed ondisk database uses six permutation indexes, following standard practice in the field (Neumann and Weikum 2010). No other tool is specifically optimized for our setting, but the leading in-memory system RDFox is most similar, and we therefore use it for comparison. As our current prototype does not use parallelism, we compared it to the sequential version of the original version of RDFox (Motik et al. 2014). We recompiled it with the “release” configuration and the sequential storage variant. Later RDFox versions perform equality reasoning, which would lead to some input data being interpreted differently (2015a; 2015b). We were unable\n2http://www.cs.ox.ac.uk/isg/tools/RDFox/2014/AAAI/\nto deactivate this feature, and hence did not use these versions. If not stated otherwise, VLog was always used with dynamic optimizations activated but without memoization. Runtime and Memory Usage Table 2 reports the runtime and memory usage for materialization on our test data, and the total number of inferences computed by VLog. Not all operations could be completed on our hardware: oom denotes an out-of-memory error, while tout denotes a timeout after 3h. Memory denotes the peak RAM usage as measured using OS APIs.\nThe number of IDB facts inferred by VLog is based on a strict separation of IDB and EDB predicates, using rules like (2) to import facts used in rules. This is different from the figure reported for RDFox, which corresponds to unique triples (inferred or given). We have compared the output of both tools to ensure correctness.\nRDFox has been shown to achieve excellent speedups using multiple CPUs, so our sequential runtime measurements are not RDFox’s best performance but a baseline for fast in-memory computation in a single thread. Memory usage can be compared more directly, since the parallel version of RDFox uses only slightly more memory (Motik et al. 2014). As we can see, VLog requires only 6%–46% of the working memory used by RDFox. As we keep EDB data on disk, the comparison with a pure in-memory system like RDFox should take the on-disk file sizes into account (Table 1); even when we add these, VLog uses less memory in all cases where RDFox terminates. In spite of these memory savings, VLog shows comparable runtimes, even when considering an (at most linear) speedup when parallelizing RDFox. Dynamic Optimization Our prototype supports the optimizations “Mismatching Rules” (MR) and “Redundant Rules” (RR) discussed earlier. Table 3 shows the runtimes obtained by enabling both, one, or none of them.\nBoth MR and RR have little effect on LUBM and DBpedia. We attribute this to the rather “shallow” rules used in\nboth cases. In constrast, both optimizations are very effective on Claros, reducing runtime by a factor of almost five. This is because SNE leads to some expensive joins that produce only duplicates and that the optimizations can avoid. Memoization To evaluate the impact of memoization, we materialized LUBM1K with and without this feature, using the L and O rules. Table 4 shows total runtimes with and without memoization, the number of IDB atoms memoized, and the time used to compute their memoization.\nFor the L rules, memoization has no effect on materialization runtime despite the fact that 39 IDB atoms were memoized. For the O rules, in contrast, memoization decreases materialization runtime by a factor of six, at an initial cost of 6.5 seconds. We conclude that this procedure is indeed beneficial, but only if we use the standard OWL RL rules. Indeed, rules such as (4), which we used to motivate memoization, do not occur in the L rules. In a sense, the construction of L rules internalizes certain EDB facts and thus pre-computes their effect before materialization."
+    }, {
+      "heading" : "Discussion and Conclusions",
+      "text" : "We have introduced a new column-oriented approach to perform Datalog in-memory materialization over large KGs. Our goal was to perform this task in an efficient manner, minimizing memory consumption and CPU power. Our evaluation indicates that it is a viable alternative to existing Datalog engines, leading to competitive runtimes at a significantly reduced memory consumption.\nOur evaluation has also highlighted some challenges to address in future work. First, we observed that the execution of large joins can become problematic when many tables must be scanned for removing duplicates. This was the primary reason why the computation did not finish in time on some large datasets. Second, our implementation does not currently exploit multiple processors, and it will be interesting to see to how techniques of intra/inter query parallelism can be applied in this setting. Third, we plan to study mechanisms for efficiently merging inferences back into the input KG, which is not part of Datalog but useful in practice. Finally, we would also like to continue extending our dynamic optimizations to more complex cases, and to develop further optimizations that take advantage of our design.\nMany further continuations of this research come to mind. To the best of our knowledge, this is the first work to exploit a column-based approach for Datalog inferencing, and it does indeed seem as if the research on large-scale inmemory Datalog computation has only just begun. Acknowledgments This work was partially funded by COMMIT, the NWO VENI project 639.021.335, and the DFG in Emmy Noether grant KR 4381/1-1 and in CRC 912 HAEC within the cfAED Cluster of Excellence."
+    }, {
+      "heading" : "Appendix: Proofs",
+      "text" : ""
+    }, {
+      "heading" : "Proof of Theorem 1",
+      "text" : "We first observe that the naive approach (8) terminates and leads to a unique least model P∞(I). Recall that the latter was defined by applying all rules in parallel in each step. Now consider an arbitrary, fair sequence of individual applications of rules rule[1], rule[2], . . ., each applied naively as in (8). Let P̂`(I) denote the set of all facts derived in this way up until step `. Clearly, the rule-by-rule inference is sound, i.e., P̂`(I) ⊆ P∞(I) for all derivation steps `. It remains to show that it is also complete in the sense that P̂`(I) ⊇ P∞(I) for some `. Since we apply rules fairly, there is a sequence of derivation step indices i1 < i2 < i3 < . . . such that every rule has been applied in each interval of the form ik < ik+1. Formally, for every ik in the sequence, and for every rule r, there is j ∈ {ik + 1, . . . , ik+1} such that r = rule[ j]. It follows that P̂ik+1 (I) ⊇ P(P̂ik (I)) (in words: the sequential application of rules derives at least the inferences that a parallel application of rules would derive). Therefore, by a simple induction, P`(I) ⊆ P̂i` (I) for every ` ≥ 0. Since P∞(I) = Pm(I) for some finite m (Abiteboul, Hull, and Vianu 1995), we have P∞(I) ⊆ P̂im (I). Together with soundness, this implies that P∞(I) = P̂im (I), as required.\nNow to show that the semi-naive application strategy based on rules of the form (9) is also sound, we merely need to show that it produces the same inferences as the naive rule-by-rule application would produce (based on the same, fair sequence of rules). Let ∆ip refer to the facts derived for p in step i using the semi-naive procedure, and let ∆̂ip denote the set of facts produced for p in step i by the naive procedure. We show by induction that ∆[0,i]p = ∆̂ [0,i] p holds for ever predicate p and every step i. The induction base is trivial, since ∆0p = ∆̂ 0 p = ∅. For the induction step, assume that the claim holds for all k ≤ i. Let r of form (7) be the rule applied in step i+1, and assume that r was last applied in step j (set to −1 if it was never applied). ∆i+1p is computed by evaluating (9) for every ` ∈ {1, . . . ,m}, while ∆̂0p is obtained by evaluating (8).\nFor every inference tmpp(c) obtained from (8), there is a ground substitution σ such that the rule tmpp(t)σ← e1(t1)σ, . . . , en(tn)σ,∆[0,i]q1 (s1)σ, . . . ,∆ [0,i] qm (sm)σ is applicable and tσ = c. Being applicable here means that saσ ∈ ∆[0,i]qa for every a ∈ {1, . . . ,m} (and likewise for expressions eb(tb)σ). Now whenever saσ ∈ ∆[0,i]qa , there is an index wa ∈ {0, . . . , i} such that saσ ∈ ∆waqa .\nGiven an inference tmpp(c) and ground substitution σ as above, tmpp(c) is also inferred by a rule of the form (9). Indeed, let ` be the largest index from the range {1, . . . ,m} such that w` ≥ j. Then the following ground instantiation of (9) is applicable:\ntmpp(t)σ← e1(t1)σ, . . . , en(tn)σ, ∆[0,i]q1 (s1)σ, . . . ,∆ [0,i] q`−1 (s`−1)σ,\n∆ [ j,i] q` (s`)σ,∆ [0, j−1] q`+1 (s`+1)σ, . . . ,∆ [0, j−1] qm (sm)σ.\nThis follows from the induction hypothesis and the definition of `. Note that the case where wa < j for all a ∈\n{1, . . . ,m} can be disregarded, since it follows by the induction hypothesis that such inferences have already been produced when applying rule r in step j. This completes the induction and the proof."
+    }, {
+      "heading" : "Proof of Theorem 2",
+      "text" : "This claim is immediate from the definitions. In detail, consider Rk and rule[o] as in the claim of the theorem. Moreover, let Rm be the set of all complete rule body matches that could be computed without taking any optimization into account. Clearly, Rk ./ Rm ⊆ Rm, i.e., Rm contains only tuples compatible with Rk. By the assumption in the theorem, for all σ ∈ Rk, the atom qk(sk)σ does not unify with the head of rule[o]. Therefore, ∆oqk does not contain any fact that is compatible with Rk, i.e., Rk ./ ∆oqk = ∅ (where the join here is meant to join the positions in accordance with the terms used in qk(sk)). This implies that Rm ./ ∆oqk = ∅, and thus ∆oqk does not need to be considered for finding matches of qk(sk) when computing Rm."
+    }, {
+      "heading" : "Proof of Theorem 3",
+      "text" : "The claim is again rather immediate, but we spell it out in detail for completeness. Assume we apply a rule r of the form (7) in step i + 1, after it was last applied in step j. We use similar notation for (partial) joins as in the proof of Theorem 2 in the previous section. In addition, let rule[o] be of the following form:\nrule[o] = qk(t′)← e′1(t′1), . . . , e ′ n′ (t ′ n′ ), q ′ 1(s ′ 1), . . . , q ′ m′ (s ′ m′ ).\nAs shown in Theorem 1, ∆[0,o]qk is the same set of facts that would be produced by evaluating a naive version of rule[o] in step o, i.e., by using a computation of the form\ntmpqk (t ′)← e′1(t′1), . . . , e ′ n′ (t ′ n′ ),∆ [0,o] q′1 (s′1), . . . ,∆ [0,o] q′m′ (s′m′ ).\nNote that ∆oqk ⊆ tmpqk (t′). Let R′ denote the result of the following join\ne′1(t ′ 1) ./ . . . ./ e ′ n′ (t ′ n′ ) ./ ∆ [0,o] q′1 (s′1) ./ . . . ./ ∆ [0,o] q′m′ (s′m′ ).\nWe can again consider the element of R′ as substitutions over the variables of rule[o], where we assume without loss of generality that rule[o] shares no variables with r.\nNow consider the situation as in the claim where we apply a particular semi-naive rule of the form (9) and have partially evaluated the rule body until Rk. Consider any σ ∈ Rk ./ R′ (where the join identifies positions/variables as necessary to unify the atoms qk(t′) and qk(s1)). By the definition of redundancy, rule[o] contains an atom q′a(s′a) such that p(t)σ = q′a(s′a)σ (in particular p = q ′ a). As R\n′ assigns values to all variables in rule[o], we find that s′aσ = tσ is a list of ground terms. By definition of R′, tσ ∈ ∆[0,o]q′a = ∆ [0,o] p . Since ∆i+1p = tmpp\\∆[0,i]p and ∆[0,o]p ⊆ ∆[0,i]p , we get tσ < ∆i+1p . Therefore, applying rule r with any substitution that extends σ in step i + 1 is redundant. Since the argument holds for all assignments in Rk ./ R′, and since the projection to of Rk ./ R′ to variables in r is a superset of Rk ./ ∆oqk , we find that all tuples from ∆oqk can be ignored when applying r."
+    } ],
+    "references" : [ {
+      "title" : "D",
+      "author" : [ "Abadi" ],
+      "venue" : "J.; Marcus, A.; Madden, S.; and Hollenbach, K.",
+      "citeRegEx" : "Abadi et al. 2009",
+      "shortCiteRegEx" : null,
+      "year" : 2009
+    }, {
+      "title" : "Integrating compression and execution in column-oriented database systems",
+      "author" : [ "Madden Abadi", "D. Ferreira 2006] Abadi", "S. Madden", "M. Ferreira" ],
+      "venue" : "In Proceedings of SIGMOD,",
+      "citeRegEx" : "Abadi et al\\.,? \\Q2006\\E",
+      "shortCiteRegEx" : "Abadi et al\\.",
+      "year" : 2006
+    }, {
+      "title" : "Schema-agnostic query rewriting for SPARQL 1.1",
+      "author" : [ "Bischoff" ],
+      "venue" : "In Proc. 13th Int. Semantic Web Conf. (ISWC’14),",
+      "citeRegEx" : "Bischoff,? \\Q2014\\E",
+      "shortCiteRegEx" : "Bischoff",
+      "year" : 2014
+    }, {
+      "title" : "OWLIM: a family of scalable semantic repositories",
+      "author" : [ "Bishop" ],
+      "venue" : "Semantic Web Journal 2(1):33–42",
+      "citeRegEx" : "Bishop,? \\Q2011\\E",
+      "shortCiteRegEx" : "Bishop",
+      "year" : 2011
+    }, {
+      "title" : "DBpedia – A crystallization point for the Web of Data",
+      "author" : [ "Bizer" ],
+      "venue" : "J. of Web Semantics",
+      "citeRegEx" : "Bizer,? \\Q2009\\E",
+      "shortCiteRegEx" : "Bizer",
+      "year" : 2009
+    }, {
+      "title" : "and Koenig",
+      "author" : [ "B. Bonet" ],
+      "venue" : "S., eds.",
+      "citeRegEx" : "Bonet and Koenig 2015",
+      "shortCiteRegEx" : null,
+      "year" : 2015
+    }, {
+      "title" : "Ontology-based querying with Bio2RDF’s linked open data",
+      "author" : [ "Cruz-Toledo Callahan", "A. Dumontier 2013] Callahan", "J. Cruz-Toledo", "M. Dumontier" ],
+      "venue" : "J. of Biomedical Semantics 4(S-1)",
+      "citeRegEx" : "Callahan et al\\.,? \\Q2013\\E",
+      "shortCiteRegEx" : "Callahan et al\\.",
+      "year" : 2013
+    }, {
+      "title" : "LUBM: A benchmark for OWL knowledge base systems. Web Semantics: Science, Services and Agents on the World Wide Web 3:158–182",
+      "author" : [ "Pan Guo", "Y. Heflin 2005] Guo", "Z. Pan", "J. Heflin" ],
+      "venue" : null,
+      "citeRegEx" : "Guo et al\\.,? \\Q2005\\E",
+      "shortCiteRegEx" : "Guo et al\\.",
+      "year" : 2005
+    }, {
+      "title" : "F",
+      "author" : [ "Hoffart, J.", "Suchanek" ],
+      "venue" : "M.; Berberich, K.; and Weikum, G.",
+      "citeRegEx" : "Hoffart et al. 2013",
+      "shortCiteRegEx" : null,
+      "year" : 2013
+    }, {
+      "title" : "M",
+      "author" : [ "S. Idreos", "F. Groffen", "N. Nes", "S. Manegold", "K.S. Mullender", "Kersten" ],
+      "venue" : "L.",
+      "citeRegEx" : "Idreos et al. 2012",
+      "shortCiteRegEx" : null,
+      "year" : 2012
+    }, {
+      "title" : "Optimizing enterprise-scale OWL 2 RL reasoning in a relational database system",
+      "author" : [ "Wu Kolovski", "V. Eadon 2010] Kolovski", "Z. Wu", "G. Eadon" ],
+      "venue" : "In Proc. 9th Int. Semantic Web Conf. (ISWC’10),",
+      "citeRegEx" : "Kolovski et al\\.,? \\Q2010\\E",
+      "shortCiteRegEx" : "Kolovski et al\\.",
+      "year" : 2010
+    }, {
+      "title" : "M",
+      "author" : [ "Krötzsch" ],
+      "venue" : "2011. Efficient rule-based inferencing for OWL EL. In Walsh, T., ed., Proc. 22nd Int. Joint Conf. on Artificial Intelligence (IJCAI’11), 2668–",
+      "citeRegEx" : "Krötzsch 2011",
+      "shortCiteRegEx" : null,
+      "year" : 2673
+    }, {
+      "title" : "OWL 2 Web Ontology Language: Profiles",
+      "author" : [ "Motik" ],
+      "venue" : null,
+      "citeRegEx" : "Motik,? \\Q2009\\E",
+      "shortCiteRegEx" : "Motik",
+      "year" : 2009
+    }, {
+      "title" : "Parallel materialisation of Datalog programs in centralised, main-memory RDF systems",
+      "author" : [ "Motik" ],
+      "venue" : "In Proc. AAAI’14,",
+      "citeRegEx" : "Motik,? \\Q2014\\E",
+      "shortCiteRegEx" : "Motik",
+      "year" : 2014
+    }, {
+      "title" : "Combining rewriting and incremental materialisation maintenance for datalog programs with equality",
+      "author" : [ "Motik" ],
+      "venue" : "In Proc. 24th Int. Joint Conf. on Artificial Intelligence",
+      "citeRegEx" : "Motik,? \\Q2015\\E",
+      "shortCiteRegEx" : "Motik",
+      "year" : 2015
+    }, {
+      "title" : "Handling owl:sameAs via rewriting",
+      "author" : [ "Motik" ],
+      "venue" : null,
+      "citeRegEx" : "Motik,? \\Q2015\\E",
+      "shortCiteRegEx" : "Motik",
+      "year" : 2015
+    }, {
+      "title" : "Incremental update of datalog materialisation: the backward/forward algorithm",
+      "author" : [ "B. Motik", "Y. Nenov", "R. Piro", "I. Horrocks" ],
+      "venue" : null,
+      "citeRegEx" : "Motik et al\\.,? \\Q2015\\E",
+      "shortCiteRegEx" : "Motik et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "The RDF3X engine for scalable management of RDF data",
+      "author" : [ "T. Neumann", "G. Weikum" ],
+      "venue" : "VLDB J. 19(1):91–113",
+      "citeRegEx" : "2010",
+      "shortCiteRegEx" : "2010",
+      "year" : 2010
+    }, {
+      "title" : "Marvin: Distributed reasoning over large-scale Semantic Web data",
+      "author" : [ "E. Oren", "S. Kotoulas", "G. Anadiotis", "R. Siebes", "A. ten Teije", "F. van Harmelen" ],
+      "venue" : "J. of Web Semantics",
+      "citeRegEx" : "2009",
+      "shortCiteRegEx" : "2009",
+      "year" : 2009
+    }, {
+      "title" : "Artificial Intelligence: A Modern Approach",
+      "author" : [ "S. Russell", "P. Norvig" ],
+      "venue" : null,
+      "citeRegEx" : "2003",
+      "shortCiteRegEx" : "2003",
+      "year" : 2003
+    }, {
+      "title" : "WebPIE: A Web-scale Parallel Inference Engine using MapReduce",
+      "author" : [ "J. Urbani", "S. Kotoulas", "J. Maassen", "F. Van Harmelen", "H. Bal" ],
+      "venue" : "Journal of Web Semantics",
+      "citeRegEx" : "2012",
+      "shortCiteRegEx" : "2012",
+      "year" : 2012
+    }, {
+      "title" : "Dynamite: Parallel materialization of dynamic RDF data",
+      "author" : [ "J. Urbani", "A. Margara", "C. Jacobs", "F. van Harmelen", "H. Bal" ],
+      "venue" : "In The Semantic Web–ISWC",
+      "citeRegEx" : "2013",
+      "shortCiteRegEx" : "2013",
+      "year" : 2013
+    }, {
+      "title" : "Hybrid reasoning on OWL RL",
+      "author" : [ "J. Urbani", "R. Piro", "F. van Harmelen", "H. Bal" ],
+      "venue" : "Semantic Web 5(6):423–447",
+      "citeRegEx" : "2014",
+      "shortCiteRegEx" : "2014",
+      "year" : 2014
+    }, {
+      "title" : "Column-oriented Datalog materialization for large knowledge graphs",
+      "author" : [ "J. Urbani", "C. Jacobs", "M. Krötzsch" ],
+      "venue" : "In Proc",
+      "citeRegEx" : "2016",
+      "shortCiteRegEx" : "2016",
+      "year" : 2016
+    }, {
+      "title" : "Wikidata: A free collaborative knowledge base. Commun",
+      "author" : [ "D. Vrandečić", "M. Krötzsch" ],
+      "venue" : null,
+      "citeRegEx" : "2014",
+      "shortCiteRegEx" : "2014",
+      "year" : 2014
+    }, {
+      "title" : "Parallel materialization of the finite RDFS closure for hundreds of millions of triples",
+      "author" : [ "J. Weaver", "J.A. Hendler" ],
+      "venue" : "In Proc. 8th Int. Semantic Web Conf. (ISWC’09),",
+      "citeRegEx" : "2009",
+      "shortCiteRegEx" : "2009",
+      "year" : 2009
+    } ],
+    "referenceMentions" : [ ],
+    "year" : 2016,
+    "abstractText" : "The evaluation of Datalog rules over large Knowledge Graphs (KGs) is essential for many applications. In this paper, we present a new method of materializing Datalog inferences, which combines a column-based memory layout with novel optimization methods that avoid redundant inferences at runtime. The pro-active caching of certain subqueries further increases efficiency. Our empirical evaluation shows that this approach can often match or even surpass the performance of state-of-the-art systems, especially under restricted resources.",
+    "creator" : "LaTeX with hyperref package"
+  }
+}

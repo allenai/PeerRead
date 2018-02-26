@@ -1,0 +1,723 @@
+{
+  "name" : "1510.06143.pdf",
+  "metadata" : {
+    "source" : "CRF",
+    "title" : "High Performance Latent Variable Models",
+    "authors" : [ "Aaron Q. Li", "Amr Ahmed", "Vanja Josifovski", "Alexander J. Smola" ],
+    "emails" : [ "aaron@potatos.io", "amra@google.com", "muli@cs.cmu.edu", "vanjaj@google.com", "alex@smola.org" ],
+    "sections" : [ {
+      "heading" : null,
+      "text" : "Our system uses a number of advances in distributed inference: high performance in synchronization of sufficient statistics with relaxed consistency model; fast sampling, using the Metropolis-Hastings-Walker method to overcome dense generative models; statistical modeling, moving beyond Latent Dirichlet Allocation (LDA) to Pitman-Yor distributions (PDP) and Hierarchical Dirichlet Process (HDP) models; sophisticated parameter projection schemes, to resolve the conflicts within the constraint between parameters arising from the relaxed consistency model.\nThis work significantly extends the domain of applicability of what is commonly known as the parameter server. We obtain results with up to hundreds billion of tokens, thousands of topics, and a vocabulary of a few million token-types, using up to 60,000 processor cores operating on a production cluster of a large Internet company. This demonstrates the feasibility to scale to problems orders of magnitude larger than any previously published work.\nKeywords Sampling, Scalability, Latent Variable Models, Parameter Server"
+    }, {
+      "heading" : "1. INTRODUCTION",
+      "text" : "Permission to make digital or hard copies of all or part of this work for personal or classroom use is granted without fee provided that copies are not made or distributed for profit or commercial advantage and that copies bear this notice and the full citation on the first page. To copy otherwise, to republish, to post on servers or to redistribute to lists, requires prior specific permission and/or a fee. Copyright 20XX ACM X-XXXXX-XX-X/XX/XX ...$15.00.\nLatent variable models are a highly versatile tool for inferring the structures and hierarchies from unstructured data. Typical use cases of latent variable models include learning topics from documents, building user profiles, predicting user behaviors, and generating hierarchies of class labels.\nPushing the limits of scalability for latent variable models is a fundamental challenge in large scale statistical modeling. While simple models such as Latent Dirichlet Allocation [2] per se are prevalent in use, scalability becomes a critical issue when the model is adopted on industrial data. Many of these models have shared parameters proportional to the size of the data, and high performance on small academic datasets does not imply good performance on data with industrial size. Many systems have been designed to address this challenge for one or two particular models, and even so, it often requires a large amount of efforts to implement.\nIn this paper, we use a systematic approach to solve this problem in a generic way, such that very little change and engineering effort are required when the amount of data rapidly grows, or when a new latent variable model is used. We extend our previous work on the MetropolisHastings-Walker sampler (Alias sampler) [10] to the parameter server [12], which is a scalable and general purpose distributed machine learning framework. The resulted system is an order of magnitude faster than the state-of-the-art YahooLDA [17] in both efficiency and scalability. Comparing to LDA on parameter server [12], our system is more accurate and is able to adapt to a variety of latent variable models. In particular, our contributions include:\n• We show how nontrivial hierarchical latent variable models such as the Pitman Yor Topic model [3] and the Hierarchical Dirichlet Process [5] can be distributed efficiently over thousands of cores. This is nontrivial since it requires distributing a more complex set of sufficient statistics with associated polytope constraints. • We demonstrate how distributed synchronization and\nthe Metropolis-Hastings-Walker sampler of [10] can be integrated into a very high throughput sampling inference algorithm. The key challenge in this context is to adjust the distribution approximation in the Metropolis-Hastings component with the overall distributed Gibbs sampler. • We describe an efficient distributed implementation\nwhich takes the advantages of the parameter server [12] on efficient data communication and machine fault tolerance.\nar X\niv :1\n51 0.\n06 14\n3v 1\n[ cs\n.L G\n] 2\n1 O\nct 2\n01 5\n• We present systematic evaluation of a various of latent variable models, including LDA, PDP and HDP, using up to billions of documents and tens of thousands of CPU cores in shared production data centers."
+    }, {
+      "heading" : "1.1 Prior Work",
+      "text" : "The seminal paper of [2] relied on variational methods to analyze mere thousands of documents. Subsequent progress by [9] introduced collapsed variational sampling, which proved to be a much more scalable and rapidly mixing Gibbs sampling algorithm for latent variable inference. More efficient samplers were introduced by [22] which took advantage of the sparsity structure of the data. Unfortunately, a large portion of the computational advantages in the latter approach vanishes for very large collections of documents and large numbers of topics [12], since the generative model becomes mostly dense again.\nDistributed inference strategies for sampling were first proposed by [14]. They essentially exploited bulk synchronous communications paradigms as can be found in MapReduce [7]. That is, they alternate phases of sampling latent variables independently with phases of aggregating sufficient statistics between different machines. Subsequent work introduced the notion of a parameter server to allow for asynchronous processing [17]. The advantage of the latter was to use distributed sampling combined with asynchronous message passing for faster mixing. A substantially improved synchronization protocol was proposed by [1], which demonstrated scalability to 108 brief documents and more sophisticated temporal model dependencies. [6] implement a rather similar system, albeit not quite as scalable and with somewhat different consistency properties. Figure 1 provides a summary of scalable machine learning systems and their largest reported results in terms of parameters and number of cores.\nOutline: We begin by providing a background introduction of latent variable models in Section 2. We then give an introduction of Metropolis-Hastings-Walker sampler in Section 3. After that, we provide an overview of the parameter server in Section 4. Our solution is addressed in Section 5,\nand the experiment results are presented in Section 6. Finally we conclude in Section 7."
+    }, {
+      "heading" : "2. LATENT VARIABLE MODELS",
+      "text" : "In this section, we give a brief overview over three types latent variable models: Latent Dirichlet Allocation (LDA), the Poisson-Dirichlet Process (PDP) and the Hierarchical Dirichlet Process (HDP). More details are available in [10]."
+    }, {
+      "heading" : "2.1 Latent Dirichlet Allocation",
+      "text" : "In LDA [2] one assumes that documents are mixture distributions of language models associated with individual topics. That is, the documents are generated following the graphical model below:\nfor all i\nfor all d\nfor all k\nα θd zdi wdi ψk β\nFor each document d draw a topic distribution θd from a Dirichlet distribution with concentration parameter α. Moreover, for each topic we draw a word distribution ψk from a Dirichlet with concentration parameter β.\nθd ∼ Dir(α) ψk ∼ Dir(β) (1)\nGiven these terms we proceed to draw for each word i in document d a topic zdi from θd and a word from ψzdi .\nzdi ∼ Discrete(θd) wdi ∼ Discrete(ψzdi) (2)\nThe beauty of the Dirichlet-multinomial design is that the distributions are conjugate. This means that the multinomial distributions θd and ψk can be integrated out, thus allowing one to express p(w, z|α, β, nd) in closed-form [9]. This yields a Gibbs sampler to draw p(zdi|rest) efficiently. The conditional probability is given by\np(zdi|rest) ∝ (n−ditd + αt)(n −di tw + βw)\nn−dit + β̄ . (3)\nHere the count variables ntd, ntw and nt denote the number of occurrences of a particular (topic,document) and (topic,word) pair, or of a particular topic respectively. Moreover, the superscript ·−di denotes said count when ignoring the pair (zdi, wdi). For instance, n −di tw is obtained when ignoring the (topic,word) combination at position (d, i). Finally, β̄ := ∑ w βw denotes the joint normalization.\nAt first glance, sampling from (3) appears to cost O(k) time since we have k nonzero terms in a sum that needs to be normalized. [22] devised an ingenious strategy for exploiting sparsity in terms of ntd and ntw. This works as long as the amount of data is well-controlled. However, for very large corpora ntw is no longer sparse, since there is a nonzero probability for any word to assume any topic by virtue of the Dirichlet prior. On the other hand, ntd, i.e. the number of occurrences of a particular topic in a given document remains sparse, regardless of corpus size.\nWe devise a sampler to draw from p(zdi|rest) in amortized O(kd) time. We accomplish this by using\np(zdi|rest) ∝ n−ditd n−ditw + βw\nn−dit + β̄ + αt(n\n−di tw + βw)\nn−dit + β̄ (4)\nHere the first term is sparse in kd and we can draw from it in O(kd) time. The second term is dense, regardless of the number of documents (this holds true for stochastic variational samplers, too). However, the “language model” p(w|t) does not change too drastically whenever we resample a single word. The number of words is huge, hence the amount of change per word is concomitantly small. This insight forms the basis for applying Metropolis-Hastings-Walker sampling.\nThe idea is to replace αt(n\n−di tw +βw)\nn−dit +β̄ by an approximation,\nnamely by a stale variant thereof, while keeping the first (sparse) term exact. This leads to a proposal distribution that is close to (4), while at the same time allowing us to draw from it efficiently:\n• First draw a biased coin to decide whether to draw from n−ditd n−ditw +βw\nn−dit +β̄ or from the stale approximation.\n• If we draw from the sparse term, the cost is O(kd), i.e. the number of nonzero topics in the document. If we draw from the dense term, the cost is amortized O(1) due to the alias method. • Finally, perform a Metropolis-Hastings accept/reject\nmove by comparing the approximation with the true distribution."
+    }, {
+      "heading" : "2.2 Poisson Dirichlet Process",
+      "text" : "This strategy is also applicable on more advanced models which the generative distribution contain a dense part. An example of such model is Poisson Dirichlet Process [3, 15]. The model is given by the following variant of a topic model which takes account of the power-law properties of the observed actions/tokens.\nIn a conventional topic model the language model is simply given by a multinomial draw from a Dirichlet distribution. This fails to exploit distribution information between topics, such as the fact that all topics have the same common underlying language. A means for addressing this problem is to add a level of hierarchy to model the distribution over ψt via ∏ t p(ψt|ψ0)p(ψ0|β) rather than ∏ t p(ψt|β).\nfor all i\nfor all d for all k\nα θd zdi wdi ψt ψ0 β\nThe ingredients for a refined language model are a PitmanYor Topic Model (PYTM) [16] that is more appropriate to deal with natural languages. This is then combined with the Poisson Dirichlet Process (PDP) [15, 3] to capture the fact that the number of occurrences of a word in a natural language corpus follows power-law. Within a corpus, the frequency of a word is approximately inversely proportional to its ranking in number of occurrences. Each draw from a Poisson Dirichlet Process PDP(b, a, ψ0) is a probability distribution. The base distribution ψ0 defines the common underlying distribution. Each topic defines a distribution over words, and the base distribution defines the common underlying common language model shared by the topics. The concentration parameter b controls how likely a word is to occur again while being sampled from the generated distribution. The discount parameter a prevents a word to be sampled too often by imposing a penalty on its probabil-\nity based on its frequency. The combined model described explicitly in [4]:\nθd ∼ Dir(α) ψ0 ∼ Dir(β) zdi ∼ Discrete(θd) ψt ∼ PDP(b, a, ψ0) wdi ∼ Discrete (ψzdi)\nSkipping details that can be found in [5, 4] it follows that an efficient sampler can be implemented by using the following auxiliary variables:\n• stw denotes the number of tables serving dish w in restaurant t. Here t is the equivalent of a topic. • rdi indicates whether wdi opens a new table in the\nrestaurant or not (to deal with multiplicities). • mtw denotes the number of times dish w has been\nserved in restaurant t (analogously to nwk in LDA).\nThe conditional probability is given by:\np(zdi = t, rdi = 0|rest) ∝ αt + ndt bt +mt mtw + 1− stw mtw + 1 Smtw+1stw,at Smtwstw,at (5)\nif no additional “table” is opened by word wdi. Otherwise\np(zdi = t, rdi = 1|rest) (6)\n∝(αt + ndt) bt + atst bt +mt stw + 1 mtw + 1 γ + stw γ̄ + st Smtw+1stw+1,at Smtwstw,at\nHere SNM,a is the generalized Stirling number. It is given by\nSN+1M,a = S N M−1,a + (N −Ma)SNM,a and SNM,a = 0\nfor M > N , and SN0,a = δN,0. Moreover we have mt =∑ wmtw, and st = ∑ t stw. Similar to the conditional probability expression in LDA, these two expressions can be written as a combination of a sparse term and a dense term, simply by splitting the factor (αt +ndt) into its sparse component ndt and its dense counterpart αt. Hence we can apply the same strategy as before when sampling topics from LDA, albeit now using a twice as large space of state variables."
+    }, {
+      "heading" : "2.3 Hierarchical Dirichlet Process",
+      "text" : "To illustrate the efficacy and generality of our approach we discuss a third case where the document model itself is more sophisticated than a simple collapsed Dirichlet-multinomial. We demonstrate that there, too, inference can be performed efficiently. Consider the two-level topic model based on the Hierarchical Dirichlet Process [20] (HDP-LDA). In it, the topic distribution for each document θd is drawn from a Dirichlet process DP(b1, θ0). In turn, θ0 is drawn from a Dirichlet process DP(b0, H(·)) governing the distribution over topics. In other words, we add an extra level of hierarchy on the document side (compared to the extra hierarchy on the language model used in the PDP).\nfor all i\nfor all d\nfor all k\nH θ0 θd zdi wdi ψk β\nMore formally, the joint distribution is as follows:\nθ0 ∼ DP(b0, H(·)) ψt ∼ Dir(β) θd ∼ DP(b1, θ0) zdi ∼ Discrete(θd) wdi ∼ Discrete (ψzdi)\nBy construction, DP(b0, H(·)) is a Dirichlet Process, equivalent to a Poisson Dirichlet Process PDP(b0, a,H(·)) with the\ndiscount parameter a set to 0. The base distribution H(.) is often assumed to be a uniform distribution in most cases.\nDue to space constraints we omit a detailed discussion of the sampling arrangements. They can be found in [10]. The key property is that sampling requires us to keep track of the number of counts that topics are invoked at varying levels of the hierarchy of the Hierarchical DP. Again, as before, these distributions can be approximated by a MetropolisHastings-Walker scheme."
+    }, {
+      "heading" : "3. METROPOLIS-HASTINGS-WALKER",
+      "text" : "One of the key tools for inferring latent variable models is sampling. A common strategy is to use a relaxed Gibbs sampler which acts on each machine independently without the need for locking of state between machines, as described in [17]. As sampling progresses, the joint state converges to a draw from the posterior distribution over the latent variables given the data.\nThe challenge is that recomputing a slowly changing distribution can be very costly — in particular, if we have a distribution over k outcomes and we draw only a single sample before the distribution changes, each sample will require O(k) computation. In the following we describe an algorithm to reduce this to O(1) amortized cost, whenever the changes are sufficiently small [10]. The key difference to our previous work is that now changes to the distribution can occur both due to local samples and due to updates of the state by global synchronization. We begin by describing Walker’s alias method [21, 13] and a simplified version of the Metropolis-Hastings sampler [8]."
+    }, {
+      "heading" : "3.1 Walker’s Alias Method",
+      "text" : "Denote by pi with i ∈ {1 . . . l} the probabilities of a distribution over l outcomes from which we would like to sample. If p was the uniform distribution, i.e. pi = l\n−1, then sampling would be trivial. To accomplish this, we preprocess the distribution p into a list of l triples of the form (i, j, πi) with πi ≤ l−1 as follows:\n• Partition the indices {1 . . . l} into sets U and L where pi > l\n−1 for i ∈ U and pi ≤ l−1 for i ∈ L. • Pick any i ∈ L and j ∈ U and add (i, j, pi) to L. • Remove i from L and j from U • Update pj = pi + pj − l−1 and if pj > l−1 then add j\nto U , else to L.\nBy construction the algorithm terminates after l steps and moreover, all probability mass is preserved either in the form of πi associated with i or in the form of l\n−1−πi, as associated with j. Hence, sampling from p can now be accomplished in constant time:\n• Draw (i, j, πi) uniformly from the set of l triples in L. • With probability lπi emit i, else emit j.\nHence, if we need to draw from p at least l times, sampling can be accomplished in amortized O(1) time.1 However, in our case the distribution p is slowly-varying, hence we need to adapt the alias method accordingly.\n1Note that the alias method works since we are implicitly exploiting parallelism inherent in CPUs: as long as l does not exceed 264 are guaranteed that even an information theoretically inefficient code will not require more than 64 bit, which can be generated in constant time."
+    }, {
+      "heading" : "3.2 Sampling with Proposal Distributions",
+      "text" : "To address this problem we resort to Metropolis Hastings sampling [8] using a stationary proposal distribution. That is, we treat the “stale” version of p as proposal distribution q and correct the effect of sampling from the “wrong” distribution by a subsequent acceptance step. This is very efficient since it only requires that the ratios of probabilities are close. The drawback is that instead of drawing iid samples from p we end up with a chain of dependent samples from p, as governed by q.\nFor the purpose of the current method we only need to concern ourselves with stationary distributions p and q, i.e. p(i) = p(i|j) and q(i) = q(i|j), hence we only discuss this special case below. It is well known that to satisfy the detailed balance conditions, a sampling move such as i → j where j ∼ q(j) is accepted only with probability\nPr {move} = min (\n1, q(i|j)p(j) q(j|i)p(i)\n) = min ( 1, q(i)p(j)\nq(j)p(i)\n) (7)\nThe advantage of this stateless sampler is that whenever no initial state exists, we simply accept the draw j ∼ q(j) by default. Obviously, a necessary requirement is that q(i) > 0 whenever p(i) > 0, which holds, e.g. whenever we incorporate a smoother."
+    }, {
+      "heading" : "3.3 Constant Time Sampling",
+      "text" : "In combining both methods we arrive at, what we believe is a significant improvement over each component individually. It works as follows:\n• Given q := p generate the alias table L in O(l) time. • Update p as needed • Sample j using n steps of Metropolis-Hastings sam-\npling with q as its proposal distribution.\nAfter l/n steps we discard the alias table L and restart. Since sampling from the alias table takes O(1) time, the number of Metropolis-Hasting steps is constant, and each MetropolisHasting step contains a constant number of operations, as a result we end up drawing each sample from p in constant time, provided that p does not diverge from q too far. More detail is available in [10].\nOne of the main modifications relative to the singlemachine settings is that whenever we receive a global parameter update from the parameter server, p is likely to change dramatically. In this case we recompute the proposal distribution associated with the token. Since such updates are less frequent than the changes forced by sampling it does not materially affect performance."
+    }, {
+      "heading" : "4. PARAMETER SERVER",
+      "text" : "Distributed optimization and inference is popular for solving large scale machine learning problems. These problems often use 1TB to 1PB training data, which allows the creation of powerful and complex models with 109 to 1012 parameters [12]. Training this model often requires a large number of computation nodes to frequently refine the parameters, which imposes three challenges:\n• Frequently accessing the parameters requires an enormous amount of network bandwidth, which is one of the scarcest resources in data centers. • Many distributed algorithms are sequential. The re-\nsulting barriers hurt performance when the cost of synchronization and machine latency is high.\n• At scale, fault tolerance is critical. Learning tasks often require 100 to 10,000 machine hours, and are performed in a cloud environment where machines can be unreliable and jobs can be preempted.\nThe parameter server aims to solve these challenges and simplify the implementation of efficient distributed algorithms. Here we briefly review the previous work related to the latent variable models, more detailed review is available in [12, 11]. The first generation uses memcached as the synchronization mechanism [17], which lacks flexibility and performance. YahooLDA is one of the second generation of application specific parameter servers. It improved the previews design by a dedicated and user-definable server and a more principled load distribution algorithm [1].\nOur work is based on the third generation of parameter server [12], which is a general purpose distributed framework for machine learning. Before present our implementation in next Section 5, we first describe the architecture of this framework.\nIn parameter server, nodes are grouped into a server group and one or more client groups, which are shown in Figure 2. The sever group maintains the globally shared parameters, which are presented as (key,value) pairs. Take LDA as an example, the key is a combination of the word ID and topic ID, while the value is a count. These (key,value) pairs are then partitioned into server nodes by using consistent hashing in the form of a Chord-style layout [18].\nEach client group runs an application. A client stores locally a portion of the training data to compute local statistics. It communicates with the server in two ways, one is push the parameter updates to servers, the other one is pull the new values of the parameters from servers. Both push and pull are executed asynchronously to improve the performance.\nIn addition, there is a server manager maintains a consistent view of the metadata of the servers, such as node liveness and the assignment of parameter partitions. For each client group, there is also a scheduler node, which schedules the workloads to clients and monitors their progresses.\nThe parameter server provides flexible consistency model and allows powerful user-defined filters to trade-off the data consistency and algorithm efficiency. Besides, it provides\ncontinuous fault tolerance by using optimized chain replication [12]."
+    }, {
+      "heading" : "5. TOWARDS LARGE SCALE LATENT VARIABLE MODELS",
+      "text" : "In this section we describe our method to scale the singlethread algorithm proposed in our previous work [10] into an efficient distributed implementation. We first extend the alias sampler into a multi-thread version in Section 5.1. The distributed implementation of the collapsed Gibbs sampling in parameter server is then addressed in Section 5.2. Next we describe how to communicate data efficiently in Section 5.3 and how to achieve fault tolerance in Section 5.4. Finally, we show the algorithms to solve the constraint conflicts due to the relaxed data consistency model."
+    }, {
+      "heading" : "5.1 Multi-thread Alias Sampler",
+      "text" : "In our multi-thread version, there are two thread pools. One contains alias threads which construct the alias tables and pre-compute a stash of samples. The other pool consists of sampling threads which sample the documents. In practice, we only create 1 or few threads for the alias pool, but use much more threads, at least the number of available CPU cores, for the sampling pool.\nThe alias threads and the sampling threads formulate a producer-consumer relationship. The sampling threads keep consuming samples from the pre-computed stash of samples produced by the alias threads, notifies the alias threads whenever the demand surpasses the amount of supply, and recycles from old samples if demand is severely in shortage. The alias threads weigh the importance of each token-type, adjust the amount of supply that should be generated for each token-type to meet with the demand, and decide to store an entire alias table or only a stash of samples based on memory constraints and the statistics of demand.\nWe relaxed the consistency restriction of a typical producer-consumer design to have a lock-free implementation. It substantially improves the performance of the sampler without compromising the quality of the results and the convergence speed in practice."
+    }, {
+      "heading" : "5.2 Distributed Implementation Using the Parameter Server",
+      "text" : "We implemented distributed collapsed Gibbs sampling for latent variable models in parameter server as following: first the training data is partitioned in to a number of shards. Next each client reads one or more data shards to formulate sufficient statistics. Some sufficient statistics are stored locally, while the others are shared across clients via the server nodes.\nEach model has its own set of sufficient statistics. For instance, the LDA model has statistics nwk and nk shared while statistics ndk stored locally. The PDP model has statistics mwk, swk, mk and sk as shared parameters and ndk stored locally. The HDP model has statistics m0k, mk, mtk, twk, t0k, tk, and n0k stored in the server nodes with others storing locally.\nAfter that, the clients run the multi-thread alias sampler, while the shared parameters are synchronized via the server nodes. The process is described in Section 5.3, whereas conflicts are resolved following the procedure in Section 5.5.\n5.3 Data Synchronization\nWe used three mechanisms provided by the parameter server to reduce the data synchronization cost. Batched communication. In a conventional distributed (key,value) store system, (key,value) pairs are communicated individually. It is inefficient because both key and value are typically integer or float point numbers, while the overhead of sending such a pair is high.\nThe insight to improve this problem is that many learning algorithms represent parameters as structured mathematical objects, such as vectors, matrices, or tensors. At each iteration (or a logical time), typically a part of the object is updated. That is, clients usually send a segment of a vector, or an entire row of the matrix. In LDA, the word by topic matrix is shared across clients, where each time the topics associated with a word—a row of this matrix—are updated. This provides an opportunity to automatically batch both the communication of updates and also their processing on server nodes. Furthermore, it allows the consistency tracking to be implemented efficiently. Eventual data consistency model. The parameter server provides flexible data consistency models to trade-off the algorithm efficiency and system performance. Similar to previous work [1], we found the eventual consistency model best fits our requirements. In this model, a client’s network thread tries its best effort to pull the new parameters from the severs, while at the same time, the computation threads continue working without waiting. Furthermore, clients work independently without waiting each other. Communication filters. The parameter server allows user-defined filters for selective communicating (key,value) pairs. We designed a filter which sends the parameters with priority proportional to the magnitude of the updates since synchronized last time. Besides, we use a uniform sampling strategy to send the parameters to avoid stale parameters even if they have small local updates."
+    }, {
+      "heading" : "5.4 Failure and Load Balancing",
+      "text" : "Since we use a shared industrial cluster to run our experiments, we need to deal gracefully with machine failure and in-homogeneity. In prior work [1], we utilized a synchronous snapshot scheme where we freeze the servers and clients and take a snapshot of their memory to disk every N minutes. This approach does not scale well in practice and requires unnecessary communication overhead due to the global barriers. In addition, if a server or a client fails, the whole system need to restart form the most recent snapshot, and we lose all computations since that last snapshot.\nIn this work, we adopt an asynchronous approach to both failure and recovery as follows. Clients and servers independently take a snapshot of their memory to disk every N minutes without global barrier. These snapshots are then used for node recovering. Client failover. If a client fails, the scheduler node reschedules the task assigned to this client for another node without stopping the system. The new client then reads the state of the computation from the snapshot, sends a pull request to the server to obtain the recent values of the required parameters and then continues the computation from this point onward. Server failover. We did not use the hot failover mechanism described in [12] due to the resource constraints. Instead, if there is a server failure, we freeze the whole system until\nthe server manager reschedules a new node to take over the failed server. This new node reads the state from the most recent snapshot and continues computation onward. Note here that this protocol results in a relaxed consistency since only the failed server rolls back to its most recent snapshot. However in our experiments we found that approach works well in latent variable models. Straggler client. The clients nodes are not homogeneous, some clients might be far behind in their computation that others. To detect stragglers, each worker sends a progress report to the scheduler node every few minutes. This scheduler analyzes the average progress, and decide to whether terminate stragglers and re-assigns their tasks to new nodes or not."
+    }, {
+      "heading" : "5.5 Parameter Projection for Constraint Violation Resolution",
+      "text" : "For aggregation parameters, such as nt (aggregating ntw) in LDA, or mk (aggregating mwk) in PDP, the consistency can be easily maintained by deriving the aggregation parameter from its counterparts on the client side. However, this is not the case for parameters that have complex interactions and constraints.\nFor instance in PDP, the word-topic-table counts stw must be always less or equal to the word-topic counts mtw. Furthermore, mtw is greater than than zero implies stw is also greater than zero. In addition to that, both mtw and stw are always greater or equal to zero. In the case of HDP, similar constraints exist between the root table counts and item counts, the table and item counts for each document, and more.\nFigure 3 shows an example of this problem for PDP model. In this example, each client has slightly different statistics for mwk and twk for w = 1 and k = 2. In practice, this is often the case as it can be a result of a delay in synchronization. Client 2 sends an update to the servers which decreases m1,2 by 1, and Client 3 sends an update to the servers which decreases both m1,2 and t1,2 by 1. In Client 1’s perspective,\nAlgorithm 1: Simple Single Machine Projection\nData: C1 ← Tuples (c, A,B) where C are rules constraining two parameters, and A,B are collections of the same length Data: C2 ← Tuples (A,B) where A,B are parameters collections such that B = ∑ iAi where Ai ∈ A\nInitialize on Client 1: Sort C1 and C2 such that most frequently appeared parameter types come first\nAt the end of each iteration on Client 1: for (c, A,B)← C1 do\nfor i←1 to length(A) at local machine do if c(Ai, Bi) is not true then\nif ∃A′i : c(A′i, Bi) then Ai ← arg minA′i:c(A′i,Bi) |A ′ i −Ai|\nSendUpdate(A,Ai,A ′ i −Ai)\nelse (Ai, Bi)← arg min(A′i,B′i):c(A′i,B′i) |A ′ i−Ai|+ |B′i−Bi|\nSendUpdate(A, i, A′i −Ai) SendUpdate(B, i, B′i −Bi)\nfor (A,B)← C2 do B′ ← ∑ iAi\nSendUpdate(B, B′i −B) B ← B′\nAlgorithm 2: Distributed Projection\nData: C1 ← Tuples (c, A,B) where C are rules constraining two parameters, and A,B are collections of the same length Data: C2 ← Tuples (A,B) where A,B are parameters collections such that B = ∑ iAi where Ai ∈ A\nInitialize: 1. Randomly allocate parameter correction tasks to each client by parameter ID, such that correction task of each ID is only assigned to one client. 2. Sort C1 and C2 such that most frequently appeared parameter types come first"
+    }, {
+      "heading" : "At the end of each iteration on selected clients:",
+      "text" : "(Same as Algorithm 1)\nbased on the local statistics, the update sent by Client 2 violates the constraint in PDP such that mwk cannot be 0 while twk > 0. In Client 3’s perspective, the update sent by Client 2 violates the constraint which states mwk must be greater or equal to twk at any time. In Client 2’s perspective, the update sent by Client 3 violates the constraint which states twk cannot be 0 while mwk > 0. Either the client or the server must correct the statistics on demand and from time to time, otherwise the samplers would be prone to numerical errors and might soon diverge to unexpected to results, as inferencing from statistics that violate model constraints may easily produce NaN, infinite, or other unstable probabilities for the samples.\nAlgorithm 3: On-demand projection on server\nData: C1 ← Tuples (c, A,B) where C are rules constraining two parameters, and A,B are collections of the same length Data: Update (A, i, u) received from client, where U is a parameter collection, i is the parameter ID, and u is the update in differences.\nInitialize on all servers: Sort C1 and C2 such that most frequently appeared parameter types come first\nOn receiving update (U, i, u): U ′i ← Ui + u for (c, A,B)← C1 do\nif U = A then if c(Ui, Bi) is not true then\nif ∃U ′′i : c(U ′i , Bi) then U ′i ← arg minA′i:c(U′′i ,Bi) |U ′′ i − Ui| else (U ′i , Bi)← arg min(U′′i ,B′i):c(U′′i ,B′i) |U ′′ i −U ′i |+|B′i−Bi|\nUi ← U ′i\nTo address this issue, we implemented parameter projections using a proximal operator for correction. This correction mechanism ensures the parameters are rounded to their nearest consistent values whenever they are retrieved and used in the algorithms. We demonstrate that this approach works well in practice and is akin to proximal and projected gradient approaches for gradient-based optimization. We experimented with several approaches for corrections as follows:\n• To propagate the corrections, a single machine is selected at the end of each iteration to go through all the parameters, compute the nearest consistent values, and send the updates to the parameter servers. This approach is described in Algorithm 1\n• Propagating corrections with multiple, or all machines by dividing the parameter instances across them. Details are described in Algorithm 2\n• Server-side parameter on-demand correction based on a set of constraints. The description is in Algorithm 3.\nNote the algorithm may look similar from the description, but their implementations are very different in practice, as Algorithm 1 is performed on one machine, Algorithm 2 concerns with many machines, and Algorithm 3 is performed on the server for every update. Algorithm 1 is a batch algorithm, executed from time to time. Algorithm 2 requires more coordination. Algorithm 3 must be done in real-time and requires high performance.\nAll approaches were promising, and the second approach works particularly well in practice. Therefore, in this paper, we choose to report the results for experiments using the second approach.\n6. EXPERIMENTS\nBaselines. We implemented two LDA models on the parameter server: (1) YahooLDA, using the traditional sparse sampling method described in [22], (2) AliasLDA, using the alias sampling method as described in Section 3. In addition to that, we implemented the topic model with Poisson Dirichlet Process and the one with Hierarchical Dirichlet Process as described in Section 2, both combined with the alias sampling method, denoted by AliasPDP and AliasHDP respectively. Moreover, note that YahooLDA is a re-implementation of [1] in the new parameter server architecture described in this paper for a fair comparison. Dataset. We trained these models with 2000 topics on an anonymized collection of data, where the length of each document varies from a few tokens to tens of thousands of tokens. We divided the data into shards, so that each shard has approximately 50 million tokens, 200,000 documents, and 2 million different types of tokens. We constructed experiments with 200 shards for YahooLDA, AliasLDA, AliasPDP, and AliasHDP, 500 shards for YahooLDA, AliasLDA, AliasHDP, and an additional set of large scale experiment with 1000 and 2000 shards for AliasLDA. Environment. In these experiments, we allocated one client machine for each shard for computation, and created a set of server node for communications, where the number of node is 40% of the total number of client nodes. Each node runs using 10 cores. Thus the number of cores utilized by 200 clients are in fact 2000 cores. Our largest experiment runs using 6000 nodes, i.e. 60000 cores over 5 billion documents.\nWe ran the experiments on a shared large-scale cluster of well equipped machines interconnected by gigabyte network. To simulate real-world production environment, we limited our client and server instances to a modest priority such that many other applications running on these machines may pre-empt or terminate our clients and server instances. Moreover, this setup helps us demonstrate the reliability and robustness of our design and implementation, as being able to recover from these events is crucial in any production use of our system. Evaluation criteria. For each experiment on each client machine, we record the running time for each iteration, testperplexity for each five iterations, and the average number of topics per word per ten iterations. The perplexity evaluated on a test data set with 2000 documents, 450,000 tokens, and is calculated as\nπ(W|rest) := [ D∑ d=1 Nd ]−1 D∑ d=1 log p(wd|rest)\nwhere\np(wd|rest) = nd∏ i=1 k∑ t=1 p(wi = w|zdi = t, rest)p(zdi = t|rest)\nHere we obtain the estimate of p(wi = w|zdi = t, rest) from the model being trained. The perplexity is evaluated only on the node’s own local vocabulary, and unseen words are evaluated by assuming sufficient statistics related to the word is zero instead of being totally ignored, so to incorporate the general distribution of topics insofar the model has trained.\nAt the end of the experiments, we aggregate the record\ngenerated by each machine to a single set of statistics, including the maximum, the minimum, the standard deviation, the average value, and the number of data points. Some experiments are terminated early due to limited resources available by by the shared cluster and pre-emption by high-priority jobs, resulting a reduced number of data points available for the latter stage of the experiments. To make this point more clear, we terminate a job when 90% of the workers reach the required number of iterations thus if there are lagging workers the number of available data points for higher iterations are less than the total number of workers. This was done to make sure that we don’t burn up resources waiting for the slowest worker – in a shared environment this problem is known as the curse of the last reducer problem [19]. Since we are using this strategy across all models, it shows that models with faster convergence are better and it is a fair comparison.\nWe didn’t found any change in the final performance of the learned model if we let all models run put to full completion however we observed that the total running time can be up 10x larger to wait for the slowest worker. In some of the figures given in this section, this is demonstrated by the phenomenon that the average value gets closer to the minimum as the number of iterations get closer to the finishing line. Therefore, the trends in the figures have to interpreted along with the corresponding figure showing the number of data points available to give the readers an accurate reading. For instance, a seemingly decreasing average running time curve accompanied with a non-decreasing minimum running time curve does not imply the average running time actually decreases over iterations if the number of data points is also decreasing, because only the fastest client has completed more iterations than the others, and the average is taken from this fastest subset.\nThe error bars in the figures indicate the range for +1/-1 standard deviation across all clients. Maximum and minimum of each iteration across all clients are given whenever appropriate.“Average number of topics per word”means the average number of non-zero topics across all words in the local vocabulary. Note that small error bars means better synchronization between clients."
+    }, {
+      "heading" : "6.1 YahooLDA vs AliasLDA",
+      "text" : "In YahooLDA and AliasLDA, the parameters ntw and nt are shared across all clients. In AliasLDA, a supply of samples is kept for each type of token on the local machine, and these supplies are not shared between clients.\nThe perplexity convergence, average topics per word, and running time over iterations are given in Figure 4 for the experiments with 200, 500, 1000 clients respectively, along with the number of data points collected for each iteration in each experiment. AliasLDA consistently outperforms YahooLDA in average/minimum perplexity, average/minimum running time, and average/minimum number of topics per word.\nFurthermore, the running time of AliasLDA does not increase with increased average number of topics per word or increased data size, whereas the running time of YahooLDA scales up with these values. This observation is consistent with the theory that the alias sampling method does indeed decrease the time complexity, as suggested by [10]\nThere are two reasons that the alias sampling method arrives at better perplexity and more concentrated topics\nper word: (1) It runs substantially faster than YahooLDA, therefore suffers much less error from machine-restarts and failures. This is further evidenced by the fact that the error bars (standard deviation) on AliasLDA perplexity data points are much smaller (2) The alias table is computed locally and values of parameters are cached for a small period of time, therefore it suffers much less from parameter inconsistency during sampling."
+    }, {
+      "heading" : "6.2 Large scale LDA",
+      "text" : "We performed a single large scale experiment using our best LDA model with 6000 clients. The result is presented in Figure 6 where the performance is evaluated by document log-likelihood. In this case we have 5 billions documents, arguably the largest ever reported results for LDA. As seen from Figure 6, small variation across the mean likelihood implies proper synchronization across clients.\n6.3 PDP and HDP\nThe perplexity convergence, average topics per word, and running time over iterations are given in Figure 5 along with the number of data points for each iteration. The converging perplexity shows that our system works for more complicated models and the correction mechanisms are effective (without corrections, we observed diverging values and much worse perplexity).\nThe same set of statistics are given in Figure 7. The experiment converged to a very good perplexity with 200 clients and a stable decreasing curve with 500 clients, with very small standard deviation. Note even though this model is complex and the number of topics is large, many machines are still able to achieve a throughput above one million tokens per second."
+    }, {
+      "heading" : "6.4 Effects of Using Projection",
+      "text" : "In Figure 8 we show the result from a single simple exper-\niment to illustrate the importance of correcting parameters and the effects of using projections in our implementation. Without using projection, the perplexity converges slower and quickly diverges. We observed this behavior in many other experiments, such as in PDP model and especially when running a large number of clients."
+    }, {
+      "heading" : "7. CONCLUSION",
+      "text" : "In this paper we described a high performance system for\nlatent variable models, and empirically showed its efficiency by using it to analyze large scale data with a variety of latent variable topic models. We demonstrated that our system is able to efficiently run complex algorithms such as YahooLDA and AliasLDA to analyze large scale data with hundreds billions of tokens and thousands of topics at an unprecedented speed. Furthermore, we also demonstrated that it is possible to scale up even more complex latent variable topic model such as PDP and HDP that have many constraints between the parameters, on a network using hundreds or more machines to analyze real world data at the scale of billions of tokens.\nCompared to other state-of-the-art systems such as YahooLDA, even though the scale of data and the number of machines sharing parameters is orders of magnitude larger, our system accompanied with efficient alias sampling algorithms such as AliasLDA and AliasHDP is still able to outperform many of them in terms of efficiency, at the speed of millions of tokens per second per client. Our system effectively resolves the issue of capability and efficiency of complex latent variable models that many others in the industry and the research community are facing, thus opening many new possibilities for applications in analysis of large scale data."
+    }, {
+      "heading" : "8. REFERENCES",
+      "text" : "[1] A. Ahmed, M. Aly, J. Gonzalez, S. Narayanamurthy,\nand A. J. Smola. Scalable inference in latent variable models. In Proceedings of The 5th ACM International Conference on Web Search and Data Mining (WSDM), 2012.\n[2] D. Blei, A. Ng, and M. Jordan. Latent Dirichlet allocation. Journal of Machine Learning Research, 3:993–1022, Jan. 2003.\n[3] W. Buntine and M. Hutter. A bayesian review of the poisson-dirichlet process, 2010.\n[4] C. Chen, W. Buntine, N. Ding, L. Xie, and L. Du. Differential topic models. In IEEE Transactions on Pattern Analysis and Machine Intelligence (TPAMI), 2014.\n[5] C. Chen, L. Du, and W. Buntine. Sampling table configurations for the hierarchical poisson-dirichlet process. In D. Gunopulos, T. Hofmann, D. Malerba, and M. Vazirgiannis, editors, European Conference on Machine Learning, pages 296–311. Springer, 2011.\n[6] W. Dai, J. Wei, X. Zheng, J. K. Kim, S. Lee, J. Yin, Q. Ho, and E. P. Xing. Petuum: A framework for iterative-convergent distributed ml. arXiv preprint arXiv:1312.7651, 2013.\n[7] J. Dean and S. Ghemawat. MapReduce: simplified data processing on large clusters. CACM, 51(1):107–113, 2008.\n[8] J. Geweke and H. Tanizaki. Bayesian estimation of state-space model using the metropolis-hastings algorithm within gibbs sampling. Computational Statistics and Data Analysis, 37(2):151–170, 2001.\n[9] T. Griffiths and M. Steyvers. Finding scientific topics. Proceedings of the National Academy of Sciences, 101:5228–5235, 2004.\n[10] A. Q. Li, A. Ahmed, S. Ravi, and A. J. Smola. Reducing the sampling complexity of topic models. In Proceedings of the 20th ACM SIGKDD international conference on Knowledge discovery and data mining. ACM, 2014.\n[11] M. Li, D. G. Andersen, and A. J. Smola. Communication efficient distributed machine learning with the parameter server. In Neural Information Processing Systems, 2014.\n[12] M. Li, A. J. Smola, J. Park, A. Ahmed, V. Josifovski, J. Long, E. Shekita, and B.-Y. Su. Scaling distributed machine learning with the parameter server. In USENIX Symposium on Operating Systems Design and Implementation, 2014.\n[13] G. Marsaglia, W. W. Tsang, and J. Wang. Fast generation of discrete random variables. Journal of Statistical Software, 11(3):1–8, 2004.\n[14] D. Newman, A. Asuncion, P. Smyth, and M. Welling. Distributed inference for latent dirichlet allocation. In NIPS, 2007.\n[15] J. Pitman and M. Yor. The two-parameter poisson-dirichlet distribution derived from a stable subordinator. Annals of Probability, 25(2):855–900, 1997.\n[16] I. Sato and H. Nakagawa. Topic models with power-law using pitman-yor process. In B. Rao, B. Krishnapuram, A. Tomkins, and Q. Yang, editors, Knowledge Discovery and Data Mining, pages\n673–682. ACM, 2010.\n[17] A. J. Smola and S. Narayanamurthy. An architecture for parallel topic models. In Very Large Databases (VLDB), 2010.\n[18] I. Stoica, R. Morris, D. Karger, M. F. Kaashoek, and H. Balakrishnan. Chord: A scalable peer-to-peer lookup service for internet applications. ACM SIGCOMM Computer Communication Review, 31(4):149–160, 2001.\n[19] S. Suri and S. Vassilvitskii. Counting triangles and the curse of the last reducer. In S. Srinivasan, K. Ramamritham, A. Kumar, M. P. Ravindra, E. Bertino, and R. Kumar, editors, Conference on World Wide Web, pages 607–614. ACM, 2011.\n[20] Y. Teh, M. Jordan, M. Beal, and D. Blei. Hierarchical dirichlet processes. Journal of the American Statistical Association, 101(576):1566–1581, 2006.\n[21] A. J. Walker. An efficient method for generating discrete random variables with general distributions. ACM Transactions on Mathematical Software (TOMS), 3(3):253–256, 1977.\n[22] L. Yao, D. Mimno, and A. McCallum. Efficient methods for topic model inference on streaming document collections. In KDD’09, 2009."
+    } ],
+    "references" : [ {
+      "title" : "Scalable inference in latent variable models",
+      "author" : [ "A. Ahmed", "M. Aly", "J. Gonzalez", "S. Narayanamurthy", "A.J. Smola" ],
+      "venue" : "In Proceedings of The 5th ACM International Conference on Web Search and Data Mining (WSDM),",
+      "citeRegEx" : "1",
+      "shortCiteRegEx" : "1",
+      "year" : 2012
+    }, {
+      "title" : "Latent Dirichlet allocation",
+      "author" : [ "D. Blei", "A. Ng", "M. Jordan" ],
+      "venue" : "Journal of Machine Learning Research,",
+      "citeRegEx" : "2",
+      "shortCiteRegEx" : "2",
+      "year" : 2003
+    }, {
+      "title" : "A bayesian review of the poisson-dirichlet",
+      "author" : [ "W. Buntine", "M. Hutter" ],
+      "venue" : null,
+      "citeRegEx" : "3",
+      "shortCiteRegEx" : "3",
+      "year" : 2010
+    }, {
+      "title" : "Differential topic models",
+      "author" : [ "C. Chen", "W. Buntine", "N. Ding", "L. Xie", "L. Du" ],
+      "venue" : "In IEEE Transactions on Pattern Analysis and Machine Intelligence (TPAMI),",
+      "citeRegEx" : "4",
+      "shortCiteRegEx" : "4",
+      "year" : 2014
+    }, {
+      "title" : "Sampling table configurations for the hierarchical poisson-dirichlet process",
+      "author" : [ "C. Chen", "L. Du", "W. Buntine" ],
+      "venue" : "European Conference on Machine Learning,",
+      "citeRegEx" : "5",
+      "shortCiteRegEx" : "5",
+      "year" : 2011
+    }, {
+      "title" : "Petuum: A framework for iterative-convergent distributed ml",
+      "author" : [ "W. Dai", "J. Wei", "X. Zheng", "J.K. Kim", "S. Lee", "J. Yin", "Q. Ho", "E.P. Xing" ],
+      "venue" : "arXiv preprint arXiv:1312.7651,",
+      "citeRegEx" : "6",
+      "shortCiteRegEx" : "6",
+      "year" : 2013
+    }, {
+      "title" : "MapReduce: simplified data processing on large",
+      "author" : [ "J. Dean", "S. Ghemawat" ],
+      "venue" : "clusters. CACM,",
+      "citeRegEx" : "7",
+      "shortCiteRegEx" : "7",
+      "year" : 2008
+    }, {
+      "title" : "Bayesian estimation of state-space model using the metropolis-hastings algorithm within gibbs sampling",
+      "author" : [ "J. Geweke", "H. Tanizaki" ],
+      "venue" : "Computational Statistics and Data Analysis,",
+      "citeRegEx" : "8",
+      "shortCiteRegEx" : "8",
+      "year" : 2001
+    }, {
+      "title" : "Finding scientific topics",
+      "author" : [ "T. Griffiths", "M. Steyvers" ],
+      "venue" : "Proceedings of the National Academy of Sciences,",
+      "citeRegEx" : "9",
+      "shortCiteRegEx" : "9",
+      "year" : 2004
+    }, {
+      "title" : "Reducing the sampling complexity of topic models",
+      "author" : [ "A.Q. Li", "A. Ahmed", "S. Ravi", "A.J. Smola" ],
+      "venue" : "In Proceedings of the 20th ACM SIGKDD international conference on Knowledge discovery and data mining. ACM,",
+      "citeRegEx" : "10",
+      "shortCiteRegEx" : "10",
+      "year" : 2014
+    }, {
+      "title" : "Communication efficient distributed machine learning with the parameter server",
+      "author" : [ "M. Li", "D.G. Andersen", "A.J. Smola" ],
+      "venue" : "In Neural Information Processing Systems,",
+      "citeRegEx" : "11",
+      "shortCiteRegEx" : "11",
+      "year" : 2014
+    }, {
+      "title" : "Scaling distributed machine learning with the parameter server",
+      "author" : [ "M. Li", "A.J. Smola", "J. Park", "A. Ahmed", "V. Josifovski", "J. Long", "E. Shekita", "B.-Y. Su" ],
+      "venue" : "In USENIX Symposium on Operating Systems Design and Implementation,",
+      "citeRegEx" : "12",
+      "shortCiteRegEx" : "12",
+      "year" : 2014
+    }, {
+      "title" : "Fast generation of discrete random variables",
+      "author" : [ "G. Marsaglia", "W.W. Tsang", "J. Wang" ],
+      "venue" : "Journal of Statistical Software,",
+      "citeRegEx" : "13",
+      "shortCiteRegEx" : "13",
+      "year" : 2004
+    }, {
+      "title" : "Distributed inference for latent dirichlet allocation",
+      "author" : [ "D. Newman", "A. Asuncion", "P. Smyth", "M. Welling" ],
+      "venue" : "In NIPS,",
+      "citeRegEx" : "14",
+      "shortCiteRegEx" : "14",
+      "year" : 2007
+    }, {
+      "title" : "The two-parameter poisson-dirichlet distribution derived from a stable subordinator",
+      "author" : [ "J. Pitman", "M. Yor" ],
+      "venue" : "Annals of Probability,",
+      "citeRegEx" : "15",
+      "shortCiteRegEx" : "15",
+      "year" : 1997
+    }, {
+      "title" : "Topic models with power-law using pitman-yor process",
+      "author" : [ "I. Sato", "H. Nakagawa" ],
+      "venue" : "Knowledge Discovery and Data Mining,",
+      "citeRegEx" : "16",
+      "shortCiteRegEx" : "16",
+      "year" : 2010
+    }, {
+      "title" : "An architecture for parallel topic models",
+      "author" : [ "A.J. Smola", "S. Narayanamurthy" ],
+      "venue" : "In Very Large Databases (VLDB),",
+      "citeRegEx" : "17",
+      "shortCiteRegEx" : "17",
+      "year" : 2010
+    }, {
+      "title" : "Chord: A scalable peer-to-peer lookup service for internet applications",
+      "author" : [ "I. Stoica", "R. Morris", "D. Karger", "M.F. Kaashoek", "H. Balakrishnan" ],
+      "venue" : "ACM SIGCOMM Computer Communication Review,",
+      "citeRegEx" : "18",
+      "shortCiteRegEx" : "18",
+      "year" : 2001
+    }, {
+      "title" : "Counting triangles and the curse of the last reducer",
+      "author" : [ "S. Suri", "S. Vassilvitskii" ],
+      "venue" : "Conference on World Wide Web,",
+      "citeRegEx" : "19",
+      "shortCiteRegEx" : "19",
+      "year" : 2011
+    }, {
+      "title" : "Hierarchical dirichlet processes",
+      "author" : [ "Y. Teh", "M. Jordan", "M. Beal", "D. Blei" ],
+      "venue" : "Journal of the American Statistical Association,",
+      "citeRegEx" : "20",
+      "shortCiteRegEx" : "20",
+      "year" : 2006
+    }, {
+      "title" : "An efficient method for generating discrete random variables with general distributions",
+      "author" : [ "A.J. Walker" ],
+      "venue" : "ACM Transactions on Mathematical Software (TOMS),",
+      "citeRegEx" : "21",
+      "shortCiteRegEx" : "21",
+      "year" : 1977
+    }, {
+      "title" : "Efficient methods for topic model inference on streaming document collections",
+      "author" : [ "L. Yao", "D. Mimno", "A. McCallum" ],
+      "venue" : "In KDD’09,",
+      "citeRegEx" : "22",
+      "shortCiteRegEx" : "22",
+      "year" : 2009
+    } ],
+    "referenceMentions" : [ {
+      "referenceID" : 1,
+      "context" : "While simple models such as Latent Dirichlet Allocation [2] per se are prevalent in use, scalability becomes a critical issue when the model is adopted on industrial data.",
+      "startOffset" : 56,
+      "endOffset" : 59
+    }, {
+      "referenceID" : 9,
+      "context" : "We extend our previous work on the MetropolisHastings-Walker sampler (Alias sampler) [10] to the parameter server [12], which is a scalable and general purpose distributed machine learning framework.",
+      "startOffset" : 85,
+      "endOffset" : 89
+    }, {
+      "referenceID" : 11,
+      "context" : "We extend our previous work on the MetropolisHastings-Walker sampler (Alias sampler) [10] to the parameter server [12], which is a scalable and general purpose distributed machine learning framework.",
+      "startOffset" : 114,
+      "endOffset" : 118
+    }, {
+      "referenceID" : 16,
+      "context" : "The resulted system is an order of magnitude faster than the state-of-the-art YahooLDA [17] in both efficiency and scalability.",
+      "startOffset" : 87,
+      "endOffset" : 91
+    }, {
+      "referenceID" : 11,
+      "context" : "Comparing to LDA on parameter server [12], our system is more accurate and is able to adapt to a variety of latent variable models.",
+      "startOffset" : 37,
+      "endOffset" : 41
+    }, {
+      "referenceID" : 2,
+      "context" : "• We show how nontrivial hierarchical latent variable models such as the Pitman Yor Topic model [3] and the Hierarchical Dirichlet Process [5] can be distributed efficiently over thousands of cores.",
+      "startOffset" : 96,
+      "endOffset" : 99
+    }, {
+      "referenceID" : 4,
+      "context" : "• We show how nontrivial hierarchical latent variable models such as the Pitman Yor Topic model [3] and the Hierarchical Dirichlet Process [5] can be distributed efficiently over thousands of cores.",
+      "startOffset" : 139,
+      "endOffset" : 142
+    }, {
+      "referenceID" : 9,
+      "context" : "• We demonstrate how distributed synchronization and the Metropolis-Hastings-Walker sampler of [10] can be integrated into a very high throughput sampling inference algorithm.",
+      "startOffset" : 95,
+      "endOffset" : 99
+    }, {
+      "referenceID" : 11,
+      "context" : "• We describe an efficient distributed implementation which takes the advantages of the parameter server [12] on efficient data communication and machine fault tolerance.",
+      "startOffset" : 105,
+      "endOffset" : 109
+    }, {
+      "referenceID" : 1,
+      "context" : "The seminal paper of [2] relied on variational methods to analyze mere thousands of documents.",
+      "startOffset" : 21,
+      "endOffset" : 24
+    }, {
+      "referenceID" : 8,
+      "context" : "Subsequent progress by [9] introduced collapsed variational sampling, which proved to be a much more scalable and rapidly mixing Gibbs sampling algorithm for latent variable inference.",
+      "startOffset" : 23,
+      "endOffset" : 26
+    }, {
+      "referenceID" : 21,
+      "context" : "More efficient samplers were introduced by [22] which took advantage of the sparsity structure of the data.",
+      "startOffset" : 43,
+      "endOffset" : 47
+    }, {
+      "referenceID" : 11,
+      "context" : "Unfortunately, a large portion of the computational advantages in the latter approach vanishes for very large collections of documents and large numbers of topics [12], since the generative model becomes mostly dense again.",
+      "startOffset" : 163,
+      "endOffset" : 167
+    }, {
+      "referenceID" : 13,
+      "context" : "Distributed inference strategies for sampling were first proposed by [14].",
+      "startOffset" : 69,
+      "endOffset" : 73
+    }, {
+      "referenceID" : 6,
+      "context" : "They essentially exploited bulk synchronous communications paradigms as can be found in MapReduce [7].",
+      "startOffset" : 98,
+      "endOffset" : 101
+    }, {
+      "referenceID" : 16,
+      "context" : "Subsequent work introduced the notion of a parameter server to allow for asynchronous processing [17].",
+      "startOffset" : 97,
+      "endOffset" : 101
+    }, {
+      "referenceID" : 0,
+      "context" : "A substantially improved synchronization protocol was proposed by [1], which demonstrated scalability to 10 brief documents and more sophisticated temporal model dependencies.",
+      "startOffset" : 66,
+      "endOffset" : 69
+    }, {
+      "referenceID" : 5,
+      "context" : "[6] implement a rather similar system, albeit not quite as scalable and with somewhat different consistency properties.",
+      "startOffset" : 0,
+      "endOffset" : 3
+    }, {
+      "referenceID" : 9,
+      "context" : "More details are available in [10].",
+      "startOffset" : 30,
+      "endOffset" : 34
+    }, {
+      "referenceID" : 1,
+      "context" : "In LDA [2] one assumes that documents are mixture distributions of language models associated with individual topics.",
+      "startOffset" : 7,
+      "endOffset" : 10
+    }, {
+      "referenceID" : 8,
+      "context" : "This means that the multinomial distributions θd and ψk can be integrated out, thus allowing one to express p(w, z|α, β, nd) in closed-form [9].",
+      "startOffset" : 140,
+      "endOffset" : 143
+    }, {
+      "referenceID" : 21,
+      "context" : "[22] devised an ingenious strategy for exploiting sparsity in terms of ntd and ntw.",
+      "startOffset" : 0,
+      "endOffset" : 4
+    }, {
+      "referenceID" : 2,
+      "context" : "An example of such model is Poisson Dirichlet Process [3, 15].",
+      "startOffset" : 54,
+      "endOffset" : 61
+    }, {
+      "referenceID" : 14,
+      "context" : "An example of such model is Poisson Dirichlet Process [3, 15].",
+      "startOffset" : 54,
+      "endOffset" : 61
+    }, {
+      "referenceID" : 15,
+      "context" : "The ingredients for a refined language model are a PitmanYor Topic Model (PYTM) [16] that is more appropriate to deal with natural languages.",
+      "startOffset" : 80,
+      "endOffset" : 84
+    }, {
+      "referenceID" : 14,
+      "context" : "This is then combined with the Poisson Dirichlet Process (PDP) [15, 3] to capture the fact that the number of occurrences of a word in a natural language corpus follows power-law.",
+      "startOffset" : 63,
+      "endOffset" : 70
+    }, {
+      "referenceID" : 2,
+      "context" : "This is then combined with the Poisson Dirichlet Process (PDP) [15, 3] to capture the fact that the number of occurrences of a word in a natural language corpus follows power-law.",
+      "startOffset" : 63,
+      "endOffset" : 70
+    }, {
+      "referenceID" : 3,
+      "context" : "The combined model described explicitly in [4]:",
+      "startOffset" : 43,
+      "endOffset" : 46
+    }, {
+      "referenceID" : 4,
+      "context" : "Skipping details that can be found in [5, 4] it follows that an efficient sampler can be implemented by using the following auxiliary variables:",
+      "startOffset" : 38,
+      "endOffset" : 44
+    }, {
+      "referenceID" : 3,
+      "context" : "Skipping details that can be found in [5, 4] it follows that an efficient sampler can be implemented by using the following auxiliary variables:",
+      "startOffset" : 38,
+      "endOffset" : 44
+    }, {
+      "referenceID" : 19,
+      "context" : "Consider the two-level topic model based on the Hierarchical Dirichlet Process [20] (HDP-LDA).",
+      "startOffset" : 79,
+      "endOffset" : 83
+    }, {
+      "referenceID" : 9,
+      "context" : "They can be found in [10].",
+      "startOffset" : 21,
+      "endOffset" : 25
+    }, {
+      "referenceID" : 16,
+      "context" : "A common strategy is to use a relaxed Gibbs sampler which acts on each machine independently without the need for locking of state between machines, as described in [17].",
+      "startOffset" : 165,
+      "endOffset" : 169
+    }, {
+      "referenceID" : 9,
+      "context" : "In the following we describe an algorithm to reduce this to O(1) amortized cost, whenever the changes are sufficiently small [10].",
+      "startOffset" : 125,
+      "endOffset" : 129
+    }, {
+      "referenceID" : 20,
+      "context" : "We begin by describing Walker’s alias method [21, 13] and a simplified version of the Metropolis-Hastings sampler [8].",
+      "startOffset" : 45,
+      "endOffset" : 53
+    }, {
+      "referenceID" : 12,
+      "context" : "We begin by describing Walker’s alias method [21, 13] and a simplified version of the Metropolis-Hastings sampler [8].",
+      "startOffset" : 45,
+      "endOffset" : 53
+    }, {
+      "referenceID" : 7,
+      "context" : "We begin by describing Walker’s alias method [21, 13] and a simplified version of the Metropolis-Hastings sampler [8].",
+      "startOffset" : 114,
+      "endOffset" : 117
+    }, {
+      "referenceID" : 7,
+      "context" : "To address this problem we resort to Metropolis Hastings sampling [8] using a stationary proposal distribution.",
+      "startOffset" : 66,
+      "endOffset" : 69
+    }, {
+      "referenceID" : 9,
+      "context" : "More detail is available in [10].",
+      "startOffset" : 28,
+      "endOffset" : 32
+    }, {
+      "referenceID" : 11,
+      "context" : "These problems often use 1TB to 1PB training data, which allows the creation of powerful and complex models with 10 to 10 parameters [12].",
+      "startOffset" : 133,
+      "endOffset" : 137
+    }, {
+      "referenceID" : 11,
+      "context" : "Here we briefly review the previous work related to the latent variable models, more detailed review is available in [12, 11].",
+      "startOffset" : 117,
+      "endOffset" : 125
+    }, {
+      "referenceID" : 10,
+      "context" : "Here we briefly review the previous work related to the latent variable models, more detailed review is available in [12, 11].",
+      "startOffset" : 117,
+      "endOffset" : 125
+    }, {
+      "referenceID" : 16,
+      "context" : "The first generation uses memcached as the synchronization mechanism [17], which lacks flexibility and performance.",
+      "startOffset" : 69,
+      "endOffset" : 73
+    }, {
+      "referenceID" : 0,
+      "context" : "It improved the previews design by a dedicated and user-definable server and a more principled load distribution algorithm [1].",
+      "startOffset" : 123,
+      "endOffset" : 126
+    }, {
+      "referenceID" : 11,
+      "context" : "Our work is based on the third generation of parameter server [12], which is a general purpose distributed framework for machine learning.",
+      "startOffset" : 62,
+      "endOffset" : 66
+    }, {
+      "referenceID" : 17,
+      "context" : "These (key,value) pairs are then partitioned into server nodes by using consistent hashing in the form of a Chord-style layout [18].",
+      "startOffset" : 127,
+      "endOffset" : 131
+    }, {
+      "referenceID" : 11,
+      "context" : "Besides, it provides continuous fault tolerance by using optimized chain replication [12].",
+      "startOffset" : 85,
+      "endOffset" : 89
+    }, {
+      "referenceID" : 9,
+      "context" : "In this section we describe our method to scale the singlethread algorithm proposed in our previous work [10] into an efficient distributed implementation.",
+      "startOffset" : 105,
+      "endOffset" : 109
+    }, {
+      "referenceID" : 0,
+      "context" : "Similar to previous work [1], we found the eventual consistency model best fits our requirements.",
+      "startOffset" : 25,
+      "endOffset" : 28
+    }, {
+      "referenceID" : 0,
+      "context" : "In prior work [1], we utilized a synchronous snapshot scheme where we freeze the servers and clients and take a snapshot of their memory to disk every N minutes.",
+      "startOffset" : 14,
+      "endOffset" : 17
+    }, {
+      "referenceID" : 11,
+      "context" : "We did not use the hot failover mechanism described in [12] due to the resource constraints.",
+      "startOffset" : 55,
+      "endOffset" : 59
+    }, {
+      "referenceID" : 0,
+      "context" : "Instead, if there is a server failure, we freeze the whole system until mwk[1][2]=1 twk[1][2]=1 server group",
+      "startOffset" : 75,
+      "endOffset" : 78
+    }, {
+      "referenceID" : 1,
+      "context" : "Instead, if there is a server failure, we freeze the whole system until mwk[1][2]=1 twk[1][2]=1 server group",
+      "startOffset" : 78,
+      "endOffset" : 81
+    }, {
+      "referenceID" : 0,
+      "context" : "Instead, if there is a server failure, we freeze the whole system until mwk[1][2]=1 twk[1][2]=1 server group",
+      "startOffset" : 87,
+      "endOffset" : 90
+    }, {
+      "referenceID" : 1,
+      "context" : "Instead, if there is a server failure, we freeze the whole system until mwk[1][2]=1 twk[1][2]=1 server group",
+      "startOffset" : 90,
+      "endOffset" : 93
+    }, {
+      "referenceID" : 0,
+      "context" : "client 1 mwk[1][2]=2 twk[1][2]=1",
+      "startOffset" : 12,
+      "endOffset" : 15
+    }, {
+      "referenceID" : 1,
+      "context" : "client 1 mwk[1][2]=2 twk[1][2]=1",
+      "startOffset" : 15,
+      "endOffset" : 18
+    }, {
+      "referenceID" : 0,
+      "context" : "client 1 mwk[1][2]=2 twk[1][2]=1",
+      "startOffset" : 24,
+      "endOffset" : 27
+    }, {
+      "referenceID" : 1,
+      "context" : "client 1 mwk[1][2]=2 twk[1][2]=1",
+      "startOffset" : 27,
+      "endOffset" : 30
+    }, {
+      "referenceID" : 0,
+      "context" : "client 2 mwk[1][2]=2 twk[1][2]=2",
+      "startOffset" : 12,
+      "endOffset" : 15
+    }, {
+      "referenceID" : 1,
+      "context" : "client 2 mwk[1][2]=2 twk[1][2]=2",
+      "startOffset" : 15,
+      "endOffset" : 18
+    }, {
+      "referenceID" : 0,
+      "context" : "client 2 mwk[1][2]=2 twk[1][2]=2",
+      "startOffset" : 24,
+      "endOffset" : 27
+    }, {
+      "referenceID" : 1,
+      "context" : "client 2 mwk[1][2]=2 twk[1][2]=2",
+      "startOffset" : 27,
+      "endOffset" : 30
+    }, {
+      "referenceID" : 0,
+      "context" : "client 3 mwk[1][2]-=1 twk[1][2]-=1 mwk[1][2]-=1 twk[1][2]-=1 mwk[1][2]-=1 twk[1][2]-=1",
+      "startOffset" : 12,
+      "endOffset" : 15
+    }, {
+      "referenceID" : 1,
+      "context" : "client 3 mwk[1][2]-=1 twk[1][2]-=1 mwk[1][2]-=1 twk[1][2]-=1 mwk[1][2]-=1 twk[1][2]-=1",
+      "startOffset" : 15,
+      "endOffset" : 18
+    }, {
+      "referenceID" : 0,
+      "context" : "client 3 mwk[1][2]-=1 twk[1][2]-=1 mwk[1][2]-=1 twk[1][2]-=1 mwk[1][2]-=1 twk[1][2]-=1",
+      "startOffset" : 25,
+      "endOffset" : 28
+    }, {
+      "referenceID" : 1,
+      "context" : "client 3 mwk[1][2]-=1 twk[1][2]-=1 mwk[1][2]-=1 twk[1][2]-=1 mwk[1][2]-=1 twk[1][2]-=1",
+      "startOffset" : 28,
+      "endOffset" : 31
+    }, {
+      "referenceID" : 0,
+      "context" : "client 3 mwk[1][2]-=1 twk[1][2]-=1 mwk[1][2]-=1 twk[1][2]-=1 mwk[1][2]-=1 twk[1][2]-=1",
+      "startOffset" : 38,
+      "endOffset" : 41
+    }, {
+      "referenceID" : 1,
+      "context" : "client 3 mwk[1][2]-=1 twk[1][2]-=1 mwk[1][2]-=1 twk[1][2]-=1 mwk[1][2]-=1 twk[1][2]-=1",
+      "startOffset" : 41,
+      "endOffset" : 44
+    }, {
+      "referenceID" : 0,
+      "context" : "client 3 mwk[1][2]-=1 twk[1][2]-=1 mwk[1][2]-=1 twk[1][2]-=1 mwk[1][2]-=1 twk[1][2]-=1",
+      "startOffset" : 51,
+      "endOffset" : 54
+    }, {
+      "referenceID" : 1,
+      "context" : "client 3 mwk[1][2]-=1 twk[1][2]-=1 mwk[1][2]-=1 twk[1][2]-=1 mwk[1][2]-=1 twk[1][2]-=1",
+      "startOffset" : 54,
+      "endOffset" : 57
+    }, {
+      "referenceID" : 0,
+      "context" : "client 3 mwk[1][2]-=1 twk[1][2]-=1 mwk[1][2]-=1 twk[1][2]-=1 mwk[1][2]-=1 twk[1][2]-=1",
+      "startOffset" : 64,
+      "endOffset" : 67
+    }, {
+      "referenceID" : 1,
+      "context" : "client 3 mwk[1][2]-=1 twk[1][2]-=1 mwk[1][2]-=1 twk[1][2]-=1 mwk[1][2]-=1 twk[1][2]-=1",
+      "startOffset" : 67,
+      "endOffset" : 70
+    }, {
+      "referenceID" : 0,
+      "context" : "client 3 mwk[1][2]-=1 twk[1][2]-=1 mwk[1][2]-=1 twk[1][2]-=1 mwk[1][2]-=1 twk[1][2]-=1",
+      "startOffset" : 77,
+      "endOffset" : 80
+    }, {
+      "referenceID" : 1,
+      "context" : "client 3 mwk[1][2]-=1 twk[1][2]-=1 mwk[1][2]-=1 twk[1][2]-=1 mwk[1][2]-=1 twk[1][2]-=1",
+      "startOffset" : 80,
+      "endOffset" : 83
+    }, {
+      "referenceID" : 0,
+      "context" : "mwk[1][2]=1 twk[1][2]=1 server group",
+      "startOffset" : 3,
+      "endOffset" : 6
+    }, {
+      "referenceID" : 1,
+      "context" : "mwk[1][2]=1 twk[1][2]=1 server group",
+      "startOffset" : 6,
+      "endOffset" : 9
+    }, {
+      "referenceID" : 0,
+      "context" : "mwk[1][2]=1 twk[1][2]=1 server group",
+      "startOffset" : 15,
+      "endOffset" : 18
+    }, {
+      "referenceID" : 1,
+      "context" : "mwk[1][2]=1 twk[1][2]=1 server group",
+      "startOffset" : 18,
+      "endOffset" : 21
+    }, {
+      "referenceID" : 0,
+      "context" : "client 1 mwk[1][2]=2 twk[1][2]=1",
+      "startOffset" : 12,
+      "endOffset" : 15
+    }, {
+      "referenceID" : 1,
+      "context" : "client 1 mwk[1][2]=2 twk[1][2]=1",
+      "startOffset" : 15,
+      "endOffset" : 18
+    }, {
+      "referenceID" : 0,
+      "context" : "client 1 mwk[1][2]=2 twk[1][2]=1",
+      "startOffset" : 24,
+      "endOffset" : 27
+    }, {
+      "referenceID" : 1,
+      "context" : "client 1 mwk[1][2]=2 twk[1][2]=1",
+      "startOffset" : 27,
+      "endOffset" : 30
+    }, {
+      "referenceID" : 0,
+      "context" : "client 2 mwk[1][2]=2 twk[1][2]=2",
+      "startOffset" : 12,
+      "endOffset" : 15
+    }, {
+      "referenceID" : 1,
+      "context" : "client 2 mwk[1][2]=2 twk[1][2]=2",
+      "startOffset" : 15,
+      "endOffset" : 18
+    }, {
+      "referenceID" : 0,
+      "context" : "client 2 mwk[1][2]=2 twk[1][2]=2",
+      "startOffset" : 24,
+      "endOffset" : 27
+    }, {
+      "referenceID" : 1,
+      "context" : "client 2 mwk[1][2]=2 twk[1][2]=2",
+      "startOffset" : 27,
+      "endOffset" : 30
+    }, {
+      "referenceID" : 0,
+      "context" : "client 3 mwk[1][2]-=1 mwk[1][2]-=1 mwk[1][2]-=1",
+      "startOffset" : 12,
+      "endOffset" : 15
+    }, {
+      "referenceID" : 1,
+      "context" : "client 3 mwk[1][2]-=1 mwk[1][2]-=1 mwk[1][2]-=1",
+      "startOffset" : 15,
+      "endOffset" : 18
+    }, {
+      "referenceID" : 0,
+      "context" : "client 3 mwk[1][2]-=1 mwk[1][2]-=1 mwk[1][2]-=1",
+      "startOffset" : 25,
+      "endOffset" : 28
+    }, {
+      "referenceID" : 1,
+      "context" : "client 3 mwk[1][2]-=1 mwk[1][2]-=1 mwk[1][2]-=1",
+      "startOffset" : 28,
+      "endOffset" : 31
+    }, {
+      "referenceID" : 0,
+      "context" : "client 3 mwk[1][2]-=1 mwk[1][2]-=1 mwk[1][2]-=1",
+      "startOffset" : 38,
+      "endOffset" : 41
+    }, {
+      "referenceID" : 1,
+      "context" : "client 3 mwk[1][2]-=1 mwk[1][2]-=1 mwk[1][2]-=1",
+      "startOffset" : 41,
+      "endOffset" : 44
+    }, {
+      "referenceID" : 21,
+      "context" : "We implemented two LDA models on the parameter server: (1) YahooLDA, using the traditional sparse sampling method described in [22], (2) AliasLDA, using the alias sampling method as described in Section 3.",
+      "startOffset" : 127,
+      "endOffset" : 131
+    }, {
+      "referenceID" : 0,
+      "context" : "Moreover, note that YahooLDA is a re-implementation of [1] in the new parameter server architecture described in this paper for a fair comparison.",
+      "startOffset" : 55,
+      "endOffset" : 58
+    }, {
+      "referenceID" : 18,
+      "context" : "This was done to make sure that we don’t burn up resources waiting for the slowest worker – in a shared environment this problem is known as the curse of the last reducer problem [19].",
+      "startOffset" : 179,
+      "endOffset" : 183
+    }, {
+      "referenceID" : 9,
+      "context" : "This observation is consistent with the theory that the alias sampling method does indeed decrease the time complexity, as suggested by [10] There are two reasons that the alias sampling method arrives at better perplexity and more concentrated topics",
+      "startOffset" : 136,
+      "endOffset" : 140
+    } ],
+    "year" : 2017,
+    "abstractText" : "Latent variable models have accumulated a considerable amount of interest from the industry and academia for their versatility in a wide range of applications. A large amount of effort has been made to develop systems that is able to extend the systems to a large scale, in the hope to make use of them on industry scale data. In this paper, we describe a system that operates at a scale orders of magnitude higher than previous works, and an order of magnitude faster than state-of-the-art system at the same scale, at the same time showing more robustness and more accurate results. Our system uses a number of advances in distributed inference: high performance in synchronization of sufficient statistics with relaxed consistency model; fast sampling, using the Metropolis-Hastings-Walker method to overcome dense generative models; statistical modeling, moving beyond Latent Dirichlet Allocation (LDA) to Pitman-Yor distributions (PDP) and Hierarchical Dirichlet Process (HDP) models; sophisticated parameter projection schemes, to resolve the conflicts within the constraint between parameters arising from the relaxed consistency model. This work significantly extends the domain of applicability of what is commonly known as the parameter server. We obtain results with up to hundreds billion of tokens, thousands of topics, and a vocabulary of a few million token-types, using up to 60,000 processor cores operating on a production cluster of a large Internet company. This demonstrates the feasibility to scale to problems orders of magnitude larger than any previously published work.",
+    "creator" : "LaTeX with hyperref package"
+  }
+}

@@ -1,0 +1,479 @@
+{
+  "name" : "1402.6964.pdf",
+  "metadata" : {
+    "source" : "CRF",
+    "title" : "Scalable methods for nonnegative matrix factorizations of near-separable tall-and-skinny matrices",
+    "authors" : [ "Austin R. Benson", "Jason D. Lee", "Bartek Rajwa", "David F. Gleich" ],
+    "emails" : [ "arbenson@stanford.edu", "jdl17@stanford.edu", "brajwa@purdue.edu", "dgleich@purdue.edu" ],
+    "sections" : [ {
+      "heading" : null,
+      "text" : "Categories and Subject Descriptors G.1.3 [Numerical Analysis]: Numerical Linear Algebra; G.1.6 [Numerical Analysis]: Optimization\nGeneral Terms Algorithms\nKeywords nonnegative matrix factorization, separable, QR, SVD, MapReduce, heat transfer, flow cytometry"
+    }, {
+      "heading" : "1. NONNEGATIVE MATRIX FACTORIZATIONS AT SCALE",
+      "text" : "A nonnegative matrix factorization (NMF) for an m × n matrix X with real-valued, nonnegative entries is\nX = WH (1)\nwhere W is m×r, H is r×n, r < min(m,n), and both factors have nonnegative entries. While there are already standard dimension reduction techniques for general matrices such as\nPermission to make digital or hard copies of all or part of this work for personal or classroom use is granted without fee provided that copies are not made or distributed for profit or commercial advantage and that copies bear this notice and the full citation on the first page. To copy otherwise, to republish, to post on servers or to redistribute to lists, requires prior specific permission and/or a fee. Copyright 20XX ACM X-XXXXX-XX-X/XX/XX ...$15.00.\nthe singular value decomposition and the interpolative decomposition [10], the advantage of NMF is in interpretability of the data. A common example is facial image decomposition [19]. If the columns of X are pixels of a facial image, the columns of W may be facial features such as eyes or ears, and the coefficients in H represent the intensity of these features. For this reason, among a host of other reasons, NMF is used in a broad range of applications including graph clustering [24], protein sequence motif discovery [23], and hyperspectral unmixing [20].\nAn important property of matrices in these applications and other massive scientific data sets is that they have many more rows than columns (m n). For example, this matrix structure is common in big data applications with hundreds of millions of samples and a small set of features—see, e.g., Section 5.2 for a bioinformatics application where the data matrix has 1.6 billion rows and 25 columns. We call matrices with many more rows than columns tall-and-skinny.\nIn this paper, we are concerned with efficient NMF algorithms for tall-and-skinny matrices as prior work has not taken advantage of this structure for large-scale factorizations. First, in Section 2.2, we present a new dimension reduction technique using orthogonal transformations. These transformations are particularly effective for tall-and-skinny matrices and lead to algorithms that need only one pass over the data matrix. We compare this method with a Gaussian transformation technique from the hyperspectral unmixing community [6, 8]. Since tall-and-skinny matrices are amenable to streaming computations [5, 12], we present a MapReduce implementation in Section 3. However, the algorithms are easily translated to GPUs and distributed memory MPI, since we just need the TSQR kernel (see the discussion in Section 3.1). We begin by showing that our method correctly recovers the answer hidden in synthetically generated problems in Section 4; and then we test our algorithms on data sets from two scientific applications, heat transfer simulations and flow cytometry, in Section 5.\nThe software for our algorithms and experiments is available online at https://github.com/arbenson/mrnmf.\nIn the remainder of the introduction, we review the state of the art for computing non-negative matrix factorizations."
+    }, {
+      "heading" : "1.1 Separable NMF",
+      "text" : "We first turn to the issue of how to practically compute the factorization in Equation (1). Unfortunately, for a fixed non-negative rank r, finding the factors W and H for which the residual ‖X −WH‖ is minimized is NP-complete [29]. To make the problem tractable, we make assumptions about\nar X\niv :1\n40 2.\n69 64\nv1 [\ncs .L\nG ]\n2 7\nFe b\n20 14\nthe data. In particular, we require a separability condition on the matrix. A nonnegative matrix X is r-separable if\nX = X(:,K)H,\nwhere K is an index set with |K| = r and X(:,K) is Matlab notation for the matrix X restricted to the columns indexed by K. Since the coefficients of H are nonnegative, all columns of X live in the conical hull of the “extreme” columns indexed by K. The idea of separability was developed by Donoho and Stodden [16], and recent work has produced tractable NMF algorithms by assuming that X almost satisfies a separability condition [4, 7, 17]. A matrix X is noisy r-separable or near-separable if\nX = X(:,K)H +N,\nwhere N is a noise matrix whose entries are small. Nearseparability means that all data points approximately live in the conical hull of the extreme columns.\nThe algorithms for near-separable NMF are typically based on convex geometry and can be described by the same twostep approach:\n1. Determine the extreme columns, indexed by K, and let W = X(:,K).\n2. Solve H = arg minY≥0 ‖X −WY ‖.\nThe bulk of the literature is focused on the first step. In Section 3, we show how to efficiently implement both steps in a single-pass over the data and provide the details of a MapReduce implementation.\nWe note that separability is a severe and restrictive assumption. The tradeoff is that our algorithms are extremely efficient and provably correct under this assumption. In big data applications, efficiency is at a premium, and this provides some justification for using separability as a tool for exploratory data analysis. Furthermore, our experiments on real scientific data sets in Section 5 under the separability assumption lead to new insights."
+    }, {
+      "heading" : "1.2 Alternative NMF algorithms",
+      "text" : "There are several approaches to solving Equation (1) that do not assume the separability condition. These algorithms typically employ block coordinate descent, optimizing over W and H while keeping one factor fixed. Examples include the seminal work by Lee and Seung [27], alternating least squares [11, 22], and fast projection-based least squares [21]. Some of these methods are used in MapReduce architectures at scale [26].\nAlternating methods require updating the entire factor W or H after each optimization step. When one of the factors is large, repeated updated can be prohibitively expensive. The problem is exacerbated in Hadoop MapReduce [28], where intermediate results are written to disk. Regardless of the approach or computing platform, the algorithms are not feasible when the matrices cannot fit in main memory. In contrast, we show in Sections 2 and 3 that the separability assumption leads to algorithms that do not require updates to large matrices. This approach is scalable for large talland-skinny matrices in big data problems."
+    }, {
+      "heading" : "2. ALGORITHMS AND DIMENSION REDUCTION FOR NEAR-SEPARABLE",
+      "text" : "NMF\nThere are several popular algorithms for near-separable NMF, and they are motivated by convex geometry. The goal of this section is to show that when X is tall-and-skinny, we can apply dimension reduction techniques so that established algorithms can execute on n×n matrices, rather than the original m×n. Our new dimension reduction technique in Section 2.2 is also motivated by convex geometry. In Section 3, we leverage the dimension reduction into scalable algorithms."
+    }, {
+      "heading" : "2.1 Geometric algorithms",
+      "text" : "There are two geometric strategies typically employed for near-separable NMF. The first deals with conical hulls. A cone C ⊂ Rm is a non-empty convex with\nC = {∑ i αixi|αi ∈ R+, xi ∈ Rm } ,\nThe xi are generating vectors. In separable NMF,\nX = X(:,K)H\nimplies that all columns of X lie in the cone generated by the columns indexed by K. For any k ∈ K, {αX(:, k)|α > 0} is an extreme ray of this cone. The goal of the XRAY algorithm [25] is to find these extreme rays. In particular, the greedy variant of XRAY selects the maximum column norm\narg max j ‖RTX(:, j)‖2/‖X(:, j)‖2,\nwhere R is a residual matrix that gets updated with each new extreme column.\nThe second approach deals with convex hulls. If D is a diagonal matrix with Dii = ‖A(:, i)‖1 and A is separable, then\nXD−1 = X(:,K)D(K,K)−1D(K,K)HD−1\n= (XD−1)(:,K)H̃.\nThus, XD−1 is also separable. Since the columns are `1- normalized, the columns of H̃ have non-negative entries and sum to one. In other words, all columns of XD−1 are in the convex hull of the columns indexed by K. The problem is reduced to finding the extreme points of a convex hull. Popular approaches in the context of NMF include the Successive Projection Algorithm (SPA, [3]) and its generalization [18]. Another alternative, based on linear programming, is Hott Topixx [7]. As an example of the particulars of one such method, SPA, which we will use in Sections 4 and 5, finds extreme points by computing\narg max j ‖R(:, j)‖22,\nwhere R is a residual matrix related to the data matrix X. In any algorithm, we call the columns indexed by K extreme columns. The next two subsections are devoted to dimension reduction techniques for finding the extreme columns in the case when X is tall-and-skinny."
+    }, {
+      "heading" : "2.2 Orthogonal transformations",
+      "text" : "Consider a cone C ⊂ Rm and a nonsingular m×m matrix M . It is easily shown that x is an extreme ray of C if and only if Mx is an extreme ray of MC = {Mz|z ∈ C}. Similarly,\nfor any convex set S, x is an extreme point of S if and only if Mx is an extreme point of MS.\nWe take advantage of these facts by applying specific orthogonal transformations as the invertible matrix M . Let X = QR̃ and X = UΣ̃V T be the full QR factorization and singular value decomposition (SVD) of X, so that Q and U are m×m orthogonal (and hence nonsingular) matrices. Then\nQTX = ( R 0 ) , UTX = ( ΣV T 0 ) ,\nwhere R and Σ are the top n × n blocks of R̃ and Σ̃ and 0 is an (m − n) × n matrix of zeroes. The zero rows provide no information on which columns of QTX or UTX are extreme rays or extreme points. Thus, we can restrict ourselves to finding the extreme columns of R and ΣV T . These matrices are n×n, and we have significantly reduced the dimension of the problem problem. In fact, if X = X(:,K)H is a separable representation, we immediately have separated representations for R and ΣV T :\nR = R(:,K)H, ΣV T = ΣV T (:,K)H.\nWe note that, although any invertible transformation preserves extreme columns, many transformations will destroy the geometric structure of the data. However, orthogonal transformations are either rotations or reflections, and they preserve the data’s geometry.\nThis dimension reduction technique is exact when X is r-separable, and the results will be the same for orthogonal transformations QT and UT . This is a consequence of the transformed data having the same separability as the original data. The SPA and XRAY algorithms briefly described in Section 2.1 only depend on computing column 2-norms, which are preserved under orthogonal transformations. For these algorithms, applying QT or UT preserves the column 2-norms of the data, and the selected extreme columns are the same. However, other NMF algorithms do not possess this invariance. For this reason, we present both of the orthogonal transformations.\nFinally, we highlight an important benefit of this dimension reduction technique. In many applications, the data is noisy and the separation rank (r in Equation (1)) is not known a priori. In Section 2.4, we show that the H factor can be computed in the small dimension. Thus, it is viable to try several different values of the separation rank and pick the best one. This idea is extremely useful for the applications presented in Section 5, where we do not have a good estimate of the separability of the data."
+    }, {
+      "heading" : "2.3 Gaussian projection",
+      "text" : "An alternative dimension reduction technique is random Gaussian projections, and the idea has been used in hyperspectral unmixing problems [6]. In the hyperspectral unmixing literature, the separability is referred to as the pure-pixel assumption, and the random projections are also motivated by convex geometry [8]. In particular, given a matrix G ∈ Rm×k with Gaussian i.i.d. entries, the extreme columns of X are taken as the extreme columns of GTX, which is of dimension k × n. The algorithm assumes that the columns of X are normalized to sum to one. In other words,\nX(:, i)← X(:, i)/||X(:, i)||1, i = 1, . . . , n\nIn Section 3.3, we show how to run the algorithm in one pass over the data matrix, even if the columns are not normalized. Recent work shows that when X is r-separable and k = O(r log r), then all of the extreme columns are found with high probability [14]. The extreme column selection is simple: for each row of GTX, the indices of the minimum and maximum entries are added to the set K. The Gaussian transformation translates cleanly to streaming and MapReduce algorithms. We provide an implementation in Section 3.2."
+    }, {
+      "heading" : "2.4 Computing H",
+      "text" : "Selecting the extreme columns indexed by K completes one half of the NMF factorization in Equation (1). How do we compute H? We want\nH = arg min Y ∈Rr×n+\n‖X −X(:,K)Y ‖2\nfor some norm. Choosing the Frobenius norm results in a set of n nonnegative least squares (NNLS) problems:\nH(:, i) = arg min y∈Rr+\n‖X(:,K)y −X(:, i)‖22, i = 1, . . . , n.\nLet X = QR̃ with R the upper n× n block of R̃. Then\nH(:, i) = arg min y∈Rr+\n‖X(:,K)y −X(:, i)‖22\n= arg min y∈Rr+\n‖QT (X(:,K)y −X(:, i)) ‖22\n= arg min y∈Rr+\n‖R(:,K)y −R(:, i)‖22\nThus, we can solve the NNLS problem with matrices of size n×n. After computing just the small R factor from the QR factorization, we can compute the entire nonnegative matrix factorization by working with matrices of size n×n. Analogous results hold for the SVD, where we replace Q by U , the left singular vectors. In Section 3, we show that these computations are simple and scalable. Since m n, computations on O(n2) data are fast, even in serial. Finally, note that we can also compute the residual in this reduced space, i.e.:\nmin y∈Rn+ ‖X(:,K)y −X(:, i)‖22 = min y∈Rn+ ‖R(:,K)y −R(:, i)‖22.\nThis simple fact is significant in practice. When there are several candidate sets of extreme columns K, the residual error for each set can be computed quickly. In Section 5, we compute many residual errors for different sets K in order to choose an optimal separation rank.\nWe have now shown how to use dimension reduction techniques for tall-and-skinny matrix data in near-separable NMF algorithms. Following the same strategy as many NMF algorithms, we first compute extreme columns and then solve for the coefficient matrix H. Fortunately, once the upfront cost of the orthogonal transformation is complete, both steps can be computed using O(n2) data."
+    }, {
+      "heading" : "3. IMPLEMENTATION",
+      "text" : "Remarkably, when the matrix is tall-and-skinny, we need only one pass over the data matrix and a MapReduce implementation suffices to achieve optimal communication. While all of the algorithms use sophisticated computation, these routines are only ever invoked with matrices of size n × n. Thus, we get extremely scalable implementations.\nAlgorithm 1 MapReduce Gaussian Projection for NMF\nfunction Map(key k, matrix row xTi ) Sample column vector gi ∼ N(0, Ik). for each row rk of gix T i do\nemit (k, rk) end for\nend function function Reduce(key k, matrix rows 〈rk〉)\nemit (k, sum(〈rk〉)) end function"
+    }, {
+      "heading" : "3.1 TSQR and R-SVD",
+      "text" : "The thin QR factorization of an m×n real-valued matrix A with m > n is\nA = QR\nwhere Q is an m × n orthogonal matrix and R is an n × n upper triangular matrix. This is precisely the factorization we need in Section 2. For our purposes, QT is applied implicitly, and we only need to compute R. When m n, communication-optimal algorithms for computing the factorization are referred to as TSQR [15]. TSQR is implemented in several environments, including MapReduce [5, 12], distributed memory MPI [15], GPUs [2], and grid computing [1]. All of these methods avoid computing ATA and hence are numerically stable. The dimension reduction techniques from Section 2 are independent of the platform. However, as explained in Section 3.4, we use MapReduce to target data computations.\nThe thin SVD factorization used in Section 2.2 is a small extension of the thin QR factorization. The thin SVD is\nA = UΣV T\nwhere U is m × n and orthogonal, Σ is diagonal with decreasing, nonnegative diagonal entries, and V is n × n and orthogonal. Let A = QR be the thin QR factorization of A and R = URΣV T be the SVD of R. Then\nA = (QUR)ΣV T = UΣV T .\nThe matrix U = QUR is m×n and orthogonal, so this is the thin SVD factorization of A. The dimension of R is n × n, so computing its SVD takes O(n3) floating point operations (flops), a trivial cost when n is small. When m n, this method for computing the SVD is called the R-SVD [9]. Both TSQR and R-SVD require O(mn2) flops. However, the dominant cost is communication, which we analyze in Section 3.5."
+    }, {
+      "heading" : "3.2 Gaussian projection",
+      "text" : "For implementing the Gaussian projection in Section 2.3, we assume that we can quickly sample i.i.d. Gaussians in parallel. Under this assumption, the transformation is easily implemented in MapReduce. For each row of the data matrix xTi , the map function computes the outer product gix T i , where gi consists of n sampled Gaussians. The map function emits a key-value pair for each row of this outer product, where the key is the row number. The reduce function simply sums all rows with the same key. Algorithm 1 contains the functions. In theory and practice, all of the outer products on a single map process are summed before emitting key-value pairs. The function performing the aggregation is called a combiner.\nIn practice, we can only generate i.i.d. Gaussians on a single processor. While there may be small correlations in samples across processors, this does not affect the performance of the algorithm in practice (see Section 4)."
+    }, {
+      "heading" : "3.3 Column normalization",
+      "text" : "The convex hull algorithms from Section 2.1 and the Gaussian projection algorithm from Section 2.3 require the columns of the data matrix X to be normalized. A naive implementation of the column normalization for the convex hull algorithms in a MapReduce or streaming environment would do the following:\n1. Read X and compute the column norms.\n2. Read X, normalize the columns, and write the normalized data to disk.\n3. Use TSQR on the normalized matrix.\nThis requires reading the data matrix twice times and writingO(mn) data to disk once to just normalize the columns. The better approach is a single step:\n1. Use TSQR on the unnormalized data X and simultaneous compute the column norms of X.\nLet D be the diagonal matrix of column norms. Note that\nX = QR→ XD−1 = Q(RD−1).\nThe matrix R̂ = RD−1 is upper triangular, so QR̂ is the thin QR factorization of the column-normalized data. This approach reads the data once and only writes O(n2) data. The same idea applies to Gaussian projection:\nGT (XD−1) = (GTX)D−1.\nThus, our algorithms only need to read the data matrix once in all cases."
+    }, {
+      "heading" : "3.4 MapReduce motivation",
+      "text" : "For the experiments in this paper, we use a MapReduce implementations for the NMF algorithms presented in Section 2.1 using the dimension reduction techniques in Section 2.2. Our central computational kernel is the tall-andskinny QR factorization (TSQR), which has been optimized on several architectures (see the references in the Section 3.1). Thus, our ideas in this paper are not restricted to MapReduce architectures. That being said, MapReduce remains a popular framework in data-intensive computing for several reasons. First, many large datasets are already warehoused in MapReduce clusters. Having algorithms that run on the cluster eliminate the need to transfer data to another computer. The algorithms in this paper need only one pass over the data. Since running time is dominated by the cost of loading data from disk to main memory, the time to transfer data can take as long as simply running the algorithm directly on the cluster. Second, systems like Hadoop [28] and Spark [30] typically manage the distributed file input-output routines and communication collectives. This significantly reduces the software development cycle. Finally, many MapReduce implementations provide transparent fault tolerance."
+    }, {
+      "heading" : "3.5 Communication costs for NMF on MapReduce",
+      "text" : "There are two communication costs that we analyze for MapReduce. The first is the time to read the input data. In Hadoop, data is stored on disk and loading the data is frequently the dominant cost in numerical algorithms. The second is the time spent shuffling data. This is roughly measured by the number and size of the key-value pairs sorted in the shuffle step. Current implementations of TSQR and R-SVD in MapReduce can compute R or ΣV T in a a single MapReduce iteration [5]. For the dimension reduction, the data matrix only needs to be read once. Although algorithms such as Hott Topixx, SPA, and Gaussian projection require normalized columns, we showed that the column norms can be computed at the same time as TSQR (see Section 3.3). For Gaussian projection, we cannot compute the factor H in the same projected space. To remedy this, we combine TSQR with the Gaussian projection in a single pass over the data. Following this initial computation, the H matrix is computed as in Section 2.4.\nThe map processes in the MapReduce implementations for TSQR, R-SVD, and Algorithm 1 emit O(n ·#(map tasks)) keys to the shuffle stage (one for each row of the reduced matrix). The key-value pairs are O(n) in length—each pair represents a partial row sum of the resultant n× n matrix. For tall-and-skinny matrices, n may as well be considered a constant as it is often incredibly small. Thus, our communication is optimal."
+    }, {
+      "heading" : "4. TESTING ON SYNTHETIC MATRICES",
+      "text" : "In this section, we test our dimension reduction techniques on tall-and-skinny matrices that are synthetically generated\nto be separable or near-separable. All experiments were conducted on a 10-node, 40-core MapReduce cluster at Stanford’s Institute for Computational and Mathematical Engineering (ICME). Each node has 6 2-TB disks, 24 GB of RAM, and a single Intel Core i7-960 3.2 GHz processor. They are connected via Gigabit ethernet. We test the following three algorithms:\n1. Dimension reduction with the SVD followed by SPA.\n2. Dimension reduction with the SVD followed by the greedy variant of the XRAY algorithm. The greedy method is not exact in the separable case but works well in practice [25].\n3. Gaussian projection (GP) as described in Section 2.3.\nUsing our dimension reduction technique, all three algorithms require only one pass over the data. The algorithms were selected to be a representative set of the approaches in the literature, and we will refer to the three algorithms as SPA, XRAY, and GP. As discussed in Section 2.2, the choice of QR or SVD does not matter for these algorithms (although it may matter for other NMF algorithms). Thus, we only consider the SVD transformation in the subsequent numerical experiments.\nWe generate a separable matrix X with m = 200 million rows and n = 200 columns. The nonnegative rank (r in Equation (1)) is 20. We generated the separable matrix by\nX := W ( Ir H ′)Π, where H ′ is a r×(n−r) and W is a m×r matrix with entries generated from a Uniform [0, 1] distribution. The permutation matrix Π swaps columns i and 10i, i = 2, . . . , r−1 = 19.\nIn other words, the extreme columns of X are indexed by 0, 1, 10, 20, . . . , 190. The matrix occupies 286 GB of storage in the Hadoop Distributed File System (HDFS).\nFigure 1 shows the relative residual error as a function of the separation rank r. The relative error is\n‖X −X(:,K)H‖2F /‖X‖2F .\nAs r approaches 20, the true separation rank, the relative error converges to 0. Figure 2 shows the columns selected when r = 20. All algorithms except XRAY select the correct columns. Since we use the greedy variant of XRAY, it is not guaranteed to select the correct columns. However, all 20 extreme columns are in the first 21 extreme columns selected by XRAY. Figure 3 shows the coefficient matrixH computed with each algorithm when r = 20. We see that the NNLS solver successfully recovers the correct coefficients.\nWe also test our algorithm with a near-separable matrix: X := W ( Ir H ′)Π +N, The matrices W , H, and Π are the same as the above experiment. The entries of N are chosen uniformly on [0, 1e-3]. Figures 4 5, and 6 show the relative errors for varying separation ranks, the columns selected with r = 20, and the coefficient matrices H for each algorithm. The results are identical to those in the separable case."
+    }, {
+      "heading" : "5. APPLICATIONS",
+      "text" : "We now test our algorithms and implementations on scientific data sets, using the same algorithms and compute system configuration described in Section 4. The data are nonnegative, but we do not know a priori that the data is separable."
+    }, {
+      "heading" : "5.1 Heat transfer simulation data",
+      "text" : "The heat transfer simulation data contains the simulated heat in a high-conductivity stainless steel block with a lowconductivity foam bubble inserted in the block [13]. Each column of the matrix corresponds to simulation results for a foam bubble of a different radius. Several simulations for random foam bubble locations are included in a column. Each row corresponds to a three-dimensional spatial coordinate, a time step, and a bubble location. An entry of the matrix is the temperature of the block at a single spatial location, time step, bubble location, and bubble radius. The matrix is constructed such that columns near 64 have far\nmore variability in the data – this is then responsible for additional“rank-like”structure. Thus, we would intuivitely expect the NMF algorithms to select additional columns closer to the end of the matrix. (And indeed, this is what we will see shortly.) In total, the matrix has approximately 4.9 billion rows and 64 columns and occupies a little more than 2 TB on HDFS. The data set is publicly available.1\nFigure 7 shows the residuals for varying separation ranks. Even a small separation rank (r = 4) results in a small residual. SPA has the smallest residuals, and XRAY and GP are comparable. An advantage of our projection method is that we can quickly test many values of r. For the heat transfer simulation data, we choose r = 10 for further experiments. This value of r is near an “elbow” in the residual plot for the GP curve.\n1https://www.opensciencedatacloud.org/publicdata/\nFigure 8 shows the columns selected by each algorithm. Columns five through 30 are not extreme in any algorithm. Both SPA and GP select at least one column in indices one through four. Columns 41 through 64 have the highest density of extreme columns for all algorithms. Although the extreme columns are different for the algorithms, the coefficient matrix H exhibits remarkably similar characteristics in all cases. Figure 9 visualizes the matrix H for each algorithm. Each non-extreme column is expressed as a conic combination of only two extreme columns. In general, the two extreme columns corresponding to column i are\nj1 = arg max{j ∈ K|j < i}, j2 = arg min{j ∈ K|j > i}.\nIn other words, a non-extreme column is a conic combination of the two extreme columns that “sandwich” it in the data\nmatrix. Furthermore, when the index i is closer to j1, the coefficient for j1 is larger and the coefficient for j2 is smaller. This phenomenon is illustrated in Figure 10."
+    }, {
+      "heading" : "5.2 Flow cytometry",
+      "text" : "The flow cytometry (FC) data represents abundances of fluorescent molecules labeling antibodies that bind to specific targets on the surface of blood cells. The phenotype and function of individual cells can be identified by decoding these label combinations. The analyzed data set contains measurements of 40,000 single cells. The measurement fluorescence intensity conveying the abundance information were collected at five different bands corresponding to the FITC, PE, ECD, PC5, and PC7 fluorescent labels tagging\nantibodies against CD4, CD8, CD19, CD45, and CD3 epitopes.\nThe results are represented as the data matrix A of size 40, 000 × 5. Our interest in the presented analysis was to study pairwise interactions in the data (cell vs. cell, and marker vs. marker). Thus, we are interested in the matrix X = A⊗A, the Kronecker product of A with itself. Each row of X corresponds to a pair of cells and each column to a pair of marker abundance values. X has dimension 40, 0002× 52 and occupies 345 GB on HDFS.\nFigure 11 shows the residuals for the three algorithms applied to the FC data for varying values of the separation rank. In contrast to the heat transfer simulation data,\nthe relative errors are quite large for small r. In fact, SPA has large relative error until nearly all columns are selected (r = 22). Figure 12 shows the columns selected when r = 16. XRAY and GP only disagree on one column. SPA chooses different columns, which is not surprising given the relative residual error. Interestingly, the columns involving the second marker defining the phenotype (columns 2, 6, 7, 8, 9, 10, 12, 17, 22) are underrepresented in all the choices. This suggests that the information provided by the second marker may be redundant. In biological terms, it may indicate that the phenotypes of the individual cells can be inferred from a smaller number of markers. Consequently, this opens a pos-\nsibility that in modified experimental conditions, the FC researchers may omit this particular label, and still be able to recover the complete phenotypic information. Owing to the preliminary nature of these studies, a more in-depth analysis involving multiple similar blood samples would be desirable in order to confirm this hypothesis.\nFinally, Figure 13 shows the coefficient matrix H. The coefficients are larger on the diagonal, which means that the non-extreme columns are composed of nearby extreme columns in the matrix."
+    }, {
+      "heading" : "6. DISCUSSION",
+      "text" : "We have shown how to efficiently compute nonnegative matrix factorizations for near-separable tall-and-skinny matrices. Our main tool was TSQR, and our algorithms only needed to read the data matrix once. By reducing the dimension of the problem, we can easily compute the efficacy of factorizations for several values of the separation rank r. With these tools, we have computed the largest separable nonnegative matrix factorizations to date. Furthermore, our algorithms provide new insights into massive scientific data sets. The coefficient matrix H exposed structure in the results of heat transfer simulations. Extreme column selection in flow cytometry showed that one of the labels used in measurements may be redundant. In future work, we would like to analyze additional large-scale scientific data sets. We also plan to test additional NMF algorithms.\nThe practical limits of our algorithm are imposed by the tall-and-skinny requirement where we assume that it is easy to manipulate n × n matrices. The examples we explored used up to 200 columns and we have explored regimes up to 5000 columns in prior work [12]. A rough rule of thumb is that our implementations should be possible as long as\nan n × n matrix fits into main memory. This means that implementations based on our work will scale up to 30, 000 columns on machines with more than 8 GB of memory; although at this point communication begins to dominate. Solving these problems with more columns is a challenging opportunity for the future."
+    }, {
+      "heading" : "7. ACKNOWLEDGEMENTS",
+      "text" : "Austin R. Benson is supported by an Office of Technology Licensing Stanford Graduate Fellowship. Jason D. Lee is supported by an Office of Technology Licensing Stanford Graduate Fellowship and a National Science Foundation Graduate Research Fellowship. We thank Anil Damle and Yuekai Sun for helpful discussions."
+    }, {
+      "heading" : "8. REFERENCES",
+      "text" : "[1] E. Agullo, C. Coti, J. Dongarra, T. Herault, and\nJ. Langem. QR factorization of tall and skinny matrices in a grid computing environment. In Parallel & Distributed Processing (IPDPS), 2010 IEEE International Symposium on, pages 1–11. IEEE, 2010.\n[2] M. Anderson, G. Ballard, J. Demmel, and K. Keutzer. Communication-avoiding QR decomposition for gpus. In Parallel & Distributed Processing Symposium (IPDPS), 2011 IEEE International, pages 48–58. IEEE, 2011. [3] M. C. U. Araújo, T. C. B. Saldanha, R. K. H. Galvão, T. Yoneyama, H. C. Chame, and V. Visani. The successive projections algorithm for variable selection in spectroscopic multicomponent analysis. Chemometrics and Intelligent Laboratory Systems, 57(2):65–73, 2001. [4] S. Arora, R. Ge, R. Kannan, and A. Moitra. Computing a nonnegative matrix factorization–provably. In Proceedings of the 44th symposium on Theory of Computing, pages 145–162. ACM, 2012. [5] A. R. Benson, D. F. Gleich, and J. Demmel. Direct QR factorizations for tall-and-skinny matrices in MapReduce architectures. In 2013 IEEE International Conference on Big Data, pages 264–272, 2013.\n[6] J. M. Bioucas-Dias and A. Plaza. An overview on hyperspectral unmixing: geometrical, statistical, and sparse regression based approaches. In Geoscience and Remote Sensing Symposium (IGARSS), 2011 IEEE International, pages 1135–1138. IEEE, 2011. [7] V. Bittorf, B. Recht, C. Re, and J. A. Tropp. Factoring nonnegative matrices with linear programs. arXiv preprint arXiv:1206.1270, 2012. [8] J. W. Boardman et al. Automating spectral unmixing of aviris data using convex geometry concepts. In Summaries 4th Annu. JPL Airborne Geoscience Workshop, volume 1, pages 11–14. JPL Publication 93–26, 1993. [9] T. F. Chan. An improved algorithm for computing the singular value decomposition. ACM Trans. Math. Softw., 8(1):72–83, Mar. 1982. [10] H. Cheng, Z. Gimbutas, P. Martinsson, and V. Rokhlin. On the compression of low rank matrices. SIAM Journal on Scientific Computing, 26(4):1389–1404, 2005. [11] A. Cichocki and R. Zdunek. Regularized alternating least squares algorithms for non-negative matrix/tensor factorization. In Advances in Neural Networks–ISNN 2007, pages 793–802. Springer, 2007. [12] P. G. Constantine and D. F. Gleich. Tall and skinny QR factorizations in MapReduce architectures. In Proceedings of the second international workshop on MapReduce and its applications, pages 43–50. ACM, 2011. [13] P. G. Constantine, D. F. Gleich, Y. Hou, and J. Templeton. Model reduction with mapreduce-enabled tall and skinny singular value decomposition. arXiv preprint arXiv:1306.4690, 2013. [14] A. Damle and Y. Sun. A randomized algorithm for separable non-negative matrix factorization. Technical report, Stanford University, 2014. [15] J. Demmel, L. Grigori, M. Hoemmen, and J. Langou. Communication-optimal parallel and sequential QR and LU factorizations. SIAM J. Sci. Comp., 34, Feb. 2012. [16] D. Donoho and V. Stodden. When does non-negative matrix factorization give a correct decomposition into parts? In Advances in neural information processing systems, page None, 2003. [17] N. Gillis and R. Luce. Robust Near-Separable Nonnegative Matrix Factorization Using Linear Optimization. ArXiv e-prints, Feb. 2013. [18] N. Gillis and S. Vavasis. Fast and robust recursive algorithms for separable nonnegative matrix factorization. Pattern Analysis and Machine Intelligence, IEEE Transactions on, PP(99):1–1, 2013. [19] D. Guillamet and J. Vitrià. Non-negative matrix factorization for face recognition. In Topics in Artificial\nIntelligence, pages 336–344. Springer, 2002.\n[20] S. Jia and Y. Qian. Constrained nonnegative matrix factorization for hyperspectral unmixing. Geoscience and Remote Sensing, IEEE Transactions on, 47(1):161–173, 2009. [21] D. Kim, S. Sra, and I. S. Dhillon. Fast projection-based methods for the least squares nonnegative matrix approximation problem. Statistical Analysis and Data Mining, 1(1):38–51, 2008. [22] J. Kim, Y. He, and H. Park. Algorithms for nonnegative matrix and tensor factorizations: A unified view based on block coordinate descent framework. Journal of Global Optimization, pages 1–35, 2013. [23] W. Kim, B. Chen, J. Kim, Y. Pan, and H. Park. Sparse nonnegative matrix factorization for protein sequence motif discovery. Expert Systems with Applications, 38(10):13198–13207, 2011. [24] D. Kuang, H. Park, and C. H. Ding. Symmetric nonnegative matrix factorization for graph clustering. In SDM, volume 12, pages 106–117, 2012. [25] A. Kumar, V. Sindhwani, and P. Kambadur. Fast conical hull algorithms for near-separable non-negative matrix factorization. arXiv preprint arXiv:1210.1190, 2012. [26] C. Liu, H.-c. Yang, J. Fan, L.-W. He, and Y.-M. Wang. Distributed nonnegative matrix factorization for web-scale dyadic data analysis on mapreduce. In Proceedings of the 19th international conference on World wide web, pages 681–690. ACM, 2010. [27] D. Seung and L. Lee. Algorithms for non-negative matrix factorization. Advances in neural information processing systems, 13:556–562, 2001. [28] Various. Hadoop version 0.21. http://hadoop.apache.org, 2010. [29] S. Vavasis. On the complexity of nonnegative matrix factorization. SIAM Journal on Optimization, 20(3):1364–1377, 2010. [30] M. Zaharia, M. Chowdhury, T. Das, A. Dave, J. Ma, M. McCauley, M. Franklin, S. Shenker, and I. Stoica. Resilient distributed datasets: A fault-tolerant abstraction for in-memory cluster computing. In Proceedings of the 9th USENIX conference on Networked Systems Design and Implementation, pages 2–2. USENIX Association, 2012."
+    } ],
+    "references" : [ {
+      "title" : "QR factorization of tall and skinny matrices in a grid computing environment",
+      "author" : [ "E. Agullo", "C. Coti", "J. Dongarra", "T. Herault", "J. Langem" ],
+      "venue" : "In Parallel & Distributed Processing (IPDPS),",
+      "citeRegEx" : "1",
+      "shortCiteRegEx" : "1",
+      "year" : 2010
+    }, {
+      "title" : "Communication-avoiding QR decomposition for gpus",
+      "author" : [ "M. Anderson", "G. Ballard", "J. Demmel", "K. Keutzer" ],
+      "venue" : "In Parallel & Distributed Processing Symposium (IPDPS),",
+      "citeRegEx" : "2",
+      "shortCiteRegEx" : "2",
+      "year" : 2011
+    }, {
+      "title" : "The successive projections algorithm for variable selection in spectroscopic multicomponent analysis",
+      "author" : [ "M.C.U. Araújo", "T.C.B. Saldanha", "R.K.H. Galvão", "T. Yoneyama", "H.C. Chame", "V. Visani" ],
+      "venue" : "Chemometrics and Intelligent Laboratory Systems,",
+      "citeRegEx" : "3",
+      "shortCiteRegEx" : "3",
+      "year" : 2001
+    }, {
+      "title" : "Computing a nonnegative matrix factorization–provably",
+      "author" : [ "S. Arora", "R. Ge", "R. Kannan", "A. Moitra" ],
+      "venue" : "In Proceedings of the 44th symposium on Theory of Computing,",
+      "citeRegEx" : "4",
+      "shortCiteRegEx" : "4",
+      "year" : 2012
+    }, {
+      "title" : "Direct QR factorizations for tall-and-skinny matrices in MapReduce architectures",
+      "author" : [ "A.R. Benson", "D.F. Gleich", "J. Demmel" ],
+      "venue" : "IEEE International Conference on Big Data,",
+      "citeRegEx" : "5",
+      "shortCiteRegEx" : "5",
+      "year" : 2013
+    }, {
+      "title" : "An overview on hyperspectral unmixing: geometrical, statistical, and sparse regression based approaches",
+      "author" : [ "J.M. Bioucas-Dias", "A. Plaza" ],
+      "venue" : "In Geoscience and Remote Sensing Symposium (IGARSS),",
+      "citeRegEx" : "6",
+      "shortCiteRegEx" : "6",
+      "year" : 2011
+    }, {
+      "title" : "Factoring nonnegative matrices with linear programs",
+      "author" : [ "V. Bittorf", "B. Recht", "C. Re", "J.A. Tropp" ],
+      "venue" : "arXiv preprint arXiv:1206.1270,",
+      "citeRegEx" : "7",
+      "shortCiteRegEx" : "7",
+      "year" : 2012
+    }, {
+      "title" : "Automating spectral unmixing of aviris data using convex geometry concepts",
+      "author" : [ "J.W. Boardman" ],
+      "venue" : "In Summaries 4th Annu. JPL Airborne Geoscience Workshop,",
+      "citeRegEx" : "8",
+      "shortCiteRegEx" : "8",
+      "year" : 1993
+    }, {
+      "title" : "An improved algorithm for computing the singular value decomposition",
+      "author" : [ "T.F. Chan" ],
+      "venue" : "ACM Trans. Math. Softw.,",
+      "citeRegEx" : "9",
+      "shortCiteRegEx" : "9",
+      "year" : 1982
+    }, {
+      "title" : "On the compression of low rank matrices",
+      "author" : [ "H. Cheng", "Z. Gimbutas", "P. Martinsson", "V. Rokhlin" ],
+      "venue" : "SIAM Journal on Scientific Computing,",
+      "citeRegEx" : "10",
+      "shortCiteRegEx" : "10",
+      "year" : 2005
+    }, {
+      "title" : "Regularized alternating least squares algorithms for non-negative matrix/tensor factorization",
+      "author" : [ "A. Cichocki", "R. Zdunek" ],
+      "venue" : "In Advances in Neural Networks–ISNN",
+      "citeRegEx" : "11",
+      "shortCiteRegEx" : "11",
+      "year" : 2007
+    }, {
+      "title" : "Tall and skinny QR factorizations in MapReduce architectures",
+      "author" : [ "P.G. Constantine", "D.F. Gleich" ],
+      "venue" : "In Proceedings of the second international workshop on MapReduce and its applications,",
+      "citeRegEx" : "12",
+      "shortCiteRegEx" : "12",
+      "year" : 2011
+    }, {
+      "title" : "Model reduction with mapreduce-enabled tall and skinny singular value decomposition",
+      "author" : [ "P.G. Constantine", "D.F. Gleich", "Y. Hou", "J. Templeton" ],
+      "venue" : "arXiv preprint arXiv:1306.4690,",
+      "citeRegEx" : "13",
+      "shortCiteRegEx" : "13",
+      "year" : 2013
+    }, {
+      "title" : "A randomized algorithm for separable non-negative matrix factorization",
+      "author" : [ "A. Damle", "Y. Sun" ],
+      "venue" : "Technical report, Stanford University,",
+      "citeRegEx" : "14",
+      "shortCiteRegEx" : "14",
+      "year" : 2014
+    }, {
+      "title" : "Communication-optimal parallel and sequential QR and LU factorizations",
+      "author" : [ "J. Demmel", "L. Grigori", "M. Hoemmen", "J. Langou" ],
+      "venue" : "SIAM J. Sci. Comp.,",
+      "citeRegEx" : "15",
+      "shortCiteRegEx" : "15",
+      "year" : 2012
+    }, {
+      "title" : "When does non-negative matrix factorization give a correct decomposition into parts? In Advances in neural information processing",
+      "author" : [ "D. Donoho", "V. Stodden" ],
+      "venue" : null,
+      "citeRegEx" : "16",
+      "shortCiteRegEx" : "16",
+      "year" : 2003
+    }, {
+      "title" : "Robust Near-Separable Nonnegative Matrix Factorization Using Linear Optimization",
+      "author" : [ "N. Gillis", "R. Luce" ],
+      "venue" : "ArXiv e-prints,",
+      "citeRegEx" : "17",
+      "shortCiteRegEx" : "17",
+      "year" : 2013
+    }, {
+      "title" : "Fast and robust recursive algorithms for separable nonnegative matrix factorization",
+      "author" : [ "N. Gillis", "S. Vavasis" ],
+      "venue" : "Pattern Analysis and Machine Intelligence, IEEE Transactions on,",
+      "citeRegEx" : "18",
+      "shortCiteRegEx" : "18",
+      "year" : 2013
+    }, {
+      "title" : "Non-negative matrix factorization for face recognition",
+      "author" : [ "D. Guillamet", "J. Vitrià" ],
+      "venue" : "In Topics in Artificial  Intelligence,",
+      "citeRegEx" : "19",
+      "shortCiteRegEx" : "19",
+      "year" : 2002
+    }, {
+      "title" : "Constrained nonnegative matrix factorization for hyperspectral unmixing",
+      "author" : [ "S. Jia", "Y. Qian" ],
+      "venue" : "Geoscience and Remote Sensing, IEEE Transactions on,",
+      "citeRegEx" : "20",
+      "shortCiteRegEx" : "20",
+      "year" : 2009
+    }, {
+      "title" : "Fast projection-based methods for the least squares nonnegative matrix approximation problem",
+      "author" : [ "D. Kim", "S. Sra", "I.S. Dhillon" ],
+      "venue" : "Statistical Analysis and Data Mining,",
+      "citeRegEx" : "21",
+      "shortCiteRegEx" : "21",
+      "year" : 2008
+    }, {
+      "title" : "Algorithms for nonnegative matrix and tensor factorizations: A unified view based on block coordinate descent framework",
+      "author" : [ "J. Kim", "Y. He", "H. Park" ],
+      "venue" : "Journal of Global Optimization,",
+      "citeRegEx" : "22",
+      "shortCiteRegEx" : "22",
+      "year" : 2013
+    }, {
+      "title" : "Sparse nonnegative matrix factorization for protein sequence motif discovery",
+      "author" : [ "W. Kim", "B. Chen", "J. Kim", "Y. Pan", "H. Park" ],
+      "venue" : "Expert Systems with Applications,",
+      "citeRegEx" : "23",
+      "shortCiteRegEx" : "23",
+      "year" : 2011
+    }, {
+      "title" : "Symmetric nonnegative matrix factorization for graph clustering",
+      "author" : [ "D. Kuang", "H. Park", "C.H. Ding" ],
+      "venue" : "In SDM,",
+      "citeRegEx" : "24",
+      "shortCiteRegEx" : "24",
+      "year" : 2012
+    }, {
+      "title" : "Fast conical hull algorithms for near-separable non-negative matrix factorization",
+      "author" : [ "A. Kumar", "V. Sindhwani", "P. Kambadur" ],
+      "venue" : "arXiv preprint arXiv:1210.1190,",
+      "citeRegEx" : "25",
+      "shortCiteRegEx" : "25",
+      "year" : 2012
+    }, {
+      "title" : "Distributed nonnegative matrix factorization for web-scale dyadic data analysis on mapreduce",
+      "author" : [ "C. Liu", "H.-c. Yang", "J. Fan", "L.-W. He", "Y.-M. Wang" ],
+      "venue" : "In Proceedings of the 19th international conference on World wide web,",
+      "citeRegEx" : "26",
+      "shortCiteRegEx" : "26",
+      "year" : 2010
+    }, {
+      "title" : "Algorithms for non-negative matrix factorization",
+      "author" : [ "D. Seung", "L. Lee" ],
+      "venue" : "Advances in neural information processing systems,",
+      "citeRegEx" : "27",
+      "shortCiteRegEx" : "27",
+      "year" : 2001
+    }, {
+      "title" : "On the complexity of nonnegative matrix factorization",
+      "author" : [ "S. Vavasis" ],
+      "venue" : "SIAM Journal on Optimization,",
+      "citeRegEx" : "29",
+      "shortCiteRegEx" : "29",
+      "year" : 2010
+    }, {
+      "title" : "Resilient distributed datasets: A fault-tolerant abstraction for in-memory cluster computing",
+      "author" : [ "M. Zaharia", "M. Chowdhury", "T. Das", "A. Dave", "J. Ma", "M. McCauley", "M. Franklin", "S. Shenker", "I. Stoica" ],
+      "venue" : "In Proceedings of the 9th USENIX conference on Networked Systems Design and Implementation,",
+      "citeRegEx" : "30",
+      "shortCiteRegEx" : "30",
+      "year" : 2012
+    } ],
+    "referenceMentions" : [ {
+      "referenceID" : 9,
+      "context" : "the singular value decomposition and the interpolative decomposition [10], the advantage of NMF is in interpretability of the data.",
+      "startOffset" : 69,
+      "endOffset" : 73
+    }, {
+      "referenceID" : 18,
+      "context" : "A common example is facial image decomposition [19].",
+      "startOffset" : 47,
+      "endOffset" : 51
+    }, {
+      "referenceID" : 23,
+      "context" : "For this reason, among a host of other reasons, NMF is used in a broad range of applications including graph clustering [24], protein sequence motif discovery [23], and hyperspectral unmixing [20].",
+      "startOffset" : 120,
+      "endOffset" : 124
+    }, {
+      "referenceID" : 22,
+      "context" : "For this reason, among a host of other reasons, NMF is used in a broad range of applications including graph clustering [24], protein sequence motif discovery [23], and hyperspectral unmixing [20].",
+      "startOffset" : 159,
+      "endOffset" : 163
+    }, {
+      "referenceID" : 19,
+      "context" : "For this reason, among a host of other reasons, NMF is used in a broad range of applications including graph clustering [24], protein sequence motif discovery [23], and hyperspectral unmixing [20].",
+      "startOffset" : 192,
+      "endOffset" : 196
+    }, {
+      "referenceID" : 5,
+      "context" : "We compare this method with a Gaussian transformation technique from the hyperspectral unmixing community [6, 8].",
+      "startOffset" : 106,
+      "endOffset" : 112
+    }, {
+      "referenceID" : 7,
+      "context" : "We compare this method with a Gaussian transformation technique from the hyperspectral unmixing community [6, 8].",
+      "startOffset" : 106,
+      "endOffset" : 112
+    }, {
+      "referenceID" : 4,
+      "context" : "Since tall-and-skinny matrices are amenable to streaming computations [5, 12], we present a MapReduce implementation in Section 3.",
+      "startOffset" : 70,
+      "endOffset" : 77
+    }, {
+      "referenceID" : 11,
+      "context" : "Since tall-and-skinny matrices are amenable to streaming computations [5, 12], we present a MapReduce implementation in Section 3.",
+      "startOffset" : 70,
+      "endOffset" : 77
+    }, {
+      "referenceID" : 27,
+      "context" : "Unfortunately, for a fixed non-negative rank r, finding the factors W and H for which the residual ‖X −WH‖ is minimized is NP-complete [29].",
+      "startOffset" : 135,
+      "endOffset" : 139
+    }, {
+      "referenceID" : 15,
+      "context" : "The idea of separability was developed by Donoho and Stodden [16], and recent work has produced tractable NMF algorithms by assuming that X almost satisfies a separability condition [4, 7, 17].",
+      "startOffset" : 61,
+      "endOffset" : 65
+    }, {
+      "referenceID" : 3,
+      "context" : "The idea of separability was developed by Donoho and Stodden [16], and recent work has produced tractable NMF algorithms by assuming that X almost satisfies a separability condition [4, 7, 17].",
+      "startOffset" : 182,
+      "endOffset" : 192
+    }, {
+      "referenceID" : 6,
+      "context" : "The idea of separability was developed by Donoho and Stodden [16], and recent work has produced tractable NMF algorithms by assuming that X almost satisfies a separability condition [4, 7, 17].",
+      "startOffset" : 182,
+      "endOffset" : 192
+    }, {
+      "referenceID" : 16,
+      "context" : "The idea of separability was developed by Donoho and Stodden [16], and recent work has produced tractable NMF algorithms by assuming that X almost satisfies a separability condition [4, 7, 17].",
+      "startOffset" : 182,
+      "endOffset" : 192
+    }, {
+      "referenceID" : 26,
+      "context" : "Examples include the seminal work by Lee and Seung [27], alternating least squares [11, 22], and fast projection-based least squares [21].",
+      "startOffset" : 51,
+      "endOffset" : 55
+    }, {
+      "referenceID" : 10,
+      "context" : "Examples include the seminal work by Lee and Seung [27], alternating least squares [11, 22], and fast projection-based least squares [21].",
+      "startOffset" : 83,
+      "endOffset" : 91
+    }, {
+      "referenceID" : 21,
+      "context" : "Examples include the seminal work by Lee and Seung [27], alternating least squares [11, 22], and fast projection-based least squares [21].",
+      "startOffset" : 83,
+      "endOffset" : 91
+    }, {
+      "referenceID" : 20,
+      "context" : "Examples include the seminal work by Lee and Seung [27], alternating least squares [11, 22], and fast projection-based least squares [21].",
+      "startOffset" : 133,
+      "endOffset" : 137
+    }, {
+      "referenceID" : 25,
+      "context" : "Some of these methods are used in MapReduce architectures at scale [26].",
+      "startOffset" : 67,
+      "endOffset" : 71
+    }, {
+      "referenceID" : 24,
+      "context" : "The goal of the XRAY algorithm [25] is to find these extreme rays.",
+      "startOffset" : 31,
+      "endOffset" : 35
+    }, {
+      "referenceID" : 2,
+      "context" : "Popular approaches in the context of NMF include the Successive Projection Algorithm (SPA, [3]) and its generalization [18].",
+      "startOffset" : 91,
+      "endOffset" : 94
+    }, {
+      "referenceID" : 17,
+      "context" : "Popular approaches in the context of NMF include the Successive Projection Algorithm (SPA, [3]) and its generalization [18].",
+      "startOffset" : 119,
+      "endOffset" : 123
+    }, {
+      "referenceID" : 6,
+      "context" : "Another alternative, based on linear programming, is Hott Topixx [7].",
+      "startOffset" : 65,
+      "endOffset" : 68
+    }, {
+      "referenceID" : 5,
+      "context" : "An alternative dimension reduction technique is random Gaussian projections, and the idea has been used in hyperspectral unmixing problems [6].",
+      "startOffset" : 139,
+      "endOffset" : 142
+    }, {
+      "referenceID" : 7,
+      "context" : "In the hyperspectral unmixing literature, the separability is referred to as the pure-pixel assumption, and the random projections are also motivated by convex geometry [8].",
+      "startOffset" : 169,
+      "endOffset" : 172
+    }, {
+      "referenceID" : 13,
+      "context" : "Recent work shows that when X is r-separable and k = O(r log r), then all of the extreme columns are found with high probability [14].",
+      "startOffset" : 129,
+      "endOffset" : 133
+    }, {
+      "referenceID" : 14,
+      "context" : "When m n, communication-optimal algorithms for computing the factorization are referred to as TSQR [15].",
+      "startOffset" : 99,
+      "endOffset" : 103
+    }, {
+      "referenceID" : 4,
+      "context" : "TSQR is implemented in several environments, including MapReduce [5, 12], distributed memory MPI [15], GPUs [2], and grid computing [1].",
+      "startOffset" : 65,
+      "endOffset" : 72
+    }, {
+      "referenceID" : 11,
+      "context" : "TSQR is implemented in several environments, including MapReduce [5, 12], distributed memory MPI [15], GPUs [2], and grid computing [1].",
+      "startOffset" : 65,
+      "endOffset" : 72
+    }, {
+      "referenceID" : 14,
+      "context" : "TSQR is implemented in several environments, including MapReduce [5, 12], distributed memory MPI [15], GPUs [2], and grid computing [1].",
+      "startOffset" : 97,
+      "endOffset" : 101
+    }, {
+      "referenceID" : 1,
+      "context" : "TSQR is implemented in several environments, including MapReduce [5, 12], distributed memory MPI [15], GPUs [2], and grid computing [1].",
+      "startOffset" : 108,
+      "endOffset" : 111
+    }, {
+      "referenceID" : 0,
+      "context" : "TSQR is implemented in several environments, including MapReduce [5, 12], distributed memory MPI [15], GPUs [2], and grid computing [1].",
+      "startOffset" : 132,
+      "endOffset" : 135
+    }, {
+      "referenceID" : 8,
+      "context" : "When m n, this method for computing the SVD is called the R-SVD [9].",
+      "startOffset" : 64,
+      "endOffset" : 67
+    }, {
+      "referenceID" : 28,
+      "context" : "Second, systems like Hadoop [28] and Spark [30] typically manage the distributed file input-output routines and communication collectives.",
+      "startOffset" : 43,
+      "endOffset" : 47
+    }, {
+      "referenceID" : 4,
+      "context" : "Current implementations of TSQR and R-SVD in MapReduce can compute R or ΣV T in a a single MapReduce iteration [5].",
+      "startOffset" : 111,
+      "endOffset" : 114
+    }, {
+      "referenceID" : 24,
+      "context" : "The greedy method is not exact in the separable case but works well in practice [25].",
+      "startOffset" : 80,
+      "endOffset" : 84
+    }, {
+      "referenceID" : 0,
+      "context" : "X := W ( Ir H ′)Π, where H ′ is a r×(n−r) and W is a m×r matrix with entries generated from a Uniform [0, 1] distribution.",
+      "startOffset" : 102,
+      "endOffset" : 108
+    }, {
+      "referenceID" : 12,
+      "context" : "The heat transfer simulation data contains the simulated heat in a high-conductivity stainless steel block with a lowconductivity foam bubble inserted in the block [13].",
+      "startOffset" : 164,
+      "endOffset" : 168
+    }, {
+      "referenceID" : 11,
+      "context" : "The examples we explored used up to 200 columns and we have explored regimes up to 5000 columns in prior work [12].",
+      "startOffset" : 110,
+      "endOffset" : 114
+    } ],
+    "year" : 2014,
+    "abstractText" : "Numerous algorithms are used for nonnegative matrix factorization under the assumption that the matrix is nearly separable. In this paper, we show how to make these algorithms efficient for data matrices that have many more rows than columns, so-called “tall-and-skinny matrices”. One key component to these improved methods is an orthogonal matrix transformation that preserves the separability of the NMF problem. Our final methods need a single pass over the data matrix and are suitable for streaming, multi-core, and MapReduce architectures. We demonstrate the efficacy of these algorithms on terabyte-sized synthetic matrices and real-world matrices from scientific computing and bioinformatics.",
+    "creator" : "LaTeX with hyperref package"
+  }
+}

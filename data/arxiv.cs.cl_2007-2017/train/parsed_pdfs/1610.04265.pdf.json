@@ -1,0 +1,363 @@
+{
+  "name" : "1610.04265.pdf",
+  "metadata" : {
+    "source" : "CRF",
+    "title" : "Fast, Scalable Phrase-Based SMT Decoding",
+    "authors" : [ "Hieu Hoang", "Nikolay Bogoychev", "Marcin Junczys-Dowmunt" ],
+    "emails" : [ "hieu@moses-mt.org", "s1031254@sms.ed.ac.uk", "lanes@illinois.edu", "junczys@amu.edu.pl" ],
+    "sections" : [ {
+      "heading" : null,
+      "text" : "In this paper we re-examine the major components of phrase-based decoding and decoder implementation with particular emphasis on speed and scalability on multicore machines. The result is a drop-in replacement for the Moses decoder which is up to fifteen times faster and scales monotonically with the number of cores."
+    }, {
+      "heading" : "1 Introduction",
+      "text" : "SMT has steadily progressed from a research discipline to commercial viability during the past decade as can be seen from services such as the Google and Microsoft Translation services. As well as general purpose services such as these, there is a large number of companies that offer customized translation systems, as well as companies and organization that implement in-house solutions. Many of these customized solutions use Moses as their SMT engine.\nFor many users, decoding is the most time-critical part of the translation process. Making use of the multiple cores that are now ubiquitous in today’s servers is a common strategy to ameliorate this issue. However, it has been noticed that the Moses decoder, amongst others, is unable to efficiently use multiple cores (Fernández et al., 2016). That is, decoding speed does not substantially increase when more cores are used, in fact, it may actually decrease when using more cores. There has been speculation on the causes of the inefficiency as well as potential remedies.\nThis paper is the first we know of that focuses on improving decoding speed on multicore servers. We take a holistic approach to solving this issue, creating a decoder that is optimized for multi-core processing speed by concentrating on four main areas:\n1. Faster memory management of data-structures through the use of customized memory pools\n2. Exploring alternatives to cardinality-based hypothesis stack configuration\nar X\niv :1\n61 0.\n04 26\n5v 2\n[ cs\n.C L\n] 1\n3. Re-examining the efficiency of phrase-table lookup using translation rule caching and data compression\n4. Integrating the lexicalized re-ordering model into the phrase-table, thus eliminating the need for independent random lookup this model\nThe result is a decoder that is significantly faster than the Moses baseline for singlethreaded operation, and scales with the number of cores.\nWe will maintain the Moses decoder’s embarrassingly parallel, one sentence-per-thread decoding framework. As far as possible, model scores and functionality are compatible with Moses to aid comparison and ease transition for existing users. The source code is available in the existing Moses repository1.\nThe rest of the paper will be broken up into the following sections. The rest of this section will discuss prior work and an outline of the phrase-based model. Section 2 will then describe the modifications to improve decoding speed. We describe the experiment setup in Section 3 and present results Section 4. We conclude in the last section and discuss possible future work."
+    }, {
+      "heading" : "1.1 Prior Work",
+      "text" : "Most prior work on increasing decoding speed look to optimizing specific components of the decoder or the decoding algorithm. Heafield (2011) and Yasuhara et al. (2013) describe fast, efficient data structures for language models. Zens and Ney (2007) describes an implementation of a phrase-table for an SMT decoder that is loaded on demand, reducing the initial loading time and memory requirements. Junczys-Dowmunt (2012) extends this by compressing the on-disk phrase table and lexicalized re-ordering model. Chiang (2007) describes the cube-pruning and cube-growing algorithm which allows the tradeoff between speed and translation quality to the adjusted with a single parameter. Wuebker et al. (2012b) note that language model querying is amongst the most expensive operation in decoding. They sought to improved decoding speed by caching score computations early pruning of translation options. This work is similar to Heafield et al. (2014) which group hypotheses with identical language model context and incrementally expand them, reducing LM querying. Fernández et al. (2016) was concerned with multi-core speed but treated decoding as a black box within a parallelization framework.\nThere are a number of phrase-based decoding implementations, many of which implements the extensions to the phrase-based model described above. The most well known is Moses (Koehn et al., 2007) which implements a number of speed optimizations, including cubepruning. It is widely used for MT research and commercial use.\nJoshua (Li et al., 2009) also supports cube-pruning for phrase-based models. Phrasal (Spence Green and Manning, 2014) supports a number of variants of the phrase-based model. Jane (Wuebker et al., 2012a) supports the language model look-ahead described in Wuebker et al. (2012b) in addition to other tools to speed up decoding such as having a separate fast, lightweight decoder. mtplz is a specialized decoder developed to implement the incremental decoding described in Heafield et al. (2014).\nThe Moses, Joshua and Phrasal decoders implement multithreading, however, they all report scalability problems, either in the paper (Phrasal) or via social media (Moses2 and Joshua3).\nJane and mtplz are single-threaded decoders, relying on external applications to parallelize operations.\n1https://github.com/moses-smt/mosesdecoder/tree/master/contrib/moses2 2https://github.com/moses-smt/mosesdecoder/issues/39 3https://twitter.com/ApacheJoshua/status/342022794097340416\nThis paper not only focuses on faster single-threaded decoding but also on overcoming the shortcomings of existing decoding implementations on multicore servers. Unlike Fernández et al. (2016), we will optimize decoding speed by looking inside the black box. We will compare multicore performance the best-of-breed phrase-table described in Junczys-Dowmunt (2012) with our own implementation. We will use the cube-pruning algorithm, however, the standard phrase-based decoding algorithm is also available and a framework exists to accommodate other decoding algorithms in future. We use KenLM (Heafield, 2011) due to its popularity and consistent performance, but as with Moses, other language model implementations can be added later."
+    }, {
+      "heading" : "1.2 Phrase-Based Model",
+      "text" : "The objective of decoding is to find the target translation with the maximum probability, given a source sentence. That is, for a source sentence s, the objective is to find a target translation t̂ which has the highest conditional probability p(t|s). Formally, this is written as:\nt̂ = argmax t p(t|s) (1)\nwhere the arg max function is the search. The log-linear model generalizes Equation 1 to include more component models and weighting each model according to the contribution of each model to the total probability.\np(t|s) = 1 Z exp( ∑ m λmhm(t, s)) (2)\nwhere λm is the weight, and hm is the feature function, or ‘score’, for model m. Z is the partition function which can be ignored for optimization.\nThe standard feature functions in the phrase-based model include: 1. a distortion penalty 2. a phrase-penalty, 3. a word penalty, 4. an unknown word penalty. 5. log transforms of the target language model probability p(t), 6. log transforms translation model probabilities, pTM (t|s) and pTM (s|t), and word-based\ntranslation probabilities pw(t|s) and pw(s|t), 7. log transforms of the lexicalized re-ordering probabilities,\nOf these feature functions, we will focus on optimizing the speed of the phrase-table and lexicalized re-ordering models."
+    }, {
+      "heading" : "1.3 Beam Search",
+      "text" : "A translation of a source sentence is created by applying a series of translation rules which together translate each source word once, and only once. Each partial translation is known as a hypothesis, which is created by applying a rule to an existing hypothesis. This hypothesis expansion process starts with a hypothesis that has translated no source word and ends with completed hypotheses that has translated all source words. The highest-scoring completed hypothesis, according to the model score, is considered the best translation, t̂.\nIn the phrase-based model, each rule translates a contiguous sequence of source words. Successive applications of translation rules do not have to be adjacent on the source side, depending on the distortion limit. The target output is constructed strictly left-to-right from the target side using this series of translation rules.\nA beam search algorithm is used to create the completed hypothesis set efficiently. Hypotheses are grouped into stacks where each stack holds a number of comparable hypotheses. Most phrase-based implementations group hypotheses according to coverage cardinality."
+    }, {
+      "heading" : "2 Proposed Improvements",
+      "text" : "We will also concentrate on four main areas for optimization."
+    }, {
+      "heading" : "2.1 Efficient Memory Allocation",
+      "text" : "The search algorithm creates and destroy a large number of intermediate objects such as hypotheses and feature function states. This puts a burden on the operating system due to the need to synchronize memory access, especially when using a large number of threads. Libraries such as tcmalloc (Ghemawat and Menage, 2009) are designed to reduce locking contention for multi-threaded application but in our case, this is still not enough.\nWe shall seek to improve decoding speed by replacing the operating system’s general purpose memory management with our own custom memory management scheme. Memory will be allocated from a memory pool rather than use the operating system’s general purpose allocation functions.\nA memory pool is a large block of memory that has been given to the application by the operating system. The application is then responsible for allocating portions of this memory to its components when requested. We will use thread-specific memory pools to increase speed by avoiding locking contention during memory access. Our memory pools will be dynamic. That is, the memory requirement does not have to be known or specified before running the application, the pool can grow when required but they will never reduce in size. The pools are deleted only when the application ends.\nTo further increase memory management speed, objects in the memory pool are not deleted. Unused data structures accumulates in the pool until a reset event. The pool is assumed to be empty and simply reused after the event. We instantiate two memory pools per decoding thread, one which is never reset and another which is reset after the decoding of each sentence. Data structures are created in either pool according to their life cycle.\nAccumulating unused objects in the memory pools can result in unacceptably high memory usage so object queues are available for high-churn objects which allows the decoder to re-cycle unused objects before the reset event. This also increases speed as LIFO queues are used so that the most recently accessed memory are used, increasing CPU cache hits."
+    }, {
+      "heading" : "2.2 Stack Configurations",
+      "text" : "The most popular stack configuration for phrase-based models is coverage cardinality, that is, hypotheses that have translated the same number of source words are stored in the same stack. This is implemented in Pharaoh, Moses and Joshua.\nHowever, there are alternatives to this configuration. Och et al. (2001) uses a single stack for all hypotheses, Brown et al. (1993) uses coverage stacks (ie. one stack per unique coverage vector) while Wuebker et al. (2012a) and Zens and Ney (2008) apply both coverage and cardinality pruning. While useful, these prior works present only one particular stack configuration each. Ortiz-Martı́nez et al. (2006) explore a range of stack configurations by defining a granularity parameter which controls the maximum number of stacks required to decode a sentence.\nWe shall re-visit the question of stack configuration with a particular emphasis on how they can help improve the tradeoff between speed and translation quality. We will do so in the context of the cube-pruning algorithm, the algorithm that we will be using and which was not available to many of the earlier work."
+    }, {
+      "heading" : "2.3 Phrase-Table Optimizations",
+      "text" : "For any phrase-table table of a realistic size, memory and loading time constraints requires us to use a load-on-demand implementation. Moses has several which we can make use of, each with differing performance characteristics. Figure 1 shows the decoding speed for the fastest two implementations. From this, it appears that the Probing phrase-table (Bogoychev and Lopez, 2016) has the fastest translation rule lookup, especially with large number of cores, therefore, we will concentrate exclusively on this implementation from hereon.\nWe propose two optimizations. Firstly, the translation rule caching mechanism in Moses saves the most recently used rules. However, this require locking and active management in clearing of old rules. The result is slower decoding, Table 1.\nWe shall explore a simpler caching mechanism by creating a static cache of the most likely translation rules to be used at the start of decoding.\nSecondly, the Probing phrase-table use a simple compression algorithm to compress the target side of the translation rule. Compression was championed by Junczys-Dowmunt (2012) as the main reason behind the speed of their phrase-table but as we saw in Figure 1, this comes at the cost of scalability to large number of threads. We shall therefore take the opposite approach to and improve decoding speed by disabling compression."
+    }, {
+      "heading" : "2.4 Lexicalized Re-ordering Model Optimizations",
+      "text" : "Similar to the phrase-table, the lexicalized re-ordering model is trained on parallel data. A resultant model file is then queried during decoding. The need for random lookup during querying inevitably results in slower decoding speed. Previous work such as Junczys-Dowmunt (2012) improve querying speed with more compact data structures.\nHowever, the model’s query keys are the source and target phrase of each translation rule. Rather than storing the lexicalized re-ordering model separately, we shall integrating it into the translation model, eliminating the need to query a separate file. However, the model remains the same under the log-linear framework, including having its own weights.\nThis optimization has precedent in Wuebker et al. (2012a) but the effect on decoding speed\nwere not published. We will compare results with using a separate model in this paper."
+    }, {
+      "heading" : "3 Experimental Setup",
+      "text" : "We trained a phrase-based system using the Moses toolkit with standard settings. The training data consisted of most of the publicly available Arabic-English data from Opus (Tiedemann, 2012) containing over 69 million parallel sentences, and tuned on a held out set. The phrase-table was then pruned, keeping only the top 100 entries per source phrase, according to p(t|s). All model files were then binarized; the language models were binarized using KenLM (Heafield, 2011), the phrase table using the Probing phrase-table, lexicalized reordering model using the compact data structure (Junczys-Dowmunt, 2012). These binary formats were chosen for their best-in-class multithreaded performance. Table 2 gives details of the resultant sizes of the model files. For testing decoding speed, we used a subset of the training data, Table 3.\nFor verification with a different dataset, we also used a second system trained on the French-English Europarl corpus (2m parallel sentences). The two different systems have characterics that we are interested in analyzing; ar-en have short sentences with large models while fr-en have overly long sentences with smaller models. Where we need to compare model scores, we used held out test sets.\nStandard Moses phrase-based configurations are used, except that we use the cube-pruning algorithm (Chiang, 2007) with a pop-limit of 4004, rather than the basic phrase-based algorithm. The cube-pruning algorithm is often employed by users who require fast decoding as it gives them the ability to trade speed with translation quality via a simple pop-limit parameter.\nAs a baseline, we use a recent5 version of the Moses decoder taken from the github repos-\n4the pop-limit was chosen from public discussion on the Moses mailing list on an acceptable balance between decoding speed and translation quality with Moses for commercial use\n5The experiments were performed between January and May 2016 with the latest github code to hand. The main ar-en experiments were rerun with the source code as of 8th June, 2016 to ensure there were no material difference.\nitory. For all experiments, we used a Dell PowerEdge R620 server with 16 cores, 32 hyperthreads, split over 2 physical processors (Intel Xeon E5-2650 @ 2.00GHz). The server has 380GB RAM. The operating system was Ubuntu 14.04, the code was compiled with gcc 4.8.4 and Boost 1.596 and the tcmalloc library."
+    }, {
+      "heading" : "4 Results",
+      "text" : ""
+    }, {
+      "heading" : "4.1 Optimizing Memory",
+      "text" : "Over 24% of the Moses decoder running time is spent on memory management (Table 4). This increases to 39% when 32 threads are used, dampening the scalability of the decoder. By contrast, our decoder spends 11% on memory management and does not significantly increase with more threads.\nFigure 2 compares the decoding speed for Moses and our decoder, using the same models, parameters and test set. Our decoder is 4.4 times faster with one thread, and 5.0 times faster using all cores. Like Moses, however, performance actually worsens after approximately 15 threads.\nThe commit hash was bc5f8d15c6ce4bc678ba992860bfd4be6719cee8 6http://boost.org/"
+    }, {
+      "heading" : "4.2 Stack Configuration",
+      "text" : "We investigated the effects of the following three stack configurations on model score and decoding speed:\n1. coverage cardinality, 2. coverage, 3. coverage and end position of most recently translated source word.\nCoverage cardinality is the same as that in Moses and Joshua. Coverage configuration uses one stack per unique coverage vector. Coverage and end position of most recently translated source word extends the coverage configuration by separating hypotheses where the position of the last translate word are different, even if the coverages are identical.\nThis is an optimization to reduce the number of checks on the distortion limit, which is dependent on the last word position. The check is a binary function d(Ch, ehypo, ranger), where Ch is the coverage vector of hypothesis h, eh is the end position of most recent source word that has been translated, and ranger is the coverage of the rule to be applied.\nBy grouping hypotheses according to coverage and end position, the distortion limit only needs to be checked for each group. However, stack pruning occurs on each hypothesis group independently, therefore, potentially affecting search errors and model scores.\nFigure 3 presents the tradeoff between decoding time and average model scores, created by varying the cube-pruning pop-limit. None of the different stack configurations significantly outperform the others in either quality or decoding speed. However, the coverage & end position produces slightly higher model scores at higher pop-limits, therefore, we continue to use this configuration throughout the rest of this paper.\nWe verified that the translation quality of our decoder is comparable to that of Moses in Figure 4, given the same parameters and models. This fits in with our intention of creating a drop-in replacement for the Moses decoder."
+    }, {
+      "heading" : "4.3 Translation Model",
+      "text" : "In the first optimization, we create a static translation model cache containing translation rules that translates the most common source phrases. This is constructed during phrase-table training based on the source counts. The cache is then loaded when the decoder is started. It does not require the overhead of managing an active cache but there is still some overhead in using a cache. Overall however, using a static cache result in a 10% decrease in decoding time if the optimum cache size is used, Table 5.\nFor the second optimization, we disable the compression of the target side of the translation rules. This increase the size of the binary files from 17GB to 23GB but the time saved not\nneeding to decompress the data resulted in a 1.5% decrease in decoding time with 1 thread and nearly 7% when the CPUs are saturated, Table 6."
+    }, {
+      "heading" : "4.4 Lexicalized Re-ordering Model",
+      "text" : "The lexicalized re-ordering model requires a probability distribution of the re-ordering behaviour of each translation rule learnt from the training data. This is represented in the model file as a fixed number of probabilities for each rule, exactly how many probabilities is dependant on the model’s parameterization during training. During decoding, a probability from this distribution is assigned to each hypothesis according to the re-ordering of the translation rule.\nRather than holding the model probability distributions in the separate file, we pre-process the translation model file to include the lexicalized re-ordering model distributions for each rule. During decoding, the probability distribution is then taken from the translation model instead of querying a separate file.\nThis resulted in a significant decrease in decoding time, especially with high number of cores, Figure 5. Decoding speed increased by 40% when using one thread but is 5 times faster when using 32 threads."
+    }, {
+      "heading" : "4.5 Scalability",
+      "text" : "Figure 6 shows decoding speed against the number of threads used. In our work, there is a constant increase in decoding speed when more threads are used, decreasing slightly after 16 threads when virtual cores are employed by the CPU. Overall, decoding is 16 times faster than single-threaded decoding when all 16 cores (32 hyperthreads) are fully utilized.\nThis contrast with Moses where speed increases up to approximately 16 threads but then\nbecome slower thereafter. Using the tcmalloc library has a small positive effect on decoding speed but does little to improve scalability\nOur work is 4.3 times faster than Moses with a single-thread and 10.4 faster when all cores are used."
+    }, {
+      "heading" : "4.6 Other Models and Even More Cores",
+      "text" : "Our decoder show no scalability issues when we tested with the same model and tested set on a larger server, Figure 7.\nWe verify the results with the French-English phrase-based system and test set. The speed gains are even greater than the Arabic-English test scenario, Figure 8. Our decoder is 5.4 times faster than Moses with a single-thread and 14.5 faster when all cores are saturated.\nIt has been suggested that using a larger language model would overpower the improvements in decoding speed. We tested this conjecture by replacing the language model in the ar-en experiment with a 96GB language model. The time to load of language model is significant (394 sec) and was excluded from the translation speed. Results show that our decoder is 7 times faster than Moses and still scales monotonically until all CPUs are saturated, Figure 9."
+    }, {
+      "heading" : "5 Conclusion",
+      "text" : "We have presented a new decoder that is compatible with Moses. By studying the shortcomings of the current implementation, we are able to optimize for speed, particularly for multicore operation. This resulted in double digit gains compared to Moses on the same hardware. Our implementation is also unaffected by scalability issues that have afflicted Moses.\nIn future, we shall investigate other major components of the decoding algorithm, particularly the language model which has not been touched in this paper. We are also keen to explore the underlying reasons for the scalability issues in Moses to get a better understanding where potential performance issues can arise."
+    }, {
+      "heading" : "Acknowledgments",
+      "text" : "This work is sponsored by the Air Force Research Laboratory, prime contract FA8650-11-C6160. The views and conclusions contained in this document are those of the authors and should not be interpreted as representative of the official policies, either expressed or implied, of the Air Force Research Laboratory or the U.S. Government.\nThanks to Kenneth Heafield for advice and code."
+    } ],
+    "references" : [ {
+      "title" : "Fast and highly parallelizable phrase table for statistical machine translation",
+      "author" : [ "N. Bogoychev", "A. Lopez" ],
+      "venue" : "Proceedings of the First Conference on Statistical Machine Translation WMT16, Berlin, Germany.",
+      "citeRegEx" : "Bogoychev and Lopez,? 2016",
+      "shortCiteRegEx" : "Bogoychev and Lopez",
+      "year" : 2016
+    }, {
+      "title" : "The mathematics of statistical machine translation",
+      "author" : [ "P.F. Brown", "S.A. Della-Pietra", "V.J. Della-Pietra", "R.L. Mercer" ],
+      "venue" : "Computational Linguistics, 19(2):263–313.",
+      "citeRegEx" : "Brown et al\\.,? 1993",
+      "shortCiteRegEx" : "Brown et al\\.",
+      "year" : 1993
+    }, {
+      "title" : "Hierarchical phrase-based translation",
+      "author" : [ "D. Chiang" ],
+      "venue" : "Computational Linguistics, 33(2):201–228.",
+      "citeRegEx" : "Chiang,? 2007",
+      "shortCiteRegEx" : "Chiang",
+      "year" : 2007
+    }, {
+      "title" : "Boosting performance of a statistical machine translation system using dynamic parallelism",
+      "author" : [ "M. Fernández", "J.C. Pichel", "J.C. Cabaleiro", "T.F. Pena" ],
+      "venue" : "Journal of Computational Science, 13:37–48.",
+      "citeRegEx" : "Fernández et al\\.,? 2016",
+      "shortCiteRegEx" : "Fernández et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Tcmalloc: Thread-caching malloc",
+      "author" : [ "S. Ghemawat", "P. Menage" ],
+      "venue" : null,
+      "citeRegEx" : "Ghemawat and Menage,? \\Q2009\\E",
+      "shortCiteRegEx" : "Ghemawat and Menage",
+      "year" : 2009
+    }, {
+      "title" : "KenLM: faster and smaller language model queries",
+      "author" : [ "K. Heafield" ],
+      "venue" : "Proceedings of the EMNLP 2011 Sixth Workshop on Statistical Machine Translation, pages 187–197, Edinburgh, Scotland, United Kingdom.",
+      "citeRegEx" : "Heafield,? 2011",
+      "shortCiteRegEx" : "Heafield",
+      "year" : 2011
+    }, {
+      "title" : "Faster Phrase-Based decoding by refining feature state",
+      "author" : [ "K. Heafield", "M. Kayser", "C.D. Manning" ],
+      "venue" : "Proceedings of the Association for Computational Linguistics, Baltimore, MD, USA.",
+      "citeRegEx" : "Heafield et al\\.,? 2014",
+      "shortCiteRegEx" : "Heafield et al\\.",
+      "year" : 2014
+    }, {
+      "title" : "A space-efficient phrase table implementation using minimal perfect hash functions",
+      "author" : [ "M. Junczys-Dowmunt" ],
+      "venue" : "Sojka, P., Hork, A., Kopecek, I., and Pala, K., editors, 15th International Conference on Text, Speech and Dialogue (TSD), volume 7499 of Lecture Notes in Computer Science, pages 320–327. Springer.",
+      "citeRegEx" : "Junczys.Dowmunt,? 2012",
+      "shortCiteRegEx" : "Junczys.Dowmunt",
+      "year" : 2012
+    }, {
+      "title" : "Moses: Open source toolkit for statistical machine translation",
+      "author" : [ "P. Koehn", "H. Hoang", "A. Birch", "C. Callison-Burch", "M. Federico", "N. Bertoldi", "B. Cowan", "W. Shen", "C. Moran", "R. Zens", "C. Dyer", "O. Bojar", "A. Constantin", "E. Herbst" ],
+      "venue" : "Proceedings of the 45th Annual Meeting of the Association for Computational Linguistics Companion Volume Proceedings of the Demo and Poster Sessions, pages 177–180, Prague, Czech Republic. Association for Computational Linguistics.",
+      "citeRegEx" : "Koehn et al\\.,? 2007",
+      "shortCiteRegEx" : "Koehn et al\\.",
+      "year" : 2007
+    }, {
+      "title" : "Joshua: An open source toolkit for parsing-based machine translation",
+      "author" : [ "Z. Li", "C. Callison-Burch", "C. Dyer", "S. Khudanpur", "L. Schwartz", "W. Thornton", "J. Weese", "O. Zaidan" ],
+      "venue" : "Proceedings of the Fourth Workshop on Statistical Machine Translation, pages 135–139, Athens, Greece. Association for Computational Linguistics.",
+      "citeRegEx" : "Li et al\\.,? 2009",
+      "shortCiteRegEx" : "Li et al\\.",
+      "year" : 2009
+    }, {
+      "title" : "An efficient A* search algorithm for statistical machine translation",
+      "author" : [ "F.J. Och", "N. Ueffing", "H. Ney" ],
+      "venue" : "Workshop on Data-Driven Machine Translation at 39th Annual Meeting of the Association of Computational Linguistics (ACL).",
+      "citeRegEx" : "Och et al\\.,? 2001",
+      "shortCiteRegEx" : "Och et al\\.",
+      "year" : 2001
+    }, {
+      "title" : "Generalized stack decoding algorithms for statistical machine translation",
+      "author" : [ "D. Ortiz-Martı́nez", "I. Garcı́a-Varea", "F. Casacuberta" ],
+      "venue" : "In Proceedings on the Workshop on Statistical Machine Translation,",
+      "citeRegEx" : "Ortiz.Martı́nez et al\\.,? \\Q2006\\E",
+      "shortCiteRegEx" : "Ortiz.Martı́nez et al\\.",
+      "year" : 2006
+    }, {
+      "title" : "Phrasal: A toolkit for new directions in statistical machine translation",
+      "author" : [ "D.C. Spence Green", "C.D. Manning" ],
+      "venue" : "Proceedings of the Ninth Workshop on Statistical Machine Translation, pages 114–121. Citeseer.",
+      "citeRegEx" : "Green and Manning,? 2014",
+      "shortCiteRegEx" : "Green and Manning",
+      "year" : 2014
+    }, {
+      "title" : "Parallel data, tools and interfaces in opus",
+      "author" : [ "J. Tiedemann" ],
+      "venue" : "LREC, pages 2214–2218.",
+      "citeRegEx" : "Tiedemann,? 2012",
+      "shortCiteRegEx" : "Tiedemann",
+      "year" : 2012
+    }, {
+      "title" : "Jane 2: Open source phrase-based and hierarchical statistical machine translation",
+      "author" : [ "J. Wuebker", "M. Huck", "S. Peitz", "M. Nuhn", "M. Freitag", "Peter", "J.-T.", "S. Mansour", "H. Ney" ],
+      "venue" : "24th International Conference on Computational Linguistics, page 483. Citeseer.",
+      "citeRegEx" : "Wuebker et al\\.,? 2012a",
+      "shortCiteRegEx" : "Wuebker et al\\.",
+      "year" : 2012
+    }, {
+      "title" : "Fast and scalable decoding with language model lookahead for phrase-based statistical machine translation",
+      "author" : [ "J. Wuebker", "H. Ney", "R. Zens" ],
+      "venue" : "Proceedings of the 50th Annual Meeting of the Association for Computational Linguistics: Short Papers-Volume 2, pages 28–32. Association for Computational Linguistics.",
+      "citeRegEx" : "Wuebker et al\\.,? 2012b",
+      "shortCiteRegEx" : "Wuebker et al\\.",
+      "year" : 2012
+    }, {
+      "title" : "An efficient language model using double-array structures",
+      "author" : [ "M. Yasuhara", "T. Tanaka", "Norimatsu", "J.-y.", "M. Yamamoto" ],
+      "venue" : "Proceedings of the 2013 Conference on Empirical Methods in Natural Language Processing, pages 222–232, Seattle, Washington, USA. Association for Computational Linguistics.",
+      "citeRegEx" : "Yasuhara et al\\.,? 2013",
+      "shortCiteRegEx" : "Yasuhara et al\\.",
+      "year" : 2013
+    }, {
+      "title" : "Efficient phrase-table representation for machine translation with applications to online mt and speech translation",
+      "author" : [ "R. Zens", "H. Ney" ],
+      "venue" : "HLT-NAACL, pages 492–499.",
+      "citeRegEx" : "Zens and Ney,? 2007",
+      "shortCiteRegEx" : "Zens and Ney",
+      "year" : 2007
+    }, {
+      "title" : "Improvements in dynamic programming beam search for phrase-based statistical machine translation",
+      "author" : [ "R. Zens", "H. Ney" ],
+      "venue" : "Proc. of IWSLT.",
+      "citeRegEx" : "Zens and Ney,? 2008",
+      "shortCiteRegEx" : "Zens and Ney",
+      "year" : 2008
+    } ],
+    "referenceMentions" : [ {
+      "referenceID" : 3,
+      "context" : "However, it has been noticed that the Moses decoder, amongst others, is unable to efficiently use multiple cores (Fernández et al., 2016).",
+      "startOffset" : 113,
+      "endOffset" : 137
+    }, {
+      "referenceID" : 8,
+      "context" : "The most well known is Moses (Koehn et al., 2007) which implements a number of speed optimizations, including cubepruning.",
+      "startOffset" : 29,
+      "endOffset" : 49
+    }, {
+      "referenceID" : 9,
+      "context" : "Joshua (Li et al., 2009) also supports cube-pruning for phrase-based models.",
+      "startOffset" : 7,
+      "endOffset" : 24
+    }, {
+      "referenceID" : 14,
+      "context" : "Jane (Wuebker et al., 2012a) supports the language model look-ahead described in Wuebker et al.",
+      "startOffset" : 5,
+      "endOffset" : 28
+    }, {
+      "referenceID" : 3,
+      "context" : "Heafield (2011) and Yasuhara et al.",
+      "startOffset" : 0,
+      "endOffset" : 16
+    }, {
+      "referenceID" : 3,
+      "context" : "Heafield (2011) and Yasuhara et al. (2013) describe fast, efficient data structures for language models.",
+      "startOffset" : 0,
+      "endOffset" : 43
+    }, {
+      "referenceID" : 3,
+      "context" : "Heafield (2011) and Yasuhara et al. (2013) describe fast, efficient data structures for language models. Zens and Ney (2007) describes an implementation of a phrase-table for an SMT decoder that is loaded on demand, reducing the initial loading time and memory requirements.",
+      "startOffset" : 0,
+      "endOffset" : 125
+    }, {
+      "referenceID" : 3,
+      "context" : "Heafield (2011) and Yasuhara et al. (2013) describe fast, efficient data structures for language models. Zens and Ney (2007) describes an implementation of a phrase-table for an SMT decoder that is loaded on demand, reducing the initial loading time and memory requirements. Junczys-Dowmunt (2012) extends this by compressing the on-disk phrase table and lexicalized re-ordering model.",
+      "startOffset" : 0,
+      "endOffset" : 298
+    }, {
+      "referenceID" : 2,
+      "context" : "Chiang (2007) describes the cube-pruning and cube-growing algorithm which allows the tradeoff between speed and translation quality to the adjusted with a single parameter.",
+      "startOffset" : 0,
+      "endOffset" : 14
+    }, {
+      "referenceID" : 2,
+      "context" : "Chiang (2007) describes the cube-pruning and cube-growing algorithm which allows the tradeoff between speed and translation quality to the adjusted with a single parameter. Wuebker et al. (2012b) note that language model querying is amongst the most expensive operation in decoding.",
+      "startOffset" : 0,
+      "endOffset" : 196
+    }, {
+      "referenceID" : 2,
+      "context" : "Chiang (2007) describes the cube-pruning and cube-growing algorithm which allows the tradeoff between speed and translation quality to the adjusted with a single parameter. Wuebker et al. (2012b) note that language model querying is amongst the most expensive operation in decoding. They sought to improved decoding speed by caching score computations early pruning of translation options. This work is similar to Heafield et al. (2014) which group hypotheses with identical language model context and incrementally expand them, reducing LM querying.",
+      "startOffset" : 0,
+      "endOffset" : 437
+    }, {
+      "referenceID" : 2,
+      "context" : "Chiang (2007) describes the cube-pruning and cube-growing algorithm which allows the tradeoff between speed and translation quality to the adjusted with a single parameter. Wuebker et al. (2012b) note that language model querying is amongst the most expensive operation in decoding. They sought to improved decoding speed by caching score computations early pruning of translation options. This work is similar to Heafield et al. (2014) which group hypotheses with identical language model context and incrementally expand them, reducing LM querying. Fernández et al. (2016) was concerned with multi-core speed but treated decoding as a black box within a parallelization framework.",
+      "startOffset" : 0,
+      "endOffset" : 575
+    }, {
+      "referenceID" : 2,
+      "context" : "Chiang (2007) describes the cube-pruning and cube-growing algorithm which allows the tradeoff between speed and translation quality to the adjusted with a single parameter. Wuebker et al. (2012b) note that language model querying is amongst the most expensive operation in decoding. They sought to improved decoding speed by caching score computations early pruning of translation options. This work is similar to Heafield et al. (2014) which group hypotheses with identical language model context and incrementally expand them, reducing LM querying. Fernández et al. (2016) was concerned with multi-core speed but treated decoding as a black box within a parallelization framework. There are a number of phrase-based decoding implementations, many of which implements the extensions to the phrase-based model described above. The most well known is Moses (Koehn et al., 2007) which implements a number of speed optimizations, including cubepruning. It is widely used for MT research and commercial use. Joshua (Li et al., 2009) also supports cube-pruning for phrase-based models. Phrasal (Spence Green and Manning, 2014) supports a number of variants of the phrase-based model. Jane (Wuebker et al., 2012a) supports the language model look-ahead described in Wuebker et al. (2012b) in addition to other tools to speed up decoding such as having a separate fast, lightweight decoder.",
+      "startOffset" : 0,
+      "endOffset" : 1283
+    }, {
+      "referenceID" : 2,
+      "context" : "Chiang (2007) describes the cube-pruning and cube-growing algorithm which allows the tradeoff between speed and translation quality to the adjusted with a single parameter. Wuebker et al. (2012b) note that language model querying is amongst the most expensive operation in decoding. They sought to improved decoding speed by caching score computations early pruning of translation options. This work is similar to Heafield et al. (2014) which group hypotheses with identical language model context and incrementally expand them, reducing LM querying. Fernández et al. (2016) was concerned with multi-core speed but treated decoding as a black box within a parallelization framework. There are a number of phrase-based decoding implementations, many of which implements the extensions to the phrase-based model described above. The most well known is Moses (Koehn et al., 2007) which implements a number of speed optimizations, including cubepruning. It is widely used for MT research and commercial use. Joshua (Li et al., 2009) also supports cube-pruning for phrase-based models. Phrasal (Spence Green and Manning, 2014) supports a number of variants of the phrase-based model. Jane (Wuebker et al., 2012a) supports the language model look-ahead described in Wuebker et al. (2012b) in addition to other tools to speed up decoding such as having a separate fast, lightweight decoder. mtplz is a specialized decoder developed to implement the incremental decoding described in Heafield et al. (2014). The Moses, Joshua and Phrasal decoders implement multithreading, however, they all report scalability problems, either in the paper (Phrasal) or via social media (Moses2 and Joshua3).",
+      "startOffset" : 0,
+      "endOffset" : 1499
+    }, {
+      "referenceID" : 5,
+      "context" : "We use KenLM (Heafield, 2011) due to its popularity and consistent performance, but as with Moses, other language model implementations can be added later.",
+      "startOffset" : 13,
+      "endOffset" : 29
+    }, {
+      "referenceID" : 3,
+      "context" : "Unlike Fernández et al. (2016), we will optimize decoding speed by looking inside the black box.",
+      "startOffset" : 7,
+      "endOffset" : 31
+    }, {
+      "referenceID" : 3,
+      "context" : "Unlike Fernández et al. (2016), we will optimize decoding speed by looking inside the black box. We will compare multicore performance the best-of-breed phrase-table described in Junczys-Dowmunt (2012) with our own implementation.",
+      "startOffset" : 7,
+      "endOffset" : 202
+    }, {
+      "referenceID" : 4,
+      "context" : "Libraries such as tcmalloc (Ghemawat and Menage, 2009) are designed to reduce locking contention for multi-threaded application but in our case, this is still not enough.",
+      "startOffset" : 27,
+      "endOffset" : 54
+    }, {
+      "referenceID" : 9,
+      "context" : "Och et al. (2001) uses a single stack for all hypotheses, Brown et al.",
+      "startOffset" : 0,
+      "endOffset" : 18
+    }, {
+      "referenceID" : 1,
+      "context" : "(2001) uses a single stack for all hypotheses, Brown et al. (1993) uses coverage stacks (ie.",
+      "startOffset" : 47,
+      "endOffset" : 67
+    }, {
+      "referenceID" : 1,
+      "context" : "(2001) uses a single stack for all hypotheses, Brown et al. (1993) uses coverage stacks (ie. one stack per unique coverage vector) while Wuebker et al. (2012a) and Zens and Ney (2008) apply both coverage and cardinality pruning.",
+      "startOffset" : 47,
+      "endOffset" : 160
+    }, {
+      "referenceID" : 1,
+      "context" : "(2001) uses a single stack for all hypotheses, Brown et al. (1993) uses coverage stacks (ie. one stack per unique coverage vector) while Wuebker et al. (2012a) and Zens and Ney (2008) apply both coverage and cardinality pruning.",
+      "startOffset" : 47,
+      "endOffset" : 184
+    }, {
+      "referenceID" : 1,
+      "context" : "(2001) uses a single stack for all hypotheses, Brown et al. (1993) uses coverage stacks (ie. one stack per unique coverage vector) while Wuebker et al. (2012a) and Zens and Ney (2008) apply both coverage and cardinality pruning. While useful, these prior works present only one particular stack configuration each. Ortiz-Martı́nez et al. (2006) explore a range of stack configurations by defining a granularity parameter which controls the maximum number of stacks required to decode a sentence.",
+      "startOffset" : 47,
+      "endOffset" : 345
+    }, {
+      "referenceID" : 0,
+      "context" : "From this, it appears that the Probing phrase-table (Bogoychev and Lopez, 2016) has the fastest translation rule lookup, especially with large number of cores, therefore, we will concentrate exclusively on this implementation from hereon.",
+      "startOffset" : 52,
+      "endOffset" : 79
+    }, {
+      "referenceID" : 0,
+      "context" : "From this, it appears that the Probing phrase-table (Bogoychev and Lopez, 2016) has the fastest translation rule lookup, especially with large number of cores, therefore, we will concentrate exclusively on this implementation from hereon. We propose two optimizations. Firstly, the translation rule caching mechanism in Moses saves the most recently used rules. However, this require locking and active management in clearing of old rules. The result is slower decoding, Table 1. We shall explore a simpler caching mechanism by creating a static cache of the most likely translation rules to be used at the start of decoding. Secondly, the Probing phrase-table use a simple compression algorithm to compress the target side of the translation rule. Compression was championed by Junczys-Dowmunt (2012) as the main reason behind the speed of their phrase-table but as we saw in Figure 1, this comes at the cost of scalability to large number of threads.",
+      "startOffset" : 53,
+      "endOffset" : 802
+    }, {
+      "referenceID" : 7,
+      "context" : "Previous work such as Junczys-Dowmunt (2012) improve querying speed with more compact data structures.",
+      "startOffset" : 22,
+      "endOffset" : 45
+    }, {
+      "referenceID" : 7,
+      "context" : "Previous work such as Junczys-Dowmunt (2012) improve querying speed with more compact data structures. However, the model’s query keys are the source and target phrase of each translation rule. Rather than storing the lexicalized re-ordering model separately, we shall integrating it into the translation model, eliminating the need to query a separate file. However, the model remains the same under the log-linear framework, including having its own weights. This optimization has precedent in Wuebker et al. (2012a) but the effect on decoding speed",
+      "startOffset" : 22,
+      "endOffset" : 519
+    }, {
+      "referenceID" : 13,
+      "context" : "The training data consisted of most of the publicly available Arabic-English data from Opus (Tiedemann, 2012) containing over 69 million parallel sentences, and tuned on a held out set.",
+      "startOffset" : 92,
+      "endOffset" : 109
+    }, {
+      "referenceID" : 5,
+      "context" : "All model files were then binarized; the language models were binarized using KenLM (Heafield, 2011), the phrase table using the Probing phrase-table, lexicalized reordering model using the compact data structure (Junczys-Dowmunt, 2012).",
+      "startOffset" : 84,
+      "endOffset" : 100
+    }, {
+      "referenceID" : 7,
+      "context" : "All model files were then binarized; the language models were binarized using KenLM (Heafield, 2011), the phrase table using the Probing phrase-table, lexicalized reordering model using the compact data structure (Junczys-Dowmunt, 2012).",
+      "startOffset" : 213,
+      "endOffset" : 236
+    }, {
+      "referenceID" : 2,
+      "context" : "Standard Moses phrase-based configurations are used, except that we use the cube-pruning algorithm (Chiang, 2007) with a pop-limit of 4004, rather than the basic phrase-based algorithm.",
+      "startOffset" : 99,
+      "endOffset" : 113
+    } ],
+    "year" : 2016,
+    "abstractText" : "The utilization of statistical machine translation (SMT) has grown enormously over the last decade, many using open-source software developed by the NLP community. As commercial use has increased, there is need for software that is optimized for commercial requirements, in particular, fast phrase-based decoding and more efficient utilization of modern multicore servers. In this paper we re-examine the major components of phrase-based decoding and decoder implementation with particular emphasis on speed and scalability on multicore machines. The result is a drop-in replacement for the Moses decoder which is up to fifteen times faster and scales monotonically with the number of cores.",
+    "creator" : "LaTeX with hyperref package"
+  }
+}

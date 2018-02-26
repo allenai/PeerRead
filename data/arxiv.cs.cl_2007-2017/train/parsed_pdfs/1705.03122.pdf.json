@@ -1,0 +1,667 @@
+{
+  "name" : "1705.03122.pdf",
+  "metadata" : {
+    "source" : "META",
+    "title" : "Convolutional Sequence to Sequence Learning",
+    "authors" : [ "Jonas Gehring", "Michael Auli", "David Grangier", "Denis Yarats", "Yann N. Dauphin" ],
+    "emails" : [ ],
+    "sections" : [ {
+      "heading" : "1. Introduction",
+      "text" : "Sequence to sequence learning has been successful in many tasks such as machine translation, speech recognition (Sutskever et al., 2014; Chorowski et al., 2015) and text summarization (Rush et al., 2015; Nallapati et al., 2016; Shen et al., 2016) amongst others. The dominant approach to date encodes the input sequence with a series of bi-directional recurrent neural networks (RNN) and generates a variable length output with another set of decoder RNNs, both of which interface via a soft-attention mechanism (Bahdanau et al., 2014; Luong et al., 2015). In machine translation, this architecture has been demonstrated to outperform traditional phrase-based models by large margins (Sennrich et al., 2016b; Zhou et al., 2016; Wu et al., 2016; §2).\n1The source code and models are available at https:// github.com/facebookresearch/fairseq.\nConvolutional neural networks are less common for sequence modeling, despite several advantages (Waibel et al., 1989; LeCun & Bengio, 1995). Compared to recurrent layers, convolutions create representations for fixed size contexts, however, the effective context size of the network can easily be made larger by stacking several layers on top of each other. This allows to precisely control the maximum length of dependencies to be modeled. Convolutional networks do not depend on the computations of the previous time step and therefore allow parallelization over every element in a sequence. This contrasts with RNNs which maintain a hidden state of the entire past that prevents parallel computation within a sequence.\nMulti-layer convolutional neural networks create hierarchical representations over the input sequence in which nearby input elements interact at lower layers while distant elements interact at higher layers. Hierarchical structure provides a shorter path to capture long-range dependencies compared to the chain structure modeled by recurrent networks, e.g. we can obtain a feature representation capturing relationships within a window of n words by applying only O(nk ) convolutional operations for a kernel of width k, compared to a linear number O(n) for recurrent neural networks. Inputs to a convolutional network are fed through a constant number of kernels and non-linearities, whereas recurrent networks apply up to n operations and non-linearities to the first word and only a single set of operations to the last word. Fixing the number of nonlinearities applied to the inputs also eases learning.\nRecent work has applied convolutional neural networks to sequence modeling such as Bradbury et al. (2016) who introduce recurrent pooling between a succession of convolutional layers or Kalchbrenner et al. (2016) who tackle neural translation without attention. However, none of these approaches has been demonstrated improvements over state of the art results on large benchmark datasets. Gated convolutions have been previously explored for machine translation by Meng et al. (2015) but their evaluation was restricted to a small dataset and the model was used in tandem with a traditional count-based model. Architec-\nar X\niv :1\n70 5.\n03 12\n2v 1\n[ cs\n.C L\n] 8\nM ay\n2 01\ntures which are partially convolutional have shown strong performance on larger tasks but their decoder is still recurrent (Gehring et al., 2016).\nIn this paper we propose an architecture for sequence to sequence modeling that is entirely convolutional. Our model is equipped with gated linear units (Dauphin et al., 2016) and residual connections (He et al., 2015a). We also use attention in every decoder layer and demonstrate that each attention layer only adds a negligible amount of overhead. The combination of these choices enables us to tackle large scale problems (§3).\nWe evaluate our approach on several large datasets for machine translation as well as summarization and compare to the current best architectures reported in the literature. On WMT’16 English-Romanian translation we achieve a new state of the art, outperforming the previous best result by 1.8 BLEU. On WMT’14 English-German we outperform the strong LSTM setup of Wu et al. (2016) by 0.5 BLEU and on WMT’14 English-French we outperform the likelihood trained system of Wu et al. (2016) by 1.5 BLEU. Furthermore, our model can translate unseen sentences at an order of magnitude faster speed than Wu et al. (2016) on GPU and CPU hardware (§4, §5)."
+    }, {
+      "heading" : "2. Recurrent Sequence to Sequence Learning",
+      "text" : "Sequence to sequence modeling has been synonymous with recurrent neural network based encoder-decoder architectures (Sutskever et al., 2014; Bahdanau et al., 2014). The encoder RNN processes an input sequence x = (x1, . . . , xm) of m elements and returns state representations z = (z1. . . . , zm). The decoder RNN takes z and generates the output sequence y = (y1, . . . , yn) left to right, one element at a time. To generate output yi+1, the decoder computes a new hidden state hi+1 based on the previous state hi, an embedding gi of the previous target language word yi, as well as a conditional input ci derived from the encoder output z. Based on this generic formulation, various encoder-decoder architectures have been proposed, which differ mainly in the conditional input and the type of RNN.\nModels without attention consider only the final encoder state zm by setting ci = zm for all i (Cho et al., 2014), or simply initialize the first decoder state with zm (Sutskever et al., 2014), in which case ci is not used. Architectures with attention (Bahdanau et al., 2014; Luong et al., 2015) compute ci as a weighted sum of (z1. . . . , zm) at each time step. The weights of the sum are referred to as attention scores and allow the network to focus on different parts of the input sequence as it generates the output sequences. Attention scores are computed by essentially comparing each encoder state zj to a combination of the previous decoder\nstate hi and the last prediction yi; the result is normalized to be a distribution over input elements.\nPopular choices for recurrent networks in encoder-decoder models are long short term memory networks (LSTM; Hochreiter & Schmidhuber, 1997) and gated recurrent units (GRU; Cho et al., 2014). Both extend Elman RNNs (Elman, 1990) with a gating mechanism that allows the memorization of information from previous time steps in order to model long-term dependencies. Most recent approaches also rely on bi-directional encoders to build representations of both past and future contexts (Bahdanau et al., 2014; Zhou et al., 2016; Wu et al., 2016). Models with many layers often rely on shortcut or residual connections (He et al., 2015a; Zhou et al., 2016; Wu et al., 2016)."
+    }, {
+      "heading" : "3. A Convolutional Architecture",
+      "text" : "Next we introduce a fully convolutional architecture for sequence to sequence modeling. Instead of relying on RNNs to compute intermediate encoder states z and decoder states h we use convolutional neural networks (CNN)."
+    }, {
+      "heading" : "3.1. Position Embeddings",
+      "text" : "First, we embed input elements x = (x1, . . . , xm) in distributional space as w = (w1, . . . , wm), where wj ∈ Rf is a column in an embedding matrix D ∈ RV×f . We also equip our model with a sense of order by embedding the absolute position of input elements p = (p1, . . . , pm) where pj ∈ Rf . Both are combined to obtain input element representations e = (w1 + p1, . . . , wm + pm). We proceed similarly for output elements that were already generated by the decoder network to yield output element representations that are being fed back into the decoder network g = (g1, . . . , gn). Position embeddings are useful in our architecture since they give our model a sense of which portion of the sequence in the input or output it is currently dealing with (§5.3)."
+    }, {
+      "heading" : "3.2. Convolutional Block Structure",
+      "text" : "Both encoder and decoder networks share a simple block structure that computes intermediate states based on a fixed number of input elements. We denote the output of the lth block as hl = (hl1, . . . , h l n) for the decoder network, and zl = (zl1, . . . , z l m) for the encoder network; we refer to blocks and layers interchangeably. Each block contains a one dimensional convolution followed by a non-linearity. For a decoder network with a single block and kernel width k, each resulting state h1i contains information over k input elements. Stacking several blocks on top of each other increases the number of input elements represented in a state. For instance, stacking 6 blocks with k = 5 results in an input field of 25 elements, i.e. each output depends on 25\ninputs. Non-linearities allow the networks to exploit the full input field, or to focus on fewer elements if needed.\nEach convolution kernel is parameterized as W ∈ R2d×kd, bw ∈ R2d and takes as input X ∈ Rk×d which is a concatenation of k input elements embedded in d dimensions and maps them to a single output element Y ∈ R2d that has twice the dimensionality of the input elements; subsequent layers operate over the k output elements of the previous layer. We choose gated linear units (GLU; Dauphin et al., 2016) as non-linearity which implement a simple gating mechanism over the output of the convolution Y = [A B] ∈ R2d:\nv([A B]) = A⊗ σ(B)\nwhere A,B ∈ Rd are the inputs to the non-linearity, ⊗ is the point-wise multiplication and the output v([A B]) ∈ Rd is half the size of Y . The gates σ(B) control which inputs A of the current context are relevant. A similar nonlinearity has been introduced in Oord et al. (2016b) who apply tanh toA but Dauphin et al. (2016) shows that GLUs perform better in the context of language modelling.\nTo enable deep convolutional networks, we add residual connections from the input of each convolution to the output of the block (He et al., 2015a).\nhli = v(W l[hl−1i−k/2, . . . , h l−1 i+k/2] + b l w) + h l−1 i\nFor encoder networks we ensure that the output of the convolutional layers matches the input length by padding the input at each layer. However, for decoder networks we have to take care that no future information is available to the decoder (Oord et al., 2016a). Specifically, we pad the input by k − 1 elements on both the left and right side by zero vectors, and then remove k elements from the end of the convolution output.\nWe also add linear mappings to project between the embedding size f and the convolution outputs that are of size 2d. We apply such a transform to w when feeding embeddings to the encoder network, to the encoder output zuj , to the final layer of the decoder just before the softmax hL, and to all decoder layers hl before computing attention scores in (1).\nFinally, we compute a distribution over the T possible next target elements yi+1 by transforming the top decoder output hLi via a linear layer with weights Wo and bias bo:\np(yi+1|y1, . . . , yi,x) = softmax(WohLi + bo) ∈ RT"
+    }, {
+      "heading" : "3.3. Multi-step Attention",
+      "text" : "We introduce a separate attention mechanism for each decoder layer. To compute the attention, we combine the current decoder state hli with an embedding of the previous\ntarget element gi:\ndli = W l dh l i + b l d + gi (1)\nFor decoder layer l the attention alij of state i and source element j is computed as a dot-product between the decoder state summary dli and each output z u j of the last encoder block u:\nalij = exp\n( dli · zuj )∑m t=1 exp ( dli · zut\n) The conditional input cli for the current decoder layer is a weighted sum of the encoder outputs as well as the input element embeddings ej (Figure 1, center right).\ncli = m∑ j=1 alij(z u j + ej) (2)\nThis is slightly different to recurrent approaches which compute both the attention and the weighted sum over zuj\nonly. We found adding ej to be beneficial and it resembles key-value memory networks where the keys are the zuj and the values are the zuj + ej (Miller et al., 2016). Encoder outputs zuj represent potentially large input contexts and ej provides point information about a specific input element that is useful when making a prediction.\nOnce cli has been computed, it is simply added to the output of the corresponding decoder layer hli. This can be seen as attention with multiple ’hops’ (Sukhbaatar et al., 2015) compared to single step attention (Bahdanau et al., 2014; Luong et al., 2015; Zhou et al., 2016; Wu et al., 2016). In particular, the attention of the first layer determines a useful source context which is then fed to the second layer that takes this information into account when computing attention etc. The decoder also has immediate access to the attention history of the k − 1 previous time steps because the conditional inputs cl−1i−k, . . . , c l−1 i are part of hl−1i−k, . . . , h l−1 i which are input to h l i. This makes it easier for the model to take into account which previous inputs have been attended to already compared to recurrent nets where this information is in the recurrent state and needs to survive several non-linearities. Overall, our attention mechanism considers which words we previously attended to (Yang et al., 2016) and performs multiple attention ’hops’ per time step. In Appendix §C, we plot attention scores for a deep decoder and show that at different layers, significantly different portions of the source sentence encoding are attended to.\nOur convolutional architecture also allows to batch the attention computation across all elements of a sequence compared to RNNs (Figure 1, middle). For multi-hop attention we batch the computations of each decoder layer individually."
+    }, {
+      "heading" : "3.4. Normalization Strategy",
+      "text" : "We stabilize learning through careful weight initialization (§3.5) and by scaling parts of the network to ensure that the variance throughout the network does not change dramatically. In particular, we scale the output of residual blocks as well as the attention to preserve the variance of activations. We multiply the sum of the input and output of a residual block by √ 0.5 to halve the variance of the sum. This assumes that both summands have the same variance which is not always true but effective in practice.\nThe conditional input cli generated by the attention is a weighted sum of m vectors (2) and we counteract a change in variance through scaling by m √ 1/m; we multiply by m to scale up the inputs to their original size, assuming the attention scores are uniformly distributed. This is generally not the case but we found this strategy to work well in practice.\nFor convolutional decoders with multiple attention, we scale the gradients for the encoder layers by the number of attention mechanisms we use; we exclude source word embeddings. We found this to stabilize learning since the encoder received too much gradient otherwise."
+    }, {
+      "heading" : "3.5. Initialization",
+      "text" : "Normalizing activations when adding the output of different layers, e.g. residual connections, requires careful weight initialization. The motivation for our initialization is the same as for the normalization: maintain the variance of activations throughout the forward and backward passes. All embeddings are initialized from a normal distribution with mean 0 and standard deviation 0.1. For layers whose output is not directly fed to a gated linear unit, we initialize weights from N (0, √ 1/nl) where nl is the number of input connections for each neuron. This ensures that the variance of a normally distributed input is retained.\nFor layers which are followed by a GLU activation, we propose a weight initialization scheme by adapting the derivations in (He et al., 2015b; Glorot & Bengio, 2010; Appendix A). If the GLU inputs are distributed with mean 0 and have sufficiently small variance, then we can approximate the output variance with 1/4 of the input variance (Appendix A.1). Hence, we initialize the weights so that the input to the GLU activations have 4 times the variance of the layer input. This is achieved by drawing their initial values fromN (0, √ 4/nl). Biases are uniformly set to zero when the network is constructed.\nWe apply dropout to the input of some layers so that inputs are retained with a probability of p. This can be seen as multiplication with a Bernoulli random variable taking value 1/p with probability p and 0 otherwise (Srivastava et al., 2014). The application of dropout will then cause the variance to be scaled by 1/p. We aim to restore the incoming variance by initializing the respective layers with larger weights. Specifically, we useN (0, √ 4p/nl) for lay-\ners whose output is subject to a GLU and N (0, √ p/nl) otherwise (Appendix A.3)."
+    }, {
+      "heading" : "4. Experimental Setup",
+      "text" : ""
+    }, {
+      "heading" : "4.1. Datasets",
+      "text" : "We consider three major WMT translation tasks as well as a text summarization task.\nWMT’16 English-Romanian. We use the same data and pre-processing as Sennrich et al. (2016b) but remove sentences with more than 175 words. This results in 2.8M sentence pairs for training and we evaluate on newstest2016.2\n2We followed the pre-processing of https://github. com/rsennrich/wmt16-scripts/blob/80e21e5/\nWe experiment with word-based models using a source vocabulary of 200K types and a target vocabulary of 80K types. We also consider a joint source and target byte-pair encoding with 40K types (Sennrich et al., 2016a;b).\nWMT’14 English-German. We use the same setup as Luong et al. (2015) which comprises 4.5M sentence pairs for training and we test on newstest2014.3 As vocabulary we use 40K sub-word tokens based on byte-pair encoding (Sennrich et al., 2016a).\nWMT’14 English-French. We use the full training set of 36M sentence pairs, and remove sentences longer than 175 words as well as pairs with a source/target length ratio exceeding 1.5. This results in 35.5M sentence-pairs for training. Results are reported on newstest2014. We use a source and target vocabulary with 40K BPE types.\nIn all setups a small subset of the training data serves as validation set (about 0.5-1% for each dataset) for early stopping and learning rate annealing.\nAbstractive summarization. We train on the Gigaword corpus (Graff et al., 2003) and pre-process it identically to Rush et al. (2015) resulting in 3.8M training examples and 190K for validation. We evaluate on the DUC-2004 test data comprising 500 article-title pairs (Over et al., 2007) and report three variants of recall-based ROUGE (Lin, 2004), namely, ROUGE-1 (unigrams), ROUGE-2 (bigrams), and ROUGE-L (longest-common substring). We also evaluate on a Gigaword test set of 2000 pairs which is identical to the one used by Rush et al. (2015) and we report F1 ROUGE similar to prior work. Similar to Shen et al. (2016) we use a source and target vocabulary of 30K words and require outputs to be at least 14 words long."
+    }, {
+      "heading" : "4.2. Model Parameters and Optimization",
+      "text" : "We use 512 hidden units for both encoders and decoders, unless otherwise stated. All embeddings, including the output produced by the decoder before the final linear layer, have dimensionality 512; we use the same dimensionalities for linear layers mapping between the hidden and embedding sizes (§3.2). Convolutional layers are initialized as described in §3.5.\nWe train our convolutional models with Nesterov’s accelerated gradient method (Sutskever et al., 2013) using a momentum value of 0.99 and renormalize gradients if their norm exceeds 0.1 (Pascanu et al., 2013). We use a learning rate of 0.25 and once the validation perplexity stops improving, we reduce the learning rate by an order of magnitude after each epoch until it falls below 10−4.\nsample/preprocess.sh and added the back-translated data from http://data.statmt.org/rsennrich/wmt16_ backtranslations/en-ro.\n3http://nlp.stanford.edu/projects/nmt\nUnless otherwise stated, we use mini-batches of 64 sentences. We restrict the maximum number of words in a mini-batch to make sure that batches with long sentences still fit in GPU memory. If the threshold is exceeded, we simply split the batch until the threshold is met and process the parts separatedly. Gradients are normalized by the number of non-padding tokens per mini-batch. We also use weight normalization for all layers except for lookup tables (Salimans & Kingma, 2016).\nBesides dropout on the embeddings and the decoder output, we also apply dropout to the input of the convolutional blocks (Srivastava et al., 2014). All models are implemented in Torch (Collobert et al., 2011) and trained on a single Nvidia M40 GPU except for WMT’14 EnglishFrench for which we use a multi-GPU setup on a single machine. We train on up to eight GPUs synchronously by maintaining copies of the model on each card and split the batch so that each worker computes 1/8-th of the gradients; at the end we sum the gradients via Nvidia NCCL."
+    }, {
+      "heading" : "4.3. Evaluation",
+      "text" : "We report average results over three runs of each model, where each differs only in the initial random seed. Translations are generated by a beam search and we normalize log-likelihood scores by sentence length. We use a beam of width 5. We divide the log-likelihoods of the final hypothesis in beam search by their length |y|. For WMT’14 English-German we tune a length normalization constant on a separate development set (newstest2015) and we normalize log-likelihoods by |y|α (Wu et al., 2016). On other datasets we did not find any benefit from tuning this constant.\nFor word-based models, we perform unknown word replacement based on attention scores after generation (Jean et al., 2015). Unknown words are replaced by looking up the source word with the maximum attention score in a precomputed dictionary. If the dictionary contains no translation, then we simply copy the source word. Dictionaries were extracted from the word aligned training data that we obtained with fast align (Dyer et al., 2013). Each source word is mapped to the target word it is most frequently aligned to. In our multi-step attention (§3.3) we simply average the attention scores over all layers. Finally, we compute case-sensitive tokenized BLEU, except for WMT’16 English-Romanian where we use detokenized BLEU to be comparable with Sennrich et al. (2016b).4\n4https://github.com/moses-smt/ mosesdecoder/blob/617e8c8/scripts/generic/ {multi-bleu.perl,mteval-v13a.pl}"
+    }, {
+      "heading" : "5. Results",
+      "text" : ""
+    }, {
+      "heading" : "5.1. Recurrent vs. Convolutional Models",
+      "text" : "We first evaluate our convolutional model on three translation tasks. On WMT’16 English-Romanian translation we compare to Sennrich et al. (2016b) which is the winning entry on this language pair at WMT’16 (Bojar et al., 2016). Their model implements the attention-based sequence to sequence architecture of Bahdanau et al. (2014) and uses GRU cells both in the encoder and decoder. We show results for word-based and BPE vocabularies (§4).\nTable 1 shows that our fully convolutional sequence to sequence model (ConvS2S) outperforms the WMT’16 winning entry for English-Romanian by 1.8 BLEU with a BPE encoding and by 1.3 BLEU with a word factored vocabulary. This instance of our architecture has 20 layes in the encoder and 20 layers in the decoder, both using kernels of width 3 and hidden size 512 throughout. Training took between 6 and 7.5 days on a single GPU.\nOn WMT’14 English to German translation we compare to the following prior work: Luong et al. (2015) is based on a four layer LSTM attention model, ByteNet (Kalchbrenner et al., 2016) propose a convolutional model based on characters without attention, with 30 layers in the encoder and 30 layers in the decoder, GNMT (Wu et al., 2016) represents the state of the art on this dataset and they use eight encoder LSTMs as well as eight decoder LSTMs, we quote their result for a word-based model, such as ours, as well as a word-piece model (Schuster & Nakajima, 2012).5\nThe results (Table 1) show that our convolutional model outpeforms GNMT by 0.5 BLEU. Our encoder has 15 layers and 15 layers in the decoder, both with 512 hidden units in the first ten layers and 768 units in the subsequent three layers, all using kernel width 3. The final two layers have 2048 hidden units which are just linear mappings with a single input. We trained this model on a single GPU over a period of 18.5 days with a batch size of 48.\nFinally, we train on the much larger WMT’14 EnglishFrench task where we compare to the state of the art result of GNMT (Wu et al., 2016). Our model is trained with a simple token-level likelihood objective and we improve over GNMT in the same setting by 1.5 BLEU on average. We also outperform their reinforcement (RL) models by 0.5 BLEU. Reinforcement learning is equally applicable to our architecture and we believe that it would further improve our results.\nThe ConvS2S model for this experiment uses 15 layers in the encoder and 15 layers in the decoder, both with 512 hidden units in the first five layers, 768 units in the subse-\n5We did not use the exact same vocabulary size because word pieces and BPE estimate the vocabulary differently.\nquent four layers, 1024 units in the next 3 layers, all using kernel width 3; the final two layers have 2048 units and 4096 units each but the they are linear mappings with kernel width 1. This model has an effective context size of only 25 words, beyond which it cannot access any information on the target size. Our results are based on training with 8 GPUs for about 37 days and batch size 32 on each worker.6 The same configuration as for WMT’14 EnglishGerman achieves 39.41 BLEU in two weeks on this dataset in an eight GPU setup.\nZhou et al. (2016) report a non-averaged result of 39.2 BLEU. More recently, Ha et al. (2016) showed that one can generate weights with one LSTM for another LSTM. This approach achieves 40.03 BLEU but the result is not averaged. Our best single run compares at 40.55 BLEU and this technique is equally applicable to our architecture.\nThe translations produced by our models often match the length of the references, particularly for the large WMT’14 English-French task, or are very close for small to medium data sets such as WMT’14 English-German or WMT’16 English-Romanian.\n6This is half of the GPU time consumed by a basic model of Wu et al. (2016) who use 96 GPUs for 6 days. We expect the time to train our model to decrease substantially in a multi-machine setup."
+    }, {
+      "heading" : "5.2. Generation Speed",
+      "text" : "Next, we evaluate the inference speed of our architecture on the development set of the WMT’14 English-French task which is the concatenation of newstest2012 and newstest2013; it comprises 6003 sentences. We measure generation speed both on GPU and CPU hardware. Specifically, we measure GPU speed on three generations of Nvidia cards: a GTX-1080ti, an M40 as well as an older K40 card. CPU timings are measured on one host with 48 hyperthreaded cores (Intel Xeon E5-2680 @ 2.50GHz) with 40 workers. In all settings, we batch up to 128 sentences, composing batches with sentences of equal length. Note that the majority of batches is smaller because of the small size of the development set. We experiment with beams of size 5 as well as greedy search, i.e beam of size 1. To make generation fast, we do not recompute convolution states that have not changed compared to the previous time step but rather copy (shift) these activations.\nWe compare to results reported in Wu et al. (2016) who use Nvidia K80 GPUs which are essentially two K40s. We did not have such a GPU available and therefore run experiments on an older K40 card which is inferior to a K80, in addition to the newer M40 and GTX-1080ti cards. The results (Table 2) show that our model can generate translations on a K40 GPU at 9.3 times the speed and 2.25 higher BLEU; on an M40 the speed-up is up to 13.7 times and on a GTX-1080ti card the speed is 21.3 times faster. A larger beam of size 5 decreases speed but gives slightly better BLEU.\nOn CPU, our model is up to 9.3 times faster, however, the GNMT CPU results were obtained with an 88 core machine whereas our results were obtained with just over half the\nnumber of cores. On a per CPU core basis, our model is 17 times faster at a better BLEU. Finally, our CPU speed is 2.7 times higher than GNMT on a custom TPU chip which shows that high speed can be achieved on commodity hardware. We do no report TPU figures as we do not have access to this hardware."
+    }, {
+      "heading" : "5.3. Position Embeddings",
+      "text" : "In the following sections, we analyze the design choices in our architecture. The remaining results in this paper are based on the WMT’14 English-German task with 13 encoder layers at kernel size 3 and 5 decoder layers at kernel size 5. We use a target vocabulary of 160K words as well as vocabulary selection (Mi et al., 2016; L’Hostis et al., 2016) to decrease the size of the output layer which speeds up training and testing. The average vocabulary size for each training batch is about 20K target words. All figures are averaged over three runs (§4) and BLEU is reported on newstest2014 before unknown word replacement.\nWe start with an experiment that removes the position embeddings from the encoder and decoder (§3.1). These embeddings allow our model to identify which portion of the source and target sequence it is dealing with but also impose a restriction on the maximum sentence length. Table 3 shows that position embeddings are helpful but that our model still performs well without them. Removing the source position embeddings results in a larger accuracy decrease than target position embeddings. However, removing both source and target positions decreases accuracy only by 0.5 BLEU. We had assumed that the model would not be able to calibrate the length of the output sequences very well without explicit position information, however, the output lengths of models without position embeddings closely matches models with position information. This indicates that the models can learn relative position information within the contexts visible to the encoder and decoder networks which can observe up to 27 and 25 words respectively.\nRecurrent models typically do not use explicit position embeddings since they can learn where they are in the sequence through the recurrent hidden state computation. In our setting, the use of position embeddings requires only a\nAttn Layers PPL BLEU"
+    }, {
+      "heading" : "1,2,3,4,5 6.65 21.63",
+      "text" : ""
+    }, {
+      "heading" : "1,2,3,4 6.70 21.54",
+      "text" : ""
+    }, {
+      "heading" : "1,2,3 6.95 21.36",
+      "text" : ""
+    }, {
+      "heading" : "1,2 6.92 21.47",
+      "text" : ""
+    }, {
+      "heading" : "1,3,5 6.97 21.10",
+      "text" : ""
+    }, {
+      "heading" : "1 7.15 21.26",
+      "text" : ""
+    }, {
+      "heading" : "2 7.09 21.30",
+      "text" : ""
+    }, {
+      "heading" : "3 7.11 21.19",
+      "text" : ""
+    }, {
+      "heading" : "4 7.19 21.31",
+      "text" : ""
+    }, {
+      "heading" : "5 7.66 20.24",
+      "text" : "simple addition to the input word embeddings which is a negligible overhead."
+    }, {
+      "heading" : "5.4. Multi-step Attention",
+      "text" : "The multiple attention mechanism (§3.3) computes a separate source context vector for each decoder layer. The computation also takes into account contexts computed for preceding decoder layers of the current time step as well as previous time steps that are within the receptive field of the decoder. How does multiple attention compare to attention in fewer layers or even only in a single layer as is usual? Table 4 shows that attention in all decoder layers achieves the best validation perplexity (PPL). Furthermore, removing more and more attention layers decreases accuracy, both in terms of BLEU as well as PPL.\nThe computational overhead for attention is very small compared to the rest of the network. Training with attention in all five decoder layers processes 3624 target words per second on average on a single GPU, compared to 3772 words per second for attention in a single layer. This is only a 4% slow down when adding 4 attention modules. Most neural machine translation systems only use a single module. This demonstrates that attention is not the bottleneck in neural machine translation, even though it is quadratic in the sequence length (cf. Kalchbrenner et al., 2016). Part of the reason for the low impact on speed is that we batch the computation of an attention module over all target words, similar to Kalchbrenner et al. (2016). However, for RNNs batching of the attention may be less effective because of the dependence on the previous time step."
+    }, {
+      "heading" : "5.5. Kernel size and Depth",
+      "text" : "Figure 2 shows accuracy when we change the number of layers in the encoder or decoder. The kernel width for layers in the encoder is 3 and for the decoder it is 5. Deeper architectures are particularly beneficial for the encoder but\nless so for the decoder. Decoder setups with two layers already perform well whereas for the encoder accuracy keeps increasing steadily with more layers until up to 9 layers when accuracy starts to plateau.\nAside from increasing the depth of the networks, we can also change the kernel width. Table 6 shows that encoders with narrow kernels and many layers perform better than wider kernels. These networks can also be faster since the amount of work to compute a kernel operating over 3 input elements is less than half compared to kernels over 7 elements. We see a similar picture for decoder networks with large kernel sizes (Table 7). Dauphin et al. (2016) shows that context sizes of 20 words are often sufficient to achieve very good accuracy on language modeling for English."
+    }, {
+      "heading" : "5.6. Summarization",
+      "text" : "Finally, we evaluate our model on abstractive sentence summarization which takes a long sentence as input and outputs a shortened version. The current best models on this task are recurrent neural networks which either optimize the evaluation metric (Shen et al., 2016) or address specific problems of summarization such as avoiding repeated generations (Suzuki & Nagata, 2017). We use standard likelhood training for our model and a simple model with six layers in the encoder and decoder each, hidden size 256, batch size 128, and we trained on a single GPU in one night. Table 5 shows that our likelhood trained model outperforms the likelihood trained model (RNN MLE) of Shen et al. (2016) and is not far behind the best models on this task which benefit from task-specific optimization and model structure. We expect our model to benefit from these improvements as well."
+    }, {
+      "heading" : "3 20.61 21.17 21.63",
+      "text" : ""
+    }, {
+      "heading" : "5 20.80 21.02 21.42",
+      "text" : ""
+    }, {
+      "heading" : "7 20.81 21.30 21.09",
+      "text" : ""
+    }, {
+      "heading" : "3 21.10 21.71 21.62",
+      "text" : ""
+    }, {
+      "heading" : "5 21.09 21.63 21.24",
+      "text" : ""
+    }, {
+      "heading" : "7 21.40 21.31 21.33",
+      "text" : ""
+    }, {
+      "heading" : "6. Conclusion and Future Work",
+      "text" : "We introduce the first fully convolutional model for sequence to sequence learning that outperforms strong recurrent models on very large benchmark datasets at an order of magnitude faster speed. Compared to recurrent networks, our convolutional approach allows to discover compositional structure in the sequences more easily since representations are built hierarchically. Our model relies on gating and performs multiple attention steps.\nWe achieve a new state of the art on several public translation benchmark data sets. On the WMT’16 EnglishRomanian task we outperform the previous best result by 1.8 BLEU, on WMT’14 English-French translation we improve over the LSTM model of Wu et al. (2016) by 1.5 BLEU, and on WMT’14 English-German translation we ouperform the state of the art by 0.5 BLEU. In future work, we would like to apply convolutional architectures to other sequence to sequence learning problems which may benefit from learning hierarchical representations as well."
+    }, {
+      "heading" : "A. Weight Initialization",
+      "text" : "We derive a weight initialization scheme tailored to the GLU activation function similar to Glorot & Bengio (2010); He et al. (2015b) by focusing on the variance of activations within the network for both forward and backward passes. We also detail how we modify the weight initialization for dropout.\nA.1. Forward Pass\nAssuming that the inputs xl of a convolutional layer l and its weights Wl are independent and identically distributed (i.i.d.), the variance of its output, computed as yl = Wlxl+ bl, is\nV ar [ yl ] = nlV ar [ wlxl ] (3)\nwhere nl is the number inputs to the layer. For onedimensional convolutional layers with kernel width k and input dimension c, this is kc. We adopt the notation in (He et al., 2015b), i.e. yl, wl and xl represent the random variables in yl, Wl and xl. With wl and xl independent from each other and normally distributed with zero mean, this amounts to\nV ar [ yl ] = nlV ar [ wl ] V ar [ xl ] . (4)\nxl is the result of the GLU activation function yal−1 σ(y b l−1) with yl−1 = (y a l−1,y b l−1), and y a l−1,y b l−1 i.i.d. Next, we formulate upper and lower bounds in order to approximate V ar[xl]. If yl−1 follows a symmetric distribution with mean 0, then\nV ar [ xl ] = V ar [ yal−1 σ(y b l−1) ] (5)\n= E [( yal−1 σ(y b l−1) )2]− E2[yal−1 σ(ybl−1)] (6)\n= V ar[yal−1]E [ σ(ybl−1) 2 ] . (7)\nA lower bound is given by (1/4)V ar[yal−1] when expanding (6) with E2[σ(ybl−1)] = 1/4:\nV ar [ xl ] = V ar [ yal−1 σ(y b l−1) ] (8)\n= V ar [ yal−1 ] E2 [ σ(ybl−1) ] +\nV ar [ yal−1 ] V ar [ σ(ybl−1) ] (9) = 1\n4 V ar\n[ yal−1 ] + V ar [ yal−1 ] V ar [ σ(ybl−1) ] (10)\nand V ar[yal−1]V ar[σ(y b l−1)] > 0. We utilize the relation σ(x)2 ≤ (1/16)x2 − 1/4 + σ(x) (Appendix B) to provide an upper bound on E[σ(x)2]:\nE[σ(x)2] ≤ E [ 1 16 x2 − 1 4 + σ(x) ] (11)\n= 1 16 E[x2]− 1 4 + E[σ(x)] (12)\nWith x ∼ N (0, std(x)), this yields\nE [ σ(x)2 ] ≤ 1 16 E [ x2 ] − 1 4 + 1 2 (13)\n= 1\n16 V ar\n[ x ] + 1\n4 . (14)\nWith (7) and V ar[yal−1] = V ar[y b l−1] = V ar[yl−1], this results in\nV ar [ xl ] ≤ 1\n16 V ar\n[ yl−1 ]2 + 1\n4 V ar\n[ yl−1 ] . (15)\nWe initialize the embedding matrices in our network with small variances (around 0.01), which allows us to dismiss the quadratic term and approximate the GLU output variance with\nV ar[xl] ≈ 1\n4 V ar[yl−1]. (16)\nIf L network layers of equal size and with GLU activations are combined, the variance of the final output yL is given by\nV ar[yL] ≈ V ar[y1]  L∏ l=2 1 4 nlV ar[wl]  . (17) Following (He et al., 2015b), we aim to satisfy the condition\n1 4 nlV ar\n[ wl ] = 1,∀l (18)\nso that the activations in a network are neither exponentially magnified nor reduced. This is achieved by initializing Wl from N (0, √ 4/nl).\nA.2. Backward Pass\nThe gradient of a convolutional layer is computed via backpropagation as ∆xl = Ŵlyl. Considering separate gradients ∆yal and ∆y b l for GLU, the gradient of x is given by\n∆xl = Ŵ a l ∆y a l + Ŵ b l ∆y b l . (19)\nŴ corresponds to W with re-arranged weights to enable back-propagation. Analogously to the forward pass, ∆xl, ŵl and ∆yl represent the random variables for the values in ∆xl, Ŵl and ∆yl, respectively. Note that W and Ŵ contain the same values, i.e. ŵ = w. Similar to (3), the variance of ∆xl is\nV ar[∆xl] = n̂l ( V ar[wal ]V ar[∆y a l ] + V ar[w b l ]V ar[∆y b l ] ) . (20) Here, n̂l is the number of inputs to layer l+1. The gradients for the GLU inputs are:\n∆yal = ∆xl+1 σ(y b l ) and (21) ∆ybl = ∆xl+1y a l σ ′(ybl ). (22)\nThe approximation for the forward pass can be used for V ar[∆yal ], and for estimating V ar[∆y b l ] we assume an upper bound on E[σ′(ybl ) 2] of 1/16 since σ′(ybl ) ∈ [0, 14 ]. Hence,\nV ar[∆yal ]− 1\n4 V ar[∆xl+1] ≤\n1\n16 V ar[∆xl+1]V ar[y\nb l )]\n(23)\nV ar[∆ybl ] ≤ 1\n16 ∆V ar[∆xl+1]V ar[y\na l ] (24)\nWe observe relatively small gradients in our network, typically around 0.001 at the start of training. Therefore, we approximate by discarding the quadratic terms above, i.e.\nV ar[∆yal ] ≈ 1\n4 V ar[∆xl+1] (25)\nV ar[∆ybl ] ≈ 0 (26)\nV ar[∆xl] ≈ 1\n4 n̂lV ar[w\na l ]V ar[∆xl+1] (27)\nAs for the forward pass, the above result can be generalized to backpropagation through many successive layers, resulting in\nV ar[∆x2] ≈ V ar[∆xL+1]  L∏ l=2 1 4 n̂lV ar[w a l ]  (28) and a similar condition, i.e. (1/4)n̂lV ar[wal ] = 1. In the networks we consider, successions of convolutional layers usually operate on the same number of inputs so that most cases nl = n̂l. Note that W bl is discarded in the approximation; however, for the sake of consistency we use the same initialization for W al and W b l .\nFor arbitrarily large variances of network inputs and activations, our approximations are invalid; in that case, the initial values for W al and W b l would have to be balanced for the input distribution to be retained. Alternatively, methods that explicitly control the variance in the network, e.g. batch normalization (Ioffe & Szegedy, 2015) or layer normalization (Ba et al., 2016) could be employed.\nA.3. Dropout\nDropout retains activations in a neural network with a probability p and sets them to zero otherwise (Srivastava et al., 2014). It is common practice to scale the retained activations by 1/p during training so that the weights of the network do not have to be modified at test time when p is set to 1. In this case, dropout amounts to multiplying activations x by a Bernoulli random variable r where Pr[r = 1/p] = p and Pr[r = 0] = 1 − p (Srivastava et al., 2014). It holds that E[r] = 1 and V ar[r] = (1− p)/p. If x is independent\nof r and E[x] = 0, the variance after dropout is\nV ar[xr] = E[r]2V ar[x] + V ar[r]V ar[x] (29)\n= ( 1 +\n1− p p\n) V ar[x] (30)\n= 1\np V ar[x] (31)\nAssuming that a the input of a convolutional layer has been subject to dropout with a retain probability p, the variations of the forward and backward activations from §A.1 and §A.2 can now be approximated with\nV ar[xl+1] ≈ 1\n4p nlV ar[wl]V ar[xl] and (32)\nV ar[∆xl] ≈ 1\n4p nlV ar[w\na l ]V ar[∆xl+1]. (33)\nThis amounts to a modified initialization of Wl from a normal distribution with zero mean and a standard deviation of√\n4p/n. For layers without a succeeding GLU activation function, we initialize weights from N (0, √ p/n) to calibrate for any immediately preceding dropout application."
+    }, {
+      "heading" : "B. Upper Bound on Squared Sigmoid",
+      "text" : "The sigmoid function σ(x) can be expressed as a hyperbolic tangent by using the identity tanh(x) = 2σ(2x)− 1. The derivative of tanh is tanh′(x) = 1 − tanh2(x), and with tanh(x) ∈ [0, 1], x ≥ 0 it holds that\ntanh′(x) ≤ 1, x ≥ 0 (34)∫ x 0 tanh′(x) dx ≤ ∫ x 0 1 dx (35)\ntanh(x) ≤ x, x ≥ 0 (36)\nWe can express this relation with σ(x) as follows:\n2σ(x)− 1 ≤ 1 2 x, x ≥ 0 (37)\nBoth terms of this inequality have rotational symmetry w.r.t 0, and thus\n( 2σ(x)− 1 )2 ≤ (1 2 x )2 ∀x (38)\n⇔ σ(x)2 ≤ 1 16 x2 − 1 4 + σ(x). (39)"
+    }, {
+      "heading" : "C. Attention Visualization",
+      "text" : "Figure 3 shows attention scores for a generated sentence from the WMT’14 English-German task. The model used for this plot has 8 decoder layers and a 80K BPE vocabulary. The attention passes in different decoder layers capture different portions of the source sentence. Layer 1, 3\nand 6 exhibit a linear alignment. The first layer shows the clearest alignment, although it is slightly off and frequently attends to the corresponding source word of the previously generated target word. Layer 2 and 8 lack a clear structure and are presumably collecting information about the whole source sentence. The fourth layer shows high alignment scores on nouns such as “festival”, “way” and “work” for both the generated target nouns as well as their preceding words. Note that in German, those preceding words depend on gender and object relationship of the respective noun. Finally, the attention scores in layer 5 and 7 focus on “built”, which is reordered in the German translation and is moved from the beginning to the very end of the sentence. One interpretation for this is that as generation progresses, the model repeatedly tries to perform the re-ordering. “aufgebaut” can be generated after a noun or pronoun only, which is reflected in the higher scores at positions 2, 5, 8, 11 and 13."
+    } ],
+    "references" : [ {
+      "title" : "Neural machine translation by jointly learning to align and translate",
+      "author" : [ "Bahdanau", "Dzmitry", "Cho", "Kyunghyun", "Bengio", "Yoshua" ],
+      "venue" : "arXiv preprint arXiv:1409.0473,",
+      "citeRegEx" : "Bahdanau et al\\.,? \\Q2014\\E",
+      "shortCiteRegEx" : "Bahdanau et al\\.",
+      "year" : 2014
+    }, {
+      "title" : "Findings of the 2016 conference on machine translation",
+      "author" : [ "Rubino", "Raphaël", "Scarton", "Carolina", "Specia", "Lucia", "Turchi", "Marco", "Verspoor", "Karin M", "Zampieri", "Marcos" ],
+      "venue" : "In Proc. of WMT,",
+      "citeRegEx" : "Rubino et al\\.,? \\Q2016\\E",
+      "shortCiteRegEx" : "Rubino et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Learning Phrase Representations using RNN Encoder-Decoder for Statistical Machine Translation",
+      "author" : [ "Cho", "Kyunghyun", "Van Merriënboer", "Bart", "Gulcehre", "Caglar", "Bahdanau", "Dzmitry", "Bougares", "Fethi", "Schwenk", "Holger", "Bengio", "Yoshua" ],
+      "venue" : "In Proc. of EMNLP,",
+      "citeRegEx" : "Cho et al\\.,? \\Q2014\\E",
+      "shortCiteRegEx" : "Cho et al\\.",
+      "year" : 2014
+    }, {
+      "title" : "Attention-based models for speech recognition",
+      "author" : [ "Chorowski", "Jan K", "Bahdanau", "Dzmitry", "Serdyuk", "Dmitriy", "Cho", "Kyunghyun", "Bengio", "Yoshua" ],
+      "venue" : "In Advances in Neural Information Processing Systems,",
+      "citeRegEx" : "Chorowski et al\\.,? \\Q2015\\E",
+      "shortCiteRegEx" : "Chorowski et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "Torch7: A Matlab-like Environment for Machine Learning",
+      "author" : [ "Collobert", "Ronan", "Kavukcuoglu", "Koray", "Farabet", "Clement" ],
+      "venue" : "In BigLearn, NIPS Workshop,",
+      "citeRegEx" : "Collobert et al\\.,? \\Q2011\\E",
+      "shortCiteRegEx" : "Collobert et al\\.",
+      "year" : 2011
+    }, {
+      "title" : "Language modeling with gated linear units",
+      "author" : [ "Dauphin", "Yann N", "Fan", "Angela", "Auli", "Michael", "Grangier", "David" ],
+      "venue" : "arXiv preprint arXiv:1612.08083,",
+      "citeRegEx" : "Dauphin et al\\.,? \\Q2016\\E",
+      "shortCiteRegEx" : "Dauphin et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "A Simple, Fast, and Effective Reparameterization of IBM Model 2",
+      "author" : [ "Dyer", "Chris", "Chahuneau", "Victor", "Smith", "Noah A" ],
+      "venue" : "In Proc. of ACL,",
+      "citeRegEx" : "Dyer et al\\.,? \\Q2013\\E",
+      "shortCiteRegEx" : "Dyer et al\\.",
+      "year" : 2013
+    }, {
+      "title" : "Finding Structure in Time",
+      "author" : [ "Elman", "Jeffrey L" ],
+      "venue" : "Cognitive Science,",
+      "citeRegEx" : "Elman and L.,? \\Q1990\\E",
+      "shortCiteRegEx" : "Elman and L.",
+      "year" : 1990
+    }, {
+      "title" : "A Convolutional Encoder Model for Neural Machine Translation",
+      "author" : [ "Gehring", "Jonas", "Auli", "Michael", "Grangier", "David", "Dauphin", "Yann N" ],
+      "venue" : "arXiv preprint arXiv:1611.02344,",
+      "citeRegEx" : "Gehring et al\\.,? \\Q2016\\E",
+      "shortCiteRegEx" : "Gehring et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Understanding the difficulty of training deep feedforward neural networks",
+      "author" : [ "Glorot", "Xavier", "Bengio", "Yoshua" ],
+      "venue" : "The handbook of brain theory and neural networks,",
+      "citeRegEx" : "Glorot et al\\.,? \\Q2010\\E",
+      "shortCiteRegEx" : "Glorot et al\\.",
+      "year" : 2010
+    }, {
+      "title" : "Deep Residual Learning for Image Recognition",
+      "author" : [ "He", "Kaiming", "Zhang", "Xiangyu", "Ren", "Shaoqing", "Sun", "Jian" ],
+      "venue" : "In Proc. of CVPR,",
+      "citeRegEx" : "He et al\\.,? \\Q2015\\E",
+      "shortCiteRegEx" : "He et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "Delving deep into rectifiers: Surpassing humanlevel performance on imagenet classification",
+      "author" : [ "He", "Kaiming", "Zhang", "Xiangyu", "Ren", "Shaoqing", "Sun", "Jian" ],
+      "venue" : "In Proceedings of the IEEE International Conference on Computer Vision,",
+      "citeRegEx" : "He et al\\.,? \\Q2015\\E",
+      "shortCiteRegEx" : "He et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "Long shortterm memory",
+      "author" : [ "Hochreiter", "Sepp", "Schmidhuber", "Jürgen" ],
+      "venue" : "Neural computation,",
+      "citeRegEx" : "Hochreiter et al\\.,? \\Q1997\\E",
+      "shortCiteRegEx" : "Hochreiter et al\\.",
+      "year" : 1997
+    }, {
+      "title" : "Batch normalization: Accelerating deep network training by reducing internal covariate shift",
+      "author" : [ "Ioffe", "Sergey", "Szegedy", "Christian" ],
+      "venue" : "In Proceedings of The 32nd International Conference on Machine Learning,",
+      "citeRegEx" : "Ioffe et al\\.,? \\Q2015\\E",
+      "shortCiteRegEx" : "Ioffe et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "Montreal Neural Machine Translation systems for WMT15",
+      "author" : [ "Jean", "Sébastien", "Firat", "Orhan", "Cho", "Kyunghyun", "Memisevic", "Roland", "Bengio", "Yoshua" ],
+      "venue" : "In Proc. of WMT,",
+      "citeRegEx" : "Jean et al\\.,? \\Q2015\\E",
+      "shortCiteRegEx" : "Jean et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "Convolutional networks for images, speech, and time series",
+      "author" : [ "LeCun", "Yann", "Bengio", "Yoshua" ],
+      "venue" : "The handbook of brain theory and neural networks,",
+      "citeRegEx" : "LeCun et al\\.,? \\Q1995\\E",
+      "shortCiteRegEx" : "LeCun et al\\.",
+      "year" : 1995
+    }, {
+      "title" : "Vocabulary Selection Strategies for Neural Machine Translation",
+      "author" : [ "L’Hostis", "Gurvan", "Grangier", "David", "Auli", "Michael" ],
+      "venue" : "arXiv preprint arXiv:1610.00072,",
+      "citeRegEx" : "L.Hostis et al\\.,? \\Q2016\\E",
+      "shortCiteRegEx" : "L.Hostis et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Rouge: A package for automatic evaluation of summaries",
+      "author" : [ "Lin", "Chin-Yew" ],
+      "venue" : "In Text Summarization Branches Out: Proceedings of the ACL-04 Workshop,",
+      "citeRegEx" : "Lin and Chin.Yew.,? \\Q2004\\E",
+      "shortCiteRegEx" : "Lin and Chin.Yew.",
+      "year" : 2004
+    }, {
+      "title" : "Effective approaches to attention-based neural machine translation",
+      "author" : [ "Luong", "Minh-Thang", "Pham", "Hieu", "Manning", "Christopher D" ],
+      "venue" : "In Proc. of EMNLP,",
+      "citeRegEx" : "Luong et al\\.,? \\Q2015\\E",
+      "shortCiteRegEx" : "Luong et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "Encoding Source Language with Convolutional Neural Network for Machine Translation",
+      "author" : [ "Meng", "Fandong", "Lu", "Zhengdong", "Wang", "Mingxuan", "Li", "Hang", "Jiang", "Wenbin", "Liu", "Qun" ],
+      "venue" : "In Proc. of ACL,",
+      "citeRegEx" : "Meng et al\\.,? \\Q2015\\E",
+      "shortCiteRegEx" : "Meng et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "Vocabulary Manipulation for Neural Machine Translation",
+      "author" : [ "Mi", "Haitao", "Wang", "Zhiguo", "Ittycheriah", "Abe" ],
+      "venue" : "In Proc. of ACL,",
+      "citeRegEx" : "Mi et al\\.,? \\Q2016\\E",
+      "shortCiteRegEx" : "Mi et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Key-value memory networks for directly reading documents",
+      "author" : [ "Miller", "Alexander H", "Fisch", "Adam", "Dodge", "Jesse", "Karimi", "Amir-Hossein", "Bordes", "Antoine", "Weston", "Jason" ],
+      "venue" : "In Proc. of EMNLP,",
+      "citeRegEx" : "Miller et al\\.,? \\Q2016\\E",
+      "shortCiteRegEx" : "Miller et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Abstractive text summarization using sequence-to-sequence rnns and beyond",
+      "author" : [ "Nallapati", "Ramesh", "Zhou", "Bowen", "Gulcehre", "Caglar", "Xiang", "Bing" ],
+      "venue" : "In Proc. of EMNLP,",
+      "citeRegEx" : "Nallapati et al\\.,? \\Q2016\\E",
+      "shortCiteRegEx" : "Nallapati et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Pixel recurrent neural networks",
+      "author" : [ "Oord", "Aaron van den", "Kalchbrenner", "Nal", "Kavukcuoglu", "Koray" ],
+      "venue" : "arXiv preprint arXiv:1601.06759,",
+      "citeRegEx" : "Oord et al\\.,? \\Q2016\\E",
+      "shortCiteRegEx" : "Oord et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Conditional image generation with pixelcnn decoders",
+      "author" : [ "Oord", "Aaron van den", "Kalchbrenner", "Nal", "Vinyals", "Oriol", "Espeholt", "Lasse", "Graves", "Alex", "Kavukcuoglu", "Koray" ],
+      "venue" : "arXiv preprint arXiv:1606.05328,",
+      "citeRegEx" : "Oord et al\\.,? \\Q2016\\E",
+      "shortCiteRegEx" : "Oord et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "On the difficulty of training recurrent neural networks",
+      "author" : [ "Pascanu", "Razvan", "Mikolov", "Tomas", "Bengio", "Yoshua" ],
+      "venue" : "In Proceedings of The 30th International Conference on Machine Learning,",
+      "citeRegEx" : "Pascanu et al\\.,? \\Q2013\\E",
+      "shortCiteRegEx" : "Pascanu et al\\.",
+      "year" : 2013
+    }, {
+      "title" : "A neural attention model for abstractive sentence summarization",
+      "author" : [ "Rush", "Alexander M", "Chopra", "Sumit", "Weston", "Jason" ],
+      "venue" : "In Proc. of EMNLP,",
+      "citeRegEx" : "Rush et al\\.,? \\Q2015\\E",
+      "shortCiteRegEx" : "Rush et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "Weight normalization: A simple reparameterization to accelerate training of deep neural networks",
+      "author" : [ "Salimans", "Tim", "Kingma", "Diederik P" ],
+      "venue" : "arXiv preprint arXiv:1602.07868,",
+      "citeRegEx" : "Salimans et al\\.,? \\Q2016\\E",
+      "shortCiteRegEx" : "Salimans et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Japanese and korean voice search",
+      "author" : [ "Schuster", "Mike", "Nakajima", "Kaisuke" ],
+      "venue" : "In Acoustics, Speech and Signal Processing (ICASSP),",
+      "citeRegEx" : "Schuster et al\\.,? \\Q2012\\E",
+      "shortCiteRegEx" : "Schuster et al\\.",
+      "year" : 2012
+    }, {
+      "title" : "Neural Machine Translation of Rare Words with Subword Units",
+      "author" : [ "Sennrich", "Rico", "Haddow", "Barry", "Birch", "Alexandra" ],
+      "venue" : "In Proc. of ACL,",
+      "citeRegEx" : "Sennrich et al\\.,? \\Q2016\\E",
+      "shortCiteRegEx" : "Sennrich et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Neural headline generation with sentence-wise optimization",
+      "author" : [ "Shen", "Shiqi", "Zhao", "Yu", "Liu", "Zhiyuan", "Sun", "Maosong" ],
+      "venue" : "arXiv preprint arXiv:1604.01904,",
+      "citeRegEx" : "Shen et al\\.,? \\Q2016\\E",
+      "shortCiteRegEx" : "Shen et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Dropout: a simple way to prevent Neural Networks from overfitting",
+      "author" : [ "Srivastava", "Nitish", "Hinton", "Geoffrey E", "Krizhevsky", "Alex", "Sutskever", "Ilya", "Salakhutdinov", "Ruslan" ],
+      "venue" : null,
+      "citeRegEx" : "Srivastava et al\\.,? \\Q1929\\E",
+      "shortCiteRegEx" : "Srivastava et al\\.",
+      "year" : 1929
+    }, {
+      "title" : "End-to-end Memory Networks",
+      "author" : [ "Sukhbaatar", "Sainbayar", "Weston", "Jason", "Fergus", "Rob", "Szlam", "Arthur" ],
+      "venue" : "In Proc. of NIPS, pp",
+      "citeRegEx" : "Sukhbaatar et al\\.,? \\Q2015\\E",
+      "shortCiteRegEx" : "Sukhbaatar et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "On the importance of initialization and momentum in deep learning",
+      "author" : [ "Sutskever", "Ilya", "Martens", "James", "Dahl", "George E", "Hinton", "Geoffrey E" ],
+      "venue" : "In ICML,",
+      "citeRegEx" : "Sutskever et al\\.,? \\Q2013\\E",
+      "shortCiteRegEx" : "Sutskever et al\\.",
+      "year" : 2013
+    }, {
+      "title" : "Sequence to Sequence Learning with Neural Networks",
+      "author" : [ "Sutskever", "Ilya", "Vinyals", "Oriol", "Le", "Quoc V" ],
+      "venue" : "In Proc. of NIPS,",
+      "citeRegEx" : "Sutskever et al\\.,? \\Q2014\\E",
+      "shortCiteRegEx" : "Sutskever et al\\.",
+      "year" : 2014
+    }, {
+      "title" : "Cutting-off redundant repeating generations for neural abstractive summarization",
+      "author" : [ "Suzuki", "Jun", "Nagata", "Masaaki" ],
+      "venue" : "arXiv preprint arXiv:1701.00138,",
+      "citeRegEx" : "Suzuki et al\\.,? \\Q2017\\E",
+      "shortCiteRegEx" : "Suzuki et al\\.",
+      "year" : 2017
+    }, {
+      "title" : "Phoneme Recognition using Time-delay Neural Networks",
+      "author" : [ "Waibel", "Alex", "Hanazawa", "Toshiyuki", "Hinton", "Geoffrey", "Shikano", "Kiyohiro", "Lang", "Kevin J" ],
+      "venue" : "IEEE transactions on acoustics, speech, and signal processing,",
+      "citeRegEx" : "Waibel et al\\.,? \\Q1989\\E",
+      "shortCiteRegEx" : "Waibel et al\\.",
+      "year" : 1989
+    }, {
+      "title" : "Neural Machine Translation with Recurrent Attention Modeling",
+      "author" : [ "Yang", "Zichao", "Hu", "Zhiting", "Deng", "Yuntian", "Dyer", "Chris", "Smola", "Alex" ],
+      "venue" : "arXiv preprint arXiv:1607.05108,",
+      "citeRegEx" : "Yang et al\\.,? \\Q2016\\E",
+      "shortCiteRegEx" : "Yang et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Deep Recurrent Models with Fast-Forward Connections for Neural Machine Translation",
+      "author" : [ "Zhou", "Jie", "Cao", "Ying", "Wang", "Xuguang", "Li", "Peng", "Xu", "Wei" ],
+      "venue" : "arXiv preprint arXiv:1606.04199,",
+      "citeRegEx" : "Zhou et al\\.,? \\Q2016\\E",
+      "shortCiteRegEx" : "Zhou et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "2015b) by focusing on the variance",
+      "author" : [ "He" ],
+      "venue" : null,
+      "citeRegEx" : "He,? \\Q2015\\E",
+      "shortCiteRegEx" : "He",
+      "year" : 2015
+    } ],
+    "referenceMentions" : [ {
+      "referenceID" : 34,
+      "context" : "Sequence to sequence learning has been successful in many tasks such as machine translation, speech recognition (Sutskever et al., 2014; Chorowski et al., 2015) and text summarization (Rush et al.",
+      "startOffset" : 112,
+      "endOffset" : 160
+    }, {
+      "referenceID" : 3,
+      "context" : "Sequence to sequence learning has been successful in many tasks such as machine translation, speech recognition (Sutskever et al., 2014; Chorowski et al., 2015) and text summarization (Rush et al.",
+      "startOffset" : 112,
+      "endOffset" : 160
+    }, {
+      "referenceID" : 26,
+      "context" : ", 2015) and text summarization (Rush et al., 2015; Nallapati et al., 2016; Shen et al., 2016) amongst others.",
+      "startOffset" : 31,
+      "endOffset" : 93
+    }, {
+      "referenceID" : 22,
+      "context" : ", 2015) and text summarization (Rush et al., 2015; Nallapati et al., 2016; Shen et al., 2016) amongst others.",
+      "startOffset" : 31,
+      "endOffset" : 93
+    }, {
+      "referenceID" : 30,
+      "context" : ", 2015) and text summarization (Rush et al., 2015; Nallapati et al., 2016; Shen et al., 2016) amongst others.",
+      "startOffset" : 31,
+      "endOffset" : 93
+    }, {
+      "referenceID" : 0,
+      "context" : "The dominant approach to date encodes the input sequence with a series of bi-directional recurrent neural networks (RNN) and generates a variable length output with another set of decoder RNNs, both of which interface via a soft-attention mechanism (Bahdanau et al., 2014; Luong et al., 2015).",
+      "startOffset" : 249,
+      "endOffset" : 292
+    }, {
+      "referenceID" : 18,
+      "context" : "The dominant approach to date encodes the input sequence with a series of bi-directional recurrent neural networks (RNN) and generates a variable length output with another set of decoder RNNs, both of which interface via a soft-attention mechanism (Bahdanau et al., 2014; Luong et al., 2015).",
+      "startOffset" : 249,
+      "endOffset" : 292
+    }, {
+      "referenceID" : 36,
+      "context" : "Convolutional neural networks are less common for sequence modeling, despite several advantages (Waibel et al., 1989; LeCun & Bengio, 1995).",
+      "startOffset" : 96,
+      "endOffset" : 139
+    }, {
+      "referenceID" : 19,
+      "context" : "Gated convolutions have been previously explored for machine translation by Meng et al. (2015) but their evaluation was restricted to a small dataset and the model was used in tandem with a traditional count-based model.",
+      "startOffset" : 76,
+      "endOffset" : 95
+    }, {
+      "referenceID" : 8,
+      "context" : "tures which are partially convolutional have shown strong performance on larger tasks but their decoder is still recurrent (Gehring et al., 2016).",
+      "startOffset" : 123,
+      "endOffset" : 145
+    }, {
+      "referenceID" : 5,
+      "context" : "Our model is equipped with gated linear units (Dauphin et al., 2016) and residual connections (He et al.",
+      "startOffset" : 46,
+      "endOffset" : 68
+    }, {
+      "referenceID" : 34,
+      "context" : "Sequence to sequence modeling has been synonymous with recurrent neural network based encoder-decoder architectures (Sutskever et al., 2014; Bahdanau et al., 2014).",
+      "startOffset" : 116,
+      "endOffset" : 163
+    }, {
+      "referenceID" : 0,
+      "context" : "Sequence to sequence modeling has been synonymous with recurrent neural network based encoder-decoder architectures (Sutskever et al., 2014; Bahdanau et al., 2014).",
+      "startOffset" : 116,
+      "endOffset" : 163
+    }, {
+      "referenceID" : 2,
+      "context" : "Models without attention consider only the final encoder state zm by setting ci = zm for all i (Cho et al., 2014), or simply initialize the first decoder state with zm (Sutskever et al.",
+      "startOffset" : 95,
+      "endOffset" : 113
+    }, {
+      "referenceID" : 34,
+      "context" : ", 2014), or simply initialize the first decoder state with zm (Sutskever et al., 2014), in which case ci is not used.",
+      "startOffset" : 62,
+      "endOffset" : 86
+    }, {
+      "referenceID" : 0,
+      "context" : "Architectures with attention (Bahdanau et al., 2014; Luong et al., 2015) compute ci as a weighted sum of (z1.",
+      "startOffset" : 29,
+      "endOffset" : 72
+    }, {
+      "referenceID" : 18,
+      "context" : "Architectures with attention (Bahdanau et al., 2014; Luong et al., 2015) compute ci as a weighted sum of (z1.",
+      "startOffset" : 29,
+      "endOffset" : 72
+    }, {
+      "referenceID" : 2,
+      "context" : "Popular choices for recurrent networks in encoder-decoder models are long short term memory networks (LSTM; Hochreiter & Schmidhuber, 1997) and gated recurrent units (GRU; Cho et al., 2014).",
+      "startOffset" : 166,
+      "endOffset" : 189
+    }, {
+      "referenceID" : 0,
+      "context" : "Most recent approaches also rely on bi-directional encoders to build representations of both past and future contexts (Bahdanau et al., 2014; Zhou et al., 2016; Wu et al., 2016).",
+      "startOffset" : 118,
+      "endOffset" : 177
+    }, {
+      "referenceID" : 38,
+      "context" : "Most recent approaches also rely on bi-directional encoders to build representations of both past and future contexts (Bahdanau et al., 2014; Zhou et al., 2016; Wu et al., 2016).",
+      "startOffset" : 118,
+      "endOffset" : 177
+    }, {
+      "referenceID" : 38,
+      "context" : "Models with many layers often rely on shortcut or residual connections (He et al., 2015a; Zhou et al., 2016; Wu et al., 2016).",
+      "startOffset" : 71,
+      "endOffset" : 125
+    }, {
+      "referenceID" : 5,
+      "context" : "We choose gated linear units (GLU; Dauphin et al., 2016) as non-linearity which implement a simple gating mechanism over the output of the convolution Y = [A B] ∈ R:",
+      "startOffset" : 29,
+      "endOffset" : 56
+    }, {
+      "referenceID" : 22,
+      "context" : "A similar nonlinearity has been introduced in Oord et al. (2016b) who apply tanh toA but Dauphin et al.",
+      "startOffset" : 46,
+      "endOffset" : 66
+    }, {
+      "referenceID" : 5,
+      "context" : "(2016b) who apply tanh toA but Dauphin et al. (2016) shows that GLUs perform better in the context of language modelling.",
+      "startOffset" : 31,
+      "endOffset" : 53
+    }, {
+      "referenceID" : 21,
+      "context" : "We found adding ej to be beneficial and it resembles key-value memory networks where the keys are the z j and the values are the z j + ej (Miller et al., 2016).",
+      "startOffset" : 138,
+      "endOffset" : 159
+    }, {
+      "referenceID" : 32,
+      "context" : "This can be seen as attention with multiple ’hops’ (Sukhbaatar et al., 2015) compared to single step attention (Bahdanau et al.",
+      "startOffset" : 51,
+      "endOffset" : 76
+    }, {
+      "referenceID" : 0,
+      "context" : ", 2015) compared to single step attention (Bahdanau et al., 2014; Luong et al., 2015; Zhou et al., 2016; Wu et al., 2016).",
+      "startOffset" : 42,
+      "endOffset" : 121
+    }, {
+      "referenceID" : 18,
+      "context" : ", 2015) compared to single step attention (Bahdanau et al., 2014; Luong et al., 2015; Zhou et al., 2016; Wu et al., 2016).",
+      "startOffset" : 42,
+      "endOffset" : 121
+    }, {
+      "referenceID" : 38,
+      "context" : ", 2015) compared to single step attention (Bahdanau et al., 2014; Luong et al., 2015; Zhou et al., 2016; Wu et al., 2016).",
+      "startOffset" : 42,
+      "endOffset" : 121
+    }, {
+      "referenceID" : 37,
+      "context" : "Overall, our attention mechanism considers which words we previously attended to (Yang et al., 2016) and performs multiple attention ’hops’ per time step.",
+      "startOffset" : 81,
+      "endOffset" : 100
+    }, {
+      "referenceID" : 29,
+      "context" : "We use the same data and pre-processing as Sennrich et al. (2016b) but remove sentences with more than 175 words.",
+      "startOffset" : 43,
+      "endOffset" : 67
+    }, {
+      "referenceID" : 18,
+      "context" : "We use the same setup as Luong et al. (2015) which comprises 4.",
+      "startOffset" : 25,
+      "endOffset" : 45
+    }, {
+      "referenceID" : 26,
+      "context" : ", 2003) and pre-process it identically to Rush et al. (2015) resulting in 3.",
+      "startOffset" : 42,
+      "endOffset" : 61
+    }, {
+      "referenceID" : 26,
+      "context" : ", 2003) and pre-process it identically to Rush et al. (2015) resulting in 3.8M training examples and 190K for validation. We evaluate on the DUC-2004 test data comprising 500 article-title pairs (Over et al., 2007) and report three variants of recall-based ROUGE (Lin, 2004), namely, ROUGE-1 (unigrams), ROUGE-2 (bigrams), and ROUGE-L (longest-common substring). We also evaluate on a Gigaword test set of 2000 pairs which is identical to the one used by Rush et al. (2015) and we report F1 ROUGE similar to prior work.",
+      "startOffset" : 42,
+      "endOffset" : 474
+    }, {
+      "referenceID" : 26,
+      "context" : ", 2003) and pre-process it identically to Rush et al. (2015) resulting in 3.8M training examples and 190K for validation. We evaluate on the DUC-2004 test data comprising 500 article-title pairs (Over et al., 2007) and report three variants of recall-based ROUGE (Lin, 2004), namely, ROUGE-1 (unigrams), ROUGE-2 (bigrams), and ROUGE-L (longest-common substring). We also evaluate on a Gigaword test set of 2000 pairs which is identical to the one used by Rush et al. (2015) and we report F1 ROUGE similar to prior work. Similar to Shen et al. (2016) we use a source and target vocabulary of 30K words and require outputs to be at least 14 words long.",
+      "startOffset" : 42,
+      "endOffset" : 550
+    }, {
+      "referenceID" : 33,
+      "context" : "We train our convolutional models with Nesterov’s accelerated gradient method (Sutskever et al., 2013) using a momentum value of 0.",
+      "startOffset" : 78,
+      "endOffset" : 102
+    }, {
+      "referenceID" : 25,
+      "context" : "1 (Pascanu et al., 2013).",
+      "startOffset" : 2,
+      "endOffset" : 24
+    }, {
+      "referenceID" : 4,
+      "context" : "All models are implemented in Torch (Collobert et al., 2011) and trained on a single Nvidia M40 GPU except for WMT’14 EnglishFrench for which we use a multi-GPU setup on a single machine.",
+      "startOffset" : 36,
+      "endOffset" : 60
+    }, {
+      "referenceID" : 14,
+      "context" : "For word-based models, we perform unknown word replacement based on attention scores after generation (Jean et al., 2015).",
+      "startOffset" : 102,
+      "endOffset" : 121
+    }, {
+      "referenceID" : 6,
+      "context" : "Dictionaries were extracted from the word aligned training data that we obtained with fast align (Dyer et al., 2013).",
+      "startOffset" : 97,
+      "endOffset" : 116
+    }, {
+      "referenceID" : 6,
+      "context" : "Dictionaries were extracted from the word aligned training data that we obtained with fast align (Dyer et al., 2013). Each source word is mapped to the target word it is most frequently aligned to. In our multi-step attention (§3.3) we simply average the attention scores over all layers. Finally, we compute case-sensitive tokenized BLEU, except for WMT’16 English-Romanian where we use detokenized BLEU to be comparable with Sennrich et al. (2016b).4",
+      "startOffset" : 98,
+      "endOffset" : 451
+    }, {
+      "referenceID" : 28,
+      "context" : "On WMT’16 English-Romanian translation we compare to Sennrich et al. (2016b) which is the winning entry on this language pair at WMT’16 (Bojar et al.",
+      "startOffset" : 53,
+      "endOffset" : 77
+    }, {
+      "referenceID" : 0,
+      "context" : "Their model implements the attention-based sequence to sequence architecture of Bahdanau et al. (2014) and uses GRU cells both in the encoder and decoder.",
+      "startOffset" : 80,
+      "endOffset" : 103
+    }, {
+      "referenceID" : 18,
+      "context" : "On WMT’14 English to German translation we compare to the following prior work: Luong et al. (2015) is based on a four layer LSTM attention model, ByteNet (Kalchbrenner et al.",
+      "startOffset" : 80,
+      "endOffset" : 100
+    }, {
+      "referenceID" : 20,
+      "context" : "We use a target vocabulary of 160K words as well as vocabulary selection (Mi et al., 2016; L’Hostis et al., 2016) to decrease the size of the output layer which speeds up training and testing.",
+      "startOffset" : 73,
+      "endOffset" : 113
+    }, {
+      "referenceID" : 16,
+      "context" : "We use a target vocabulary of 160K words as well as vocabulary selection (Mi et al., 2016; L’Hostis et al., 2016) to decrease the size of the output layer which speeds up training and testing.",
+      "startOffset" : 73,
+      "endOffset" : 113
+    }, {
+      "referenceID" : 5,
+      "context" : "Dauphin et al. (2016) shows that context sizes of 20 words are often sufficient to achieve very good accuracy on language modeling for English.",
+      "startOffset" : 0,
+      "endOffset" : 22
+    }, {
+      "referenceID" : 30,
+      "context" : "The current best models on this task are recurrent neural networks which either optimize the evaluation metric (Shen et al., 2016) or address specific problems of summarization such as avoiding repeated generations (Suzuki & Nagata, 2017).",
+      "startOffset" : 111,
+      "endOffset" : 130
+    }, {
+      "referenceID" : 30,
+      "context" : "The current best models on this task are recurrent neural networks which either optimize the evaluation metric (Shen et al., 2016) or address specific problems of summarization such as avoiding repeated generations (Suzuki & Nagata, 2017). We use standard likelhood training for our model and a simple model with six layers in the encoder and decoder each, hidden size 256, batch size 128, and we trained on a single GPU in one night. Table 5 shows that our likelhood trained model outperforms the likelihood trained model (RNN MLE) of Shen et al. (2016) and is not far behind the best models on this task which benefit from task-specific optimization and model structure.",
+      "startOffset" : 112,
+      "endOffset" : 555
+    }, {
+      "referenceID" : 30,
+      "context" : "RNN MLE (Shen et al., 2016) 24.",
+      "startOffset" : 8,
+      "endOffset" : 27
+    }, {
+      "referenceID" : 30,
+      "context" : "56 RNN MRT (Shen et al., 2016) 30.",
+      "startOffset" : 11,
+      "endOffset" : 30
+    } ],
+    "year" : 2017,
+    "abstractText" : "The prevalent approach to sequence to sequence learning maps an input sequence to a variable length output sequence via recurrent neural networks. We introduce an architecture based entirely on convolutional neural networks.1 Compared to recurrent models, computations over all elements can be fully parallelized during training and optimization is easier since the number of non-linearities is fixed and independent of the input length. Our use of gated linear units eases gradient propagation and we equip each decoder layer with a separate attention module. We outperform the accuracy of the deep LSTM setup of Wu et al. (2016) on both WMT’14 EnglishGerman and WMT’14 English-French translation at an order of magnitude faster speed, both on GPU and CPU.",
+    "creator" : "LaTeX with hyperref package"
+  }
+}

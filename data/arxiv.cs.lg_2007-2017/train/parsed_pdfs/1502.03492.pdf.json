@@ -1,0 +1,440 @@
+{
+  "name" : "1502.03492.pdf",
+  "metadata" : {
+    "source" : "META",
+    "title" : "Gradient-based Hyperparameter Optimization through Reversible Learning",
+    "authors" : [ "Dougal Maclaurin", "David Duvenaud", "Ryan P. Adams" ],
+    "emails" : [ "MACLAURIN@PHYSICS.HARVARD.EDU", "DDUVENAUD@SEAS.HARVARD.EDU", "RPA@SEAS.HARVARD.EDU" ],
+    "sections" : [ {
+      "heading" : "1. Introduction",
+      "text" : "Machine learning systems abound with hyperparameters. These can be parameters that control model complexity, such as L1 and L2 penalties, or parameters that specify the learning procedure itself – step sizes, momentum decay parameters and initialization conditions. Choosing the best hyperparameters is both crucial and frustratingly difficult.\nThe current gold standard for hyperparameter selection is gradient-free model-based optimization (Snoek et al., 2012; Bergstra et al., 2011; 2013; Hutter et al., 2011). Hyperparameters are chosen to optimize the validation loss after complete training of the model parameters. These approaches have demonstrated that automatic tuning of hyperparameters can yield state-of-the-art performance. However, in general they are not able to effectively optimize more than 10 to 20 hyperparameters.\nWhy not use gradients? Reverse-mode differentiation allows gradients to be computed with a similar time cost to the original objective function. This approach is taken almost universally for optimization of elementary1 parame-\n†The order of these two authors is random. See github.com/hips/author-roulette\n1Since this paper is about hyperparameters, we use “elementary” to unambiguously denote the other sort of parameter, the “parameter-that-is-just-a-parameter-and-not-a-hyperparameter”.\nters. The problem with taking gradients with respect to hyperparameters is that computing the validation loss requires an inner loop of elementary optimization, which makes naı̈ve reverse-mode differentiation infeasible from a memory perspective. Section 2 describes this problem and proposes a solution, which is the main technical contribution of this paper.\nGaining access to gradients with respect to hyperparamters opens up a garden of delights. Instead of straining to eliminate hyperparameters from our models, we can embrace them, and richly hyperparameterize our models. Just as having a high-dimensional elementary parameterization gives a flexible model, having a high-dimensional hyperparameterization gives flexibility over model classes, regularization, and training methods. Section 3 explores these new opportunities."
+    }, {
+      "heading" : "1.1. Contributions",
+      "text" : "• We give an algorithm that exactly reverses stochastic gradient descent with momentum to compute gradi-\nar X\niv :1\n50 2.\n03 49\n2v 3\n[ st\nat .M\nL ]\n2 A\npr 2\n01 5\nents with respect to all continuous training parameters.\n• We show how to efficiently store only the information needed to exactly reverse learning dynamics. For example, when the momentum term is 0.9, this method reduces the memory requirements of reverse-mode differentiation of hyperparameters by a factor of 200.\n• We show that these gradients allow optimization of validation loss with respect to thousands of hyperparameters. For example, we optimize fine-grained learning-rate schedules, per-layer initialization distributions of neural network parameters, per-input regularization schemes, and per-pixel data preprocessing.\n• We provide insight into learning procedures by examining optimized learning-rate schedules and initialization procedures, comparing them to standard advice in the literature."
+    }, {
+      "heading" : "2. Hypergradients",
+      "text" : "Reverse-mode differentiation (RMD) has been an asset to the field of machine learning (LeCun et al., 1989) (see the 7 for a refresher). The RMD method, known as “backpropagation” in the deep learning community, allows the gradient of a scalar loss with respect to its parameters to be computed in a single backward pass. This increases the computational burden by only a factor of two over evaluating the loss itself, regardless of the number of parameters. Obtaining the same sort of information by either forwardmode differentiation or brute force finite differences would require a separate pass for each parameter and would make deep learning entirely infeasible.\nApplying RMD to hyperparameter optimization was proposed by Bengio (2000) and Baydin & Pearlmutter (2014), and applied to small problems by Domke (2012). However, the naı̈ve approach fails for real-sized problems because of memory constraints. RMD requires that intermediate variables be maintained in memory for the reverse pass. Evaluating the validation loss requires training the model, which may require many elementary iterations. Conventional RMD stores this entire training trajectory, w1...wT in memory. In large neural networks, the amount of memory required to store the millions of parameters being trained is typically close to the amount of physical RAM available (Sutskever et al., 2014). If storing the parameter vector takes∼1GB, and the parameter vector is updated tens of thousands of times (the number of mini batches times the number of epochs) then storing the learning history is unmanageable even with physical storage.\nImagine that we could exactly trace a training procedure backwards, starting from the trained parameter values and working back to the initial parameters. Then we could recompute the learning trajectory on the fly during the reverse\npass of RMD rather than storing it in memory. This is not possible in general, but we will show that for the popular training procedure of stochastic gradient descent with momentum, we can do exactly this, storing a small number of auxiliary bits to handle finite precision arithmetic."
+    }, {
+      "heading" : "2.1. Reversible learning with exact arithmetic",
+      "text" : "Stochastic gradient descent (SGD) with momentum (Algorithm 1) can be seen as a physical simulation of a system moving through a series of fixed force fields indexed by time t. With exact arithmetic this procedure is reversible. This lets us write Algorithm 2, which reverses the steps in Algorithm 1, interleaved with computations of gradients. It outputs the gradient of a function of the trained weights f(w) (such as the validation loss) with respect to the initial weights w1, the learning-rate and momentum schedules, and any other hyperparameters which affect training gradients.\nAlgorithm 1 Stochastic gradient descent with momentum 1: input: initial w1, decays γ, learning rates α, loss func-\ntion L(w,θ, t) 2: initialize v1 = 0 3: for t = 1 to T do 4: gt = ∇wL(wt,θ, t) . evaluate gradient 5: vt+1 = γtvt − (1− γt)gt . update velocity 6: wt+1 = wt + αtvt . update position 7: end for 8: output trained parameters wT\nAlgorithm 2 Reverse-mode differentiation of SGD 1: input: wT , vT , γ, α, train loss L(w,θ, t), loss f(w) 2: initialize dv = 0, dθ = 0, dαt = 0, dγ = 0 3: initialize dw = ∇wf(wT ) 4: for t = T counting down to 1 do 5: dαt = dwTvt 6: wt−1 = wt − αtvt 7: gt = ∇wL(wt,θ, t)\n} exactly reverse gradient descent operations8: vt−1 = [vt + (1− γt)gt]/γt\n9: dv = dv + αtdw 10: dγt = dvT(vt + gt) 11: dw = dw − (1− γt)dv∇w∇wL(wt,θ, t) 12: dθ = dθ − (1− γt)dv∇θ∇wL(wt,θ, t) 13: dv = γtdv 14: end for 15: output gradient of f(wT ) w.r.t w1, v1, γ, α and θ\nComputations of steps 11 and 12 both require a Hessianvector product, but these can be computed exactly by applying RMD to the dot product of the gradient with a vector (Pearlmutter, 1994). Thus the time complexity of reverse SGD is O(T ), the same as forward SGD."
+    }, {
+      "heading" : "2.2. Reversible learning with finite precision arithmetic",
+      "text" : "In practice, Algorithm 2 fails utterly due to finite numerical precision. The problem is the momentum decay term γ. Every time we apply step 8 to reduce the velocity, we lose information. Assuming we are using a fixed-point representation, 2 each multiplication by γ < 1 shifts bits to the right, destroying the least significant bits. This is more than a pedantic concern. Attempting to carry out the reverse training requires repeated multiplication by 1/γ. Errors accumulate exponentially, and the reversed learning procedure ends far from the initial point (and usually overflows). Do we need γ < 1? Unfortunately we do. γ > 1 results in unstable dynamics, and γ = 1, recovers the leapfrog integrator (Hut et al., 1995), a perfectly reversible set of dynamics, but one that does not converge.\nThis problem is quite a deep one: optimization necessarily discards information. Ideally, optimization maps all initializations to the same optimum, a many-to-one mapping with no hope of inversion. Put another way, optimization moves a system from a high-entropy initial state to a low-entropy (hopefully zero entropy) optimized final state.\nIt is interesting to consider the analogy with physical dynamics. The γ term is analogous to a drag term in the simulation of Hamiltonian dynamics. Having γ < 1 corresponds to dissipative dynamics which generates heat, increases the entropy of the environment and is not therefore not reversible. But we must have dissipation in order for our system to converge to equilibrium.\nIf we want to reverse the dynamics, there is no choice but to store the extra bits discarded by the γ operation. But we can at least try to be parsimonious about the number of extra bits we store. This is what the next section addresses."
+    }, {
+      "heading" : "2.3. Optimal storage of discarded entropy",
+      "text" : "This section gives the technical details of how to efficiently store the information discarded each time the momentum decay operation (Step 8) is applied.\nIf γ = 0.5, we can simply store the single bit that falls off at each iteration, and if γ = 0.25 we could store two bits. But for fine-grained control over γ we need a way to store the information lost when we multiply by, say, γ = 0.9, which will be less than one bit on average. Here we give a procedure which achieves exactly this.\nWe represent the velocity v and parameter w vectors with\n2We assume fixed-point representation to simplify the discussion (and the implementation). Courbariaux et al. (2014) show that fixed-point arithmetic is sufficient to train deep networks. Floating point representation doesn’t fix the problem, it just defers the loss of information from the division step to the addition step.\n64-bit integers. With an implied radix point this can be a fixed-point representation of the reals. We represent γ as a rational number, n/d. When we divide each v by d we use integer division. In order to be able to reverse the process we just need to store the remainder, v modulo s, in some “information buffer”, B. If B were an integer and n = 2, the remainder r would just be a single bit, and we could store it in B by left-shifting B’s bits and adding r. For arbitrary n, we can do the base-n analogue of this operation: multiply B by n and add r. Eventually, B will overflow. We need a way to either detect this, store the bits, and start a fresh integer, or else we can just use an arbitrary size integer that grows as needed. (Python’s “long” integer type supports this). This procedure allows division by n while storing the remainder in log2(n) bits on average.\nWhen we multiply by the numerator of n/d we don’t need to store anything extra, since integer division will bring us back to exactly the same point anyway. But the procedure as it stands would store three bits when γ = 7/8, whereas it should store less than one (log2(8/7) = 0.19). Our solution is the following: when we multiply v by n, there is an opportunity to add a nonnegative integer smaller than n to the result without affecting the reverse process (integer division by n). We can get such an integer from the information buffer by dividing it by n and recording B modulo n. We are using the velocity v as an information buffer itself! Algorithm 3 illustrates the entire process.\nAlgorithm 3 Exactly reversible multiplication by a ratio 1: Input: Information buffer i, value c, ratio n/d 2: i = i× d . make room for new digit 3: i = i+ (c mod d) . store digit lost by division 4: c = c÷ d . divide by denominator 5: c = c× n . multiply by numerator 6: c = c+ (i mod n) . add digit from buffer 7: i = i÷ n . shorten information buffer 8: return updated buffer i, updated value c\nWe could also have used an arithmetic coding scheme for our information buffer (MacKay, 2003, Chapter 6). How much does this procedure save us? When γ = 0.98, we will have to store only 0.029 bits on average. Compared to storing a new 32-bit integer or floating-point number at each iteration, this reduces memory requirements by a factor of one thousand.\nThe standard way to save memory in RMD is checkpointing. Checkpointing stores the entire parameter vector on only a fraction of the training steps, and recomputes the missing steps of the training procedure (forwards) as needed during the backward pass. However, this would require too much memory to be practical for large neural nets trained for thousands of minibatches."
+    }, {
+      "heading" : "3. Experiments",
+      "text" : "In typical machine learning applications, only a few hyperparameters (less than 20) are optimized. Since each experiment only yields a single number (the validation loss), the search rapidly becomes more difficult as the dimension of the hyperparameter vector increases. In contrast, when hypergradients are available, the amount of information gained from each training run grows along with the number of hyperparameters, allowing us to optimize thousands of hyperparameters. How can we take advantage of this new ability?\nThis section shows several proof-of-concept experiments in which we can more richly parameterize training and regularization schemes in ways that would have been previously impractical to optimize."
+    }, {
+      "heading" : "3.1. Gradient-based optimization of gradient-based optimization",
+      "text" : "Modern neural net training procedures often employ various heuristics to set learning rate schedules, or set their shape using one or two hyperparameters set by crossvalidation (Dahl et al., 2014; Sutskever et al., 2013). These schedule choices are supported by a mixture of intuition, arguments about the shape of the objective function, and empirical tuning.\nTo more directly shed light on good learning rate schedules, we jointly optimized separate learning rates for every single learning iteration of training of a deep neural network, as well as separately for weights and biases in each layer. Each meta-iteration trained a network for 100 iterations of SGD, meaning that the learning rate schedules were specified by 800 hyperparameters (100 iterations × 4 layers × 2 types of parameters). To avoid learning an optimization schedule that depended on the quirks of a particular random initialization, each evaluation of hypergradients used a different random seed. These random seeds were used both to initialize network weights and to choose mini batches. The network was trained on 10,000 examples of MNIST, and had 4 layers, of sizes 784, 50, 50, and 50.\nBecause learning schedules can implicitly regularize networks (Erhan et al., 2010), for example by enforcing early stopping, for this experiment we optimized the learning rate schedules on the training error rather than on the validation set error. Figure 2 shows the results of optimizing learning rate schedules separately for each layer of a deep neural network. When Bayesian optimization was used to choose a fixed learning rate for all layers and iterations, it chose a learning rate of 2.4.\nMeta-optimization strategies We experimented with several standard stochastic optimization methods for meta-\noptimization, including SGD, RMSprop (Tieleman & Hinton, 2012), and minibatch conjugate gradients. The results in this section used Adam (Kingma & Ba, 2014), a variant of RMSprop that includes momentum. We typically ran for 50 meta-iterations, and used a meta-step size of 0.04. Figure 3 shows the elementary and meta-learning curves that generated the hyperparameters shown in Figure 2.\nHow smooth are hypergradients? To demonstrate that the hypergradients are smooth with respect to time steps in the training schedule, Figure 4 shows the hypergradient with respect to the step size training schedule at the beginning of training, averaged over 100 random seeds.\nOptimizing weight initialization scales We optimized a separate weight initialization scale hyperparameter for each type of parameter (weights and biases) in each layer - a total of 8 hyperparameters. Results are shown in Figure 5.\nInterestingly, the initialization scale chosen for the first layer weights matches a heuristic which says to choose an\ninitialization scale of 1/ √ N , where N is the number of weights in the layer."
+    }, {
+      "heading" : "3.2. Optimizing regularization parameters",
+      "text" : "Regularization is often important for generalization performance. Typically, a single parameter controls a single L2 norm or sparsity penalty on the entire parameter vector of a neural network. Because different types of parameters in different layers play different roles, it is reasonable to suspect that separate regularization hyperparameter for each parameter type would improve performance. Indeed, Snoek et al. (2012) optimized separate regularization parameters for each layer in a neural network, and found that it improved performance.\nWe can take this idea even further, and introduce a separate regularization penalty for each individual parameter in a neural network. We use a simple model as an example – logistic regression, which can be seen as a neural network without a hidden layer. We choose this model because ev-\nery weight corresponds to an input-pixel and output-label pair, meaning that these 7,840 hyperparameters might be relatively interpretable. Figure 6 shows a set of regularization hyperparameters learned for a logistic regression network. Because each parameter corresponds to a particular input, this regularization scheme could be seen as a generalization of automatic relevance determination (MacKay & Neal, 1994)."
+    }, {
+      "heading" : "3.3. Optimizing training data",
+      "text" : "We can use Algorithm 2 to take the gradient with respect to any parameter the training procedure depends on. This includes the training data, which can be viewed as just another set of hyperparameters. By chaining gradients through transformations of the data, we can compute gradients of the validation objective with respect to data preprocessing, weighting, or augmentation procedures.\nWe demonstrate a simple proof-of-concept where an entire training set is learned by gradient descent, starting from blank images. Figure 7 shows a training set, the pixels of which were optimized to improve performance on a validation set of 10,000 examples from MNIST. We optimized 10 training examples, each having a different fixed label, again from 0 to 9 respectively. Learning the labels of a larger training set might shed light on which classes are difficult to distinguish and so require more examples."
+    }, {
+      "heading" : "3.4. Optimizing initial parameters",
+      "text" : "The last remaining parameter to SGD is the initial parameter vector. Treating this vector as a hyperparameter blurs the distinction between learning and meta-learning. In the extreme case where all elementary learning rates are set to zero, the training set ceases to matter and the meta-learning procedure exactly reduces to elementary learning on the validation set. Due to philosophical vertigo, we chose not to optimize the initial parameter vector."
+    }, {
+      "heading" : "3.5. Learning continuously parameterized architetures",
+      "text" : "Many of the notable successes in deep learning have come from novel architectures adapted to particular domains: convolutional neural nets, recurrent neural nets and multitask neural nets. We can think of these architectures as hard constraints that force particular weights to be zero and tie particular pairs of weights together. By softening these hard architectural constraints we can form continuous (but very high-dimensional) parameterizations of architecture. Having access to hypergradients makes learning these softened architectures feasible.\nWe illustrate this “architecture learning” with a multitask learning problem, the Omniglot data set (Lake, 2014). This data set consists of 28x28 pixel greyscale images of characters from 50 alphabets with up to 55 characters in each alphabet but only 15 examples of each character. Rather than learning a separate neural net for each alphabet, a multitask approach would be for all the neural nets to share a single first layer, pooling statistical strength to learn generic Gabor-like filters, while maintaining separate higher layers specific to each alphabet.\nWe can parameterize any architecture based on weight tying or weight absence with a pairwise quadratic penalty on the weights, wTAw, where A is a number-of-weights by number-of-weights matrix. Learning this enormous matrix is clearly infeasible but we can implicitly build such a matrix from lower dimensional structures of manageable size.\nFor the Omniglot problem, we learn a penalty for each alphabet pair, separately for each neural net layer. Thus, for ten three-layer neural networks, the penalty matrix A is fully described by three ten-by-ten matrices. An architecture with fully independent nets for each alphabet corresponds to three diagonal matrices while an architecture with a mutual lower layer corresponds to two diagonal matrices for the upper layers and a matrix of all ones for the lowest layer (Figure 9).\nWe use five alphabets from the Omniglot set. To see whether our multitask learning system is able to learn high level similarities as well as low-level similarities, we repeat these five alphabets with the images rotated by 90 degrees (Figure 8) to make ten alphabets total.\nFigure 9 shows the learned penalties (normalized by row and column to have ones on the diagonal, akin to a correlation matrix). We see that the lowest layer has been partially shared, across all alphabets equally, with the upper layers much less shared. Interestingly, the top layer penalty learns to share weights between the rotated alphabets.\nInput Middle Output Train Test weights weights weights error error"
+    }, {
+      "heading" : "3.6. Implementation Details",
+      "text" : "Automatic differentiation (AD) software packages such as Theano (Bastien et al., 2012; Bergstra et al., 2010) are mainstays of deep learning, significantly speeding up development time by providing gradients automatically. Since we required access to the internal logic of RMD in order to implement Algorithm 2, we implemented our own automatic differentiation package for Python, available at\ngithub.com/HIPS/autograd. This package differentiates standard Numpy (Oliphant, 2007) code, and can differentiate code containing while loops, branches, and even gradient evaluations.\nCode for all experiments in this paper is available at github.com/HIPS/hypergrad."
+    }, {
+      "heading" : "4. Limitations",
+      "text" : "Back-propagation for training neural networks has several pitfalls that were later addressed by analysis and engineering. Likewise, the use of hypergradients also has several apparent difficulties that need to be addressed before it becomes practical. This section explores several issues with this technique that became apparent in our experiments.\nWhen are gradients meaningful? Bengio et al. (1994) noted that “learning long-term dependencies with gradient descent is difficult.” Our situation is even worse: We are using gradients to optimize functions which depend on their hyperparameters through hundreds of iterations of SGD. To make things worse, each elementary iteration’s gradient itself depends on forward- and then back-propagation through a neural network. Thus the same issues that sometimes make elementary learning difficult are compounded.\nFor example, Pearlmutter (1996, Chapter 4) showed that large learning rates induce chaotic behavior in the learning dynamics, making the gradient uninformative about the medium-term shape of the training objective. This phenomenon is related to the exploding-gradient problem (Pascanu et al., 2012).\nFigure 10 illustrates this phenomenon when training a neural network having 2 hidden layers for 50 elementary iterations. We partially addressed this problem in our experiments by initializing learning rates to be relatively small, and stopping meta-optimization when the magnitude of the meta-gradient began to grow.\nOverfitting How many hyperparameters can we fruitfully optimize? One limitation is overfitting the validation objective, in the same way that optimizing too many parameters can overfit the training objective. However, the same rules of thumb still apply – the size of the validation set, assuming examples are i.i.d., gives a rough guide to how many hyperparameters can be optimized.\nDiscrete parameters Of course, gradients are not necessarily useful for optimizing discrete hyperparameters such as the number of layers, or hyperparameters that affect discrete changes such as dropout regularization parameters. Some of these difficulties could be addressed by parameterizing apparently discrete choices in a continuous man-\nner. For instance, the per-hidden-unit regularization of section 3.2 is an example of a continuous way to choose the number of hidden units."
+    }, {
+      "heading" : "5. Related work",
+      "text" : "The most closely-related work is Domke (2012), who derived algorithms to compute reverse-mode derivatives of gradient descent with momentum and L-BFGS, using them to update the hyperparameters of CRF image models. However, his approach relied on naı̈ve caching of all parameter vectors w1,w2, . . . ,wT , making it impractical for large models with many training iterations.\nLarsen et al. (1998), Eigenmann & Nossek (1999), Chen & Hagan (1999), Bengio (2000), Abdel-Gawad & Ratner (2007), and Foo et al. (2008) showed that gradients of regularization parameters are available in closed form when training has converged exactly to a local minimum. In contrast, our procedure can compute exact gradients of any type of hyperparameter, whether or not learning has converged.\nSupport vector machines Chapelle et al. (2002) introduced a differentiable bound on the SVM loss in order to be able to compute derivatives with respect to hundreds of hyperparameters, including weighting parameters for each input dimension in the kernel. However, this bound was not tight, since optimizing the SVM objective requires a discrete selection of training points.\nBayesian methods For Bayesian models with a closedform marginal likelihood, gradients with respect to all continuous hyperparameters are usually available. For example, this ability has been used to construct complex kernels for Gaussian process models (Rasmussen & Williams, 2006, Chapter 5). Variational inference also allows gradient-based tuning of hyperparameters in Bayesian neural-network models such as deep Gaussian processes (Hensman & Lawrence, 2014). However, it does not provide gradients with respect to training parameters.\nGradients with respect to Markov chain parameters Salimans et al. (2014) tune the step-size and mass-matrix parameters of Hamiltonian Monte Carlo by chaining gradients from a lower bound on the marginal likelihood through several iterations of leapfrog dynamics. Because they used only a small number of steps, all intermediate values could be stored naı̈vely. Our reversible-dynamics memory-tape approach could be used to dramatically extend the number of HMC iterations used in this approach."
+    }, {
+      "heading" : "6. Extensions and future work",
+      "text" : "Bayesian optimization with gradients Hypergradients could be used with parallel, model-based optimization of hyperparameters. For example, Gaussian-process-based optimization methods could incorporate gradient information (Solak et al., 2003). Such methods could make use of parallel evaluations of hypergradients, which might be too slow to evaluate in a sequential manner.\nReversible elementary computation Recurrent neural network models can require so much memory to differentiate that checkpointing is required simply to compute their elementary gradients (Martens & Sutskever, 2012). Reversible computation might offer memory savings for some architectures. For example, evaluations of Long ShortTerm Memory (Hochreiter & Schmidhuber, 1997) or a Neural Turing Machines (Graves et al., 2014) rely on long chains of mostly-small updates of parameters. Exactly reversing these dynamics might allow more memory-efficient elementary gradient evaluations of their outputs on very long input sequences.\nExactly reversing other learning methods The memory saving trick from Section 2.3 could presumably be applied to other momentum-based variants of SGD such as RMSprop (Tieleman & Hinton, 2012) or Adam (Kingma & Ba, 2014)."
+    }, {
+      "heading" : "7. Conclusion",
+      "text" : "In this paper, we derived a computationally efficient procedure for computing gradients through stochastic gradi-\nent descent with momentum. We showed how the approximate reversibility of learning dynamics can be used to drastically reduce the memory requirement for exactly backpropagating gradients through hundreds of training iterations.\nWe showed how these gradients allow the optimization of validation loss with respect to thousands of hyperparameters, something which was previously infeasible. This new ability allows the automatic tuning of most details of training neural networks. We demonstrated the tuning of detailed training schedules, regularization schedules, and neural network architectures."
+    }, {
+      "heading" : "Acknowledgments",
+      "text" : "We would like to thank Christian Steinruecken, Oren Rippel, and Matthew James Johnson for helpful discussions. We also thank Brenden Lake for graciously providing the Omniglot dataset. Thanks to Jason Rolfe for helpful feedback. We thank Analog Devices International and Samsung Advanced Institute of Technology for their support."
+    }, {
+      "heading" : "Appendix: Forward vs. reverse-mode differentiation",
+      "text" : "By the chain rule, the gradient of a set of nested functions is given by the product of the individual derivatives of each function:\n∂f4(f3(f2(f1(x)))) ∂x = ∂f4 ∂f3 · ∂f3 ∂f2 · ∂f2 ∂f1 · ∂f1 ∂x\nIf each function has multivariate inputs and outputs, the gradients are Jacobian matrices.\nForward and reverse mode differentiation differ only by the order in which they evaluate this product. Forward-mode differentiation works by multiplying gradients in the same order as the functions are evaluated:\n∂f4(f3(f2(f1(x)))) ∂x = ∂f4 ∂f3 · ( ∂f3 ∂f2 · ( ∂f2 ∂f1 · ∂f1 ∂x )) Reverse-mode multiplies the gradients in the opposite order, starting from the final result:\n∂f4(f3(f2(f1(x))))\n∂x = (( ∂f4 ∂f3 · ∂f3 ∂f2 ) · ∂f2 ∂f1 ) · ∂f1 ∂x\nIn an optimization setting, the final result of the nested functions, f4, is a scalar, while the input x and intermediate values, f1 − f3, can be vectors. In this scenario the advantage of reverse-mode differentiation is very clear. Let’s imagine that the dimensionality of all the intermediate vectors isD. In reverse mode, we start from the (scalar) output, and multiply by the next D×D Jacobian at each step. The\nvalue we accumulate is just aD-dimensional vector. In forward mode, however, we must accumulate an entireD×D matrix at each step. But do we have still have to compute and instantiate the D×D Jacobian matrices themselves either way? In general, yes. But in the (common) case that the vector-to-vector functions are either elementwise operations or (reshaped) matrix multiplications, the Jacobian matrices can actually be very sparse, and multiplication by the Jacobian can be performed efficiently without instantiation (Pearlmutter & Siskind, 2008).\nThe main drawback of reverse-mode differentiation is that intermediate values must be maintained in memory during the forward pass. In sections 2.1 and 2.3, we show how to drastically reduce the memory requirements of reversemode differentiation when differentiating through the entire learning procedure."
+    } ],
+    "references" : [ {
+      "title" : "Adaptive optimization of hyperparameters in L2-regularised logistic regression",
+      "author" : [ "Abdel-Gawad", "Ahmed", "Ratner", "Simon" ],
+      "venue" : "Technical report,",
+      "citeRegEx" : "Abdel.Gawad et al\\.,? \\Q2007\\E",
+      "shortCiteRegEx" : "Abdel.Gawad et al\\.",
+      "year" : 2007
+    }, {
+      "title" : "Theano: new features and speed improvements",
+      "author" : [ "Bastien", "Frédéric", "Lamblin", "Pascal", "Pascanu", "Razvan", "Bergstra", "James", "Goodfellow", "Ian J", "Bergeron", "Arnaud", "Bouchard", "Nicolas", "Bengio", "Yoshua" ],
+      "venue" : "Deep Learning and Unsupervised Feature Learning NIPS 2012 Workshop,",
+      "citeRegEx" : "Bastien et al\\.,? \\Q2012\\E",
+      "shortCiteRegEx" : "Bastien et al\\.",
+      "year" : 2012
+    }, {
+      "title" : "Automatic differentiation of algorithms for machine learning",
+      "author" : [ "A.G. Baydin", "B.A. Pearlmutter" ],
+      "venue" : "In Proceedings of the AutoML Workshop at the International Conference on Machine Learning (ICML),",
+      "citeRegEx" : "Baydin and Pearlmutter,? \\Q2014\\E",
+      "shortCiteRegEx" : "Baydin and Pearlmutter",
+      "year" : 2014
+    }, {
+      "title" : "Gradient-based optimization of hyperparameters",
+      "author" : [ "Bengio", "Yoshua" ],
+      "venue" : "Neural computation,",
+      "citeRegEx" : "Bengio and Yoshua.,? \\Q2000\\E",
+      "shortCiteRegEx" : "Bengio and Yoshua.",
+      "year" : 2000
+    }, {
+      "title" : "Learning long-term dependencies with gradient descent is difficult",
+      "author" : [ "Bengio", "Yoshua", "Simard", "Patrice", "Frasconi", "Paolo" ],
+      "venue" : "Neural Networks, IEEE Transactions on,",
+      "citeRegEx" : "Bengio et al\\.,? \\Q1994\\E",
+      "shortCiteRegEx" : "Bengio et al\\.",
+      "year" : 1994
+    }, {
+      "title" : "Algorithms for hyper-parameter optimization",
+      "author" : [ "Bergstra", "James", "Bardenet", "Rémi", "Bengio", "Yoshua", "Kégl", "Balázs" ],
+      "venue" : "In Advances in Neural Information Processing Systems,",
+      "citeRegEx" : "Bergstra et al\\.,? \\Q2011\\E",
+      "shortCiteRegEx" : "Bergstra et al\\.",
+      "year" : 2011
+    }, {
+      "title" : "Making a science of model search: Hyperparameter optimization in hundreds of dimensions for vision architectures",
+      "author" : [ "Bergstra", "James", "Yamins", "Daniel", "Cox", "David" ],
+      "venue" : "In International Conference on Machine Learning,",
+      "citeRegEx" : "Bergstra et al\\.,? \\Q2013\\E",
+      "shortCiteRegEx" : "Bergstra et al\\.",
+      "year" : 2013
+    }, {
+      "title" : "Choosing multiple parameters for support vector machines",
+      "author" : [ "Chapelle", "Olivier", "Vapnik", "Vladimir", "Bousquet", "Mukherjee", "Sayan" ],
+      "venue" : "Machine learning,",
+      "citeRegEx" : "Chapelle et al\\.,? \\Q2002\\E",
+      "shortCiteRegEx" : "Chapelle et al\\.",
+      "year" : 2002
+    }, {
+      "title" : "Optimal use of regularization and cross-validation in neural network modeling",
+      "author" : [ "Chen", "Dingding", "Hagan", "Martin T" ],
+      "venue" : "In International Joint Conference on Neural Networks,",
+      "citeRegEx" : "Chen et al\\.,? \\Q1999\\E",
+      "shortCiteRegEx" : "Chen et al\\.",
+      "year" : 1999
+    }, {
+      "title" : "JeanPierre. Low precision arithmetic for deep learning",
+      "author" : [ "Courbariaux", "Matthieu", "Bengio", "Yoshua", "David" ],
+      "venue" : "arXiv preprint arXiv:1412.7024,",
+      "citeRegEx" : "Courbariaux et al\\.,? \\Q2014\\E",
+      "shortCiteRegEx" : "Courbariaux et al\\.",
+      "year" : 2014
+    }, {
+      "title" : "Multi-task neural networks for QSAR predictions",
+      "author" : [ "Dahl", "George E", "Jaitly", "Navdeep", "Salakhutdinov", "Ruslan" ],
+      "venue" : "arXiv preprint arXiv:1406.1231,",
+      "citeRegEx" : "Dahl et al\\.,? \\Q2014\\E",
+      "shortCiteRegEx" : "Dahl et al\\.",
+      "year" : 2014
+    }, {
+      "title" : "Generic methods for optimization-based modeling",
+      "author" : [ "Domke", "Justin" ],
+      "venue" : "In International Conference on Artificial Intelligence and Statistics,",
+      "citeRegEx" : "Domke and Justin.,? \\Q2012\\E",
+      "shortCiteRegEx" : "Domke and Justin.",
+      "year" : 2012
+    }, {
+      "title" : "Gradient based adaptive regularization",
+      "author" : [ "Eigenmann", "Robert", "Nossek", "Josef A" ],
+      "venue" : "In Proceedings of the 1999 IEEE Signal Processing Society Workshop on Neural Networks,",
+      "citeRegEx" : "Eigenmann et al\\.,? \\Q1999\\E",
+      "shortCiteRegEx" : "Eigenmann et al\\.",
+      "year" : 1999
+    }, {
+      "title" : "Why does unsupervised pre-training help deep learning",
+      "author" : [ "Erhan", "Dumitru", "Bengio", "Yoshua", "Courville", "Aaron", "Manzagol", "Pierre-Antoine", "Vincent", "Pascal", "Samy" ],
+      "venue" : "The Journal of Machine Learning Research,",
+      "citeRegEx" : "Erhan et al\\.,? \\Q2010\\E",
+      "shortCiteRegEx" : "Erhan et al\\.",
+      "year" : 2010
+    }, {
+      "title" : "Efficient multiple hyperparameter learning for log-linear models",
+      "author" : [ "Foo", "Chuan-sheng", "Do", "Chuong B", "Ng", "Andrew Y" ],
+      "venue" : "In Advances in neural information processing systems,",
+      "citeRegEx" : "Foo et al\\.,? \\Q2008\\E",
+      "shortCiteRegEx" : "Foo et al\\.",
+      "year" : 2008
+    }, {
+      "title" : "Neural turing machines",
+      "author" : [ "Graves", "Alex", "Wayne", "Greg", "Danihelka", "Ivo" ],
+      "venue" : "arXiv preprint arXiv:1410.5401,",
+      "citeRegEx" : "Graves et al\\.,? \\Q2014\\E",
+      "shortCiteRegEx" : "Graves et al\\.",
+      "year" : 2014
+    }, {
+      "title" : "Nested variational compression in deep Gaussian processes",
+      "author" : [ "Hensman", "James", "Lawrence", "Neil D" ],
+      "venue" : "arXiv preprint arXiv:1412.1370,",
+      "citeRegEx" : "Hensman et al\\.,? \\Q2014\\E",
+      "shortCiteRegEx" : "Hensman et al\\.",
+      "year" : 2014
+    }, {
+      "title" : "Long shortterm memory",
+      "author" : [ "Hochreiter", "Sepp", "Schmidhuber", "Jürgen" ],
+      "venue" : "Neural computation,",
+      "citeRegEx" : "Hochreiter et al\\.,? \\Q1997\\E",
+      "shortCiteRegEx" : "Hochreiter et al\\.",
+      "year" : 1997
+    }, {
+      "title" : "Building a better leapfrog",
+      "author" : [ "P. Hut", "J. Makino", "S. McMillan" ],
+      "venue" : "Astrophysical Journal, Part 2 - Letters,",
+      "citeRegEx" : "Hut et al\\.,? \\Q1995\\E",
+      "shortCiteRegEx" : "Hut et al\\.",
+      "year" : 1995
+    }, {
+      "title" : "Sequential model-based optimization for general algorithm configuration",
+      "author" : [ "Hutter", "Frank", "Hoos", "Holger H", "Leyton-Brown", "Kevin" ],
+      "venue" : "In Proceedings of LION-5,",
+      "citeRegEx" : "Hutter et al\\.,? \\Q2011\\E",
+      "shortCiteRegEx" : "Hutter et al\\.",
+      "year" : 2011
+    }, {
+      "title" : "Adam: A method for stochastic optimization",
+      "author" : [ "Kingma", "Diederik", "Ba", "Jimmy" ],
+      "venue" : "arXiv preprint arXiv:1412.6980,",
+      "citeRegEx" : "Kingma et al\\.,? \\Q2014\\E",
+      "shortCiteRegEx" : "Kingma et al\\.",
+      "year" : 2014
+    }, {
+      "title" : "Towards more human-like concept learning in machines: Compositionality, causality, and learning-to-learn",
+      "author" : [ "Lake", "Brenden M" ],
+      "venue" : "PhD thesis, Massachusetts Institute of Technology,",
+      "citeRegEx" : "Lake and M.,? \\Q2014\\E",
+      "shortCiteRegEx" : "Lake and M.",
+      "year" : 2014
+    }, {
+      "title" : "Adaptive regularization in neural network modeling",
+      "author" : [ "Larsen", "Jan", "Svarer", "Claus", "Andersen", "Lars Nonboe", "Hansen", "Lars Kai" ],
+      "venue" : "In Neural Networks: Tricks of the Trade,",
+      "citeRegEx" : "Larsen et al\\.,? \\Q1998\\E",
+      "shortCiteRegEx" : "Larsen et al\\.",
+      "year" : 1998
+    }, {
+      "title" : "Backpropagation applied to handwritten zip code recognition",
+      "author" : [ "Y. LeCun", "B. Boser", "J.S. Denker", "D. Henderson", "R.E. Howard", "W. Hubbard", "L.D. Jackel" ],
+      "venue" : "Neural Computation,",
+      "citeRegEx" : "LeCun et al\\.,? \\Q1989\\E",
+      "shortCiteRegEx" : "LeCun et al\\.",
+      "year" : 1989
+    }, {
+      "title" : "Information theory, inference, and learning algorithms",
+      "author" : [ "MacKay", "David J.C" ],
+      "venue" : null,
+      "citeRegEx" : "MacKay and J.C.,? \\Q2003\\E",
+      "shortCiteRegEx" : "MacKay and J.C.",
+      "year" : 2003
+    }, {
+      "title" : "Automatic relevance determination for neural networks",
+      "author" : [ "MacKay", "David J.C", "Neal", "Radford M" ],
+      "venue" : "Technical Report. Cambridge University,",
+      "citeRegEx" : "MacKay et al\\.,? \\Q1994\\E",
+      "shortCiteRegEx" : "MacKay et al\\.",
+      "year" : 1994
+    }, {
+      "title" : "Training deep and recurrent networks with hessian-free optimization",
+      "author" : [ "Martens", "James", "Sutskever", "Ilya" ],
+      "venue" : "In Neural Networks: Tricks of the Trade,",
+      "citeRegEx" : "Martens et al\\.,? \\Q2012\\E",
+      "shortCiteRegEx" : "Martens et al\\.",
+      "year" : 2012
+    }, {
+      "title" : "Python for scientific computing",
+      "author" : [ "Oliphant", "Travis E" ],
+      "venue" : "Computing in Science & Engineering,",
+      "citeRegEx" : "Oliphant and E.,? \\Q2007\\E",
+      "shortCiteRegEx" : "Oliphant and E.",
+      "year" : 2007
+    }, {
+      "title" : "Understanding the exploding gradient problem",
+      "author" : [ "Pascanu", "Razvan", "Mikolov", "Tomas", "Bengio", "Yoshua" ],
+      "venue" : "arXiv preprint arXiv:1211.5063,",
+      "citeRegEx" : "Pascanu et al\\.,? \\Q2012\\E",
+      "shortCiteRegEx" : "Pascanu et al\\.",
+      "year" : 2012
+    }, {
+      "title" : "An investigation of the gradient descent process in neural networks",
+      "author" : [ "Pearlmutter", "Barak" ],
+      "venue" : "PhD thesis,",
+      "citeRegEx" : "Pearlmutter and Barak.,? \\Q1996\\E",
+      "shortCiteRegEx" : "Pearlmutter and Barak.",
+      "year" : 1996
+    }, {
+      "title" : "Fast exact multiplication by the Hessian",
+      "author" : [ "Pearlmutter", "Barak A" ],
+      "venue" : "Neural computation,",
+      "citeRegEx" : "Pearlmutter and A.,? \\Q1994\\E",
+      "shortCiteRegEx" : "Pearlmutter and A.",
+      "year" : 1994
+    }, {
+      "title" : "Reversemode AD in a functional framework: Lambda the ultimate backpropagator",
+      "author" : [ "Pearlmutter", "Barak A", "Siskind", "Jeffrey Mark" ],
+      "venue" : "ACM Transactions on Programming Languages and Systems (TOPLAS),",
+      "citeRegEx" : "Pearlmutter et al\\.,? \\Q2008\\E",
+      "shortCiteRegEx" : "Pearlmutter et al\\.",
+      "year" : 2008
+    }, {
+      "title" : "Gaussian Processes for Machine Learning",
+      "author" : [ "Rasmussen", "Carl E", "Williams", "Christopher K.I" ],
+      "venue" : null,
+      "citeRegEx" : "Rasmussen et al\\.,? \\Q2006\\E",
+      "shortCiteRegEx" : "Rasmussen et al\\.",
+      "year" : 2006
+    }, {
+      "title" : "Markov chain Monte Carlo and variational inference: Bridging the gap",
+      "author" : [ "Salimans", "Tim", "Kingma", "Diederik P", "Welling", "Max" ],
+      "venue" : "arXiv preprint arXiv:1410.6460,",
+      "citeRegEx" : "Salimans et al\\.,? \\Q2014\\E",
+      "shortCiteRegEx" : "Salimans et al\\.",
+      "year" : 2014
+    }, {
+      "title" : "Practical Bayesian optimization of machine learning algorithms",
+      "author" : [ "Snoek", "Jasper", "Larochelle", "Hugo", "Adams", "Ryan P" ],
+      "venue" : "In Advances in Neural Information Processing Systems",
+      "citeRegEx" : "Snoek et al\\.,? \\Q2012\\E",
+      "shortCiteRegEx" : "Snoek et al\\.",
+      "year" : 2012
+    }, {
+      "title" : "Derivative observations in Gaussian process models of dynamic systems",
+      "author" : [ "E. Solak", "R. Murray Smith", "W.E. Leithead", "D. Leith", "Rasmussen", "Carl E" ],
+      "venue" : "Advances in Neural Information Processing Systems,",
+      "citeRegEx" : "Solak et al\\.,? \\Q2003\\E",
+      "shortCiteRegEx" : "Solak et al\\.",
+      "year" : 2003
+    }, {
+      "title" : "On the importance of initialization and momentum in deep learning",
+      "author" : [ "Sutskever", "Ilya", "Martens", "James", "Dahl", "George", "Hinton", "Geoffrey" ],
+      "venue" : "In Proceedings of the 30th International Conference on Machine Learning",
+      "citeRegEx" : "Sutskever et al\\.,? \\Q2013\\E",
+      "shortCiteRegEx" : "Sutskever et al\\.",
+      "year" : 2013
+    }, {
+      "title" : "Sequence to sequence learning with neural networks",
+      "author" : [ "Sutskever", "Ilya", "Vinyals", "Oriol", "Le", "Quoc V. V" ],
+      "venue" : "In Advances in Neural Information Processing Systems",
+      "citeRegEx" : "Sutskever et al\\.,? \\Q2014\\E",
+      "shortCiteRegEx" : "Sutskever et al\\.",
+      "year" : 2014
+    }, {
+      "title" : "Lecture 6.5—RmsProp: Divide the gradient by a running average of its recent magnitude",
+      "author" : [ "T. Tieleman", "G. Hinton" ],
+      "venue" : "Coursera: Neural Networks for Machine Learning,",
+      "citeRegEx" : "Tieleman and Hinton,? \\Q2012\\E",
+      "shortCiteRegEx" : "Tieleman and Hinton",
+      "year" : 2012
+    } ],
+    "referenceMentions" : [ {
+      "referenceID" : 34,
+      "context" : "The current gold standard for hyperparameter selection is gradient-free model-based optimization (Snoek et al., 2012; Bergstra et al., 2011; 2013; Hutter et al., 2011).",
+      "startOffset" : 97,
+      "endOffset" : 167
+    }, {
+      "referenceID" : 5,
+      "context" : "The current gold standard for hyperparameter selection is gradient-free model-based optimization (Snoek et al., 2012; Bergstra et al., 2011; 2013; Hutter et al., 2011).",
+      "startOffset" : 97,
+      "endOffset" : 167
+    }, {
+      "referenceID" : 19,
+      "context" : "The current gold standard for hyperparameter selection is gradient-free model-based optimization (Snoek et al., 2012; Bergstra et al., 2011; 2013; Hutter et al., 2011).",
+      "startOffset" : 97,
+      "endOffset" : 167
+    }, {
+      "referenceID" : 23,
+      "context" : "Reverse-mode differentiation (RMD) has been an asset to the field of machine learning (LeCun et al., 1989) (see the 7 for a refresher).",
+      "startOffset" : 86,
+      "endOffset" : 106
+    }, {
+      "referenceID" : 37,
+      "context" : "In large neural networks, the amount of memory required to store the millions of parameters being trained is typically close to the amount of physical RAM available (Sutskever et al., 2014).",
+      "startOffset" : 165,
+      "endOffset" : 189
+    }, {
+      "referenceID" : 18,
+      "context" : "γ > 1 results in unstable dynamics, and γ = 1, recovers the leapfrog integrator (Hut et al., 1995), a perfectly reversible set of dynamics, but one that does not converge.",
+      "startOffset" : 80,
+      "endOffset" : 98
+    }, {
+      "referenceID" : 9,
+      "context" : "Courbariaux et al. (2014) show that fixed-point arithmetic is sufficient to train deep networks.",
+      "startOffset" : 0,
+      "endOffset" : 26
+    }, {
+      "referenceID" : 10,
+      "context" : "Modern neural net training procedures often employ various heuristics to set learning rate schedules, or set their shape using one or two hyperparameters set by crossvalidation (Dahl et al., 2014; Sutskever et al., 2013).",
+      "startOffset" : 177,
+      "endOffset" : 220
+    }, {
+      "referenceID" : 36,
+      "context" : "Modern neural net training procedures often employ various heuristics to set learning rate schedules, or set their shape using one or two hyperparameters set by crossvalidation (Dahl et al., 2014; Sutskever et al., 2013).",
+      "startOffset" : 177,
+      "endOffset" : 220
+    }, {
+      "referenceID" : 13,
+      "context" : "Because learning schedules can implicitly regularize networks (Erhan et al., 2010), for example by enforcing early stopping, for this experiment we optimized the learning rate schedules on the training error rather than on the validation set error.",
+      "startOffset" : 62,
+      "endOffset" : 82
+    }, {
+      "referenceID" : 34,
+      "context" : "Indeed, Snoek et al. (2012) optimized separate regularization parameters for each layer in a neural network, and found that it improved performance.",
+      "startOffset" : 8,
+      "endOffset" : 28
+    }, {
+      "referenceID" : 1,
+      "context" : "Automatic differentiation (AD) software packages such as Theano (Bastien et al., 2012; Bergstra et al., 2010) are mainstays of deep learning, significantly speeding up development time by providing gradients automatically.",
+      "startOffset" : 64,
+      "endOffset" : 109
+    }, {
+      "referenceID" : 4,
+      "context" : "When are gradients meaningful? Bengio et al. (1994) noted that “learning long-term dependencies with gradient descent is difficult.",
+      "startOffset" : 31,
+      "endOffset" : 52
+    }, {
+      "referenceID" : 28,
+      "context" : "This phenomenon is related to the exploding-gradient problem (Pascanu et al., 2012).",
+      "startOffset" : 61,
+      "endOffset" : 83
+    }, {
+      "referenceID" : 14,
+      "context" : "(1998), Eigenmann & Nossek (1999), Chen & Hagan (1999), Bengio (2000), Abdel-Gawad & Ratner (2007), and Foo et al. (2008) showed that gradients of regularization parameters are available in closed form when training has converged exactly to a local minimum.",
+      "startOffset" : 104,
+      "endOffset" : 122
+    }, {
+      "referenceID" : 7,
+      "context" : "Support vector machines Chapelle et al. (2002) introduced a differentiable bound on the SVM loss in order to be able to compute derivatives with respect to hundreds of hyperparameters, including weighting parameters for each input dimension in the kernel.",
+      "startOffset" : 24,
+      "endOffset" : 47
+    }, {
+      "referenceID" : 33,
+      "context" : "Gradients with respect to Markov chain parameters Salimans et al. (2014) tune the step-size and mass-matrix parameters of Hamiltonian Monte Carlo by chaining gradients from a lower bound on the marginal likelihood through several iterations of leapfrog dynamics.",
+      "startOffset" : 50,
+      "endOffset" : 73
+    }, {
+      "referenceID" : 35,
+      "context" : "For example, Gaussian-process-based optimization methods could incorporate gradient information (Solak et al., 2003).",
+      "startOffset" : 96,
+      "endOffset" : 116
+    }, {
+      "referenceID" : 15,
+      "context" : "For example, evaluations of Long ShortTerm Memory (Hochreiter & Schmidhuber, 1997) or a Neural Turing Machines (Graves et al., 2014) rely on long chains of mostly-small updates of parameters.",
+      "startOffset" : 111,
+      "endOffset" : 132
+    } ],
+    "year" : 2015,
+    "abstractText" : "Tuning hyperparameters of learning algorithms is hard because gradients are usually unavailable. We compute exact gradients of cross-validation performance with respect to all hyperparameters by chaining derivatives backwards through the entire training procedure. These gradients allow us to optimize thousands of hyperparameters, including step-size and momentum schedules, weight initialization distributions, richly parameterized regularization schemes, and neural network architectures. We compute hyperparameter gradients by exactly reversing the dynamics of stochastic gradient descent with momentum.",
+    "creator" : "LaTeX with hyperref package"
+  }
+}

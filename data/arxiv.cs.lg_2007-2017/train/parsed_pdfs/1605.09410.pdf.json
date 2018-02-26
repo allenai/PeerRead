@@ -1,0 +1,541 @@
+{
+  "name" : "1605.09410.pdf",
+  "metadata" : {
+    "source" : "CRF",
+    "title" : "End-to-End Instance Segmentation and Counting with Recurrent Attention",
+    "authors" : [ "Mengye Ren", "Richard S. Zemel" ],
+    "emails" : [ "mren@cs.toronto.edu", "zemel@cs.toronto.edu" ],
+    "sections" : [ {
+      "heading" : "1 Introduction",
+      "text" : "Instance segmentation is a fundamental computer vision problem, which aims to assign pixel-level instance labelling to a given image. While the standard semantic segmentation problem entails assigning class labels to each pixel in an image, it says nothing about the number of instances of each class in the image. Unlike semantic segmentation, instance segmentation is particularly difficult in terms of distinguising nearby and occluded objects. Segmenting at the instance level is useful for many tasks, such as highlighting the outline of objects for improved recognition and allowing robots to delineate and grasp individual objects. Obtaining instance level pixel labels is also significant with respect to general machine understanding of images.\nCounting the objects in an image is also of practical value, and is another problem of interest of this work. Traditionally, counting is performed in a task-specific setting, either by detection followed by regression, or by learning discriminatively with a counting distance metric [8]. Studies in applications such as image question answering [1, 16] also reveal that counting, especially on everyday objects, is a very challenging task on its own [3].\nOne of the main challenges of instance segmentation is object occlusion. Classical object detection pipelines [17] is composed of four stages: proposals, scoring, refinement, and non-maximal suppression (NMS). NMS typically utilizes a hard threshold that is fixed for the entire dataset. In cluttered scenes, NMS may suppress the detection results for a heavily occluded object because it has too much overlap with foreground objects. This challenge remains in the problem of instance segmentation, which is a more difficult version of object detection. One motivation of this work is to introduce a way of performing dynamic NMS to reason about occlusion.\nIn addition to object occlusion, another challenge is the dimensionality of the structured output, which is bounded by the number of pixels times the maximum number of objects. Standard fully\nar X\niv :1\n60 5.\n09 41\n0v 1\n[ cs\n.L G\n] 3\n0 M\nay 2\nconvolutional networks (FCN) [11] will have trouble directly outputting all instance labels in a single shot. Recent work on instance segmentation [21, 27, 26] formulates complex graphical models, which results in a complex and time-consuming pipeline. Furthermore, these models cannot be trained in an end-to-end fashion.\nTo tackle both these challenges, we propose a new model based on a recurrent neural network (RNN) that utilizes visual attention, to perform instance segmentation. Our system addresses the dimensionality issue by using a temporal chain that outputs a single instance at a time. It also performs dynamic NMS, using an object that is already segmented to aid in the discovery of an occluded object later in the sequence. Using an RNN to segment one instance at a time is also inspired by human-like iterative and attentive counting processes. For real-world cluttered scenes, iterative counting with attention will likely perform better than a regression model that operates on the global image level.\nIn this work, we focus on instance segmentation of a single object-type per image. We evaluate our model on a number of challenging datasets: 1) CVPPP leaf segmentation dataset [12]; 2) KITTI car segmentation dataset [5]; and 3) on MS-COCO [10] images, where we train two different models, for “person” and “zebra” categories, and test the model with images that contain at least one instance of the chosen category. We show state-of-the-art performance on both CVPPP and KITTI dataset, and impressive counting ability on MS-COCO."
+    }, {
+      "heading" : "2 Recurrent attention model",
+      "text" : "Our proposed model has four major components: A) a 2D external memory that tracks the state of the segmented objects; B) a box proposal network responsible for localizing objects of interest; C) a segmentation network for segmenting image pixels within the box; and D) a scoring network that determines if an object instance has been found, and also decides when to stop. See Figure 2 for an illustration of these components.\nNotation. We use the following notation to describe the model architecture: x ∈ RH×W is the input image; t indexes the iterations of the model, and τ indexes the glimpses of the inner RNN; yt, y∗t ∈ (0, 1)H×W is the segmentation output/ground-truth sequence; st, s∗t ∈ (0, 1) is the confidence score output/ground-truth sequence;W(z) = wT z + b is a learned affine transformation."
+    }, {
+      "heading" : "2.1 Part A: Model input and external 2D memory",
+      "text" : "We explore three variants of our model which differ in the first component. In one formulation the input is the raw image, and in the others the image is fed into a pretrained fully convolutional network (FCN). This Pretrained FCN has two channels of output. The first is a pixel-level foreground segmentation, produced by a variant of the DeconvNet [13] with skip connections. In addition to predicting this foreground mask, as a second channel we followed the work of Uhrig et al. [23] by producing a 2-d object angle map. For each foreground pixel, we calculate its relative angle towards\nthe centroid of the object, and quantize the angle into 8 different classes, as shown in Figure 3. The angle map forces the model to learn object boundary information, which is missing in the foreground segmentation. The architecture and training of these components are detailed in the Appendix. We denote D0(x) as the pretrained FCN applied to the original image.\nTo facilitate learning to sequentially enumerate the objects, we incorporate an external 2D memory in the RNN structure. We treat this 2D memory as the third channel of the model input. We explore two alternative formulations of this memory: 1) a cumulative canvas that stores the full history of segmentation outputs, and 2) a convolutional-RNN with extra parameters to dynamically adapt memory storage. Both operate at the full input resolution to precisely deal with occlusion.\n1. Cumulative canvas. We hypothesize that providing information of the completed segmentation helps the network reason about occluded objects and determine the next region of interest. The first channel of the canvas keeps adding new pixels from the output of the previous time step.\ndCanvast = [ct, D0(x)] , c Canvas 0 = 0, c Canvas t = max(ct−1, yt−1) ∀t > 0 (1)\n2. Convolutional LSTM. One issue of the cumulative canvas is that the recurrent connection from the output of the previous time step into the canvas sometimes leads to training instability. In practice, we observe that reducing the gradient flowing back from the input of the canvas aids training. An alternative is to learn the “addition” operation with another RNN. Convolutional LSTM [20] is a form of RNN that uses convolution as its recurrent operator and thus is able to efficiently process a 2D image input and store a 2D hidden state. We initialize the hidden state of the ConvLSTM with the\nFCN output, and feed the output segmentation back into the ConvLSTM (See Figure 2, right). This allows the gradient to flow through the ConvLSTM without introducing instability.\ndConvLSTM0 = D0(x), d ConvLSTM t = ConvLSTM(dt−1, yt−1) ∀t > 0 (2)"
+    }, {
+      "heading" : "2.2 Part B: Box network",
+      "text" : "The box network localizes objects of interest. The CNN in the box network outputs a H ′ ×W ′ × L feature map ubox,t. We employ a “soft-attention” mechanism here to extract useful information along spatial dimensions and feed a dimension L vector into the glimpse LSTM. Since one single glimpse may not give the upper network enough information to decide where exactly to draw the box, we allow the glimpse LSTM to look at different locations. α is initialized to be uniform over all locations, and τ indexes the glimpses.\nubox,t = CNN(dt), zt,τ = LSTM( ∑ h,w αh,wt,τ u h,w,l box,t , zt,τ−1), αt,τ+1 = MLP(zt,τ ) (3)\nWe pass the LSTM’s hidden state through a linear layer to obtain predicted box coordinates. We parameterize the box by its normalized center gX,Y , and log size log δX,Y . A scaling factor γ is also predicted by the linear layer, and used when re-projecting the patch to the original image size.\n(g̃X,Y , log δ̃X,Y , log σX,Y , γ) =W(zt,end) (4)\ngX , gY = (g̃X + 1) W\n2 , (g̃Y + 1)\nH\n2 , δX , δY = δ̃XW, δ̃YH (5)\nExtracting a sub-region. We follow DRAW [7] and use a Gaussian interpolation kernel to extract an N × N patch from the x̃, a concatenation of the original image with dt. We further allow the model to output rectangular patches to account for different shapes of the object.\nµiX , µ j Y = gX + (δX + 1) · (i−N/2 + 0.5)/N, gY + (δY + 1) · (j −N/2 + 0.5)/N (6)\nFX [a, i], FY [b, j] = 1√\n2πσX exp\n( − (a− µ i X) 2\n2σ2X\n) ,\n1√ 2πσY exp\n( − (b− µjY )2\n2σ2Y\n) (7)\npt = Extract(x̃t, FY , FX) ≡ FTY x̃tFX (8)"
+    }, {
+      "heading" : "2.3 Part C: Segmentation network",
+      "text" : "The remaining task is to segment out the pixels that belong to the dominant object within the window. In the segmentation network, we adopt a variant of the DeconvNet [13] with skip connections, which appends deconvolution (or convolution transpose) layers after convolution layers to upsample the low-resolution feature map to a full-size segmentation. After the fully convolutional layers, we get a patch-level segmentation prediction heat map ỹt. We then re-project this patch prediction to the original image using the transpose of the previous computed Gaussian filters. The learned γ to magnifies the signal within the bounding box, and a constant β to suppresses the pixels outside the box. Lastly, the sigmoid function produces final segmentation values between 0 and 1.\nyt = sigmoid ( γ · Extract(ỹt, FTY , FTX)− β ) (9)"
+    }, {
+      "heading" : "2.4 Part D: Scoring network",
+      "text" : "To estimate the number of objects in the image, and to terminate our sequential process, we incorporate a scoring network, similar to the one presented in [18]. Our scoring network takes information from the box and segmentation network to produce a score between 0 and 1.\nst = sigmoid(W(zt,end) +W(usegm)) (10)\nTermination condition. We train the entire model with a sequence length determined by the maximum number of objects plus one. During inference, we cut off iterations once the output score goes below 0.5. The loss function (described below) encourages scores to decrease monotonically."
+    }, {
+      "heading" : "2.5 Loss functions",
+      "text" : "Joint loss. The total loss function is a sum of three losses: the segmentation matching IoU loss Ly; the box IoU loss Lb; and the score cross-entropy loss Ls:\nL(y, b, s) = Ly(y, y ∗) + Lb(b, b ∗) + Ls(s, s ∗) (11)\n(a) Matching IoU loss (mIOU). A primary challenge of instance segmentation involves matching model and ground-truth instances. we compute a maximum-weighted bipartite graph matching between the output instances and ground-truth instances [22] and [18]. Matching makes the loss insensitive to the ordering of the ground-truth instances. Unlike coverage scores proposed in [21] it directly penalizes both false positive and false negative segmentation. The matching weight Mi,j is the IoU score between a pair of segmentation. We use the Hungarian algorithm to compute the matching.\nMi,j = softIOU(yi, y∗j ) ≡ ∑ yi · y∗j∑\nyi + y∗j − yi · y∗j (12)\nLy(y, y ∗) = −mIOU(y, y∗) ≡ − 1\nN ∑ i,j Mi,j1[match(yi) = y∗j ] (13)\n(b) Soft box IoU loss. Although the exact IoU can be derived from the 4-d box coordinates, its gradient vanishes when two boxes do not overlap, which can be problematic for gradient-based learning. Instead, we propose a soft version of the box IoU. We use the same Gaussian filter to re-project a constant patch on the original image, pad the ground-truth boxes and compute the mIOU between the predicted box and the matched padded ground-truth bounding box.\nbt = sigmoid(γ · Extract(1, FTY , FTX)− β) (14) Lb(b, b ∗) = −mIOU(b,Pad(b∗)) (15)\n(c) Monotonic score loss. To facilitate automatic termination, the network should output more confident objects first. We proposed a loss function that encourages monotonically decreasing values in the score output. Iterations with target score 1 are compared to the lower bound of preceding scores, and 0 targets to the upper bound of subsequent scores.\nLs(s, s ∗) = ∑ t −s∗t log ( max t′=t...T−1 {st′} ) − (1− s∗t ) log ( 1− min t′=0...t {st′} ) (16)"
+    }, {
+      "heading" : "2.6 Training procedure and post-processing",
+      "text" : "Bootstrap training. The box and segmentation networks rely on the output of each other to make decisions for the next time-step. Because of the coupled nature of the two networks, we propose a bootstrap training procedure: these networks are pre-trained with ground-truth segmentation and boxes, respectively, and in later stages we replace the ground-truth with the model predicted values.\nScheduled sampling. To smooth out the transition between stages, we explore the idea of “scheduled sampling” [2] where we gradually remove the reliance on ground-truth segmentation at the input of the network. As shown in Figure 2, during training there is a dynamic switch in the input of the external memory, to utilize either the maximally overlapping ground-truth instance segmentation, or the output of the network from the previous time step.\nPost-processing. We truncate segmentation outside the predicted foreground mask, fill holes with the labels from the nearest neighboring predicted instance, and remove object segmentation of size smaller than 425 square pixels. We study the effect of post-processing in ablation studies in Table 3."
+    }, {
+      "heading" : "3 Related Work",
+      "text" : "Instance segmentation has recently received a burst of research attention, as it provides higher level of precision of image understanding compared to object detection and semantic segmentation.\nInstance segmentation using graphical models. An early exploration of instance segmentation proposes a multi-stage pipeline composed of patch-wise features based on deep learning, combined\ninto a segmentation tree [21]. They formulated a new loss function, the coverage score, that calculated the amount of ground truth regions not covered by the model’s instance segmentation. More recently, Zhang et al. [26] formulated a dense CRF for instance segmentation; . They apply a CNN on dense image patches to make local predictions, and constructed a dense CRF to produce globally consistent labellings. Their key contribution is a shifting-label potential that encourages consistency across different patches. They achieved strong results on the challenging KITTI object dataset; however, the graphical model formulation entails long running times, and their energy functions are dependent on instances being connected and having a clear depth ordering.\nInstance segmentation using CNN. Liang et al. [9] used a CNN to generate pixel-level object size information, and used clustering as a post-processing step. They added a regressor at the top of the CNN to estimate the count, which is the total number of clusters. An erroneous count can usually leads to poor segmentation. Dai et al. [4] proposed a pipeline-based approach and won the MS-COCO instance segmentation challenge. Their method first predicts bounding box proposals and extracts regions of interest (ROI), then uses shared features to perform segmentation within each ROI. Their architecture can also be fine-tuned end-to-end. However, since their method is based on detector proposals, it does not explicitly handle object occlusions, which may lead it to fail during non- maximal suppression (NMS). Uhrig et al. [23] presented another approach with FCN, and achieved very impressive results. Their FCN outputs three channels: semantic segmentation, object orientation and depth. Post-processing based on template matching and instance fusion produce the instance identities. Their approach is based on bottom-up clustering since their FCN can only provide pixel-level information, whereas our model is processing the image in a top-down fashion. Importantly, they also used ground-truth depth labels in training their model.\nInstance segmentation using RNN. Another recent line of research, e.g. [22, 15, 18] employs endto-end recurrent neural networks (RNN) to perform object detection and segmentation. A permutation agnostic loss function based on maximum weighted bipartite matching was proposed by [22]. To process an entire image, they treat each element of a 15 × 20 feature map individually. Similarly, our box proposal network also uses an RNN to generate box proposals: instead of running the image 300 times through the RNN, we only run it once by using a soft attention mechanism [24]. RomeraParedes and Torr [18] use convolutional LSTM (ConvLSTM) [20] to produce instance segmentation directly. However, since their ConvLSTM is required to handle object detection, inhibition, and segmentation all at the same time on a global scale, the final output loses precision. They add a dense CRF to restore the resolution. Compared to their approach, our segmentation network operates on a local level. Instead of resorting to graphical models, we added skip connections to restore the resolution.\nInstance counting. Previous work on object counting in images has mainly focused on crowds of pedestrians and biological cells [8]. Chattopadhyay et al. [3] focused on counting questions in VQA and proposed detector approaches as well as a regression based method (“associative subitizing”) that works on a 3× 3 field of CNN features level. Note that unlike our approach, this method does not provide instance segmentations."
+    }, {
+      "heading" : "4 Experiments",
+      "text" : "CVPPP leaf segmentation. One instance segmentation benchmark is the CVPPP plant leaf dataset [12], which was developed due to the importance of instance segmentation in plant phenotyping. We ran the A1 subset of CVPPP plant leaf segmentation dataset. We trained our model on 128 labelled images, and report results on the 33 test images. We compare our performance to [18], and other top approaches that were published with the CVPPP conference; see the collation study [19] for details of these other approaches.\nKITTI car segmentation. Instance segmentation also provides rich information in the context of autonomous driving. Following [27, 26, 23], we also evaluated the model performance on KITTI car segmentation dataset. We trained the model with 3712 training images, and report performance on 144 test images. We also examine the relative importance of model components via ablation studies.\nMS-COCO counting. Additionally, we train class specific models on MS-COCO and test counting performance on the results. We chose “person” and “zebra” because these are the two of the most common classes in VQA questions. We report counting performance on images with at least one instance of the class: 677 zebra images, and 21,634 “person” images.\nTable 1: Leaf segmentation and counting performance\nTable 2: Counting performance on MS-COCO\nEvaluation metrics. We report the metrics used by the other studies in the respective benchmarks: symmetric best dice (SBD) for leaf segmentation (see Equations 17, 18) and mean (weighted) coverage (MWCov, MUCov) for car segmentation (see Equations 19, 20). The coverage scores measure the instance-wise IoU for each ground-truth instance averaged over the image; MWCov further weights the score by the size of the ground-truth instance segmentation (larger objects get larger weights).\nDICE(A,B) = 2|A ∪B| |A|+ |B|\nBD({Ai}, B) = max i DICE(Ai, B) (17)\nSBD({ŷi}, {yj}) = min  1 N ∑ j BD({ŷi}, yj), 1 N ∑ i BD(ŷi, {yj})  (18) MWCov({yi}, {y∗j }) = 1\nN ∑ i |yi|∑ i |yi| max j IoU(yi, y∗j ) (19)\nMUCov({yi}, {y∗j }) = 1\nN ∑ i max j IoU(yi, y∗j ) (20)\nCounting is measured in absolute difference in count (|DiC|) (see Equation 21), average false positive (AvgFP), and average false negative (AvgFN). False positive is the number of predicted instances that do not overlap with the ground-truth, and false negative is the number of ground-truth instances that do not overlap with the prediction.\n|DiC| = 1 N ∑ i |counti − count∗i | (21)"
+    }, {
+      "heading" : "4.1 Results & discussion",
+      "text" : "In the leaf segmentation task, our best model outperforms the previous state-of-the-art by a large margin in both segmentation and counting. Table 1 shows that the models with FCN overfit and scores lower than the simpler version. This is sensible as the dataset size is small, and including the FCN significantly increases the input dimension and number of parameters.\nIn the car segmentation task, our model achieves the state-of-the-art MWCov shown in Table 3, but our MUCov is lower than results reported by Uhrig et al. [23]. One possible explanation is their inclusion of depth information during training, which may help the model disambiguate distant object boundaries. Moreover, their bottom-up “instance fusion” method plays a crucial role (omitting this leads to a steep performance drop); this likely helps segment smaller objects, whereas our box network does not reliably detect distant cars.\nIn the zebra counting task, we found that our model outperforms the detector and NMS method, and associative-subitizing methods [3], but we are not doing as well in the person category. However, relative to these regression-based methods, our model permits insight into the recognition of each instance by inspecting the output segmentation. Figure 6 shows the relation between counting performance and number of instances. Mean absolute difference in count is around 1 for up to 18 leaves, 7 cars, 4 zebras and 3 people.\nFrom the figures above we see our model is handling a significant amount of object occlusion and truncation. We verified that the external memory helps with the counting process as the network first segments the more salient objects and then accounts for the occluded instances. In addition, our segmentation network can handle a range of object sizes because of the design of the box network.\nWe found that using scheduled sampling results in much better performance. It helps by making training resemble testing, gradually forcing the model to carry out a full sequence during training instead of relying on ground-truth input. Finally, the convolutional and attentional architecture significantly reduces the number of parameters and the performance is quite strong despite being trained with only 100 leaf images and 1000 zebra images."
+    }, {
+      "heading" : "5 Conclusion",
+      "text" : "In this work, we borrow intuition from human counting and formulate instance segmentation and counting as a recurrent attentive process. Our end-to-end recurrent architecture demonstrates significant improvement compared to earlier exploration of using RNN on the same tasks, and shows state-of-the-art results on challenging leaf and car segmentation datasets. We address the classic object occlusion problem with a recurrent external memory, and the attention structure brings segmentation at a fine resolution. Our model also shows promising counting performance on a portion of the MS-COCO dataset."
+    }, {
+      "heading" : "A Training procedure specification",
+      "text" : "We used the Adam optimizer with learning rate 0.001 and batch size of 8. The learning rate is multiplied by 0.85 for every 5000 steps of training.\nA.1 Scheduled sampling\nWe denote θt as the probability of feeding in ground-truth segmentation that has the greatest overlap with the previous prediction, as opposed to model output. θt follows exponential decay as training goes on, and for larger t, the decay occurs later:\nθt = min ( Γt exp ( −epoch− S\nS2\n) , 1 ) (22)\nΓt = 1 + log(1 +Kt) (23)\nwhere epoch is the training index, S, S2, and K are constants. In the experiments reported here, their values are 10000, 2885, and 3."
+    }, {
+      "heading" : "B Model architecture",
+      "text" : "B.1 Foreground + Orientation FCN\nWe resize the image to uniform size. For CVPPP and MS-COCO dataset, we adopt a uniform size of 224× 224, and for KITTI, we adopt 128× 448. Table 4 lists the specification of all layers.\nTable 5: External memory specification\nName Filter spec Size CVPPP/MS-COCO Size KITTI\nConvLSTM 3× 3 224× 224× 9 128× 448× 9\nB.2 External memory\nB.3 Box network\nThe box network takes in 9 channel input. Either directly from the output of the FCN, or from the hidden state of the ConvLSTM. It goes through a CNN structure again and uses the attention vector predicted by the LSTM to perform dynamic pooling in the last layer. The CNN hyperparameters are listed in Table 6 and the LSTM and glimpse MLP hyperparameters are listed in Table 7. The glimpse MLP takes input from the hidden state of the LSTM and ouputs a vector of normalized weighting over all the box CNN feature map spatial grids.\nB.4 Segmentation network\nThe segmentation networks takes in a patch size 48 × 48 with multiple channels. The first three channels are the original image R, G, B channels. Then there are 8 channels of orientation angles, and then 1 channel of foreground heat map, all predicted by FCN. Full detail is listed in Table 8. Constant β is chosen to be 5."
+    } ],
+    "references" : [ {
+      "title" : "VQA: Visual question answering",
+      "author" : [ "S. Antol", "A. Agrawal", "J. Lu", "M. Mitchell", "D. Batra", "C.L. Zitnick", "D. Parikh" ],
+      "venue" : "ICCV,",
+      "citeRegEx" : "1",
+      "shortCiteRegEx" : null,
+      "year" : 2015
+    }, {
+      "title" : "Scheduled sampling for sequence prediction with recurrent neural networks",
+      "author" : [ "S. Bengio", "O. Vinyals", "N. Jaitly", "N. Shazeer" ],
+      "venue" : "NIPS,",
+      "citeRegEx" : "2",
+      "shortCiteRegEx" : null,
+      "year" : 2015
+    }, {
+      "title" : "Counting everyday objects in everyday scenes",
+      "author" : [ "P. Chattopadhyay", "R. Vedantam", "R.S. Ramprasaath", "D. Batra", "D. Parikh" ],
+      "venue" : "CoRR, abs/1604.03505,",
+      "citeRegEx" : "3",
+      "shortCiteRegEx" : null,
+      "year" : 2016
+    }, {
+      "title" : "Instance-aware semantic segmentation via multi-task network cascades",
+      "author" : [ "J. Dai", "K. He", "J. Sun" ],
+      "venue" : "CoRR, abs/1512.04412,",
+      "citeRegEx" : "4",
+      "shortCiteRegEx" : null,
+      "year" : 2015
+    }, {
+      "title" : "Are we ready for autonomous driving? The KITTI vision benchmark suite",
+      "author" : [ "A. Geiger", "P. Lenz", "R. Urtasun" ],
+      "venue" : "CVPR,",
+      "citeRegEx" : "5",
+      "shortCiteRegEx" : null,
+      "year" : 2012
+    }, {
+      "title" : "Learning to count leaves in rosette plants",
+      "author" : [ "M.V. Giuffrida", "M. Minervini", "S. Tsaftaris" ],
+      "venue" : "Proceedings of the Computer Vision Problems in Plant Phenotyping (CVPPP),",
+      "citeRegEx" : "6",
+      "shortCiteRegEx" : null,
+      "year" : 2015
+    }, {
+      "title" : "DRAW: A recurrent neural network for image generation",
+      "author" : [ "K. Gregor", "I. Danihelka", "A. Graves", "D.J. Rezende", "D. Wierstra" ],
+      "venue" : "ICML,",
+      "citeRegEx" : "7",
+      "shortCiteRegEx" : null,
+      "year" : 2015
+    }, {
+      "title" : "Learning to count objects in images",
+      "author" : [ "V.S. Lempitsky", "A. Zisserman" ],
+      "venue" : "NIPS,",
+      "citeRegEx" : "8",
+      "shortCiteRegEx" : null,
+      "year" : 2010
+    }, {
+      "title" : "Proposal-free network for instance-level object segmentation",
+      "author" : [ "X. Liang", "Y. Wei", "X. Shen", "J. Yang", "L. Lin", "S. Yan" ],
+      "venue" : "CoRR, abs/1509.02636,",
+      "citeRegEx" : "9",
+      "shortCiteRegEx" : null,
+      "year" : 2015
+    }, {
+      "title" : "Microsoft COCO: Common Objects in Context",
+      "author" : [ "T. Lin", "M. Maire", "S. Belongie", "J. Hays", "P. Perona", "D. Ramanan", "P. Dollár", "C.L. Zitnick" ],
+      "venue" : "ECCV,",
+      "citeRegEx" : "10",
+      "shortCiteRegEx" : null,
+      "year" : 2014
+    }, {
+      "title" : "Fully convolutional networks for semantic segmentation",
+      "author" : [ "J. Long", "E. Shelhamer", "T. Darrell" ],
+      "venue" : "CVPR,",
+      "citeRegEx" : "11",
+      "shortCiteRegEx" : null,
+      "year" : 2015
+    }, {
+      "title" : "Finely-grained annotated datasets for imagebased plant phenotyping",
+      "author" : [ "M. Minervini", "A. Fischbach", "H. Scharr", "S.A. Tsaftaris" ],
+      "venue" : "Pattern Recognition Letters,",
+      "citeRegEx" : "12",
+      "shortCiteRegEx" : null,
+      "year" : 2015
+    }, {
+      "title" : "Learning deconvolution network for semantic segmentation",
+      "author" : [ "H. Noh", "S. Hong", "B. Han" ],
+      "venue" : "ICCV,",
+      "citeRegEx" : "13",
+      "shortCiteRegEx" : null,
+      "year" : 2015
+    }, {
+      "title" : "3-d histogram-based segmentation and leaf detection for rosette plants",
+      "author" : [ "J. Pape", "C. Klukas" ],
+      "venue" : "ECCV Workshops,",
+      "citeRegEx" : "14",
+      "shortCiteRegEx" : null,
+      "year" : 2014
+    }, {
+      "title" : "Learning to decompose for object detection and instance segmentation",
+      "author" : [ "E. Park", "A.C. Berg" ],
+      "venue" : "CoRR, abs/1511.06449,",
+      "citeRegEx" : "15",
+      "shortCiteRegEx" : null,
+      "year" : 2015
+    }, {
+      "title" : "Exploring models and data for image question answering",
+      "author" : [ "M. Ren", "R. Kiros", "R.S. Zemel" ],
+      "venue" : "NIPS,",
+      "citeRegEx" : "16",
+      "shortCiteRegEx" : null,
+      "year" : 2015
+    }, {
+      "title" : "Faster R-CNN: Towards real-time object detection with region proposal networks",
+      "author" : [ "S. Ren", "K. He", "R.B. Girshick", "J. Sun" ],
+      "venue" : "NIPS,",
+      "citeRegEx" : "17",
+      "shortCiteRegEx" : null,
+      "year" : 2015
+    }, {
+      "title" : "Recurrent instance segmentation",
+      "author" : [ "B. Romera-Paredes", "P.H.S. Torr" ],
+      "venue" : "CoRR, abs/1511.08250,",
+      "citeRegEx" : "18",
+      "shortCiteRegEx" : null,
+      "year" : 2015
+    }, {
+      "title" : "Leaf segmentation in plant phenotyping: A collation study",
+      "author" : [ "H. Scharr", "M. Minervini", "A.P. French", "C. Klukas", "D.M. Kramer", "X. Liu", "I. Luengo", "J. Pape", "G. Polder", "D. Vukadinovic", "X. Yin", "S.A. Tsaftaris" ],
+      "venue" : "Mach. Vis. Appl., 27(4):585–606,",
+      "citeRegEx" : "19",
+      "shortCiteRegEx" : null,
+      "year" : 2016
+    }, {
+      "title" : "Convolutional LSTM network: A machine learning approach for precipitation nowcasting",
+      "author" : [ "X. Shi", "Z. Chen", "H. Wang", "D. Yeung", "W. Wong", "W. Woo" ],
+      "venue" : "NIPS,",
+      "citeRegEx" : "20",
+      "shortCiteRegEx" : null,
+      "year" : 2015
+    }, {
+      "title" : "Instance segmentation of indoor scenes using a coverage loss",
+      "author" : [ "N. Silberman", "D. Sontag", "R. Fergus" ],
+      "venue" : "ECCV,",
+      "citeRegEx" : "21",
+      "shortCiteRegEx" : null,
+      "year" : 2014
+    }, {
+      "title" : "End-to-end people detection in crowded scenes",
+      "author" : [ "R. Stewart", "M. Andriluka" ],
+      "venue" : "CoRR, abs/1506.04878,",
+      "citeRegEx" : "22",
+      "shortCiteRegEx" : null,
+      "year" : 2016
+    }, {
+      "title" : "Pixel-level encoding and depth layering for instance-level semantic labeling",
+      "author" : [ "J. Uhrig", "M. Cordts", "U. Franke", "T. Brox" ],
+      "venue" : "CoRR, abs/1604.05096,",
+      "citeRegEx" : "23",
+      "shortCiteRegEx" : null,
+      "year" : 2016
+    }, {
+      "title" : "Show, attend and tell: Neural image caption generation with visual attention",
+      "author" : [ "K. Xu", "J. Ba", "R. Kiros", "K. Cho", "A.C. Courville", "R. Salakhutdinov", "R.S. Zemel", "Y. Bengio" ],
+      "venue" : "ICML,",
+      "citeRegEx" : "24",
+      "shortCiteRegEx" : null,
+      "year" : 2015
+    }, {
+      "title" : "Multi-leaf tracking from fluorescence plant videos",
+      "author" : [ "X. Yin", "X. Liu", "J. Chen", "D.M. Kramer" ],
+      "venue" : "ICIP,",
+      "citeRegEx" : "25",
+      "shortCiteRegEx" : null,
+      "year" : 2014
+    }, {
+      "title" : "Instance-level segmentation with deep densely connected MRFs",
+      "author" : [ "Z. Zhang", "S. Fidler", "R. Urtasun" ],
+      "venue" : "CoRR, abs/1512.06735,",
+      "citeRegEx" : "26",
+      "shortCiteRegEx" : null,
+      "year" : 2015
+    }, {
+      "title" : "Monocular object instance segmentation and depth ordering with CNNs",
+      "author" : [ "Z. Zhang", "A.G. Schwing", "S. Fidler", "R. Urtasun" ],
+      "venue" : "ICCV,",
+      "citeRegEx" : "27",
+      "shortCiteRegEx" : null,
+      "year" : 2015
+    } ],
+    "referenceMentions" : [ {
+      "referenceID" : 11,
+      "context" : "The proposed model achieves state-of-the-art results on the CVPPP leaf segmentation dataset [12] and KITTI vehicle segmentation dataset [5].",
+      "startOffset" : 92,
+      "endOffset" : 96
+    }, {
+      "referenceID" : 4,
+      "context" : "The proposed model achieves state-of-the-art results on the CVPPP leaf segmentation dataset [12] and KITTI vehicle segmentation dataset [5].",
+      "startOffset" : 136,
+      "endOffset" : 139
+    }, {
+      "referenceID" : 7,
+      "context" : "Traditionally, counting is performed in a task-specific setting, either by detection followed by regression, or by learning discriminatively with a counting distance metric [8].",
+      "startOffset" : 173,
+      "endOffset" : 176
+    }, {
+      "referenceID" : 0,
+      "context" : "Studies in applications such as image question answering [1, 16] also reveal that counting, especially on everyday objects, is a very challenging task on its own [3].",
+      "startOffset" : 57,
+      "endOffset" : 64
+    }, {
+      "referenceID" : 15,
+      "context" : "Studies in applications such as image question answering [1, 16] also reveal that counting, especially on everyday objects, is a very challenging task on its own [3].",
+      "startOffset" : 57,
+      "endOffset" : 64
+    }, {
+      "referenceID" : 2,
+      "context" : "Studies in applications such as image question answering [1, 16] also reveal that counting, especially on everyday objects, is a very challenging task on its own [3].",
+      "startOffset" : 162,
+      "endOffset" : 165
+    }, {
+      "referenceID" : 16,
+      "context" : "Classical object detection pipelines [17] is composed of four stages: proposals, scoring, refinement, and non-maximal suppression (NMS).",
+      "startOffset" : 37,
+      "endOffset" : 41
+    }, {
+      "referenceID" : 10,
+      "context" : "convolutional networks (FCN) [11] will have trouble directly outputting all instance labels in a single shot.",
+      "startOffset" : 29,
+      "endOffset" : 33
+    }, {
+      "referenceID" : 20,
+      "context" : "Recent work on instance segmentation [21, 27, 26] formulates complex graphical models, which results in a complex and time-consuming pipeline.",
+      "startOffset" : 37,
+      "endOffset" : 49
+    }, {
+      "referenceID" : 26,
+      "context" : "Recent work on instance segmentation [21, 27, 26] formulates complex graphical models, which results in a complex and time-consuming pipeline.",
+      "startOffset" : 37,
+      "endOffset" : 49
+    }, {
+      "referenceID" : 25,
+      "context" : "Recent work on instance segmentation [21, 27, 26] formulates complex graphical models, which results in a complex and time-consuming pipeline.",
+      "startOffset" : 37,
+      "endOffset" : 49
+    }, {
+      "referenceID" : 11,
+      "context" : "We evaluate our model on a number of challenging datasets: 1) CVPPP leaf segmentation dataset [12]; 2) KITTI car segmentation dataset [5]; and 3) on MS-COCO [10] images, where we train two different models, for “person” and “zebra” categories, and test the model with images that contain at least one instance of the chosen category.",
+      "startOffset" : 94,
+      "endOffset" : 98
+    }, {
+      "referenceID" : 4,
+      "context" : "We evaluate our model on a number of challenging datasets: 1) CVPPP leaf segmentation dataset [12]; 2) KITTI car segmentation dataset [5]; and 3) on MS-COCO [10] images, where we train two different models, for “person” and “zebra” categories, and test the model with images that contain at least one instance of the chosen category.",
+      "startOffset" : 134,
+      "endOffset" : 137
+    }, {
+      "referenceID" : 9,
+      "context" : "We evaluate our model on a number of challenging datasets: 1) CVPPP leaf segmentation dataset [12]; 2) KITTI car segmentation dataset [5]; and 3) on MS-COCO [10] images, where we train two different models, for “person” and “zebra” categories, and test the model with images that contain at least one instance of the chosen category.",
+      "startOffset" : 157,
+      "endOffset" : 161
+    }, {
+      "referenceID" : 12,
+      "context" : "The first is a pixel-level foreground segmentation, produced by a variant of the DeconvNet [13] with skip connections.",
+      "startOffset" : 91,
+      "endOffset" : 95
+    }, {
+      "referenceID" : 22,
+      "context" : "[23] by producing a 2-d object angle map.",
+      "startOffset" : 0,
+      "endOffset" : 4
+    }, {
+      "referenceID" : 19,
+      "context" : "Convolutional LSTM [20] is a form of RNN that uses convolution as its recurrent operator and thus is able to efficiently process a 2D image input and store a 2D hidden state.",
+      "startOffset" : 19,
+      "endOffset" : 23
+    }, {
+      "referenceID" : 6,
+      "context" : "We follow DRAW [7] and use a Gaussian interpolation kernel to extract an N × N patch from the x̃, a concatenation of the original image with dt.",
+      "startOffset" : 15,
+      "endOffset" : 18
+    }, {
+      "referenceID" : 12,
+      "context" : "In the segmentation network, we adopt a variant of the DeconvNet [13] with skip connections, which appends deconvolution (or convolution transpose) layers after convolution layers to upsample the low-resolution feature map to a full-size segmentation.",
+      "startOffset" : 65,
+      "endOffset" : 69
+    }, {
+      "referenceID" : 17,
+      "context" : "To estimate the number of objects in the image, and to terminate our sequential process, we incorporate a scoring network, similar to the one presented in [18].",
+      "startOffset" : 155,
+      "endOffset" : 159
+    }, {
+      "referenceID" : 21,
+      "context" : "we compute a maximum-weighted bipartite graph matching between the output instances and ground-truth instances [22] and [18].",
+      "startOffset" : 111,
+      "endOffset" : 115
+    }, {
+      "referenceID" : 17,
+      "context" : "we compute a maximum-weighted bipartite graph matching between the output instances and ground-truth instances [22] and [18].",
+      "startOffset" : 120,
+      "endOffset" : 124
+    }, {
+      "referenceID" : 20,
+      "context" : "Unlike coverage scores proposed in [21] it directly penalizes both false positive and false negative segmentation.",
+      "startOffset" : 35,
+      "endOffset" : 39
+    }, {
+      "referenceID" : 1,
+      "context" : "To smooth out the transition between stages, we explore the idea of “scheduled sampling” [2] where we gradually remove the reliance on ground-truth segmentation at the input of the network.",
+      "startOffset" : 89,
+      "endOffset" : 92
+    }, {
+      "referenceID" : 20,
+      "context" : "into a segmentation tree [21].",
+      "startOffset" : 25,
+      "endOffset" : 29
+    }, {
+      "referenceID" : 25,
+      "context" : "[26] formulated a dense CRF for instance segmentation; .",
+      "startOffset" : 0,
+      "endOffset" : 4
+    }, {
+      "referenceID" : 8,
+      "context" : "[9] used a CNN to generate pixel-level object size information, and used clustering as a post-processing step.",
+      "startOffset" : 0,
+      "endOffset" : 3
+    }, {
+      "referenceID" : 3,
+      "context" : "[4] proposed a pipeline-based approach and won the MS-COCO instance segmentation challenge.",
+      "startOffset" : 0,
+      "endOffset" : 3
+    }, {
+      "referenceID" : 22,
+      "context" : "[23] presented another approach with FCN, and achieved very impressive results.",
+      "startOffset" : 0,
+      "endOffset" : 4
+    }, {
+      "referenceID" : 21,
+      "context" : "[22, 15, 18] employs endto-end recurrent neural networks (RNN) to perform object detection and segmentation.",
+      "startOffset" : 0,
+      "endOffset" : 12
+    }, {
+      "referenceID" : 14,
+      "context" : "[22, 15, 18] employs endto-end recurrent neural networks (RNN) to perform object detection and segmentation.",
+      "startOffset" : 0,
+      "endOffset" : 12
+    }, {
+      "referenceID" : 17,
+      "context" : "[22, 15, 18] employs endto-end recurrent neural networks (RNN) to perform object detection and segmentation.",
+      "startOffset" : 0,
+      "endOffset" : 12
+    }, {
+      "referenceID" : 21,
+      "context" : "A permutation agnostic loss function based on maximum weighted bipartite matching was proposed by [22].",
+      "startOffset" : 98,
+      "endOffset" : 102
+    }, {
+      "referenceID" : 23,
+      "context" : "Similarly, our box proposal network also uses an RNN to generate box proposals: instead of running the image 300 times through the RNN, we only run it once by using a soft attention mechanism [24].",
+      "startOffset" : 192,
+      "endOffset" : 196
+    }, {
+      "referenceID" : 17,
+      "context" : "RomeraParedes and Torr [18] use convolutional LSTM (ConvLSTM) [20] to produce instance segmentation directly.",
+      "startOffset" : 23,
+      "endOffset" : 27
+    }, {
+      "referenceID" : 19,
+      "context" : "RomeraParedes and Torr [18] use convolutional LSTM (ConvLSTM) [20] to produce instance segmentation directly.",
+      "startOffset" : 62,
+      "endOffset" : 66
+    }, {
+      "referenceID" : 7,
+      "context" : "Previous work on object counting in images has mainly focused on crowds of pedestrians and biological cells [8].",
+      "startOffset" : 108,
+      "endOffset" : 111
+    }, {
+      "referenceID" : 2,
+      "context" : "[3] focused on counting questions in VQA and proposed detector approaches as well as a regression based method (“associative subitizing”) that works on a 3× 3 field of CNN features level.",
+      "startOffset" : 0,
+      "endOffset" : 3
+    }, {
+      "referenceID" : 11,
+      "context" : "One instance segmentation benchmark is the CVPPP plant leaf dataset [12], which was developed due to the importance of instance segmentation in plant phenotyping.",
+      "startOffset" : 68,
+      "endOffset" : 72
+    }, {
+      "referenceID" : 17,
+      "context" : "We compare our performance to [18], and other top approaches that were published with the CVPPP conference; see the collation study [19] for details of these other approaches.",
+      "startOffset" : 30,
+      "endOffset" : 34
+    }, {
+      "referenceID" : 18,
+      "context" : "We compare our performance to [18], and other top approaches that were published with the CVPPP conference; see the collation study [19] for details of these other approaches.",
+      "startOffset" : 132,
+      "endOffset" : 136
+    }, {
+      "referenceID" : 26,
+      "context" : "Following [27, 26, 23], we also evaluated the model performance on KITTI car segmentation dataset.",
+      "startOffset" : 10,
+      "endOffset" : 22
+    }, {
+      "referenceID" : 25,
+      "context" : "Following [27, 26, 23], we also evaluated the model performance on KITTI car segmentation dataset.",
+      "startOffset" : 10,
+      "endOffset" : 22
+    }, {
+      "referenceID" : 22,
+      "context" : "Following [27, 26, 23], we also evaluated the model performance on KITTI car segmentation dataset.",
+      "startOffset" : 10,
+      "endOffset" : 22
+    }, {
+      "referenceID" : 17,
+      "context" : "RIS+CRF [18] 66.",
+      "startOffset" : 8,
+      "endOffset" : 12
+    }, {
+      "referenceID" : 18,
+      "context" : "9) MSU [19] 66.",
+      "startOffset" : 7,
+      "endOffset" : 11
+    }, {
+      "referenceID" : 18,
+      "context" : "6) Nottingham [19] 68.",
+      "startOffset" : 14,
+      "endOffset" : 18
+    }, {
+      "referenceID" : 24,
+      "context" : "0) Wageningen [25] 71.",
+      "startOffset" : 14,
+      "endOffset" : 18
+    }, {
+      "referenceID" : 13,
+      "context" : "6) IPK [14] 74.",
+      "startOffset" : 7,
+      "endOffset" : 11
+    }, {
+      "referenceID" : 5,
+      "context" : "8) PRIAn [6] 1.",
+      "startOffset" : 9,
+      "endOffset" : 12
+    }, {
+      "referenceID" : 2,
+      "context" : "detect [3] Person 3.",
+      "startOffset" : 7,
+      "endOffset" : 10
+    }, {
+      "referenceID" : 2,
+      "context" : "22 aso-sub [3] Person 1.",
+      "startOffset" : 11,
+      "endOffset" : 14
+    }, {
+      "referenceID" : 2,
+      "context" : "detect [3] Zebra 2.",
+      "startOffset" : 7,
+      "endOffset" : 10
+    }, {
+      "referenceID" : 2,
+      "context" : "56 aso-sub [3] Zebra 1.",
+      "startOffset" : 11,
+      "endOffset" : 14
+    }, {
+      "referenceID" : 26,
+      "context" : "DenseCRFv1 [27] 77.",
+      "startOffset" : 11,
+      "endOffset" : 15
+    }, {
+      "referenceID" : 25,
+      "context" : "736 DenseCRFv2 [26] 78.",
+      "startOffset" : 15,
+      "endOffset" : 19
+    }, {
+      "referenceID" : 22,
+      "context" : "833 FCN+Depth [23] 84.",
+      "startOffset" : 14,
+      "endOffset" : 18
+    }, {
+      "referenceID" : 22,
+      "context" : "[23].",
+      "startOffset" : 0,
+      "endOffset" : 4
+    }, {
+      "referenceID" : 2,
+      "context" : "In the zebra counting task, we found that our model outperforms the detector and NMS method, and associative-subitizing methods [3], but we are not doing as well in the person category.",
+      "startOffset" : 128,
+      "endOffset" : 131
+    } ],
+    "year" : 2016,
+    "abstractText" : "While convolutional neural networks have gained impressive success recently in solving structured prediction problems such as semantic segmentation, it remains a challenge to differentiate individual object instances in the scene. Instance segmentation is very important in a variety of applications, such as autonomous driving, image captioning, and visual question answering. Techniques that combine large graphical models with low-level vision have been proposed to address this problem; however, we propose an end-to-end recurrent neural network (RNN) architecture with an attention mechanism to model a human-like counting process, and produce detailed instance segmentations. The network is jointly trained to sequentially produce regions of interest as well as a dominant object segmentation within each region. The proposed model achieves state-of-the-art results on the CVPPP leaf segmentation dataset [12] and KITTI vehicle segmentation dataset [5].",
+    "creator" : "LaTeX with hyperref package"
+  }
+}

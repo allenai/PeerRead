@@ -1,0 +1,370 @@
+{
+  "name" : "1608.05675.pdf",
+  "metadata" : {
+    "source" : "META",
+    "title" : "lpopt: A Rule Optimization Tool for Answer Set Programming Author=Manuel Bichler, Michael Morak, and Stefan Woltran",
+    "authors" : [ "Manuel Bichler", "Michael Morak", "Stefan Woltran" ],
+    "emails" : [ "surname@dbai.tuwien.ac.at" ],
+    "sections" : [ {
+      "heading" : "1 Introduction",
+      "text" : "Answer set programming (ASP) [15,17,8,13] is a well-established logic programming paradigm based on the stable model semantics of logic programs. Its main advantage is an intuitive, declarative language, and the fact that, generally, each answer set of a given logic program describes a valid answer to the original question. Moreover, ASP solvers—see e.g. [14,1,12,2]—have made huge strides in efficiency.\nA logic program usually consists of a set of logical implications by which new facts can be inferred from existing ones, and a set of facts that represent the concrete input instance. Logic programming in general, and ASP in particular, have also gained popularity because of their intuitive, declarative syntax. The following example illustrates this:\nExample 1. The following rule naturally expresses the fact that two people are relatives of the same generation up to second cousin if they share a great-grandparent.\nuptosecondcousin(X, Y) :- parent(X, PX), parent(PX, GPX), parent(GPX, GGP), parent(GPY, GGP), parent(PY, GPY), parent(Y, PY), X != Y.\nar X\niv :1\n60 8.\n05 67\n5v 2\n[ cs\n.L O\n] 2\n3 A\nug 2\nRules written in an intuitive fashion, like the one in the above example, are usually larger than strictly necessary. Unfortunately, the use of large rules causes problems for current ASP solvers since the input program is grounded first (i.e. all the variables in each rule are replaced by all possible, valid combinations of constants). This grounding step generally requires exponential time for rules of arbitrary size. In practice, the grounding time can thus become prohibitively large. Also, the ASP solver is usually quicker in evaluating the program if the grounding size remains small.\nIn order to increase solving performance, we could therefore split the rule in Example 1 up into several smaller ones by hand, keeping track of grandparents and greatgrandparents in separate predicates, and then writing a smaller version of the second cousin rule. While this is comparatively easy to do for this example, this can become very tedious if the rules become even more complex and larger, maybe also involving negation or arithmetic expressions. However, since current ASP grounders and solvers become increasingly slower with larger rules, and noting the fact that ASP programs often need expert hand-tuning to perform well in practice, this represents a significant entry barrier and contradicts the fact that logic programs should be fully declarative: in a perfect world, the concrete formulation should not have an impact on the runtime. In addition, to minimize solver runtime in general, it is therefore one of our goals to enable logic programs to be written in an intuitive, fully declarative way without having to think about various technical encoding optimizations.\nTo this end, in this paper we propose the lpopt tool that automatically optimizes and rewrites large logic programming rules into multiple smaller ones in order to improve solving performance. This tool, based on an idea proposed for very simple ASP programs in [18], uses the concept of tree decompositions of rules to split them into smaller chunks. Intuitively, via a tree decomposition joins in the body of a rule are arranged into a tree-like form. Joins that belong together are then split off into a separate rule, only keeping the join result in a temporary atom. We then extend the algorithm to handle the entire standardized ASP language [10], and also introduce new optimizations for complex language constructs such as weak constraints, arithmetic expressions, and aggregates.\nThe main contributions of this paper are therefore as follows:\n– we extend, on a theoretical basis, the lpopt algorithm proposed in [18] to the full syntax of the ASP language according to the ASP-Core-2 language specification [10];\n– we establish how to treat complex constructs like aggregates, and propose an adaptation of the decomposition approach so that it can split up large aggregate expressions into multiple smaller rules and expressions, further reducing the grounding size;\n– we implement the lpopt algorithm in C++, yielding the lpopt tool for automated logic program optimization, and give an overview of how this tool is used in practice; and\n– we perform an experimental evaluation of the tool on the encodings and instances used in the fifth Answer Set Programming Competition which show the benefit of our approach, even for encodings already heavily hand-optimized by ASP experts."
+    }, {
+      "heading" : "2 Preliminaries",
+      "text" : "General Definitions. We define two pairwise disjoint countably infinite sets of symbols: a set C of constants and a set V of variables. Different constants represent different values (unique name assumption). By X we denote sequences (or, with slight notational abuse, sets) of variables X1, . . . , Xk with k > 0. For brevity, let [n] = {1, . . . , n}, for any integer n > 1.\nA (relational) schema S is a (finite) set of relational symbols (or predicates). We write p/n for the fact that p is an n-ary predicate. A term is a constant or variable. An atomic formula a over S (called S-atom) has the form p(t), where p ∈ S and t is a sequence of terms. An S-literal is either an S-atom (i.e. a positive literal), or an S-atom preceded by the negation symbol “¬” (i.e. a negative literal). For a literal `, we write dom(`) for the set of its terms, and var(`) for its variables. This notation naturally extends to sets of literals. For brevity, we will treat conjunctions of literals as sets. For a domainC ⊆ C, a (total or two-valued) S-interpretation I is a set of S-atoms containing only constants from C such that, for every S-atom p(a) ∈ I , p(a) is true, and otherwise false. When obvious from the context, we will omit the schema-prefix.\nA substitution from a set of literals L to a set of literals L′ is a mapping s : C∪V→ C ∪ V that is defined on dom(L), is the identity on C, and p(t1, . . . , tn) ∈ L (resp. ¬p(t1, . . . , tn) ∈ L) implies p(s(t1), . . . , s(tn)) ∈ L′ (resp., ¬p(s(t1), . . . , s(tn)) ∈ L′).\nAnswer Set Programming (ASP). A logic programming rule is a universally quantified reverse first-order implication of the form\nH(X,Y)← B+(X,Y,Z,W) ∧ B−(X,Z),\nwhere H (the head), resp. B+ (the positive body), is a disjunction, resp. conjunction, of atoms, and B− (the negative body) is a conjunction of negative literals, each over terms from C ∪ V. For a rule π, let H (π), B+(π), and B−(π) denote the set of atoms occurring in the head, the positive, and the negative body, respectively. Let B(π) = B+(π) ∪ B−(π). A rule π where H (π) = ∅ is called a constraint. Substitutions naturally extend to rules. We focus on safe rules where every variable in the rule occurs in the positive body. A rule is called ground if all its terms are constants. The grounding of a rule π w.r.t. a domain C ⊆ C is the set of rules groundC(π) = {s(π) | s is a substitution, mapping var(π) to elements from C}.\nA logic program Π is a finite set of logic programming rules. The schema of a programΠ , denoted sch(Π), is the set of predicates appearing inΠ . The active domain of Π , denoted adom(Π), with adom(Π) ⊂ C, is the set of constants appearing in Π . A program Π is ground if all its rules are ground. The grounding of a program Π is the ground program ground(Π) = ⋃ π∈Π groundadom(Π)(π). The (GelfondLifschitz) reduct of a ground programΠ w.r.t. an interpretation I is the ground program ΠI = {H (π)← B+(π) | π ∈ Π,B−(π) ∩ I = ∅}.\nA sch(Π)-interpretation I is a (classical) model of a ground program Π , denoted I Π if, for every ground rule π ∈ Π , it holds that I ∩ B+(π) = ∅ or I ∩ (H (π) ∪ B−(π)) 6= ∅, that is, I satisfies π. I is a stable model (or answer set) ofΠ , denoted I s\nΠ if, in addition, there is no J ⊂ I such that J ΠI , that is, I is subset-minimal w.r.t. the reduct ΠI . The set of answer sets of Π , denoted AS (Π), are defined as AS (Π) = {I | I is a sch(Π)-interpretation, and I s Π}. For a non-ground program Π , we define AS (Π) = AS (ground(Π)). When referring to the fact that a logic program is intended to be interpreted under the answer set semantics, we often refer to it as an ASP program.\nTree Decompositions. A tree decomposition of a graph G = (V,E) is a pair T = (T, χ), where T is a rooted tree and χ is a labelling function over nodes t of T , with χ(t) ⊆ V called the bag of t, such that the following holds: (i) for each v ∈ V , there exists a node t in T , such that v ∈ χ(t); (ii) for each {v, w} ∈ E, there exists a node t in T , such that {v, w} ⊆ χ(t); and (iii) for all nodes r, s, and t in T , such that s lies on the path from r to t, we have χ(r) ∩ χ(t) ⊆ χ(s). The width of a tree decomposition is defined as the cardinality of its largest bag minus one. The treewidth of a graph G, denoted by tw(G), is the minimum width over all tree decompositions of G. To decide whether a graph has treewidth at most k is NP-complete [3]. For an arbitrary but fixed k however, this problem can be solved (and a tree decomposition constructed) in linear time [6].\nGiven a non-ground logic programming rule π, we let its Gaifman graph Gπ = (var(π), E) such that there is an edge (X,Y ) inE iff variablesX and Y occur together in the head or in a body atom of π. We refer to a tree decomposition of Gπ as a tree decomposition of rule π. The treewidth of rule π is the treewidth of Gπ ."
+    }, {
+      "heading" : "3 Rule Decomposition",
+      "text" : "This section lays out the theoretical foundations for our rule decomposition approach. First, we recall the algorithm from [18], and then describe how it can be extended to handle three of the main extensions of the ASP language, namely arithmetic expressions, aggregates, and weak constraints (i.e. optimization statements), as defined in the ASP-Core language standard [10].\nAs demonstrated in Example 1, rules that are intuitive to write and read are not necessarily the most efficient ones to evaluate in practice. ASP solvers generally struggle with rules that contain many variables since they rely on a grounder-solver approach: first, the grounding of a logic program is computed by a grounder. As per the definition in Section 2, the size of the grounding can, in the worst case, be exponential in the number of variables. For large rules, the grounding step can already take a prohibitively large amount of time. However, the solver is also adversely affected by this blowup. In practice, this leads to long runtimes and sometimes the inability of the ASP system to solve a given instance. This also contributes to the fact that, while the syntax of ASP is fully declarative, writing efficient encodings still takes expert knowledge.\nIt is therefore desirable to have a way to automatically rewrite such large rules into a more efficient representation. One way to do this is the rule decomposition approach, first proposed in [18], which we will briefly recall next."
+    }, {
+      "heading" : "3.1 Decomposition of Simple Rules",
+      "text" : "Generally speaking, the approach in [18] computes the tree decomposition of a rule, and then splits the rule up into multiple, smaller rules according to this decomposition. While in the worst case this decomposition may not change the rule at all, in practice it is often the case that large rules can be split up very well. For instance, the large rule in Example 1 will be amenable for such a decomposition.\nLet us briefly recall the algorithm from [18] which we will refer to as the lpopt algorithm. For a given rule π, the algorithm works as follows:\n1. Compute a tree decomposition T = (T, χ) of π with minimal width where all variables occurring in the head of π are contained in its root node bag. 2. For each node n, let tempn be a fresh predicate, and the same for each variable X in π and predicate domX . Let Yn = χ(n) ∩ χ(pn), where pn is the parent node of n. For the root node root , let temproot be the entire head of π, and, accordingly, Yroot = var(H (π)). Now, for a node n, generate the following rule:\ntempn(Yn)← {a ∈ B(π) | var(a) ⊆ χ(n)} ∪ {domX(X) | a ∈ B−(π), X ∈ var(a), var(a) ⊆ χ(n),\n6 ∃b ∈ B+(π) : var(b) ⊆ χ(n), X ∈ var(b)} ∪ {tempm(Ym) | m is a child of n}.\n3. For each X ∈ var(B−(π)), for which a domain predicate dom is needed to guarantee safety of a rule generated above, pick an atom a ∈ B+(π), such that X ∈ var(a) and generate a rule\ndomX (X)← a.\nStep 3 is needed because splitting up a rule may make it unsafe. In order to remedy this, a domain predicate is generated for each unsafe variable that arises due to the rule splitting in step 2. The following example illustrates how the algorithm works.\nExample 2. Given the rule\nπ = h(X,W )← e(X,Y ), e(Y, Z),¬e(Z,W ), e(W,X),\na tree decomposition of π could look as follows (note that we write in each bag of the tree decomposition not just the variables as per definition but also all literals of rule π over these variables which is a more intuitive notation):\nh(X,W ), e(X,Y ), e(W,X)\ne(Y,Z),¬e(Z,W )\nApplying the lpopt algorithm to π with the tree decomposition above yields the following set of rules lpopt(π):\ndomW (W )← e(W,X), temp(Y,W )← e(Y, Z),¬e(Z,W ), domW (W ), and\nh(X,W )← e(X,Y ), e(W,X), temp(Y,W ), where temp is a fresh predicate not appearing anywhere else.\nLet Π be a logic program. When the above algorithm is applied to all rules in Π , resulting in a logic program lpopt(Π) as stated in [18], the answer sets of Π are preserved in the following way: when all temporary atoms are removed, each answer set of lpopt(Π) coincides with exactly one answer set from the original program Π . Furthermore, the size of the grounding now no longer depends on the rule size. In fact, it now only depends on the rule treewidth as the following result states:\nTheorem 1 ([18]). The size of ground(lpopt(Π)) is bounded by O(2k · n), where n is the size of Π , and k is the maximal treewidth of the rules in Π .\nThe above theorem implies that the size of the grounding of a program Π , after optimization via the lpopt algorithm, is no longer exponential in the size of Π , but only in the treewidth of its rules. As [18] demonstrates, this decomposition approach already has a significant impact on the size of the grounding in practical instances.\nHowever, the ASP language standard [10] extends the ASP language with other useful constructs that the lpopt algorithm proposed in [18] cannot handle. These include arithmetic expressions, aggregates, and weak constraints. Looking at concrete, practical instances of ASP programs, e.g. the encodings used in recent ASP competitions [11], a large majority use such constructs. In the following, we will therefore extend the lpopt algorithm to be able to treat them in a similar way."
+    }, {
+      "heading" : "3.2 Treating Arithmetic Expressions",
+      "text" : "Arithmetic expressions are atoms of the form X = ϕ(Y), that is, an equality with one variable (or constant number) X on the left-hand side, and an expression ϕ on the right-hand side, where ϕ is any mathematical expression built using the variables from Y, constant numbers, and the arithmetic connectives “+,” “-,” “*,” and “/.” In addition to the positive and negative body, a rule π may also contain a set of such arithmetic expressions describing a relationship between variables with the obvious meaning.\nClearly, in order to adapt the rule decomposition approach to this it is easy to extend the definition of the graph representation of π to simply contain a clique between all variables occurring together in an arithmetic expression. The lpopt algorithm then works as described above up to step 2. However, a problem may arise when, in step 3 of the lpopt algorithm, a domain predicate domX (X) is to be generated. Consider the following example:\nExample 3. Let π be the rule a(X) ← ¬b(X,Y ), c(Y ), d(Z), X = Z + Z. A simple decomposition according to the lpopt algorithm may lead to the following rules:\ntemp(X)← ¬b(X,Y ), c(Y ), domX (X), and\na(X)← d(Z), X = Z + Z, temp(X).\nIt remains to define the domain predicate domX . According to the original definition of lpopt, we would get\ndomX (X)← X = Z + Z\nwhich is unsafe.\nThe conditions for safety of rules with arithmetic expressions are defined in the ASP language specification [10]. As Example 3 shows, in order for such expressions to work with the lpopt algorithm a more general approach to defining the domain predicates is needed in step 3. In fact, instead of choosing a single atom from the rule body to generate the domain predicate, in general a set of atoms and arithmetic expressions must be chosen. It is easy to see that if a rule π is safe then, for each variable X ∈ B(π), there is a set A of (positive) atoms and arithmetic expressions in the body of π that makes that variable safe. In step 3 of the lpopt algorithm, for a variable X we now choose such a setAX of body elements in a greedy fashion as follows: let S = {X} the set of variables that we need to make safe. For each variable S ∈ S, pick a (positive) atom from B(π) that makes S safe, add it to AX , and remove S from S. If no such atom exists in the body of π, greedily add the smallest arithmetic expression S = ϕ(Y) in B(π) to AX and let S = S \\ {S} ∪Y. Repeat this process until S is empty. Since π itself is safe and finite in size, the above procedure necessarily terminates. Finally, generate the rule domX (X)← AX . It is easy to see that this rule is safe and describes the possible domain of variable X as required. Note also that this rule can not be split up futher as removing any single element of the rule would make it unsafe.\nExample 4. A correct domain predicate for Example 3 would be defined as follows:\ndomX (X)← X = Z + Z, d(Z).\nThis ensures the proper safety of all rules generated by the lpopt algorithm.\nNote that the rule generated in Example 4 repeats most of the atoms that the second rule generated in Example 3 already contains. It is not immediately obvious how such situations can be remedied in general. Investigating this issue is part of ongoing work."
+    }, {
+      "heading" : "3.3 Treating Weak Constraints",
+      "text" : "As defined in [10], a weak constraint π[k : t] is a constraint π annotated with a term k representing a weight and a sequence of terms t occurring in π. The intended meaning is that each answer set I is annotated by a total weight w(I), which is the sum over all k for each tuple of constants c that realize t in I and satisfy the body of π. Such a weak constraint can easily be decomposed by replacing π[k : t] with the rule π′ = temp(k, t) ← B(π), where temp is a fresh predicate, and the weak constraint ⊥ ← temp(k, t)[k : t]. Finally, the lpopt algorithm is then applied to rule π′. This allows our rule decomposition approach also to be applied in an optimization context (i.e. where the task for the solver is to find optimal answer sets w.r.t. their weight)."
+    }, {
+      "heading" : "3.4 Treating Aggregate Expressions",
+      "text" : "An aggregate expression, as defined in [10], is an expression of the form\nt 4 #agg{t : ϕ(X)},\nwhere t is a term; 4∈ {<,6,=, 6=,>, >} is a builtin relation; agg is one of sum , count , max , and min; t = 〈t1, . . . , tn〉 is a sequence of terms; and ϕ(X) is a set of literals, arithmetic expressions, and aggregate expressions, called the aggregate body. Aggregates may appear in rule bodies, or recursively inside other aggregates, with the following semantic meaning: Given an interpretation I , for each valid substitution s such that s(ϕ(X)) ⊆ I , take the tuple of constants s(t). Let us denote this set with T . Now, execute the aggregate function on T as follows: for #count , calculate |T |; for #sum , calculate Σt∈T t1, where t1 is the first term in t; for #max and #min , take the maximum and minimum term appearing in the first position of each tuple in T , respectively. Finally, an aggregate expression is true if the relation 4 between term t and the result of the aggregate function is fulfilled.\nExtending the lpopt algorithm to aggregate expressions is again straightforward: The rule graph Gπ = (V,E) of a rule π containing aggregate expressions is defined as follows: Let V be the set of variables occurring in π outside of aggregate expressions. Let E be as before and, in addition, add, for each aggregate expression e, a clique between all variables var(e) ∩ V to E. Intuitively, the rule graph should contain, for each aggregate expression, a clique between all variables that appear in the aggregate and somewhere else in the rule. Variables appearing only in aggregates are in a sense “local” and are therefore not of interest when decomposing the rule.\nWhile the above transformation is straightforward, we can, however, go one step further and also decompose the inside elements of an aggregate expression. To this end, let t 4 #agg{t : ϕ(X,Y)} be an aggregate expression occurring in some rule π, where X are variables that occur either in t or somewhere else in π, and Y are variables occurring inside the aggregate only. Replace the aggregate expression with t 4 #agg{t : ψ(X,Z), temp(t,Z)}, and furthermore, generate a rule temp(t,Z) ← ψ(Y), ψdom(Y), for some fresh predicate temp. Here, ψ contains all those atoms from ϕ that contain a variable from X, and ψ contains the rest. ψdom contains domain predicates generated like in step 3 of the lpopt algorithm, as needed to make the temporary rule safe. The temporary rule can then be decomposed via lpopt. This is best illustrated by an example:\nExample 5. Let π be the following logic programming rule, saying that a vertex is “good” if it has at least two neighbours that, themselves, have a red neighbour:\ngood(X)← vertex (X), 2 6 #count{Y : edge(X,Y ), edge(Y, Z), red(Z)}.\nAccording to the above approach, the rule can now be split up as follows. Firstly, the aggregate is replaced:\ngood(X)← vertex (X), 2 6 #count{Y : edge(X,Y ), temp(Y )},\nand furthermore, a temporary rule is created as follows:\ntemp(Y )← edge(Y, Z), red(Z).\nThe latter rule is now amenable for decomposition via the lpopt algorithm.\nNote that the above approach allows us to decompose, to a degree, even the insides of an aggregate, which, for large aggregate bodies, can lead to a further significant reduction in the grounding size."
+    }, {
+      "heading" : "3.5 Correctness",
+      "text" : "The correctness of the above extensions to the original algorithm follows by the same arguments that prove the correctness of the original algorithm proposed in [18], and trivially from the construction for arithmetic expressions and safety. For the latter, note that for domain predicates of a variable X we explicitly select a set of atoms that make the variable safe, and that such a set always exists, since the original rule is safe. For the former two (namely weak constraints and aggregate expressions), the only thing that needs to be examined is the first step: replacing (part of) the body with a temporary predicate. But correctness of this is easy to see. Instead of performing all joins within the weak constraint or aggregate, we perform the join in a new, separate rule and project only relevant variables into a temporary predicate. The weak constraint or aggregate then only needs to consider this temporary predicate since, by construction, all other variables not projected into the temporary predicate do not play a role w.r.t. optimization or aggregation. Finally, the original algorithm from [18] extended to handle arithmetic expressions, for which correctness has already been established, is then applied to this new, separate rule."
+    }, {
+      "heading" : "3.6 Further Language Extensions",
+      "text" : "The ASP-Core language specification [10], as well as the gringo grounder1, allow further constructs like variable pooling, aggregates with multiple bodies, or with upper and lower bounds in the same expression, in addition to various extensions that amount to syntactic sugar. These constructs make the above explanations unnecessarily more tedious. However, from a theoretical point of view, all of these additional constructs can be normalized to one of the forms discussed in the previous subsections. Furthermore, as we shall see in the next section, we have implemented the lpopt algorithm to directly treat all standard ASP language constructs and certain other additions, like variable pooling. More details about this general approach, and the exact, but more tedious, algorithm details, can be found in [4]."
+    }, {
+      "heading" : "4 Implementation",
+      "text" : "A full implementation of the algorithm and its extensions described in Section 3 is now available in the form of the lpopt tool, available with relevant documentation and examples at http://dbai.tuwien.ac.at/proj/lpopt. The following gives a quick outline of how to use the tool.\nlpopt accepts as its input any form of ASP program that follows the ASP input language specification laid out in [10]. The output of the program in its default configuration is a decomposed program that also follows this specification. In addition, the tool guarantees that no language construct is introduced in the output that was not previously present in the input (cf. Section 3). Therefore, for example, a program without aggregates will not contain any aggregates as a result of rule decomposition. The following is a description of the parameters of the tool:\n1 http://potassco.sourceforge.net\nUsage: lpopt [-idbt] [-s seed] [-f file] [-h alg] [-l file] -d dumb: do not perform optimization -b print verbose and benchmark information -t perform only tree decomposition step -i ignore head variables when decomposing -h alg decomposition algorithm, one of {mcs, mf, miw (def)} -s seed initialize random number generator with seed. -f file the file to read from (default is stdin) -l file output infos (treewidth) to file\nIn what follows, we will briefly describe the most important features of the tool.\nTree Decomposition Heuristics. As stated in Section 2, computing an optimal tree decomposition w.r.t. width is an NP-hard problem. We thus make use of several heuristic algorithms, namely the maximum cardinality search (mcs), minimum fill (mf), and minimum induced width (miw) approaches described in [7], that yield tree decompositions that provide good upper bounds on the treewidth (i.e. on an optimal decomposition). It turns out that in practice, since rules in ASP programs are usually not overly large, these heuristics come close to, and often even yield, an optimal tree decomposition for rules. The heuristic algorithm to use for decomposition can be selected using the -h command line parameter. Since these heuristic approaches rely to some degree on randomization, a seed for the pseudo-random number generator can be passed along with the -s command line parameter.\nMeasuring the Treewidth of Rules. Theorem 1 allows us to calculate an upper bound on the size of the grounding of the input program. In order to do this, the maximal treewidth of any rule in an ASP program must be known. The -l switch of the lpopt tool allows this to be calculated. It forces the tool to perform tree decompositions on all rules inside an input ASP program, simply outputting the maximal treewidth (or, more accurately, an upper bound; see above) over all of them into the given file, and then exiting. Clearly, when a single ASP rule is given as input, this switch will output a treewidth upper bound of that single rule.\nRecommended Usage\nAssuming that a file enc.lp contains the encoding of a problem as an ASP program and that a file instance.db contains a set of ground facts representing a problem instance, the recommended usage of the tool is as follows:\ncat enc.lp instance.db | lpopt | grounder | solver\nIn the above command, grounder and solver are programs for grounding and for solving, respectively. One established solver that we will use in the next section for our experimental evaluation is clasp [14]. If clasp is used as a solver together with the lpopt tool, we generally recommend the use of the --sat-prepro flag, which often speeds up the solving process substantially for decomposed rules generated by lpopt (by considering the fact that the truth values of all temporary atoms generated by lpopt are determined exactly by the rule body, and need never be guessed)."
+    }, {
+      "heading" : "5 Experimental Evaluation",
+      "text" : "We have tested our lpopt tool and benchmarked the performance of grounding and solving of programs preprocessed with lpopt against non-preprocessed ones. All benchmarks were made on the instance sets of the fifth answer set programming competition 2014 2, which, for most problem classes, provides two encodings, one from 2013, and one from 2014. The benchmarks have been run on a 3.5GHz AMD Opteron Processor 6308 with 192 GB of RAM to its disposal. We used the potassco software suite3, namely gringo verison 4.5.3 as the grounder and clasp version 3.1.3 as the solver. A timeout of 300 seconds was set for solving, and 1000 seconds for grounding. Furthermore, as suggested in the previous section, clasp was called with the --sat-prepro flag enabled. In this paper, we will survey the most important results.\nRemark. One central aim of our tool is to improve solving performance for handwritten encodings by non-experts of ASP. In the spirit of a truly declarative language, it shouldn’t matter how an encoding is written as long as it is correct (i.e. w.r.t. runtime, there should not be a difference between “good” and “bad” encodings). In this respect, the ASP competition does not offer an optimal benchmark set since all encodings are extensively hand-tuned by ASP experts. However, as to the best of our knowledge there is no better-suited comprehensive benchmark set available, we will show that even for these extensively hand-tuned ASP competition encodings our tool can still find decompositions that decrease grounding size and improve solving performance. However, there are also encodings that are so perfectly hand-tuned that only trivial optimizations are possible with the current version of lpopt.\nResults. Let us first note that the runtime of lpopt itself, for all encodings in the benchmark set, was always less than what can be accurately measured on a computer system today. Applying our rule decomposition algorithm thus comes virtually for free for hand-written encodings. Out of the 49 encodings provided by the ASP competition, lpopt was able to syntactically rewrite 41 which indicates that, as mentioned above, even extensively hand-tuned programs can be further decomposed in an automated manner. The remaining eight encodings contained rules that were so small that no further decomposition was possible (i.e. their Gaifman graph was a clique of usually 3-4 nodes) and thus the output of lpopt was the original, unmodified encoding in these cases. In 27 of the 41 encodings rewritten by lpopt, the decompositions were trivial and had no significant impact on the solving performance. This is due to the fact that only rules that were already very small (and thus did not contribute much to the grounding size in the first place) could be decomposed. In five cases out of the 41 rewritten encodings, we noticed a decrease in solving performance (see the paragraph on limitations of lpopt below for an explanation) and in the remaining seven cases, the lpopt rewriting was able to speed up the solving process with substantial improvements in three of these seven. Two of those were the stable marriage problem encoding of 2013, and the permutation pattern matching encoding of 2014 which we will take a closer look at below. Full benchmark results for the entire dataset can be found in [4].\n2 https://www.mat.unical.it/aspcomp2014/ 3 http://potassco.sourceforge.net\nAs can be seen in Figure 1, both grounding and solving time decrease dramatically. Notice that the grounding time is, in general, directly correlated with the size of the respective grounding. With lpopt preprocessing, the grounding size decreases dramatically by a factor of up to 65. The grounder is thirty times faster when using preprocessing, and the solver about three times. This is because of the following constraint in the encoding that can be decomposed very well:\n:- match(M,W1), manAssignsScore(M,W,Smw), W1!=W, manAssignsScore(M,W1,Smw1), Smw>Smw1, match(M1,W), womanAssignsScore(W,M,Swm), womanAssignsScore(W,M1,Swm1), Swm>=Swm1.\nThe constraint rule above is quite intuitive to read: There cannot be a man M and a woman W , such that they would both be better off if they were matched together, instead of being matched as they are (that is, to W1 and M1, respectively). It encodes, precisely and straightforwardly, the condition of a stable marriage. The 2014 encoding splits this rule up, making the encoding much harder to understand. However, with lpopt preprocessing, the grounding and solving performance matches that of the hand-tuned 2014 encoding. This again illustrates that the lpopt algorithm allows for efficient processing of rules written by non-experts that are not explicitly hand-tuned.\nA second example of lpopt’s capabilities is the permutation pattern matching problem illustrated in Figure 2. The grounding time of the largest instance is 980 seconds without preprocessing and 17 seconds with preprocessing. This instance was also impossible to solve within the timeout window of 300 seconds without lpopt preprocessing, but finishing within 88 seconds when lpopt was run first.\nOther Use Cases. lpopt has also been employed in other works that illustrate its performance benefits. In particular, several solvers for other formalisms rely on a rewriting to ASP in order to solve the original problem. Such rewritings can easily lead to the generation of large rules that current ASP solving systems are generally unable to handle. For example, in [16] ASP rewritings for several problems from the abstract argumentation domain, proposed in [9], are implemented. In Section 4.6 of the thesis, the performance benefits of lpopt are clearly demonstated for these rewritings. Interestingly, these rewritings also make heavy use of aggregates which goes to show that lpopt also handles these constructs well. Another example is [5], where multiple rewritings for Σ2P and Σ 3 P-hard problems are proposed and then benchmarked, again showcasing that without lpopt these rewritings could not be solved by current ASP solvers in all but the most simple cases.\nLimitations. However, we also want to point out some limitations of the lpopt algorithm. When a domain predicate is used by the algorithm, the selection of atoms that generate this domain predicate is at the moment essentially random, since the greedy selection depends on the order of the atoms appearing in the rule. This approach, as discussed in Section 3, may thus not pick an optimal set of atoms. However, it depends on this selection how many ground rules this domain predicate rule will generate when passed to the grounder. Therefore, it may at the moment be the case that the increased grounding size caused by the domain predicate rules may destroy any benefit caused by splitting up the main rule. This is precisely what caused the increase in solving time for the five encodings out of 49 that lpopt was able to rewrite but where solving performance deteriorated. Clearly, this begs the question of what the best strategy is to select atoms to generate domain predicates. This is part of ongoing work."
+    }, {
+      "heading" : "6 Conclusions",
+      "text" : "In this paper, we present an algorithm, based on a prototype from [18], that allows the decomposition of large logic programming rules into smaller ones that current state-ofthe-art answer set programming solvers are better equipped to handle. Our implementation handles the entire ASP-Core-2 language [10]. Benchmark results show that in practice, even for extensively hand-tuned ASP programs, our rule decomposition algorithm can improve solving performance significantly. Future work will include implementing this approach directly into state-of-the-art grounders like the gringo grounder used in our benchmarks, as well as further refining the algorithm w.r.t. selection of domain predicate atoms, as discussed at the end of Section 5.\nAcknowledgments. Funded by the Austrian Science Fund (FWF): Y698, P25607."
+    } ],
+    "references" : [ {
+      "title" : "WASP: A native ASP solver based on constraint learning",
+      "author" : [ "M. Alviano", "C. Dodaro", "W. Faber", "N. Leone", "F. Ricca" ],
+      "venue" : "Proc. LPNMR. pp",
+      "citeRegEx" : "1",
+      "shortCiteRegEx" : "1",
+      "year" : 2013
+    }, {
+      "title" : "The disjunctive datalog system DLV",
+      "author" : [ "M. Alviano", "W. Faber", "N. Leone", "S. Perri", "G. Pfeifer", "G. Terracina" ],
+      "venue" : "Datalog Reloaded. Revised Selected Papers. pp",
+      "citeRegEx" : "2",
+      "shortCiteRegEx" : "2",
+      "year" : 2010
+    }, {
+      "title" : "Complexity of finding embeddings in a k-tree",
+      "author" : [ "S. Arnborg", "D.G. Corneil", "A. Proskurowski" ],
+      "venue" : "SIAM J. Algeb. Discr. Meth. 8(2),",
+      "citeRegEx" : "3",
+      "shortCiteRegEx" : "3",
+      "year" : 1987
+    }, {
+      "title" : "Optimizing non-ground answer set programs via rule decomposition",
+      "author" : [ "M. Bichler" ],
+      "venue" : "BSc Thesis, TU Wien. http://dbai.tuwien.ac.at/proj/lpopt",
+      "citeRegEx" : "4",
+      "shortCiteRegEx" : null,
+      "year" : 2015
+    }, {
+      "title" : "The power of non-ground rules in answer set programming",
+      "author" : [ "M. Bichler", "M. Morak", "S. Woltran" ],
+      "venue" : "Proc. ICLP",
+      "citeRegEx" : "5",
+      "shortCiteRegEx" : "5",
+      "year" : 2016
+    }, {
+      "title" : "A linear-time algorithm for finding tree-decompositions of small treewidth",
+      "author" : [ "H.L. Bodlaender" ],
+      "venue" : "SIAM J. Comput",
+      "citeRegEx" : "6",
+      "shortCiteRegEx" : "6",
+      "year" : 1996
+    }, {
+      "title" : "Answer set programming at a glance",
+      "author" : [ "G. Brewka", "T. Eiter", "M. Truszczynski" ],
+      "venue" : "Commun. ACM 54(12),",
+      "citeRegEx" : "8",
+      "shortCiteRegEx" : "8",
+      "year" : 2011
+    }, {
+      "title" : "GRAPPA: A semantical framework for graph-based argument processing",
+      "author" : [ "G. Brewka", "S. Woltran" ],
+      "venue" : "Proc. ECAI. pp",
+      "citeRegEx" : "9",
+      "shortCiteRegEx" : "9",
+      "year" : 2014
+    }, {
+      "title" : "ASP-Core-2 Input Language Format v2.03c",
+      "author" : [ "F. Calimeri", "W. Faber", "M. Gebser", "G. Ianni", "R. Kaminski", "T. Krennwallner", "N. Leone", "F. Ricca", "T. Schaub" ],
+      "venue" : "https://www",
+      "citeRegEx" : "10",
+      "shortCiteRegEx" : "10",
+      "year" : 2013
+    }, {
+      "title" : "Design and results of the fifth answer set programming competition",
+      "author" : [ "F. Calimeri", "M. Gebser", "M. Maratea", "F. Ricca" ],
+      "venue" : "Artif. Intell",
+      "citeRegEx" : "11",
+      "shortCiteRegEx" : "11",
+      "year" : 2015
+    }, {
+      "title" : "Smodels - A system for computing answer sets of logic programs with aggregates",
+      "author" : [ "I. Elkabani", "E. Pontelli", "T.C. Son" ],
+      "venue" : "Proc. LPNMR. pp",
+      "citeRegEx" : "12",
+      "shortCiteRegEx" : "12",
+      "year" : 2005
+    }, {
+      "title" : "Answer Set Solving in Practice",
+      "author" : [ "M. Gebser", "R. Kaminski", "B. Kaufmann", "T. Schaub" ],
+      "venue" : "Synthesis Lectures on Artificial Intelligence and Machine Learning,",
+      "citeRegEx" : "13",
+      "shortCiteRegEx" : "13",
+      "year" : 2012
+    }, {
+      "title" : "Conflict-driven answer set solving: From theory to practice",
+      "author" : [ "M. Gebser", "B. Kaufmann", "T. Schaub" ],
+      "venue" : "Artif. Intell. 187,",
+      "citeRegEx" : "14",
+      "shortCiteRegEx" : "14",
+      "year" : 2012
+    }, {
+      "title" : "The stable model semantics for logic programming",
+      "author" : [ "M. Gelfond", "V. Lifschitz" ],
+      "venue" : "Proc. ICLP/SLP. pp. 1070–1080",
+      "citeRegEx" : "15",
+      "shortCiteRegEx" : null,
+      "year" : 1988
+    }, {
+      "title" : "A System for Advanced Graphical Argumentation Formalisms",
+      "author" : [ "G. Heißenberger" ],
+      "venue" : "Master’s thesis, TU Wien (2016),",
+      "citeRegEx" : "16",
+      "shortCiteRegEx" : "16",
+      "year" : 2016
+    }, {
+      "title" : "Stable Models and an Alternative Logic Programming Paradigm",
+      "author" : [ "V.W. Marek", "M. Truszczyński" ],
+      "venue" : "The Logic Programming Paradigm – A 25-Year Perspective, pp. 375–398. Springer",
+      "citeRegEx" : "17",
+      "shortCiteRegEx" : null,
+      "year" : 1999
+    }, {
+      "title" : "Preprocessing of complex non-ground rules in answer set programming",
+      "author" : [ "M. Morak", "S. Woltran" ],
+      "venue" : "Proc. ICLP. pp",
+      "citeRegEx" : "18",
+      "shortCiteRegEx" : "18",
+      "year" : 2012
+    } ],
+    "referenceMentions" : [ {
+      "referenceID" : 13,
+      "context" : "Answer set programming (ASP) [15,17,8,13] is a well-established logic programming paradigm based on the stable model semantics of logic programs.",
+      "startOffset" : 29,
+      "endOffset" : 41
+    }, {
+      "referenceID" : 15,
+      "context" : "Answer set programming (ASP) [15,17,8,13] is a well-established logic programming paradigm based on the stable model semantics of logic programs.",
+      "startOffset" : 29,
+      "endOffset" : 41
+    }, {
+      "referenceID" : 6,
+      "context" : "Answer set programming (ASP) [15,17,8,13] is a well-established logic programming paradigm based on the stable model semantics of logic programs.",
+      "startOffset" : 29,
+      "endOffset" : 41
+    }, {
+      "referenceID" : 11,
+      "context" : "Answer set programming (ASP) [15,17,8,13] is a well-established logic programming paradigm based on the stable model semantics of logic programs.",
+      "startOffset" : 29,
+      "endOffset" : 41
+    }, {
+      "referenceID" : 12,
+      "context" : "[14,1,12,2]—have made huge strides in efficiency.",
+      "startOffset" : 0,
+      "endOffset" : 11
+    }, {
+      "referenceID" : 0,
+      "context" : "[14,1,12,2]—have made huge strides in efficiency.",
+      "startOffset" : 0,
+      "endOffset" : 11
+    }, {
+      "referenceID" : 10,
+      "context" : "[14,1,12,2]—have made huge strides in efficiency.",
+      "startOffset" : 0,
+      "endOffset" : 11
+    }, {
+      "referenceID" : 1,
+      "context" : "[14,1,12,2]—have made huge strides in efficiency.",
+      "startOffset" : 0,
+      "endOffset" : 11
+    }, {
+      "referenceID" : 16,
+      "context" : "This tool, based on an idea proposed for very simple ASP programs in [18], uses the concept of tree decompositions of rules to split them into smaller chunks.",
+      "startOffset" : 69,
+      "endOffset" : 73
+    }, {
+      "referenceID" : 8,
+      "context" : "We then extend the algorithm to handle the entire standardized ASP language [10], and also introduce new optimizations for complex language constructs such as weak constraints, arithmetic expressions, and aggregates.",
+      "startOffset" : 76,
+      "endOffset" : 80
+    }, {
+      "referenceID" : 16,
+      "context" : "– we extend, on a theoretical basis, the lpopt algorithm proposed in [18] to the full syntax of the ASP language according to the ASP-Core-2 language specification [10];",
+      "startOffset" : 69,
+      "endOffset" : 73
+    }, {
+      "referenceID" : 8,
+      "context" : "– we extend, on a theoretical basis, the lpopt algorithm proposed in [18] to the full syntax of the ASP language according to the ASP-Core-2 language specification [10];",
+      "startOffset" : 164,
+      "endOffset" : 168
+    }, {
+      "referenceID" : 2,
+      "context" : "To decide whether a graph has treewidth at most k is NP-complete [3].",
+      "startOffset" : 65,
+      "endOffset" : 68
+    }, {
+      "referenceID" : 5,
+      "context" : "For an arbitrary but fixed k however, this problem can be solved (and a tree decomposition constructed) in linear time [6].",
+      "startOffset" : 119,
+      "endOffset" : 122
+    }, {
+      "referenceID" : 16,
+      "context" : "First, we recall the algorithm from [18], and then describe how it can be extended to handle three of the main extensions of the ASP language, namely arithmetic expressions, aggregates, and weak constraints (i.",
+      "startOffset" : 36,
+      "endOffset" : 40
+    }, {
+      "referenceID" : 8,
+      "context" : "optimization statements), as defined in the ASP-Core language standard [10].",
+      "startOffset" : 71,
+      "endOffset" : 75
+    }, {
+      "referenceID" : 16,
+      "context" : "One way to do this is the rule decomposition approach, first proposed in [18], which we will briefly recall next.",
+      "startOffset" : 73,
+      "endOffset" : 77
+    }, {
+      "referenceID" : 16,
+      "context" : "Generally speaking, the approach in [18] computes the tree decomposition of a rule, and then splits the rule up into multiple, smaller rules according to this decomposition.",
+      "startOffset" : 36,
+      "endOffset" : 40
+    }, {
+      "referenceID" : 16,
+      "context" : "Let us briefly recall the algorithm from [18] which we will refer to as the lpopt algorithm.",
+      "startOffset" : 41,
+      "endOffset" : 45
+    }, {
+      "referenceID" : 16,
+      "context" : "When the above algorithm is applied to all rules in Π , resulting in a logic program lpopt(Π) as stated in [18], the answer sets of Π are preserved in the following way: when all temporary atoms are removed, each answer set of lpopt(Π) coincides with exactly one answer set from the original program Π .",
+      "startOffset" : 107,
+      "endOffset" : 111
+    }, {
+      "referenceID" : 16,
+      "context" : "Theorem 1 ([18]).",
+      "startOffset" : 11,
+      "endOffset" : 15
+    }, {
+      "referenceID" : 16,
+      "context" : "As [18] demonstrates, this decomposition approach already has a significant impact on the size of the grounding in practical instances.",
+      "startOffset" : 3,
+      "endOffset" : 7
+    }, {
+      "referenceID" : 8,
+      "context" : "However, the ASP language standard [10] extends the ASP language with other useful constructs that the lpopt algorithm proposed in [18] cannot handle.",
+      "startOffset" : 35,
+      "endOffset" : 39
+    }, {
+      "referenceID" : 16,
+      "context" : "However, the ASP language standard [10] extends the ASP language with other useful constructs that the lpopt algorithm proposed in [18] cannot handle.",
+      "startOffset" : 131,
+      "endOffset" : 135
+    }, {
+      "referenceID" : 9,
+      "context" : "the encodings used in recent ASP competitions [11], a large majority use such constructs.",
+      "startOffset" : 46,
+      "endOffset" : 50
+    }, {
+      "referenceID" : 8,
+      "context" : "The conditions for safety of rules with arithmetic expressions are defined in the ASP language specification [10].",
+      "startOffset" : 109,
+      "endOffset" : 113
+    }, {
+      "referenceID" : 8,
+      "context" : "As defined in [10], a weak constraint π[k : t] is a constraint π annotated with a term k representing a weight and a sequence of terms t occurring in π.",
+      "startOffset" : 14,
+      "endOffset" : 18
+    }, {
+      "referenceID" : 8,
+      "context" : "An aggregate expression, as defined in [10], is an expression of the form",
+      "startOffset" : 39,
+      "endOffset" : 43
+    }, {
+      "referenceID" : 16,
+      "context" : "The correctness of the above extensions to the original algorithm follows by the same arguments that prove the correctness of the original algorithm proposed in [18], and trivially from the construction for arithmetic expressions and safety.",
+      "startOffset" : 161,
+      "endOffset" : 165
+    }, {
+      "referenceID" : 16,
+      "context" : "Finally, the original algorithm from [18] extended to handle arithmetic expressions, for which correctness has already been established, is then applied to this new, separate rule.",
+      "startOffset" : 37,
+      "endOffset" : 41
+    }, {
+      "referenceID" : 8,
+      "context" : "The ASP-Core language specification [10], as well as the gringo grounder1, allow further constructs like variable pooling, aggregates with multiple bodies, or with upper and lower bounds in the same expression, in addition to various extensions that amount to syntactic sugar.",
+      "startOffset" : 36,
+      "endOffset" : 40
+    }, {
+      "referenceID" : 3,
+      "context" : "More details about this general approach, and the exact, but more tedious, algorithm details, can be found in [4].",
+      "startOffset" : 110,
+      "endOffset" : 113
+    }, {
+      "referenceID" : 8,
+      "context" : "lpopt accepts as its input any form of ASP program that follows the ASP input language specification laid out in [10].",
+      "startOffset" : 113,
+      "endOffset" : 117
+    }, {
+      "referenceID" : 12,
+      "context" : "One established solver that we will use in the next section for our experimental evaluation is clasp [14].",
+      "startOffset" : 101,
+      "endOffset" : 105
+    }, {
+      "referenceID" : 3,
+      "context" : "Full benchmark results for the entire dataset can be found in [4].",
+      "startOffset" : 62,
+      "endOffset" : 65
+    }, {
+      "referenceID" : 14,
+      "context" : "For example, in [16] ASP rewritings for several problems from the abstract argumentation domain, proposed in [9], are implemented.",
+      "startOffset" : 16,
+      "endOffset" : 20
+    }, {
+      "referenceID" : 7,
+      "context" : "For example, in [16] ASP rewritings for several problems from the abstract argumentation domain, proposed in [9], are implemented.",
+      "startOffset" : 109,
+      "endOffset" : 112
+    }, {
+      "referenceID" : 4,
+      "context" : "Another example is [5], where multiple rewritings for Σ2 P and Σ 3 P-hard problems are proposed and then benchmarked, again showcasing that without lpopt these rewritings could not be solved by current ASP solvers in all but the most simple cases.",
+      "startOffset" : 19,
+      "endOffset" : 22
+    }, {
+      "referenceID" : 16,
+      "context" : "In this paper, we present an algorithm, based on a prototype from [18], that allows the decomposition of large logic programming rules into smaller ones that current state-ofthe-art answer set programming solvers are better equipped to handle.",
+      "startOffset" : 66,
+      "endOffset" : 70
+    }, {
+      "referenceID" : 8,
+      "context" : "Our implementation handles the entire ASP-Core-2 language [10].",
+      "startOffset" : 58,
+      "endOffset" : 62
+    } ],
+    "year" : 2016,
+    "abstractText" : "State-of-the-art answer set programming (ASP) solvers rely on a program called a grounder to convert non-ground programs containing variables into variable-free, propositional programs. The size of this grounding depends heavily on the size of the non-ground rules, and thus, reducing the size of such rules is a promising approach to improve solving performance. To this end, in this paper we announce lpopt, a tool that decomposes large logic programming rules into smaller rules that are easier to handle for current solvers. The tool is specifically tailored to handle the standard syntax of the ASP language (ASP-Core) and makes it easier for users to write efficient and intuitive ASP programs, which would otherwise often require significant hand-tuning by expert ASP engineers. It is based on an idea proposed by Morak and Woltran (2012) that we extend significantly in order to handle the full ASP syntax, including complex constructs like aggregates, weak constraints, and arithmetic expressions. We present the algorithm, the theoretical foundations on how to treat these constructs, as well as an experimental evaluation showing the viability of our approach.",
+    "creator" : "LaTeX with hyperref package"
+  }
+}

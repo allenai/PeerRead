@@ -1,0 +1,303 @@
+{
+  "name" : "1701.03038.pdf",
+  "metadata" : {
+    "source" : "CRF",
+    "title" : "Decoding with Finite-State Transducers on GPUs",
+    "authors" : [ "Arturo Argueta", "David Chiang" ],
+    "emails" : [ "aargueta@nd.edu", "dchiang@nd.edu" ],
+    "sections" : [ {
+      "heading" : "1 Introduction",
+      "text" : "Weighted finite automata (Mohri, 2009), including hidden Markov models and conditional random fields (Lafferty et al., 2001), are used to solve a wide range of natural language processing (NLP) problems, including phonology and morphology, part-of-speech tagging, chunking, named entity recognition, and others. Even models for speech recognition and phrase-based translation can be thought of as extensions of finite automata (Mohri et al., 2002; Kumar et al., 2005).\nAlthough the use of graphics processing units (GPUs) is now de rigeur in applications of neural networks and made easy through toolkits like Theano (Theano Development Team, 2016), there has been little previous work, to our knowledge,\non acceleration of weighted finite-state computations on GPUs (Narasiman et al., 2011; Li et al., 2014; Peng et al., 2016; Chong et al., 2009). In this paper, we consider the operations that are most likely to have high speed requirements: decoding using the Viterbi algorithm, and training using the forward-backward algorithm. We present an implementation of the Viterbi and forward-backward algorithms for CUDA GPUs. We release it as open-source software, with the hope of expanding in the future to a toolkit including other operations like composition.\nMost previous work on parallel processing of finite automata (Ladner and Fischer, 1980; Hillis and Steele, 1986; Mytkowicz et al., 2014) uses dense representations of finite automata, which is only appropriate if the automata are not too sparse (that is, most states can transition to most other states). But the automata used for natural language tend to be extremely large and sparse. In addition, the more recent work in this line assumes deterministic automata, but automata that model natural language ambiguity are generally nondeterministic.\nPrevious work has been done on accelerating particular NLP tasks on GPUs: in machine translation, phrase-pair retrieval (He et al., 2013) and language model querying (Bogoychev and Lopez, 2016); parsing (Hall et al., 2014; Canny et al., 2013); and speech recognition (Kim et al., 2012). Our aim here is for a more general-purpose collection of algorithms for finite automata.\nOur work uses concepts from the work of Merrill et al. (2012), who show that GPUs can be used to accelerate breadth-first search in sparse graphs. Our approach is simple, but well-suited to the large, sparse automata that are often found in NLP applications. We show that it achieves a speedup of a factor of 5.2 on a GPU relative to a serial algorithm, and 6093 relative to OpenFST.\nar X\niv :1\n70 1.\n03 03\n8v 2\n[ cs\n.C L\n] 1\n7 Ja\nn 20\n17"
+    }, {
+      "heading" : "2 Graphics Processing Units",
+      "text" : "GPUs became known for their ability to render high quality images faster than conventional multi-core CPUs. Current off-the-shelf CPUs contain 8–16 cores while GPUs contain 1500–2500 simple CUDA cores built into the card. General Purpose GPUs (GPGPU) contain cores able to execute calculations that are not constrained to image processing. GPGPUs are now widely used across scientific domains to enhance the performance of diverse applications."
+    }, {
+      "heading" : "2.1 Architecture",
+      "text" : "CUDA cores (also known as scalar processors) are grouped into different Streaming Multiprocessors (SM) on the graphics card. The number of cores per SM varies depending on the GPU’s microarchitecture, ranging from 8 cores per SM (Tesla) up to 192 (Kepler). The overall number of SM on the chip varies, and it can range from 15 (Kepler) up to 24 (Maxwell). Streaming Multiprocessors are composed of the following components:\n• Special Function units (SFU) These allow computations of functions such as sine, cosine, etc.\n• Shared Memory and L1 Cache The size of the memory varies on the GPU model.\n• Warp Schedulers assigns threads in an SM to be executed in a specific warp.\nTo execute a workload on the GPU, a kernel must be launched with a specified grid structure. The kernel must specify the number of threads to run on a block and the number of blocks in a grid before being executed on the device. The maximum number of threads per block and blocks per grid can vary depending on the GPU device. If the kernel is successfully launched, each block in the grid will get assigned to a SM. Each SM will execute 32 threads at a time (also called a warp) in its assigned block. If the number of threads in a block is not divisible by 32, the kernel will not launch on the device. Each SM contains a warp scheduler in charge of choosing the warps in a block to be executed in parallel. When the amount of blocks in a grid surpasses the amount of SM on the device, the SMs will execute a subset of blocks in parallel.\nThe memory hierarchy on the device is laid out to maximize the data throughput. Table 1 shows the amount of cores available for execution as well as the amount of memory available on a Kepler based GPU. Registers are the fastest type of memory on the device, and this memory is private to each thread running on a block. Shared memory is the second fastest, and is shared by all threads running in the same block. The next type of memory is the L2 cache, which is shared among all streaming multiprocessors. The slowest and largest type of memory is global memory. Directly reading and writing to global memory affects performance significantly. Efficient memory management (reading and writing to and from contiguous addresses in memory) is important to fully utilize the memory hierarchy and increase performance."
+    }, {
+      "heading" : "2.2 Optimizations",
+      "text" : "Different factors such as number of threads in a block or coalesced memory accesses affect the performance on the GPU. In this section, we will cover the methods and modifications we used to improve the performance of our parallel implementations.\nThe optimal number of threads per block depends on the device configuration. The number of multiprocessors and cores per multiprocessor must be considered before launching a CUDA kernel on the device. Table 1 shows the number of streaming multiprocessors and the number of cores per multiprocessor on a K40 GPU. Multiple blocks in a kernel grid can get scheduled to be executed on a single streaming multiprocessor if the number of blocks in a grid exceeds the number of streaming multiprocessors. Each streaming multiprocessor will only execute one warp in a block in parallel during execution, and that is why choosing an appropriate number of blocks is important. For example, if two blocks get assigned to a multiprocessor and each block contains 192 threads, the\nmultiprocessor must execute 12 warps total where 1 warp gets executes at a time in parallel.\nIn our implementations, we take the following approach. The number of cores per multiprocessor is considered first to configure the block size. The block size is set to contain the same number of threads as the number of cores per multiprocessor of the graphics card used. If the number of threads needed to perform a computation is not divisible by the amount of cores per multiprocessor, the number of threads is rounded up to the closest dividend. Once the block size and number of threads are selected, the number of blocks is chosen by dividing the total number of threads by the block size.\nCoalesced memory accesses are essential to maximize the use of resources running on the GPU. When data is requested by a warp executing on a streaming multiprocessor, a block from global memory will be accessed and allocated in shared memory. It is crucial to coalesce memory accesses so the number of blocks of global memory requested and the global memory access times decrease. This can be achieved by making all threads in a warp access contiguous spaces in memory. A similar speedup can be achieved if each thread in a block allocates all the data required from global memory into a compact data structure allocated in shared memory (size of the shared memory varies across devices). Section 4 describes the data structure used to coalesce memory reads. For each input symbol wt the source states of all possible transitions can be read in a coalesced form and stored in shared memory allowing faster execution times.\nUsing special function units on the device can inhibit the performance of a program running on the GPU. Performance is affected because the number of SFU is lower than the amount of regular cores (e.g. The GK104 Kepler architecture contains 1536 regular cores and 256 special function units total). Also, the cycle penalty for using SFU rather than CUDA cores is higher than the penalty for regular cores on the device. For this work, the amount of instructions that use a specific SFU are kept to a minimum to obtain a higher speedup. By combining the mentioned techniques in this section, an application can significantly increase its performance."
+    }, {
+      "heading" : "3 Weighted Finite Automata",
+      "text" : "In this section, we review weighted finite automata, using a matrix formulation. A weighted finite automaton is a tuple M = (Q,Σ, s, F, δ), where\n• Q is a finite set of states.\n• Σ is a finite input alphabet.\n• s ∈ RQ is a one-hot vector: if M can start in state q, then s[q] = 1; otherwise, s[q] = 0.\n• f ∈ RQ is a vector of final weights: if M can accept in state q, then f [q] > 0 is the weight incurred; otherwise, f [q] = 0.\n• δ : Σ → RQ×Q is the transition function: if M is in state q and the next input symbol is a, then δ[a][q, q′] is the weight of going to state q′.\nNote that we currently do not allow transitions on empty strings or epsilon transitions. This definition can easily be extended to weighted finite transducers by augmenting the transitions with output symbols. See Figure 1 for an example FST.\nUsing this notation, the total weight of a string w = w1 · · ·wn can be written succinctly as:\nweight(w) = s>  n∏\nt=1\nδ[wt]  f . (1) Matrix multiplication is defined in terms of multiplication and addition of weights. It is common to redefine weights and their multiplication/addition to make the computation of (1) yield various useful values. When this is done, multiplication is often written as ⊗ and addition as ⊕. If we define p1⊗p2 = p1 p2 and p1⊕p2 = p1+p2, then equation (1) gives the total weight of the string.\nOr, we can make Equation (1) obtain the maximum weight path as follows. The weight of a transition is (p, k), where p is the probability of the transition and k is (a representation of) the transition itself. Then\n(p1, k1) ⊗ (p2, k2) ≡ (p1 p2, k1k2) (p1, k1) ⊕ (p2, k2) ≡ (p1, k1) if p1 > p2(p2, k2) otherwise.\nThe Viterbi algorithm simply computes Equation (1) under the above definition of weights."
+    }, {
+      "heading" : "4 Serial Algorithm",
+      "text" : "Applications of finite automata use a variety of algorithms, but the most common are the Viterbi, forward, and backward algorithms. Several of these automata algorithms are related to one another and used for learning and inference. Speeding up these algorithms will allow faster training and development of large scale machine learning systems.\nThe forward and backward algorithms are used to compute weights (Eq. 1), in left-to-right (Reading an input utterance from left to right) and rightto-left order, respectively. Their intermediate values are used to compute expected counts during training by expectation-maximization (Eisner, 2002). They can be computed by Algorithm 2.\nAlgorithm 1 is one way of computing Viterbi using Equation (1). It is a straightforward algorithm, but the data structures require a brief explanation.\nThroughout this paper, we use zero-based indexing for arrays. Let m = |Σ|, and number the input symbols in Σ consecutively 0, . . . ,m− 1. Then we can think of δ as a three-dimensional array. In general, this array is very sparse. We store it using a combination of compressed sparse row (CSR) format and coordinate (COO) format, as shown in Figure 2 where:\n• z is the number of transitions with nonzero weight\n• R is an array of length (m + 1) containing offsets into the arrays S ,T ,O, and P. if a ∈ Σ, the transitions on input a can be found at positions R[a], . . .R[a + 1]− 1 (i.e. to access all transitions δ[a] ). Note that R[m] = z\n• S contains the source states for each transition 0 ≤ k < z ∈ δ[a]\n• T contains target states for transitions 0 ≤ k < z ∈ δ[a]"
+    }, {
+      "heading" : "P 0.48 0.08 1 1 1 1",
+      "text" : "• O contains the output symbols for transitions from state S [k] to state T [k]\n• P contains the probabilities for transitions from state S [k] to state T [k]\nThe vector f of final weights is stored as a sparse vector: for each k, S f [k] is a final state with weight P f [k].\nAlgorithm 1 Serial Viterbi algorithm (using CSR/COO representation).\n1: for q ∈ Q do 2: α[0][q] = 0 3: α[0][s] = 1 4: for t = 1, . . . , n do 5: a← wt 6: for k = R[a], . . . ,R[a + 1] − 1 do 7: p← α[t − 1][S [k]] ⊗ P[k] 8: α[t][T [k]]← α[t][T [k]] ⊕ p 9: return ⊕ k α[n][S f [k]] ⊗ P f [k]\nIf the transition matrices δ[a] are stored in compressed sparse row (CSR) format, which enables efficient traversal of a matrix in row-major order, then these algorithms can be written out as Algorithm 2 for the forward-backward algorithm and 1 for Viterbi. (Using compressed sparse columns (CSC) format, the loop over q′ would be outside the loop over q, which is perhaps the more common way to implement these algorithms.)"
+    }, {
+      "heading" : "5 Parallel Algorithm",
+      "text" : "Our parallel implementation is based on Algorithm 1 for Viterbi and Algorithm 2 for forwardbackward, but parallelizes the loop over t, that is, over the transitions on symbol wt. The transitions\nAlgorithm 2 Forward-Backward algorithm (rowmajor).\n1: forward[0][s]← 1 . Begin forward pass 2: for t = 0, . . . , n − 1 do 3: for q ∈ Q do 4: for q′ ∈ Q such that δ[wt+1][q, q′] > 0 do 5: p = forward[t][q]δ[wt+1][q, q′] 6: forward[t + 1][q′] += p 7: for q ∈ Q do . backward pass 8: backward[n][q] = f [q] 9: for t = n − 1, . . . , 0 do 10: for q ∈ Q do 11: for q′ ∈ Q such that δ[wt+1][q, q′] > 0 do 12: p = δ[wt+1][q, q′]backward[t][q′] 13: backward[t][q] += p 14: Z = ∑ q∈Q forward[n][q] f [q] 15: for t = 0, . . . , n − 1 do 16: for q, q′ ∈ Q do 17: α = forward[t][q] . Expected counts 18: β = backward[t + 1][q′] 19: count[q, q′] += α × δ[w][q, q′] × β/Z\nare stored in CSR/COO format as described above for Algorithm 1. The S , T , and P arrays are stored on the GPU in global memory; the R and O arrays are kept on the host. For each input symbol a, the transitions on S and T are sorted first by source state and then by target state; this improves memory locality slightly. For the forward-backward algorithm, sorting by target improves the performance for the backward pass since the input is read from right to left.\nFor each input symbol wt, one thread is launched per transition, that is, for each nonzero entry of the transition matrix δ[wt]. Equivalently, one thread is launched for each transition k such that R[wt] ≤ k < R[wt + 1], for a total of R[wt + 1] − R[wt] threads. Each thread looks up q = S [k], q′ = T [k] and computes its corresponding operation.\nFor example, in Figure 2, input word “le” has index 0; since R[0] = 0 and R[1] = 2, two threads are launched, one for k = 0 (that is, 0 le:the/0.48−−−−−−−→ 1) and one for k = 1 (that is, 0 le:a/0.08−−−−−−→ 2)."
+    }, {
+      "heading" : "5.1 Viterbi",
+      "text" : "At the time of computing a transition δ[wt][q, q′], if the probability (at line 8 in Algorithm 1) is higher than α[t][q′], we store the probability in α[t][q′]. Because this update potentially involves\nconcurrent reads and writes at the same memory location, we use an atomic max operation (defined as atomicMax on the NVIDIA toolkit). However, atomicMax is not defined for floating-point values. Additionally, this update needs to store a back-pointer (k) that will be used afterwards to reconstruct the highest-probability path. The problem is that the atomicMax provided by NVIDIA can only update a single value atomically.\nWe solve both problems with a trick: pack the Viterbi probability and the back-pointer into a single 64-bit integer, with the probability in the higher 32 bits and the back-pointer in the lower 32 bits. In IEEE 754 format, the mapping between nonnegative real numbers and their bit representations (viewed as integers) is order-preserving, so a max operation on this packed representation updates both the probability and the back-pointer simultaneously.\nThe reconstruction of the Viterbi path is not parallelizable, but is done on the GPU to avoid copying α back to the host avoiding a slowdown. This generates a sequence of transition indices, which is moved back to the host. There, the output symbols can be looked up in array O."
+    }, {
+      "heading" : "5.2 Forward-Backward",
+      "text" : "The forward and backward algorithms 2 are similar to the Viterbi algorithm, but do not need to keep back-pointers. In the forward algorithm, when a transition δ[wt][q, q′] is processed, we update the sum of probabilities reaching state q′ in forward[t + 1][q′]. Likewise, in the backward algorithm, we update the sum of probabilities starting from q in backward[t][q]. Both passes require atomic addition operations, but because we use log-probabilities to avoid underflow, the atomic addition must be implemented as:\nlog(exp a + exp b) = b + log1p(exp(a − b)), (2)\nassuming a ≤ b and where log1p(x) = log(1+ x), a common function in math libraries which is more numerically stable for small x.\nWe implemented an atomic version of this log-add-exp operation. The two transcendentals are expensive, but CUDA’s fast math option (-use_fast_math) speeds them up somewhat by sacrificing some accuracy."
+    }, {
+      "heading" : "6 Other Approaches",
+      "text" : ""
+    }, {
+      "heading" : "6.1 Parallel prefix sum",
+      "text" : "We have already mentioned a line of work begun by (Ladner and Fischer, 1980) for unweighted, nondeterministic finite automata, and continued by (Hillis and Steele, 1986) and (Mytkowicz et al., 2014) for unweighted, deterministic finite automata. These approaches use parallel prefix sum to compute the weight (1), multiplying each adjacent pair of matrices in parallel and repeating until all the matrices have been multiplied together.\nThis approach could be combined with ours; we leave this for future work. A possible issue is that matrix-vector products are replaced with slower matrix-matrix products. Another is that prefix sum might not be applicable in a more general setting – for example, if a FST is composed with an input lattice rather than an input string."
+    }, {
+      "heading" : "6.2 Matrix libraries",
+      "text" : "The formulation of the Viterbi and forwardbackward algorithms as a sequence of matrix multiplications suggests two possible easy implementation strategies. First, if transition matrices are stored as dense matrices, then the forward algorithm becomes identical to forward propagation through a rudimentary recurrent neural network. Thus, a neural network toolkit could be used to carry out this computation on a GPU. However, in practice, because our transition matrices are sparse, this approach will probably be inefficient.\nSecond, off-the-shelf libraries exist for sparse matrix/vector operations, like cuSPARSE.1 However, such libraries do not allow redefinition of the addition and multiplication operations, making it difficult to implement the Viterbi algorithm or use log-probabilities. Also, parallelization of sparse matrix/vector operations depends heavily on the sparsity pattern (Bell and Garland, 2008), so that an off-the-shelf library may not provide the best solution for finite-state models of language. We test this approach below and find it to be several times slower than a non-GPU implementation."
+    }, {
+      "heading" : "7 Experiment",
+      "text" : ""
+    }, {
+      "heading" : "7.1 Setup",
+      "text" : "To test our algorithm, we constructed a FST for rudimentary French-to-English translation. We trained different unsmoothed bigram language\n1http://docs.nvidia.com/cuda/cusparse/\nmodels on 1k/10k/100k/150k lines of FrenchEnglish parallel data from the Europarl corpus and converted it into a finite automaton (see Figure 3a for a toy example).\nGIZA++ was used to word-align the same data and generate word-translation tables P( f | e) from the word alignments, as in lexical weighting (Koehn et al., 2003). We converted this table into a single-state FST (Figure 3b). The language model automaton and the translation table transducer were intersected to create a transducer similar to the one in Figure 1.\nFor more details about the transducers (number of nodes, edges, and percentage of non-zero elements on the transducer) see Table 4.\nWe tested on a subset of 100 sentences from the French corpus with lengths of up to 80 words. For each experimental setting, we ran on this set 1000 times and report the total time. Our experiments were run on three different systems: (1) a system with an Intel Core i7-4790 8-core CPU and an NVIDIA Tesla K40c GPU, (2) a system with an Intel Xeon E5 16-core CPU and an NVIDIA Titan X GPU, and (3) a system with an Intel Xeon E5 24-core CPU and an NVIDIA Tesla P100 GPU."
+    }, {
+      "heading" : "7.2 Baselines",
+      "text" : "We compared against the following baselines:\nCarmel is an FST toolkit developed at USC/ISI.2\nOpenFST is a FST toolkit developed by Google as an open-source successor of the AT&T Finite State Machine library (Allauzen et al., 2007). For compatibility, our implementations read the OpenFST/AT&T text file format.\n2https://github.com/graehl/carmel\nOur serial implementation Algorithm 1 for Viterbi and Algorithm 2 for forward-backward. cuSPARSE was used to implement the forward algorithm, using CSR format instead of COO for transition matrices. Since we can’t redefine addition and multiplication, we could not implement the Viterbi algorithm. To avoid underflow, we rescaled the vector of forward values at each time step and kept track of the log of the scale in a separate variable.\nTo be fair, it should be noted that Carmel and OpenFST are much more general than the other implementations listed here. Both perform FST composition in order to decode an input string adding another layer of complexity to the process. The timings for OpenFST and Carmel on Table 2 include composition"
+    }, {
+      "heading" : "7.3 Results",
+      "text" : "Table 2 shows the overall performance of our Viterbi algorithm and the baseline algorithms. Our parallel implementation does worse than our serial implementation when the transducer used is\nsmall (presumably due to the overhead of kernel launches and memory copies), but the speedups increase as the size of the transducer grows, reaching a speedup of 5x. The forward-backward algorithm with expected counts obtains a 5x speedup over the serial code on the largest transducer (See Table 3).\nCuSPARSE does significantly worse than even our serial implementation; presumably, it would have done better if the transition matrices of our transducers were sparser.\nFigure 4 shows decoding times for three algorithms (our serial and parallel Viterbi, and cuSPARSE forward) on individual sentences. It can be seen that all three algorithms are roughly linear in the sentence length.\nViterbi is faster than either the forward or backward algorithm across the board. This is because the latter need to add log-probabilities (lines 6 and 13 of Algorithm 2), which involves expensive calls to transcendental functions."
+    }, {
+      "heading" : "7.4 Comparison across GPU architectures",
+      "text" : "Table 2 compares the performance of the Keplerbased K40, where we did most of our experiments, with the Maxwell-based Titan X and the Pascalbased Tesla P100. The performance improvement is due to different factors, such as a larger number of active thread blocks per streaming multiprocessor on a GPU architecture, the grid and block size selected to run the kernels, and memory management on the GPU. After the release of the Kepler architecture, the Maxwell architecture introduced an improved workload balancing, reduced\narithmetic latency, and faster atomic operations. The Pascal architecture allows speedups over all the other architectures by introducing an increased floating point performance, faster data movement performance (NVLink), larger and more efficient shared memory, and improved atomic operations. Also, SMs on the pascal architecture are more efficient allowing speedups larger speedups than its predecessors. Our parallel implementations were compiled using architecture specific flags (-arch=compute_XX) to take full advantage of the architectural enhancements described in this section."
+    }, {
+      "heading" : "7.5 Comparison against a multi-core implementation",
+      "text" : "Table 2 shows how our parallel implementation on a GPU compares against a multi-core version of our serial Viterbi algorithm implemented in MPI. We chose MPI since it supports distributed and shared memory unlike OpenMP that supports shared memory only. Results show that a multicore implementation of the algorithm leads to slower performance than the serial code due to the communication and synchronization overhead. Several cores must transfer information frequently and synchronize all messages on a single core. GPUs perform better than multi-core in this case since all the memory is already on the graphics card and the cost of using global memory on the GPU is lower than synchronizing and sharing data between cores."
+    }, {
+      "heading" : "8 Conclusion",
+      "text" : "We have shown that our algorithm outperforms several serial implementations (our own serial implementation on a Intel Core i7 and Xeon E machines, Carmel and OpenFST) as well as a GPU implementation using cuSPARSE.\nA system with newer and faster cores might achieve higher speedups than a GPU on smaller datasets. However,building a multi-core system that beats a GPU setup can be more expensive. For example, a 16 core Intel Xeon E5-2698 V3 can cost 3,500 USD (Bogoychev and Lopez, 2016). Newer GPU models offer previous generation CPU’s the opportunity to obtain speedups for a lower price (Titan X GPUs sell cheaper than Xeon E5 setups at US$1,200). Speeding up computation on a GPU would allow users to speed up applications cheaper without investing on a newer multicore system.\nOur implementation has been open-sourced and is available online. 3 In the future, we plan to expand this software into a toolkit that includes other algorithms needed to run a full machine translation system."
+    }, {
+      "heading" : "Acknowledgements",
+      "text" : "This research was supported in part by a gift of a Tesla K40c GPU card from NVIDIA Corporation."
+    } ],
+    "references" : [ {
+      "title" : "OpenFst: A general and efficient weighted finite-state transducer library",
+      "author" : [ "Mohri." ],
+      "venue" : "Proc. International Conference on Implementation and Application of Automata (CIAA 2007), pages 11–23.",
+      "citeRegEx" : "Mohri.,? 2007",
+      "shortCiteRegEx" : "Mohri.",
+      "year" : 2007
+    }, {
+      "title" : "Efficient sparse matrix-vector multiplication on CUDA",
+      "author" : [ "Bell", "Garland2008] Nathan Bell", "Michael Garland" ],
+      "venue" : "Technical Report NVIDIA Technical Report NVR-2008-004,",
+      "citeRegEx" : "Bell et al\\.,? \\Q2008\\E",
+      "shortCiteRegEx" : "Bell et al\\.",
+      "year" : 2008
+    }, {
+      "title" : "N-gram language models for massively parallel devices",
+      "author" : [ "Bogoychev", "Lopez2016] Nikolay Bogoychev", "Adam Lopez" ],
+      "venue" : "In Proc. ACL,",
+      "citeRegEx" : "Bogoychev et al\\.,? \\Q2016\\E",
+      "shortCiteRegEx" : "Bogoychev et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "A multi-teraflop constituency parser using GPUs",
+      "author" : [ "Canny et al.2013] John Canny", "David Hall", "Dan Klein" ],
+      "venue" : "In Proc. EMNLP,",
+      "citeRegEx" : "Canny et al\\.,? \\Q2013\\E",
+      "shortCiteRegEx" : "Canny et al\\.",
+      "year" : 2013
+    }, {
+      "title" : "A fully data parallel WFST-based large vocabulary continuous speech recognition on a graphics processing unit",
+      "author" : [ "Chong et al.2009] Jike Chong", "Ekaterina Gonina", "Youngmin Yi", "Kurt Keutzer" ],
+      "venue" : "In Proc. INTERSPEECH,",
+      "citeRegEx" : "Chong et al\\.,? \\Q2009\\E",
+      "shortCiteRegEx" : "Chong et al\\.",
+      "year" : 2009
+    }, {
+      "title" : "Parameter estimation for probabilistic finite-state transducers",
+      "author" : [ "Jason Eisner" ],
+      "venue" : "In Proc. ACL,",
+      "citeRegEx" : "Eisner.,? \\Q2002\\E",
+      "shortCiteRegEx" : "Eisner.",
+      "year" : 2002
+    }, {
+      "title" : "Sparser, better, faster GPU parsing",
+      "author" : [ "Hall et al.2014] David Hall", "Taylor Berg-Kirkpatrick", "Dan Klein" ],
+      "venue" : "In Proc. ACL,",
+      "citeRegEx" : "Hall et al\\.,? \\Q2014\\E",
+      "shortCiteRegEx" : "Hall et al\\.",
+      "year" : 2014
+    }, {
+      "title" : "Massively parallel suffix array queries and on-demand phrase extraction for statistical machine translation using gpus",
+      "author" : [ "He et al.2013] Hua He", "Jimmy Lin", "Adam Lopez" ],
+      "venue" : "In Proc. NAACL HLT,",
+      "citeRegEx" : "He et al\\.,? \\Q2013\\E",
+      "shortCiteRegEx" : "He et al\\.",
+      "year" : 2013
+    }, {
+      "title" : "Efficient on-the-fly hypothesis rescoring in a hybrid gpu/cpu-based large vocabulary continuous speech recognition engine",
+      "author" : [ "Kim et al.2012] Jungsuk Kim", "Jike Chong", "Ian R Lane" ],
+      "venue" : "In Proc. INTERSPEECH,",
+      "citeRegEx" : "Kim et al\\.,? \\Q2012\\E",
+      "shortCiteRegEx" : "Kim et al\\.",
+      "year" : 2012
+    }, {
+      "title" : "Statistical phrase-based translation",
+      "author" : [ "Koehn et al.2003] Philipp Koehn", "Franz Josef Och", "Daniel Marcu" ],
+      "venue" : "In Proc. NAACL HLT,",
+      "citeRegEx" : "Koehn et al\\.,? \\Q2003\\E",
+      "shortCiteRegEx" : "Koehn et al\\.",
+      "year" : 2003
+    }, {
+      "title" : "A weighted finite state transducer translation template model for statistical machine translation",
+      "author" : [ "Kumar et al.2005] Shankar Kumar", "Yonggang Deng", "William Byrne" ],
+      "venue" : "J. Natural Language Engineering,",
+      "citeRegEx" : "Kumar et al\\.,? \\Q2005\\E",
+      "shortCiteRegEx" : "Kumar et al\\.",
+      "year" : 2005
+    }, {
+      "title" : "Parallel prefix computation",
+      "author" : [ "Ladner", "Fischer1980] Richard E. Ladner", "Michael J. Fischer" ],
+      "venue" : "J. ACM,",
+      "citeRegEx" : "Ladner et al\\.,? \\Q1980\\E",
+      "shortCiteRegEx" : "Ladner et al\\.",
+      "year" : 1980
+    }, {
+      "title" : "Conditional random fields: Probabilistic models for segmenting and labeling sequence data",
+      "author" : [ "Andrew McCallum", "Fernando C.N. Pereira" ],
+      "venue" : "In Proc. ICML,",
+      "citeRegEx" : "Lafferty et al\\.,? \\Q2001\\E",
+      "shortCiteRegEx" : "Lafferty et al\\.",
+      "year" : 2001
+    }, {
+      "title" : "Efficient parallel implementation of threepoint viterbi decoding algorithm on CPU, GPU, and FPGA. Concurrency and Computation: Practice and Experience, 26(3):821–840",
+      "author" : [ "Li et al.2014] Rongchun Li", "Yong Dou", "Dan Zou" ],
+      "venue" : null,
+      "citeRegEx" : "Li et al\\.,? \\Q2014\\E",
+      "shortCiteRegEx" : "Li et al\\.",
+      "year" : 2014
+    }, {
+      "title" : "Scalable GPU graph traversal",
+      "author" : [ "Michael Garland", "Andrew Grimshaw" ],
+      "venue" : "In Proc. 17th ACM SIGPLAN Symposium on Principles and Practice of Parallel Programming (PPoPP),",
+      "citeRegEx" : "Merrill et al\\.,? \\Q2012\\E",
+      "shortCiteRegEx" : "Merrill et al\\.",
+      "year" : 2012
+    }, {
+      "title" : "Weighted finitestate transducers in speech recognition",
+      "author" : [ "Mohri et al.2002] Mehryar Mohri", "Fernando C.N. Pereira", "Michael Riley" ],
+      "venue" : "Computer Speech and Language,",
+      "citeRegEx" : "Mohri et al\\.,? \\Q2002\\E",
+      "shortCiteRegEx" : "Mohri et al\\.",
+      "year" : 2002
+    }, {
+      "title" : "Weighted automata algorithms",
+      "author" : [ "Mehryar Mohri" ],
+      "venue" : "Handbook of Weighted Automata,",
+      "citeRegEx" : "Mohri.,? \\Q2009\\E",
+      "shortCiteRegEx" : "Mohri.",
+      "year" : 2009
+    }, {
+      "title" : "Dataparallel finite-state machines",
+      "author" : [ "Madanlal Musuvathi", "Wolfram Schulte" ],
+      "venue" : "In Proc. Architectural Support for Programming Languages and Operating Systems (ASPLOS),",
+      "citeRegEx" : "Mytkowicz et al\\.,? \\Q2014\\E",
+      "shortCiteRegEx" : "Mytkowicz et al\\.",
+      "year" : 2014
+    }, {
+      "title" : "Improving GPU performance via large warps and two-level warp scheduling",
+      "author" : [ "Michael Shebanow", "Chang Joo Lee", "Rustam Miftakhutdinov", "Onur Mutlu", "Yale N Patt" ],
+      "venue" : null,
+      "citeRegEx" : "Narasiman et al\\.,? \\Q2011\\E",
+      "shortCiteRegEx" : "Narasiman et al\\.",
+      "year" : 2011
+    }, {
+      "title" : "A Gb/s parallel block-based viterbi decoder for convolutional codes on gpu",
+      "author" : [ "Peng et al.2016] Hao Peng", "Rongke Liu", "Yi Hou", "Ling Zhao" ],
+      "venue" : "arXiv preprint arXiv:1608.00066",
+      "citeRegEx" : "Peng et al\\.,? \\Q2016\\E",
+      "shortCiteRegEx" : "Peng et al\\.",
+      "year" : 2016
+    } ],
+    "referenceMentions" : [ {
+      "referenceID" : 16,
+      "context" : "Weighted finite automata (Mohri, 2009), including hidden Markov models and conditional random fields (Lafferty et al.",
+      "startOffset" : 25,
+      "endOffset" : 38
+    }, {
+      "referenceID" : 12,
+      "context" : "Weighted finite automata (Mohri, 2009), including hidden Markov models and conditional random fields (Lafferty et al., 2001), are used to solve a wide range of natural language processing (NLP) problems, including phonology and morphology, part-of-speech tagging, chunking, named entity recognition, and others.",
+      "startOffset" : 101,
+      "endOffset" : 124
+    }, {
+      "referenceID" : 15,
+      "context" : "Even models for speech recognition and phrase-based translation can be thought of as extensions of finite automata (Mohri et al., 2002; Kumar et al., 2005).",
+      "startOffset" : 115,
+      "endOffset" : 155
+    }, {
+      "referenceID" : 10,
+      "context" : "Even models for speech recognition and phrase-based translation can be thought of as extensions of finite automata (Mohri et al., 2002; Kumar et al., 2005).",
+      "startOffset" : 115,
+      "endOffset" : 155
+    }, {
+      "referenceID" : 18,
+      "context" : "Although the use of graphics processing units (GPUs) is now de rigeur in applications of neural networks and made easy through toolkits like Theano (Theano Development Team, 2016), there has been little previous work, to our knowledge, on acceleration of weighted finite-state computations on GPUs (Narasiman et al., 2011; Li et al., 2014; Peng et al., 2016; Chong et al., 2009).",
+      "startOffset" : 298,
+      "endOffset" : 378
+    }, {
+      "referenceID" : 13,
+      "context" : "Although the use of graphics processing units (GPUs) is now de rigeur in applications of neural networks and made easy through toolkits like Theano (Theano Development Team, 2016), there has been little previous work, to our knowledge, on acceleration of weighted finite-state computations on GPUs (Narasiman et al., 2011; Li et al., 2014; Peng et al., 2016; Chong et al., 2009).",
+      "startOffset" : 298,
+      "endOffset" : 378
+    }, {
+      "referenceID" : 19,
+      "context" : "Although the use of graphics processing units (GPUs) is now de rigeur in applications of neural networks and made easy through toolkits like Theano (Theano Development Team, 2016), there has been little previous work, to our knowledge, on acceleration of weighted finite-state computations on GPUs (Narasiman et al., 2011; Li et al., 2014; Peng et al., 2016; Chong et al., 2009).",
+      "startOffset" : 298,
+      "endOffset" : 378
+    }, {
+      "referenceID" : 4,
+      "context" : "Although the use of graphics processing units (GPUs) is now de rigeur in applications of neural networks and made easy through toolkits like Theano (Theano Development Team, 2016), there has been little previous work, to our knowledge, on acceleration of weighted finite-state computations on GPUs (Narasiman et al., 2011; Li et al., 2014; Peng et al., 2016; Chong et al., 2009).",
+      "startOffset" : 298,
+      "endOffset" : 378
+    }, {
+      "referenceID" : 17,
+      "context" : "Most previous work on parallel processing of finite automata (Ladner and Fischer, 1980; Hillis and Steele, 1986; Mytkowicz et al., 2014) uses dense representations of finite automata, which is only appropriate if the automata are not too sparse (that is, most states can transition to most other states).",
+      "startOffset" : 61,
+      "endOffset" : 136
+    }, {
+      "referenceID" : 7,
+      "context" : "Previous work has been done on accelerating particular NLP tasks on GPUs: in machine translation, phrase-pair retrieval (He et al., 2013) and language model querying (Bogoychev and Lopez, 2016); parsing (Hall et al.",
+      "startOffset" : 120,
+      "endOffset" : 137
+    }, {
+      "referenceID" : 6,
+      "context" : ", 2013) and language model querying (Bogoychev and Lopez, 2016); parsing (Hall et al., 2014; Canny et al., 2013); and speech recognition (Kim et al.",
+      "startOffset" : 73,
+      "endOffset" : 112
+    }, {
+      "referenceID" : 3,
+      "context" : ", 2013) and language model querying (Bogoychev and Lopez, 2016); parsing (Hall et al., 2014; Canny et al., 2013); and speech recognition (Kim et al.",
+      "startOffset" : 73,
+      "endOffset" : 112
+    }, {
+      "referenceID" : 8,
+      "context" : ", 2013); and speech recognition (Kim et al., 2012).",
+      "startOffset" : 32,
+      "endOffset" : 50
+    }, {
+      "referenceID" : 14,
+      "context" : "Our work uses concepts from the work of Merrill et al. (2012), who show that GPUs can be used to accelerate breadth-first search in sparse graphs.",
+      "startOffset" : 40,
+      "endOffset" : 62
+    }, {
+      "referenceID" : 5,
+      "context" : "Their intermediate values are used to compute expected counts during training by expectation-maximization (Eisner, 2002).",
+      "startOffset" : 106,
+      "endOffset" : 120
+    }, {
+      "referenceID" : 17,
+      "context" : "We have already mentioned a line of work begun by (Ladner and Fischer, 1980) for unweighted, nondeterministic finite automata, and continued by (Hillis and Steele, 1986) and (Mytkowicz et al., 2014) for unweighted, deterministic finite automata.",
+      "startOffset" : 174,
+      "endOffset" : 198
+    }, {
+      "referenceID" : 9,
+      "context" : "GIZA++ was used to word-align the same data and generate word-translation tables P( f | e) from the word alignments, as in lexical weighting (Koehn et al., 2003).",
+      "startOffset" : 141,
+      "endOffset" : 161
+    } ],
+    "year" : 2017,
+    "abstractText" : "Weighted finite automata and transducers (including hidden Markov models and conditional random fields) are widely used in natural language processing (NLP) to perform tasks such as morphological analysis, part-of-speech tagging, chunking, named entity recognition, speech recognition, and others. Parallelizing finite state algorithms on graphics processing units (GPUs) would benefit many areas of NLP. Although researchers have implemented GPU versions of basic graph algorithms, limited previous work, to our knowledge, has been done on GPU algorithms for weighted finite automata. We introduce a GPU implementation of the Viterbi and forward-backward algorithm, achieving decoding speedups of up to 5.2x over our serial implementation running on different computer architectures and 6093x over OpenFST.",
+    "creator" : "LaTeX with hyperref package"
+  }
+}

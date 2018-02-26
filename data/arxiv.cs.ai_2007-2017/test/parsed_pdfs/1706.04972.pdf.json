@@ -1,0 +1,532 @@
+{
+  "name" : "1706.04972.pdf",
+  "metadata" : {
+    "source" : "META",
+    "title" : "Device Placement Optimization with Reinforcement Learning",
+    "authors" : [ "Azalia Mirhoseini", "Hieu Pham", "Benoit Steiner", "Rasmus Larsen", "Yuefeng Zhou", "Naveen Kumar", "Mohammad Norouzi", "Samy Bengio", "Jeff Dean" ],
+    "emails" : [ "lia@google.com>,", "<hyhieu@google.com>." ],
+    "sections" : [ {
+      "heading" : null,
+      "text" : "ar X\niv :1\n70 6.\n04 97\n2v 1\n[ cs\n.L G\n] 1\n3 Ju\nn 20\n17\nsize and computational requirements for training and inference with neural networks. Currently, a common approach to address these requirements is to use a heterogeneous distributed environment with a mixture of hardware devices such as CPUs and GPUs. Importantly, the decision of placing parts of the neural models on devices is often made by human experts based on simple heuristics and intuitions. In this paper, we propose a method which learns to optimize device placement for TensorFlow computational graphs. Key to our method is the use of a sequence-tosequence model to predict which subsets of operations in a TensorFlow graph should run on which of the available devices. The execution time of the predicted placements is then used as the reward signal to optimize the parameters of the sequence-to-sequence model. Our main result is that on Inception-V3 for ImageNet classification, and on RNN LSTM, for language modeling and neural machine translation, our model finds non-trivial device placements that outperform hand-crafted heuristics and traditional algorithmic methods."
+    }, {
+      "heading" : "1. Introduction",
+      "text" : "Over the past few years, neural networks have proven to be a general and effective tool for many practical problems, such as image classification (Krizhevsky et al., 2012; Szegedy et al., 2015; He et al., 2016), speech recognition (Hinton et al., 2012; Graves & Jaitly, 2014; Hannun et al., 2014; Chan et al., 2015), machine translation (Sutskever et al., 2014; Cho et al., 2014;\n*Equal contribution 1Google Brain 2Members of the Google Brain Residency Program (g.co/brainresidency) 3Google. Correspondence to: Azalia Mirhoseini <azalia@google.com>, Hieu Pham <hyhieu@google.com>.\nProceedings of the 34 th International Conference on Machine Learning, Sydney, Australia, PMLR 70, 2017. Copyright 2017 by the author(s).\nBahdanau et al., 2015; Wu et al., 2016) and speech synthesis (Oord et al., 2016; Arik et al., 2017; Wang et al., 2017). Together with their success is the growth in size and computational requirements of training and inference. Currently, a typical approach to address these requirements is to use a heterogeneous distributed environment with a mixture of many CPUs and GPUs. In this environment, it is a common practice for a machine learning practitioner to specify the device placement for certain operations in the neural network. For example, in a neural translation network, each layer, including all LSTM layers, the attention layer, and the softmax layer, is computed by a GPU (Sutskever et al., 2014; Wu et al., 2016).\nAlthough such decisions can be made by machine learning practitioners, they can be challenging, especially when the network has many branches (Szegedy et al., 2016), or when the minibatches get larger. Existing algorithmic solvers (Pellegrini, 2009; Karypis & Kumar, 1995b), on the other hand, are not flexible enough to work with a dynamic environment with many interferences.\nIn this paper, we propose a method which learns to optimize device placement for training and inference with neural networks. The method, illustrated in Figure 1, takes into account information of the environment by performing series of experiments to understand which parts of the model should be placed on which device, and how to arrange the computations so that the communication is optimized. Key to our method is the use of a sequence-to-sequence model to read input information about the operations as well as the dependencies between them, and then propose a placement for each operation. Each proposal is executed in the hardware environment to measure the execution time. The execution time is then used as a reward signal to train the\nrecurrent model so that it gives better proposals over time.\nOur main result is that our method finds non-trivial placements onmultiple devices for Inception-V3 (Szegedy et al., 2016), Recurrent Neural Language Model (Zaremba et al., 2014; Jozefowicz et al., 2016) and Neural Machine Translation (Sutskever et al., 2014; Wu et al., 2016). Single-step measurements show that Scotch (Pellegrini, 2009) yields disappointing results on all three benchmarks, suggesting that their graph-based heuristics are not flexible enough for them. Our method can find non-trivial placements that are up to 3.5 times faster. When applied to train the three models in real time, the placements found by our method are up to 20% faster than human experts’ placements."
+    }, {
+      "heading" : "2. Related Work",
+      "text" : "Our work is closely related to the idea of using neural networks and reinforcement learning for combinatorial optimization (Vinyals et al., 2015; Bello et al., 2016). The space of possible placements for a computational graph is discrete, and we model the placements using a sequenceto-sequence approach, trained with policy gradients. However, experiments in early work were only concerned with toy datasets, whereas this work applies the framework to a large-scale practical application with noisy rewards.\nReinforcement learning has also been applied to optimize system performance. For example, Mao et al. (2016) propose to train a resource management algorithm with policy gradients. However, they optimize the expected value of a hand-crafted reward, unlike this work, where we optimize directly for the running time of the configurations, hence relieving the need to design intermediate cost models.\nGraph partitioning is an intensively studied subject in computer science. Early work such as Kernighan & Lin (1970); Kirkpatrick et al. (1983); Fiduccia & Mattheyses (1988); Johnson et al. (1989) employ several iterative refinement procedures that start from a partition and continue to explore similar partitions to improve. Alternative methods such as Hagen & Kahng (1992); Karypis & Kumar (1995b) perform spectral analyses on matrix representations of graphs to partition them. Despite their extensive literature, graph partitioning algorithms remain heuristics for computational graphs. The reason is that in order to apply these algorithms, one has to construct cost models for the graphs of concern. Since such models are expensive to even estimate and in virtually all cases, are not accurate, graph partitioning algorithms applied on them can lead to unsatisfying results, as we show in Section 4 of this paper.\nA well-known graph partitioning algorithm with an open source software library is the Scotch optimizer (Pellegrini, 2009), which we use as a baseline in our experiments. The Scotch mapper attempts to balance the\ncomputational load of a collection of tasks among a set of connected processing nodes, while reducing the cost of communication by keeping intensively communicating tasks on nearby nodes. Scotch relies on a collection of graph partitioning techniques such as k-way Fiduccia-Mattheyses (Fiduccia & Mattheyses, 1988), multilevel method (Barnard & Simon, 1994; Hendrickson & Leland, 1993; Karypis & Kumar, 1995a), band method (Chevalier & Pellegrini, 2006), diffusion method (Pellegrini, 2007), and dual recursive bipartitioning mapping (Pellegrini & Roman, 1996)).\nScotch models the problem with 2 graphs. The first graph is called the target architecture graph, whose vertices represent hardware resources such as CPUs or GPUs and whose edges represent the communication paths available between them, such as a PCIe bus or a network link. The second graph is called the source graph, which models the computation to be mapped onto the target architecture graph. In the case of TensorFlow (Abadi et al., 2016), the computations of programs are modeled as a graph whose vertices represent operations, while the graph edges represent the multidimensional data arrays (tensors) communicated between them. Scotch users have to choose how and when given partitioning should be applied to graphs. However, in our experiment, we rely on the software’s default strategies implemented in Scotch, which have already been extensively tuned."
+    }, {
+      "heading" : "3. Method",
+      "text" : "Consider a TensorFlow computational graph G, which consists ofM operations {o1, o2, ..., oM}, and a list ofD available devices. A placement P = {p1, p2, ..., pM} is an assignment of an operation oi ∈ G to a device pi, where pi ∈ {1, ..., D}. Let r(P) denote the time that it takes to perform a complete execution of G under the placement P . The goal of device placement optimization is to find P such that the execution time r(P) is minimized."
+    }, {
+      "heading" : "3.1. Training with Policy Gradients",
+      "text" : "While we seek to minimize the execution time r(P), direct optimization of r(P) results in two major issues. First, in the beginning of the training process, due to the bad placements sampled, the measurements of r(P) can be noisy, leading to inappropriate learning signals. Second, as the RL model gradually converges, the placements that are sampled become more similar to each other, leading to small differences between the corresponding running times, which results in less distinguishable training signals. We empirically find that the square root of running time, R(P) = √\nr(P), makes the learning process more robust. Accordingly, we propose to train a stochastic pol-\nFigure 2. Device placement model architecture.\nicy π(P|G; θ) to minimize the objective\nJ(θ) = EP∼π(P|G;θ) [R (P) |G] (1)\nIn our work, π(P|G; θ) is defined by an attentional sequence-to-sequence model, which we will describe in Section 3.2. We learn the network parameters using Adam (Kingma & Ba, 2014) optimizer based on policy gradients computed via the REINFORCE equation (Williams, 1992),\n∇θJ(θ) = EP∼π(P|G;θ) [R (P) · ∇θ log p (P|G; θ)] (2)\nWe estimate∇θJ(θ) by drawingK placement samples using Pi ∼ π(·|G; θ). We reduce the variance of policy gradients by using a baseline term B, leading to\n∇θJ(θ) ≈ 1\nK\nK ∑\ni=1\n(R (Pi)−B) · ∇θ log p (Pi|G; θ) (3)\nWe find that a simple moving average baseline B works well in our experiments. In practice, on computational graphs with large memory footprints, some placements can fail to execute, e.g., putting all of the operations of a huge LSTM on a single GPU will exceed the device’s memory limit. For such cases, we set the square root of running time R(P) to a large constant, which we call the failing signal. We specify the failing signal manually depending on the input graph. We observe that throughout our training process, some placements sporadically and unexpectedly fail, perhaps due to factors such as the state of the machine (we train our model on a shared cluster). This phenomenon is particularly undesirable towards the end of the training process, since a large difference between R(Pi) and the baseline B leads to a large update of the parameters, which potentially perturbs parameters θ out of a good minimum. We thus hard-code the training process so that after 5, 000 steps, one performs a parameter update with a sampled placement P only if the placement executes. In our experiments, we also find that initializing the baseline B with the failing signal results in more exploration."
+    }, {
+      "heading" : "3.2. Architecture Details",
+      "text" : "We use a sequence-to-sequence model (Sutskever et al., 2014) with LSTM (Hochreiter & Schmidhuber, 1997) and a content-based attention mechanism (Bahdanau et al., 2015) to predict the placements. Figure 2 shows the overall architecture of our model, which can be divided into two parts: encoder RNN and decoder RNN.\nThe input to the encoder RNN is the sequence of operations of the input graph. We embed the operations by concatenating their information. Specifically, for each input graph G, we first collect the types of its operations. An operation’s type describes the underlying computation, such as MatMul or conv2d. For each type, we store a tunable embedding vector. We then record the size of each operation’s list of output tensors and concatenate them into a fixed-size zero-padded list called the output shape. We also take the one-hot encoding vector that represents the operations that are direct inputs and outputs to each operation. Finally, the embedding of each operation is the concatenation of its type, its output shape, and its one-hot encoded adjacency information.\nThe decoder is an attentional LSTM (Bahdanau et al., 2015) with a fixed number of time steps that is equal to the number of operations in a graph G. At each step, the decoder outputs the device for the operation at the same encoder time step. Each device has its own tunable embedding, which is then fed as input to the next decoder time step."
+    }, {
+      "heading" : "3.3. Co-locating Operations",
+      "text" : "A key challenge when applying our method to TensorFlow computational graphs is that these graphs generally have thousands of operations (see Table 1). Modeling such a large number of operations with sequence-to-sequence models is difficult due to vanishing and exploding gradient issues (Pascanu et al., 2013) and large memory footprints. We propose to reduce the number of objects to place on dif-\nferent devices by manually forcing several operations to be located on the same device. In practice, this is implemented by the colocate with feature of TensorFlow.\nWe use several heuristics to create co-location groups. First, we rely on TensorFlow’s default co-location groups, such as co-locating each operation’s outputs with its gradients. We further apply a simple heuristic to merge more operations into co-location groups. Specifically, if the output of an operation X is consumed only by another operation Y , then operations X and Y are co-located. Many initialization operations in TensorFlow can be grouped in this way. In our experiments, we apply this heuristic recursively, and after each iteration, we treat the co-location groups as operations until there are not any further groups that can be merged. For certain models, we apply specific rules to construct co-location groups. For example, with ConvNets, we can treat several convolutions and pooling layers as a co-location group, and with RNN models, we treat each LSTM cell as a group."
+    }, {
+      "heading" : "3.4. Distributed Training",
+      "text" : "We speed up the training process of our model using asynchronous distributed training, as shown in Figure 3. Our framework consists of several controllers, each of which execute the current policy defined by the attentional sequence-to-sequence model as described in Section 3.2. All of the controllers interact with a single shared parameter server. We note that the parameter server holds only the controllers’ parameters, and not the input graph’s parameters, because keeping the input graph’s parameters on the parameter server can potentially create a latency bottleneck to transfer these parameters. Each controller in our framework interacts with K workers, where K is the number of Monte Carlo samples in Equation 3.\nThe training process has two alternating phases. In the first phase, each worker receives a signal that indicates that it should wait for placements from its controller, while each controller receives a signal that indicates it should sample K placements. Each sampled placement comes with a probability. Each controller then independently sends the\nplacements to their workers, one placement per worker, and sends a signal to indicate a phase change.\nIn the second phase, each worker executes the placement it receives and measures the running time. To reduce the variance in these measurements, each placement is executed for 10 steps and the average running time of the steps but the first one is recorded. We observe that in TensorFlow, the first step can take longer to execute compared to the following steps, and hence we treat the first layer as an outlier. Each controller waits for all of its workers to finish executing their assigned placements and returning their running times. When all of the running times are received, the controller uses the running times to scale the corresponding gradients to asynchronously update the controller parameters that reside in the parameter server.\nIn our experiments, we use up to 20 controllers, each with either 4 or 8 workers. Under this setting, it takes between 12 to 27 hours to find the best placement for the models in our experiments. Using more workers per controller yields more accurate estimates of the policy gradient as in Equation 3, but comes at the expense of possibly having to put more workers in idle states. We also note that due to the discrepancies between machines, it is more stable to let each controller have its own baseline."
+    }, {
+      "heading" : "4. Experiments",
+      "text" : "In the following experiments, we apply our proposed method to assign computations to devices on three important neural networks in the deep learning literature: Recurrent Neural Language Model (RNNLM) (Zaremba et al., 2014; Jozefowicz et al., 2016), Attentional Neural Machine Translation (Bahdanau et al., 2015), and InceptionV3 (Szegedy et al., 2016). We compare the RL placements against strong existing baselines described in Section 4.2."
+    }, {
+      "heading" : "4.1. Experiment Setup",
+      "text" : "Benchmarks. We evaluate our approach on three established deep learning models:\n• Recurrent Neural Network Language Model (RNNLM) with multiple LSTM lay-\ners (Zaremba et al., 2014; Jozefowicz et al., 2016). The grid structure of this model introduces tremendous potential for parallel executions because each LSTM cell can start as soon as its input and previous states are available.\n• Neural Machine Translation with attention mechanism (NMT) (Bahdanau et al., 2015; Wu et al., 2016).\nWhile the architecture of this model is similar to that of RNNLM, its large number of hidden states due to the source and target sentences necessitates model\nparallelism. Both Sutskever et al. (2014) andWu et al. (2016) propose to place each LSTM layer, the attention layer, and the softmax layer, each on a separate device. While the authors observe significant improvements at training time, their choices are not optimal. In fact, we show in our experiments that a trained policy can find significantly better placements.\n• Inception-V3 (Szegedy et al., 2016) is a widely-used architecture for image recognition and visual feature\nextraction (Khetan & Oh, 2016; Esteva et al., 2016). The Inception network has multiple blocks. Each block has several branches of convolutional and pooling layers, which are then concatenated to make the inputs for the next block. While these branches can be executed in parallel, the network’s depth restricts such potential since the later blocks have to wait for the previous ones.\nModel details. For Inception-V3, each step is executed on a batch of images, each of size 299 × 299 × 3, which is the widely-used setting for the ImageNet Challenge (Szegedy et al., 2015). For RNNLM and NMT, we use the model with 2 LSTM layers, with sizes of 2048 and 1024, respectively. We set the number of unrolling steps for RNNLM, as well as the maximum length for the source and target sentences of NMT, to 40. Each pass on RNNLM and NMT consists of a minibatch of 64 sequences.\nCo-location groups. We pre-process the TensorFlow computational graphs of the three aforementioned models to manually create their co-location groups. More precisely; for RNNLM and NMT, we treat each LSTM cell, each embedding lookup, each attention step and each softmax prediction step as a group; for Inception-V3, we treat each branch as a group. Table 1 shows the grouping statistics of these models.\nMetrics. We implement training operations for RNNLM and NMT using Adam (Kingma & Ba, 2014), and for Inception-V3 using RMSProp (Tieleman & Hinton, 2012). We evaluate a placement by the total time it takes to perform one forward pass, one backward pass and one parameter update. To reduce measurement variance, we average the running times over several trials. Additionally, we train each model from scratch using the placements found by\nour method and compare the training time to that of the strongest baseline placement.\nDevices. In our experiments, the available devices are 1 Intel Haswell 2300 CPU, which has 18 cores, and either 2 or 4 Nvidia Tesla K80 GPUs. We allow 50 GB of RAM for all models and settings."
+    }, {
+      "heading" : "4.2. Baselines",
+      "text" : "Single-CPU. This placement executes the whole neural network on a single CPU. Processing some large models on GPUs is infeasible due to memory limits, leaving SingleCPU the only choice despite being slow.\nSingle-GPU. This placement executes the whole neural network on a single CPU. If an operation lacks GPU implemention, it will be placed on CPU.\nScotch. We estimate the computational costs of each operation as well as the amount of data that flows along each edge of the neural network model, and feed them to the Scotch static mapper (Pellegrini, 2009). We also annotate the architecture graph (see Section 2) with compute and communication capacities of the underlying devices.\nMinCut. We use the same Scotch optimizer, but eliminate the CPU from the list of available devices fed to the optimizer. Similar to the single-GPU placement, if an operation has no GPU implementation, it runs on the CPU.\nExpert-designed. For RNNLM and NMT, we put each LSTM layer on a device. For NMT, we also put the attention mechanism and the softmax layer on the same device with the highest LSTM layer, and we put the embedding layer on the same device with the first LSTM layer. For Inception-V3, the common practice for the batch size of 32 is to put the entire model on a single GPU. There is no implementation of Inception-V3 with batch 32 using more than 1 GPU. To create an intuitive baseline on multiple GPUs, we heuristically partition the model into contiguous parts that have roughly the same number of layers. We compare against this approach in Section 4.3. The common practice for Inception-V3 with the larger batch size of 128 is to apply data parallelism using 4 GPUs. Each GPU runs a replica of the model and processes a batch of size 32 (Szegedy et al., 2016). We compare against this approach in Section 4.4."
+    }, {
+      "heading" : "4.3. Single-Step Runtime Efficiency",
+      "text" : "In Table 2, we present the per-step running times of the placements found by our method and by the baselines. We observe that our model is either on par with or better than\nother methods of placements. Despite being given no information other than the running times of the placements and the number of available devices, our model learns subtle tradeoffs between performance gain by parallelism and the costs induced by inter-device communications.\nRNNLM. Our method detects that it is possible to fit the whole RNNLM graph into one GPU, and decides to do so to save the inter-device communication latencies. The resulting placement is more than twice faster than the best published human-designed baseline.\nNeural MT. Our method finds a non-trivial placement (see Figure 4) that leads to a speedup of up to 20.6% for 4 GPUs. Our method also learns to put the less computational expensive operations, such as embedding lookups, on the CPU. We suspect that whilst being the slowest device, the CPU can handle these lookup operations (which are less computationally expensive than other operations) to reduce the load for other GPUs.\nInception-V3. For Inception-V3 with the batch size of 32, RL-based placer learns that when there are only 2GPUs available, the degree of freedom for model parallelism is limited. It thus places all the operations on a single GPU (although it could use 2 GPUs). However, when 4 GPUs\nare available, the RL-based placer finds an efficient way to use all of the GPUs, reducing the model’s per-step running time from 4.60 seconds to 3.85 seconds. This result is significant, as neither of our baselines could find a placement better than assigning all the operations to a single GPU.\nWe also conduct a simple extension of our experiments, by increasing the batch sizes of RNNLM andNMT to 256, and their LSTM sizes to 4, 096 and 2, 048, respectively. This makes the models’ memory footprints so large that even one layer of them cannot be fitted into any single device, hence ruling out the human-designed placement. Nevertheless, after several steps of finding placements that fail to run, our approach manages to find a way to successfully place input models on devices The running times of the placements found for large RNNLM and NMT are 33.46 and 35.84 seconds, respectively."
+    }, {
+      "heading" : "4.4. End-to-End Runtime Efficiency",
+      "text" : "We now investigate whether the RL-based placements can speedup not only the single-step running time but also the entire training process.\nNeural MT. We train our Neural MT model on the WMT14 English-German dataset.1 For these experiments, we pre-process the dataset into word pieces (Wu et al., 2016) such that the vocabularies of both languages consist of 32, 000 word pieces. In order to match our model’s settings, we consider only the translation pairs where no sentence has more than 40 word pieces. We train each model for 200, 000 steps and record their train perplexities. Each training machine has 4 Nvidia Tesla K80 GPUs and 1 Intel Haswell 2300 CPU. Since there are inevitable noises in the computer systems when measuring the running times, we train each model 4 times independently and average their per-step running times and perplexities.\nThe RL-based placement runs faster than the expertdesigned placement, as shown in the training curves in Figure 6. Quantitatively, the expert-designed placement, which puts each layer (LSTM, attention and softmax) on a different GPU, takes 229.57 hours; meanwhile the RLbased placement (see Figure 4) takes 165.73 hours, giving 27.8% speed up of total training time. We note that the measured speedup rate (and the running times) of these models appear different than reported in Table 2 because measuring them in our RL method has several overheads.\n1 http://www.statmt.org/wmt14/\nInception-V3. We train Inception-V3 on the ImageNet dataset (Russakovsky et al., 2015) until the model reaches the accuracy of 72% on the validation set. In practice, more often, inception models are trained with data parallelism rather than model parallelism. We thus compare the placements found by our algorithm (see Figure 5) against two such baselines.\nThe first baseline, called Asynchronous Tower, puts one replica of the Inception-V3 network on each GPU. These replicas share the data reading operations, which are assigned to the CPU. Each replica independently performs forward and backward passes to compute the model’s gradients with respect to a minibatch of 32 images and then updates the parameters asynchronously. The second baseline, called Synchronous Tower, is the same as Asynchronous Tower, except that it waits for the gradients of all copies before making an update. All settings use the learning rate of 0.045 and are trained using RMSProp.\nFigure 7 shows the training curves of the three settings for Inception-V3. As can be seen from the figure, the endto-end training result confirms that the RL-based placement indeed speedups the training process by 19.7% com-\npared to the Synchronous Tower. While Asynchronous Tower gives a better per-step time, synchronous approaches lead to faster convergence. The training curve of the RLbased placement, being slower at first, eventually crosses the training curve of Asynchronous Tower."
+    }, {
+      "heading" : "4.5. Analysis of Found Placements",
+      "text" : "In order to understand the rationale behind the RL-based placements, we analyze their profiling information and compare them against those of expert-designed placements.\nNeural MT. We first compare the per-device computational loads by RL-based placement and expert-designed placement for the NMT model. Figure 8 shows such performance profiling. RL-based placement balances the workload significantly better than does the expert-designed placement. Interestingly, if we do not take into account the time for back-propagation, then expert-designed placement makes sense because the workload is more balanced (whilst still less balanced than ours). The imbalance is much more significant when back-propagation time is considered.\nInception-V3. On Inception-V3, however, the RL-based placement does not seek to balance the computations between GPUs, as illustrated in Figure 9-top. We suspect this is because Inception-V3 has more dependencies than NMT, allowing less room for model parallelism across GPUs. The reduction in running time of the RL-based placement comes from the less time it spends copying data between devices, as shown in Figure 9-bottom. In particular, the models parameters are on the same device as the operations that use them, unlike in Synchronous Towers, where\nall towers have to wait for all parameters have to be updated and sent to them. On the contrary, that use them to reduce the communication cost, leading to overall reduction in computing time."
+    }, {
+      "heading" : "5. Conclusion",
+      "text" : "In this paper, we present an adaptive method to optimize device placements for neural networks. Key to our approach is the use of a sequence-to-sequence model to propose device placements given the operations in a neural network. The model is trained to optimize the execution time of the neural network. Besides the execution time, the number of available devices is the only other information about the hardware configuration that we feed to our model.\nOur results demonstrate that the proposed approach learns the properties of the environment including the complex\ntradeoff between computation and communication in hardware. On a range of tasks including image classification, language modeling, and machine translation, our method surpasses placements carefully designed by human experts and highly optimized algorithmic solvers."
+    }, {
+      "heading" : "Acknowledgements",
+      "text" : "We thank Martin Abadi, Stephan Gouws, and the Google Brain team for their help with the project."
+    } ],
+    "references" : [ {
+      "title" : "Tensorflow: A system for large-scale machine learning",
+      "author" : [ "Tucker", "Paul", "Vasudevan", "Vijay", "Warden", "Pete", "Wicke", "Martin", "Yu", "Yuan", "Zheng", "Xiaoqiang" ],
+      "venue" : "arXiv preprint arXiv:1605.08695,",
+      "citeRegEx" : "Tucker et al\\.,? \\Q2016\\E",
+      "shortCiteRegEx" : "Tucker et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Deep voice: Real-time neural text-tospeech",
+      "author" : [ "Arik", "Sercan O", "Chrzanowski", "Mike", "Coates", "Adam", "Diamos", "Gregory", "Gibiansky", "Andrew", "Kang", "Yongguo", "Li", "Xian", "Miller", "John", "Raiman", "Jonathan", "Sengupta", "Shubho" ],
+      "venue" : "arXiv preprint arXiv:1702.07825,",
+      "citeRegEx" : "Arik et al\\.,? \\Q2017\\E",
+      "shortCiteRegEx" : "Arik et al\\.",
+      "year" : 2017
+    }, {
+      "title" : "Neural machine translation by jointly learning to align and translate",
+      "author" : [ "Bahdanau", "Dzmitry", "Cho", "Kyunghyun", "Bengio", "Yoshua" ],
+      "venue" : "In International Conference on Learning Representations,",
+      "citeRegEx" : "Bahdanau et al\\.,? \\Q2015\\E",
+      "shortCiteRegEx" : "Bahdanau et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "A fast multilevel implementation of recursive spectral bisection for partitioning unstructured problems",
+      "author" : [ "S.T. Barnard", "H.D. Simon" ],
+      "venue" : "Concurrency: practice and Experience,",
+      "citeRegEx" : "Barnard and Simon,? \\Q1994\\E",
+      "shortCiteRegEx" : "Barnard and Simon",
+      "year" : 1994
+    }, {
+      "title" : "Neural combinatorial optimization with reinforcement learning",
+      "author" : [ "Bello", "Irwan", "Pham", "Hieu", "Le", "Quoc V", "Norouzi", "Mohammad", "Bengio", "Samy" ],
+      "venue" : "arXiv preprint arXiv:1611.09940,",
+      "citeRegEx" : "Bello et al\\.,? \\Q2016\\E",
+      "shortCiteRegEx" : "Bello et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Listen, attend and spell",
+      "author" : [ "Chan", "William", "Jaitly", "Navdeep", "Le", "Quoc V", "Vinyals", "Oriol" ],
+      "venue" : "arXiv preprint arXiv:1508.01211,",
+      "citeRegEx" : "Chan et al\\.,? \\Q2015\\E",
+      "shortCiteRegEx" : "Chan et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "Improvement of the efficiency of genetic algorithms for scalable parallel graph partitioning in a multi-level framework",
+      "author" : [ "C. Chevalier", "F. Pellegrini" ],
+      "venue" : "EuroPar, Dresden,",
+      "citeRegEx" : "Chevalier and Pellegrini,? \\Q2006\\E",
+      "shortCiteRegEx" : "Chevalier and Pellegrini",
+      "year" : 2006
+    }, {
+      "title" : "Learning phrase representations using rnn encoder-decoder for statistical machine translation",
+      "author" : [ "Holger", "Bengio", "Yoshua" ],
+      "venue" : "arXiv preprint arXiv:1406.1078,",
+      "citeRegEx" : "Holger et al\\.,? \\Q2014\\E",
+      "shortCiteRegEx" : "Holger et al\\.",
+      "year" : 2014
+    }, {
+      "title" : "Dermatologist-level classification of skin cancer",
+      "author" : [ "Esteva", "Andre", "Kuprel", "Brett", "Novoa", "Rob", "Ko", "Justin", "Swetter", "Susan", "Blau", "Helen M", "Thrun", "Sebastian" ],
+      "venue" : null,
+      "citeRegEx" : "Esteva et al\\.,? \\Q2016\\E",
+      "shortCiteRegEx" : "Esteva et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "A lineartime heuristic for improving network partitions",
+      "author" : [ "Fiduccia", "Charles M", "Mattheyses", "Robert M" ],
+      "venue" : "In Papers on Twenty-five years of electronic design automation,",
+      "citeRegEx" : "Fiduccia et al\\.,? \\Q1988\\E",
+      "shortCiteRegEx" : "Fiduccia et al\\.",
+      "year" : 1988
+    }, {
+      "title" : "Towards end-to-end speech recognition with recurrent neural networks",
+      "author" : [ "Graves", "Alex", "Jaitly", "Navdeep" ],
+      "venue" : "In International Conference on Machine Learning,",
+      "citeRegEx" : "Graves et al\\.,? \\Q2014\\E",
+      "shortCiteRegEx" : "Graves et al\\.",
+      "year" : 2014
+    }, {
+      "title" : "New spectral methods for ratio cut partitioning and clustering",
+      "author" : [ "Hagen", "Lars", "Kahng", "Andrew B" ],
+      "venue" : "IEEE transactions on computer-aided design of integrated circuits and systems,",
+      "citeRegEx" : "Hagen et al\\.,? \\Q1992\\E",
+      "shortCiteRegEx" : "Hagen et al\\.",
+      "year" : 1992
+    }, {
+      "title" : "Deep speech: Scaling up end-to-end speech recognition",
+      "author" : [ "Hannun", "Awni", "Case", "Carl", "Casper", "Jared", "Catanzaro", "Bryan", "Diamos", "Greg", "Elsen", "Erich", "Prenger", "Ryan", "Satheesh", "Sanjeev", "Sengupta", "Shubho", "Coates", "Adam" ],
+      "venue" : "arXiv preprint arXiv:1412.5567,",
+      "citeRegEx" : "Hannun et al\\.,? \\Q2014\\E",
+      "shortCiteRegEx" : "Hannun et al\\.",
+      "year" : 2014
+    }, {
+      "title" : "Deep residual learning for image recognition",
+      "author" : [ "He", "Kaiming", "Zhang", "Xiangyu", "Ren", "Shaoqing", "Sun", "Jian" ],
+      "venue" : "In Proceedings of the IEEE Conference on Computer Vision and Pattern Recognition,",
+      "citeRegEx" : "He et al\\.,? \\Q2016\\E",
+      "shortCiteRegEx" : "He et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "A multilevel algorithm for partitioning graphs",
+      "author" : [ "B. Hendrickson", "R. Leland" ],
+      "venue" : "Technical Report SAND931301,",
+      "citeRegEx" : "Hendrickson and Leland,? \\Q1993\\E",
+      "shortCiteRegEx" : "Hendrickson and Leland",
+      "year" : 1993
+    }, {
+      "title" : "Long shortterm memory",
+      "author" : [ "Hochreiter", "Sepp", "Schmidhuber", "Jurgen" ],
+      "venue" : "Neural Computation,",
+      "citeRegEx" : "Hochreiter et al\\.,? \\Q1997\\E",
+      "shortCiteRegEx" : "Hochreiter et al\\.",
+      "year" : 1997
+    }, {
+      "title" : "Optimization by simulated annealing: an experimental evaluation; part i, graph partitioning",
+      "author" : [ "Johnson", "David S", "Aragon", "Cecilia R", "McGeoch", "Lyle A", "Schevon", "Catherine" ],
+      "venue" : "Operations research,",
+      "citeRegEx" : "Johnson et al\\.,? \\Q1989\\E",
+      "shortCiteRegEx" : "Johnson et al\\.",
+      "year" : 1989
+    }, {
+      "title" : "Exploring the limits of language modeling",
+      "author" : [ "Jozefowicz", "Rafal", "Vinyals", "Oriol", "Schuster", "Mike", "Shazeer", "Noam", "Wu", "Yonghui" ],
+      "venue" : "arXiv preprint arXiv:1602.02410,",
+      "citeRegEx" : "Jozefowicz et al\\.,? \\Q2016\\E",
+      "shortCiteRegEx" : "Jozefowicz et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "A fast and high quality multilevel scheme for partitioning irregular graphs",
+      "author" : [ "G. Karypis", "V. Kumar" ],
+      "venue" : "Technical Report 95-035,",
+      "citeRegEx" : "Karypis and Kumar,? \\Q1995\\E",
+      "shortCiteRegEx" : "Karypis and Kumar",
+      "year" : 1995
+    }, {
+      "title" : "Metis–unstructured graph partitioning and sparse matrix ordering system, version",
+      "author" : [ "Karypis", "George", "Kumar", "Vipin" ],
+      "venue" : null,
+      "citeRegEx" : "Karypis et al\\.,? \\Q1995\\E",
+      "shortCiteRegEx" : "Karypis et al\\.",
+      "year" : 1995
+    }, {
+      "title" : "An efficient heuristic procedure for partitioning graphs",
+      "author" : [ "Kernighan", "Brian W", "Lin", "Shen" ],
+      "venue" : "The Bell system technical journal,",
+      "citeRegEx" : "Kernighan et al\\.,? \\Q1970\\E",
+      "shortCiteRegEx" : "Kernighan et al\\.",
+      "year" : 1970
+    }, {
+      "title" : "Achieving budgetoptimality with adaptive schemes in crowdsourcing",
+      "author" : [ "Khetan", "Ashish", "Oh", "Sewoong" ],
+      "venue" : "In Advances in Neural Information Processing Systems,",
+      "citeRegEx" : "Khetan et al\\.,? \\Q2016\\E",
+      "shortCiteRegEx" : "Khetan et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Adam: A method for stochastic optimization",
+      "author" : [ "Kingma", "Diederik", "Ba", "Jimmy" ],
+      "venue" : "In International Conference on Learning Representations,",
+      "citeRegEx" : "Kingma et al\\.,? \\Q2014\\E",
+      "shortCiteRegEx" : "Kingma et al\\.",
+      "year" : 2014
+    }, {
+      "title" : "Optimization by simulated annealing",
+      "author" : [ "Kirkpatrick", "Scott", "Vecchi", "Mario P" ],
+      "venue" : "Science, 220(4598):671–680,",
+      "citeRegEx" : "Kirkpatrick et al\\.,? \\Q1983\\E",
+      "shortCiteRegEx" : "Kirkpatrick et al\\.",
+      "year" : 1983
+    }, {
+      "title" : "Imagenet classification with deep convolutional neural networks",
+      "author" : [ "Krizhevsky", "Alex", "Sutskever", "Ilya", "Hinton", "Geoffrey E" ],
+      "venue" : "In Advances in Neural Information Processing Systems,",
+      "citeRegEx" : "Krizhevsky et al\\.,? \\Q2012\\E",
+      "shortCiteRegEx" : "Krizhevsky et al\\.",
+      "year" : 2012
+    }, {
+      "title" : "Resource management with deep reinforcement learning",
+      "author" : [ "Mao", "Hongzi", "Alizadeh", "Mohammad", "Menache", "Ishai", "Kandula", "Srikanth" ],
+      "venue" : "In Proceedings of the 15th ACM Workshop on Hot Topics in Networks,",
+      "citeRegEx" : "Mao et al\\.,? \\Q2016\\E",
+      "shortCiteRegEx" : "Mao et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Wavenet: A generative model for raw audio",
+      "author" : [ "Oord", "Aaron van den", "Dieleman", "Sander", "Zen", "Heiga", "Simonyan", "Karen", "Vinyals", "Oriol", "Graves", "Alex", "Kalchbrenner", "Nal", "Senior", "Andrew", "Kavukcuoglu", "Koray" ],
+      "venue" : "arXiv preprint arXiv:1609.03499,",
+      "citeRegEx" : "Oord et al\\.,? \\Q2016\\E",
+      "shortCiteRegEx" : "Oord et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "On the difficulty of training recurrent neural networks",
+      "author" : [ "Pascanu", "Razvan", "Mikolov", "Tomas", "Bengio", "Yoshua" ],
+      "venue" : "In International Conference on Machine Learning,",
+      "citeRegEx" : "Pascanu et al\\.,? \\Q2013\\E",
+      "shortCiteRegEx" : "Pascanu et al\\.",
+      "year" : 2013
+    }, {
+      "title" : "A parallelisable multi-level banded diffusion scheme for computing balanced partitions with smooth boundaries",
+      "author" : [ "F. Pellegrini" ],
+      "venue" : "EuroPar, Rennes,",
+      "citeRegEx" : "Pellegrini,? \\Q2007\\E",
+      "shortCiteRegEx" : "Pellegrini",
+      "year" : 2007
+    }, {
+      "title" : "Distillating knowledge about scotch",
+      "author" : [ "F. Pellegrini" ],
+      "venue" : null,
+      "citeRegEx" : "Pellegrini,? \\Q2009\\E",
+      "shortCiteRegEx" : "Pellegrini",
+      "year" : 2009
+    }, {
+      "title" : "Experimental analysis of the dual recursive bipartitioning algorithm for static mapping",
+      "author" : [ "F. Pellegrini", "J. Roman" ],
+      "venue" : "Research Report,",
+      "citeRegEx" : "Pellegrini and Roman,? \\Q1996\\E",
+      "shortCiteRegEx" : "Pellegrini and Roman",
+      "year" : 1996
+    }, {
+      "title" : "Sequence to sequence learning with neural networks",
+      "author" : [ "Sutskever", "Ilya", "Vinyals", "Oriol", "Le", "Quoc V" ],
+      "venue" : "In Advances in Neural Information Processing Systems,",
+      "citeRegEx" : "Sutskever et al\\.,? \\Q2014\\E",
+      "shortCiteRegEx" : "Sutskever et al\\.",
+      "year" : 2014
+    }, {
+      "title" : "Going deeper with convolutions",
+      "author" : [ "Szegedy", "Christian", "Liu", "Wei", "Jia", "Yangqing", "Sermanet", "Pierre", "Reed", "Scott", "Anguelov", "Dragomir", "Erhan", "Dumitru", "Vanhoucke", "Vincent", "Rabinovich", "Andrew" ],
+      "venue" : "In The IEEE Conference on Computer Vision and Pattern Recognition,",
+      "citeRegEx" : "Szegedy et al\\.,? \\Q2015\\E",
+      "shortCiteRegEx" : "Szegedy et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "Rethinking the inception architecture for computer vision",
+      "author" : [ "Szegedy", "Christian", "Vanhoucke", "Vincent", "Ioffe", "Sergey", "Shlens", "Jon", "Wojna", "Zbigniew" ],
+      "venue" : "In The IEEE Conference on Computer Vision and Pattern Recognition,",
+      "citeRegEx" : "Szegedy et al\\.,? \\Q2016\\E",
+      "shortCiteRegEx" : "Szegedy et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Lecture 6.5—RmsProp: Divide the gradient by a running average of its recent magnitude",
+      "author" : [ "T. Tieleman", "G. Hinton" ],
+      "venue" : "COURSERA: Neural Networks for Machine Learning,",
+      "citeRegEx" : "Tieleman and Hinton,? \\Q2012\\E",
+      "shortCiteRegEx" : "Tieleman and Hinton",
+      "year" : 2012
+    }, {
+      "title" : "Simple statistical gradient following algorithms for connectionnist reinforcement learning",
+      "author" : [ "Williams", "Ronald" ],
+      "venue" : "In Machine Learning,",
+      "citeRegEx" : "Williams and Ronald.,? \\Q1992\\E",
+      "shortCiteRegEx" : "Williams and Ronald.",
+      "year" : 1992
+    }, {
+      "title" : "Recurrent neural network regularization",
+      "author" : [ "Zaremba", "Wojciech", "Sutskever", "Ilya", "Vinyals", "Oriol" ],
+      "venue" : "arXiv preprint arXiv:1409.2329,",
+      "citeRegEx" : "Zaremba et al\\.,? \\Q2014\\E",
+      "shortCiteRegEx" : "Zaremba et al\\.",
+      "year" : 2014
+    } ],
+    "referenceMentions" : [ {
+      "referenceID" : 24,
+      "context" : "Over the past few years, neural networks have proven to be a general and effective tool for many practical problems, such as image classification (Krizhevsky et al., 2012; Szegedy et al., 2015; He et al., 2016), speech recognition (Hinton et al.",
+      "startOffset" : 146,
+      "endOffset" : 210
+    }, {
+      "referenceID" : 32,
+      "context" : "Over the past few years, neural networks have proven to be a general and effective tool for many practical problems, such as image classification (Krizhevsky et al., 2012; Szegedy et al., 2015; He et al., 2016), speech recognition (Hinton et al.",
+      "startOffset" : 146,
+      "endOffset" : 210
+    }, {
+      "referenceID" : 13,
+      "context" : "Over the past few years, neural networks have proven to be a general and effective tool for many practical problems, such as image classification (Krizhevsky et al., 2012; Szegedy et al., 2015; He et al., 2016), speech recognition (Hinton et al.",
+      "startOffset" : 146,
+      "endOffset" : 210
+    }, {
+      "referenceID" : 12,
+      "context" : ", 2016), speech recognition (Hinton et al., 2012; Graves & Jaitly, 2014; Hannun et al., 2014; Chan et al., 2015), machine translation (Sutskever et al.",
+      "startOffset" : 28,
+      "endOffset" : 112
+    }, {
+      "referenceID" : 5,
+      "context" : ", 2016), speech recognition (Hinton et al., 2012; Graves & Jaitly, 2014; Hannun et al., 2014; Chan et al., 2015), machine translation (Sutskever et al.",
+      "startOffset" : 28,
+      "endOffset" : 112
+    }, {
+      "referenceID" : 26,
+      "context" : ", 2016) and speech synthesis (Oord et al., 2016; Arik et al., 2017; Wang et al., 2017).",
+      "startOffset" : 29,
+      "endOffset" : 86
+    }, {
+      "referenceID" : 1,
+      "context" : ", 2016) and speech synthesis (Oord et al., 2016; Arik et al., 2017; Wang et al., 2017).",
+      "startOffset" : 29,
+      "endOffset" : 86
+    }, {
+      "referenceID" : 31,
+      "context" : "For example, in a neural translation network, each layer, including all LSTM layers, the attention layer, and the softmax layer, is computed by a GPU (Sutskever et al., 2014; Wu et al., 2016).",
+      "startOffset" : 150,
+      "endOffset" : 191
+    }, {
+      "referenceID" : 33,
+      "context" : "Although such decisions can be made by machine learning practitioners, they can be challenging, especially when the network has many branches (Szegedy et al., 2016), or when the minibatches get larger.",
+      "startOffset" : 142,
+      "endOffset" : 164
+    }, {
+      "referenceID" : 29,
+      "context" : "Existing algorithmic solvers (Pellegrini, 2009; Karypis & Kumar, 1995b), on the other hand, are not flexible enough to work with a dynamic environment with many interferences.",
+      "startOffset" : 29,
+      "endOffset" : 71
+    }, {
+      "referenceID" : 33,
+      "context" : "Our main result is that our method finds non-trivial placements onmultiple devices for Inception-V3 (Szegedy et al., 2016), Recurrent Neural Language Model (Zaremba et al.",
+      "startOffset" : 100,
+      "endOffset" : 122
+    }, {
+      "referenceID" : 36,
+      "context" : ", 2016), Recurrent Neural Language Model (Zaremba et al., 2014; Jozefowicz et al., 2016) and Neural Machine Translation (Sutskever et al.",
+      "startOffset" : 41,
+      "endOffset" : 88
+    }, {
+      "referenceID" : 17,
+      "context" : ", 2016), Recurrent Neural Language Model (Zaremba et al., 2014; Jozefowicz et al., 2016) and Neural Machine Translation (Sutskever et al.",
+      "startOffset" : 41,
+      "endOffset" : 88
+    }, {
+      "referenceID" : 31,
+      "context" : ", 2016) and Neural Machine Translation (Sutskever et al., 2014; Wu et al., 2016).",
+      "startOffset" : 39,
+      "endOffset" : 80
+    }, {
+      "referenceID" : 29,
+      "context" : "Single-step measurements show that Scotch (Pellegrini, 2009) yields disappointing results on all three benchmarks, suggesting that their graph-based heuristics are not flexible enough for them.",
+      "startOffset" : 42,
+      "endOffset" : 60
+    }, {
+      "referenceID" : 4,
+      "context" : "Our work is closely related to the idea of using neural networks and reinforcement learning for combinatorial optimization (Vinyals et al., 2015; Bello et al., 2016).",
+      "startOffset" : 123,
+      "endOffset" : 165
+    }, {
+      "referenceID" : 25,
+      "context" : "For example, Mao et al. (2016) propose to train a resource management algorithm with policy gradients.",
+      "startOffset" : 13,
+      "endOffset" : 31
+    }, {
+      "referenceID" : 22,
+      "context" : "Early work such as Kernighan & Lin (1970); Kirkpatrick et al. (1983); Fiduccia & Mattheyses (1988); Johnson et al.",
+      "startOffset" : 43,
+      "endOffset" : 69
+    }, {
+      "referenceID" : 22,
+      "context" : "Early work such as Kernighan & Lin (1970); Kirkpatrick et al. (1983); Fiduccia & Mattheyses (1988); Johnson et al.",
+      "startOffset" : 43,
+      "endOffset" : 99
+    }, {
+      "referenceID" : 16,
+      "context" : "(1983); Fiduccia & Mattheyses (1988); Johnson et al. (1989) employ several iterative refinement procedures that start from a partition and continue to explore similar partitions to improve.",
+      "startOffset" : 38,
+      "endOffset" : 60
+    }, {
+      "referenceID" : 16,
+      "context" : "(1983); Fiduccia & Mattheyses (1988); Johnson et al. (1989) employ several iterative refinement procedures that start from a partition and continue to explore similar partitions to improve. Alternative methods such as Hagen & Kahng (1992); Karypis & Kumar (1995b) perform spectral analyses on matrix representations of graphs to partition them.",
+      "startOffset" : 38,
+      "endOffset" : 239
+    }, {
+      "referenceID" : 16,
+      "context" : "(1983); Fiduccia & Mattheyses (1988); Johnson et al. (1989) employ several iterative refinement procedures that start from a partition and continue to explore similar partitions to improve. Alternative methods such as Hagen & Kahng (1992); Karypis & Kumar (1995b) perform spectral analyses on matrix representations of graphs to partition them.",
+      "startOffset" : 38,
+      "endOffset" : 264
+    }, {
+      "referenceID" : 29,
+      "context" : "A well-known graph partitioning algorithm with an open source software library is the Scotch optimizer (Pellegrini, 2009), which we use as a baseline in our experiments.",
+      "startOffset" : 103,
+      "endOffset" : 121
+    }, {
+      "referenceID" : 28,
+      "context" : "Scotch relies on a collection of graph partitioning techniques such as k-way Fiduccia-Mattheyses (Fiduccia & Mattheyses, 1988), multilevel method (Barnard & Simon, 1994; Hendrickson & Leland, 1993; Karypis & Kumar, 1995a), band method (Chevalier & Pellegrini, 2006), diffusion method (Pellegrini, 2007), and dual recursive bipartitioning mapping (Pellegrini & Roman, 1996)).",
+      "startOffset" : 284,
+      "endOffset" : 302
+    }, {
+      "referenceID" : 31,
+      "context" : "We use a sequence-to-sequence model (Sutskever et al., 2014) with LSTM (Hochreiter & Schmidhuber, 1997) and a content-based attention mechanism (Bahdanau et al.",
+      "startOffset" : 36,
+      "endOffset" : 60
+    }, {
+      "referenceID" : 2,
+      "context" : ", 2014) with LSTM (Hochreiter & Schmidhuber, 1997) and a content-based attention mechanism (Bahdanau et al., 2015) to predict the placements.",
+      "startOffset" : 91,
+      "endOffset" : 114
+    }, {
+      "referenceID" : 2,
+      "context" : "The decoder is an attentional LSTM (Bahdanau et al., 2015) with a fixed number of time steps that is equal to the number of operations in a graph G.",
+      "startOffset" : 35,
+      "endOffset" : 58
+    }, {
+      "referenceID" : 27,
+      "context" : "Modeling such a large number of operations with sequence-to-sequence models is difficult due to vanishing and exploding gradient issues (Pascanu et al., 2013) and large memory footprints.",
+      "startOffset" : 136,
+      "endOffset" : 158
+    }, {
+      "referenceID" : 36,
+      "context" : "In the following experiments, we apply our proposed method to assign computations to devices on three important neural networks in the deep learning literature: Recurrent Neural Language Model (RNNLM) (Zaremba et al., 2014; Jozefowicz et al., 2016), Attentional Neural Machine Translation (Bahdanau et al.",
+      "startOffset" : 201,
+      "endOffset" : 248
+    }, {
+      "referenceID" : 17,
+      "context" : "In the following experiments, we apply our proposed method to assign computations to devices on three important neural networks in the deep learning literature: Recurrent Neural Language Model (RNNLM) (Zaremba et al., 2014; Jozefowicz et al., 2016), Attentional Neural Machine Translation (Bahdanau et al.",
+      "startOffset" : 201,
+      "endOffset" : 248
+    }, {
+      "referenceID" : 2,
+      "context" : ", 2016), Attentional Neural Machine Translation (Bahdanau et al., 2015), and InceptionV3 (Szegedy et al.",
+      "startOffset" : 48,
+      "endOffset" : 71
+    }, {
+      "referenceID" : 33,
+      "context" : ", 2015), and InceptionV3 (Szegedy et al., 2016).",
+      "startOffset" : 25,
+      "endOffset" : 47
+    }, {
+      "referenceID" : 36,
+      "context" : "• Recurrent Neural Network Language Model (RNNLM) with multiple LSTM layers (Zaremba et al., 2014; Jozefowicz et al., 2016).",
+      "startOffset" : 76,
+      "endOffset" : 123
+    }, {
+      "referenceID" : 17,
+      "context" : "• Recurrent Neural Network Language Model (RNNLM) with multiple LSTM layers (Zaremba et al., 2014; Jozefowicz et al., 2016).",
+      "startOffset" : 76,
+      "endOffset" : 123
+    }, {
+      "referenceID" : 2,
+      "context" : "• Neural Machine Translation with attention mechanism (NMT) (Bahdanau et al., 2015; Wu et al., 2016).",
+      "startOffset" : 60,
+      "endOffset" : 100
+    }, {
+      "referenceID" : 31,
+      "context" : "Both Sutskever et al. (2014) andWu et al.",
+      "startOffset" : 5,
+      "endOffset" : 29
+    }, {
+      "referenceID" : 31,
+      "context" : "Both Sutskever et al. (2014) andWu et al. (2016) propose to place each LSTM layer, the attention layer, and the softmax layer, each on a separate device.",
+      "startOffset" : 5,
+      "endOffset" : 49
+    }, {
+      "referenceID" : 33,
+      "context" : "• Inception-V3 (Szegedy et al., 2016) is a widely-used architecture for image recognition and visual feature extraction (Khetan & Oh, 2016; Esteva et al.",
+      "startOffset" : 15,
+      "endOffset" : 37
+    }, {
+      "referenceID" : 8,
+      "context" : ", 2016) is a widely-used architecture for image recognition and visual feature extraction (Khetan & Oh, 2016; Esteva et al., 2016).",
+      "startOffset" : 90,
+      "endOffset" : 130
+    }, {
+      "referenceID" : 32,
+      "context" : "For Inception-V3, each step is executed on a batch of images, each of size 299 × 299 × 3, which is the widely-used setting for the ImageNet Challenge (Szegedy et al., 2015).",
+      "startOffset" : 150,
+      "endOffset" : 172
+    }, {
+      "referenceID" : 29,
+      "context" : "We estimate the computational costs of each operation as well as the amount of data that flows along each edge of the neural network model, and feed them to the Scotch static mapper (Pellegrini, 2009).",
+      "startOffset" : 182,
+      "endOffset" : 200
+    }, {
+      "referenceID" : 33,
+      "context" : "Each GPU runs a replica of the model and processes a batch of size 32 (Szegedy et al., 2016).",
+      "startOffset" : 70,
+      "endOffset" : 92
+    } ],
+    "year" : 2017,
+    "abstractText" : "The past few years have witnessed a growth in size and computational requirements for training and inference with neural networks. Currently, a common approach to address these requirements is to use a heterogeneous distributed environment with a mixture of hardware devices such as CPUs and GPUs. Importantly, the decision of placing parts of the neural models on devices is often made by human experts based on simple heuristics and intuitions. In this paper, we propose a method which learns to optimize device placement for TensorFlow computational graphs. Key to our method is the use of a sequence-tosequence model to predict which subsets of operations in a TensorFlow graph should run on which of the available devices. The execution time of the predicted placements is then used as the reward signal to optimize the parameters of the sequence-to-sequence model. Our main result is that on Inception-V3 for ImageNet classification, and on RNN LSTM, for language modeling and neural machine translation, our model finds non-trivial device placements that outperform hand-crafted heuristics and traditional algorithmic methods.",
+    "creator" : "LaTeX with hyperref package"
+  }
+}

@@ -1,0 +1,421 @@
+{
+  "name" : "1708.06046.pdf",
+  "metadata" : {
+    "source" : "CRF",
+    "title" : "nuts-flow/ml : data pre-processing for deep learning",
+    "authors" : [ "S. Maetschke", "R. Tennakoon", "C. Vecchiola", "R. Garnavi" ],
+    "emails" : [ "stefanrm@au1.ibm.com", "christian.vecchiola@au1.ibm.com", "rahilgar@au1.ibm.com", "ruwan.tennakoon@rmit.edu.au7" ],
+    "sections" : [ {
+      "heading" : "1 Introduction",
+      "text" : "Human level performance and beyond have been achieved in many vision and other machine learning applications due to deep learning [11]. Deep learning describes a class of artificial neural networks characterized by many layers and weights [15]. The large number of parameters to be optimized during training requires large amounts of data and hardware accelerators such as Graphical Processing Units (GPUs) or dedicated hardware such as the Tensor Processing Unit (TPU) [13] for tensor computations. Training is typically performed via Stochastic Gradient Descent (SGD) or variants thereof [27] which adjust network weights based on small batches (mini-batches) of data.\nDeep learning frameworks [2] are composed of up to three software layers (see Figure 1). On the lowest level, are hardware abstractions such as CUDA [6] or GpuArray [10]. The middle layer is focused on the manipulation of tensors and the construction of computational graphs that are employed to create and train networks. Theano [29] and Tensorflow [1] are examples of such libraries or backends. The top layer consists of APIs to simplify the definition of architecture, weight initializations, loss functions and learning algorithms for deep learning networks. For instance, Keras [4], TFLearn [28], Blocks&Fuel [17] and Caffe [12] are libraries with Python APIs used for this purpose. Torch [5] based on Lua, Mocha [18] based on Julia, and Deeplearing4J [8] based on Java are common non-Python alternatives. We will focus our discussion on the former, since the framework presented here is based on Python.\nData preprocessing is usually performed within the top or middle layer. But while the abovementioned libraries greatly reduce the effort to construct deep learning networks, they lack similar support for data-preprocessing such as lazy loading, filtering and transforming of input data. However, data-preprocessing is a fundamental part of any machine learning task and often the most timeconsuming during development and performance tuning. Similar to the iterative refinement of network hyper-parameters such as architecture, learning rate, loss function and others, the implementation of the data-preprocessing step is also an iterative process which involves, for instance, the exploration of different data normalizations, augmentations or filtering procedures.\nar X\niv :1\n70 8.\n06 04\n6v 1\n[ cs\n.L G\n] 2\n1 A\nug 2"
+    }, {
+      "heading" : "Deep Learning APIs",
+      "text" : ""
+    }, {
+      "heading" : "Keras, TFLearn, Blocks&Fuel, ...",
+      "text" : ""
+    }, {
+      "heading" : "Computational Graphs",
+      "text" : ""
+    }, {
+      "heading" : "Theano, Tensorflow",
+      "text" : ""
+    }, {
+      "heading" : "Hardware Abstractions",
+      "text" : ""
+    }, {
+      "heading" : "CUDA, GpuArray",
+      "text" : "Data preprocessing for deep learning is especially challenging due the following characteristics, 1) training data cannot be loaded in memory entirely and must be processed lazily, 2) the training set is often enriched by random augmentation, 3) training is based on batches and 4) some data preprocessing occurs on the CPU but training and inference are performed by the GPU.\nIn the following sections, we first discuss the preprocessing capabilities of existing deep learning frameworks, then describe the foundations of data preprocessing pipelines, and finally introduce the novel data preprocessing framework nuts-flow/ml, before closing with conclusions."
+    }, {
+      "heading" : "2 Background",
+      "text" : "Existing deep learning frameworks are focused on the definition and training of artificial neural networks but provide no or very limited support for data preprocessing. They largely rely on NumPy [19], Scikit [25], pandas [16] and similar deep-learning-agnostic libraries, which are designed for in-memory processing and have limited support for lazy data flows as required for deep learning. Some frameworks, however, have built-in preprocessing functionality; in the following we discuss Keras, TFLearn, Tensorflow, Caffe and Fuel in more detail.\nKeras provides an ImageDataGenerator for standard augmentations such as rotation or flipping of images, but is not easily extensible to other augmentations, does neither support patch generation nor allows applying the same random augmentation to two images at the same time, e.g. image and mask, which is a common requirement for segmentation tasks. An important feature of Keras, is that it performs pre-fetching of data; allowing data to be preprocessed on the CPU, while another data chunk is evaluated for training or inference on the GPU.\nTFLearn has DataPreprocessing and DataAugmentation classes that can be extended by custom preprocessing functions. They operate on batches, which results in more efficient but also more difficult to write code, e.g. applying random augmentations to multiple images synchronously or patch generation are challenging to implement. However, TFLearn provides a DataFlow class to construct concurrent data flows that goes beyond what nuts-flow/ml offers with respect to concurrency.\nTensorflow comes with an image module that implements a rich set of image transformations and random augmentations. Adding custom transformations is straight forward, though the actual coding is not trivial since it requires manipulation of batched data. There is no built-in support for random patch extraction or patch extraction in regions of interest.\nCaffe offers a Transformer class with a small set of image transformations and a Data/Python Layer to implement custom transformation and augmentation. However, implementing custom data layers is not an easy task. There are add-on libraries such as caffe-augmentation [3] that support a wider range of augmentations but the functionality is still limited and patching is not included.\nThe Fuel library is closest in spirit and functionality to the nuts-ml framework presented here. It allows the construction of data flows with a focus on image/text preprocessing and deep-learning. Custom transformations and augmentations can be added but their implementation requires considerably more code than in nuts-flow/ml (see example below). Patching or synchronized augmentations are not directly supported. Syntactically, flows are defined as nested function compositions, resulting in comparatively verbose and difficult-to-read pipelines.\nThe following excerpt from the Fuel tutorial [9] shows a (toy) data flow for batch generation. For brevity import statements are omitted. The flow takes a list of feature values [1, 2, 3, 4] and a list of target values [-1, 1, -1, 1], constructs a dataset (IndexableDataset), multiplies all target values by 2 (Doubler) and returns an iterator (DataStream) over batches of size 2 (SequentialScheme):\n1 >>> class Doubler(AgnosticSourcewiseTransformer): 2 ... def __init__(self, data_stream, **kw): 3 ... super(Doubler, self).__init__( 4 ... data_stream=data_stream, 5 ... produces_examples=data_stream.produces_examples, **kw) 6 ... 7 ... def transform_any_source(self, source, _): 8 ... return 2 * source 9\n10 >>> dataset = IndexableDataset( 11 ... indexables=OrderedDict([ 12 ... (’features’, np.array([1, 2, 3, 4])), 13 ... (’targets’, np.array([-1, 1, -1, 1]))])) 14 15 >>> batch_scheme = SequentialScheme( 16 ... examples=dataset.num_examples, batch_size=2) 17 18 >>> target_stream = Doubler( 19 ... data_stream=DataStream( 20 ... dataset=dataset, 21 ... iteration_scheme=batch_scheme), 22 ... which_sources=(’targets’,)) 23 24 >>> [batch for batch in target_stream.get_epoch_iterator()] 25 [(array([1, 2]), array([-2, 2])), (array([3, 4]), array([-2, 2]))]\nIn short, feature and target values are zipped, target values are doubled and mini-batches are generated. The same pipeline can be realized in three lines (again omitting imports) using nuts-flow/ml:\n1 >>> dataset = [1, 2, 3, 4] >> Zip([-1, 1, -1, 1]) 2 >>> build_batch = BuildBatch(2).by(0, ’number’, int).by(1, ’number’, int) 3 >>> dataset >> MapCol(1, _ * 2) >> build_batch >> Collect() 4 [[array([1, 2]), array([-2, 2])], [array([3, 4]), array([-2, 2])]]\nNot only is the resulting code shorter and more readable but also the direction of the data flow is clearly indicated by the ’>>’ operator. We provide a detailed explanation of the above code elements in a later section.\nNumPy is a library that is frequently employed for data pre-processing and nuts-flow/ml is using NumPy internally. The approximately equivalent code of the example above using plain NumPy is only marginally shorter but not lazy and does not perform pre-fetching. The split() function constructs all mini-batches at once in memory, which is infeasible for large datasets.\n1 >>> dataset = np.array([[1, 2, 3, 4], [-1, 1, -1, 1]]) 2 >>> dataset[1,:] *= 2 3 >>> [list(b) for b in np.split(dataset, 2, 1)] 4 [[array([1, 2]), array([-2, 2])], [array([3, 4]), array([-2, 2])]]\nFuel, nuts-ml and other preprocessing front-ends discussed above are designed for rapid prototyping of small to medium sized data sets. Large scale, cluster computing frameworks such as Apache Spark [30] or Dask [7] also support lazy evaluation and have a concept of data flows. However, these frameworks are heavy-weight, have high latencies, do not directly provide preprocessing functions for images or deep learning and generally are not suitable for rapid prototyping of deep learning systems. It is worth mentioning that flows implemented with nuts-ml can be broken into their components or sub-flows and integrated within Spark or Dask workflows.\nTo summarize: current data preprocessing implementations for deep learning generally support only basic transformations and augmentations but common, more complex use cases, such as patching, or simultaneous random augmentation and transformation of multiple images, e.g. for segmentation are\nnot directly available. Furthermore, extending existing frameworks to implement missing functionality is often challenging and the resulting pipelines tend to lack readability. For instance, the example pipeline discussed above, requires more than 10 lines of heavily nested code using Fuel, while the same functionality can be implemented in three, easily understandable lines using nuts-flow/ml. Also support for image processing is very limited or non-existent in most pipelines, while nuts-flow/ml offers a rich set functions specifically for this purpose.\nIn the following section, we discuss data preprocessing pipelines and common design pattern for their implementation within a Python environment in general, before describing the specifics of the nuts-flow/ml implementation."
+    }, {
+      "heading" : "3 Data processing pipelines",
+      "text" : "Data processing pipelines read data from a Source, transform data using Processors, and finally write data to a Sink (see Figure 2). The main advantage and purpose of a processing pipeline compared to other programmatic constructs is the lazy evaluation of data. Only a subset of the entire data volume occupies memory at a time and data is processed on demand. This enables the efficient processing of data too large for a computer’s main memory including infinitely large data volumes.\nData processing pipelines, specifically for deep learning, are characterized by a common sequence of steps that can be summarized in a Canonical Pipeline, described in the next section."
+    }, {
+      "heading" : "3.1 Canonical Pipeline",
+      "text" : "Deep learning pipelines read samples, split data sets into fold, load images or other large data, apply transformation and augmentations, build mini-batches, before feeding a network with data and logging training results. These common processing steps can be represented in a Canonical Pipeline (see Figure 3). For simplicity, we focus the following more detailed description on vision tasks and image data but any deep learning application with data too large to fit into memory such as video, audio or large text documents, will benefit from similar functionality.\nThe Reader component of the pipeline reads sample data, for instance, paths to image files and class labels, stored in text files, Pandas tables or databases. The sample set is then partitioned into training, validation and test folds by a Splitter. Since the training data cannot be loaded into memory completely, images or other data blobs are loaded lazily by a Loader. Typically, transformations of image data such as resizing, cropping, contrast normalization and other adjustments are needed and performed on-the-fly by a Transformer. Furthermore, to increase the training set, additional images are synthesized by randomly augmenting (rotating, flipping, . . . ) training images employing an Augmenter. Efficient, GPU-based training demands that data is organized in small batches by a Batcher before passed on to the Network for training or inference. Finally, the training progress is often monitored using a Logger that writes losses or accuracies to a log file.\nIt is worth reiterating that all preprocessing steps that operate on large data such as loading, transformation, augmentation and batching need to be performed lazily, avoiding the allocation of main memory for data that is not actively processed."
+    }, {
+      "heading" : "3.2 Iterators and itertools",
+      "text" : "A common design pattern to implement lazy evaluation is the Iterator [14], which ensures that data is processed on demand only. Pipelines in nuts-flow/ml are implemented as chains of iterators. Here we, firstly, discuss Python’s iterator construct and its iterator library, before describing their specific usage in the architecture of nuts-flow/ml.\nIterators in the Python programming language (Version 2.7) are classes that expose a next() 1 method. Each invocation of next() returns the next element of the iterator. For instance, the following class implements an iterator that generates even numbers:\n1 class EvenNumbers(): 2 def __init__(self): 3 self.number = 0 4 5 def next(self): 6 self.number += 2 7 return self.number 8\n9 def __iter__(self): 10 return self\nThe __iter__() method enables the iterator to be used in for-loops. The following code example would print even numbers infinitely:\n1 for e in EvenNumbers(): 2 print e # 2, 4, 6, ...\nIterators can be chained and transformed to construct lazy data processing pipelines. Python’s itertools library provides many common iterators and functions for this purpose. The following example demonstrates a simple pipeline that generates number from 0 to 9, filters all numbers greater than 5, takes the first 3 numbers, and collects the resulting numbers in a list:\n1 list(islice(ifilter(lambda x: x > 5, xrange(10)), 3))\nEvery iterator pipeline requires a sink, here list(), that drives the data flow by repeatedly calling next() until the data source, here xrange(), is depleted, or until an intermediary iterator terminates. In this case islice() terminates after 3 elements are taken from the data flow.\nPython’s iterators and the itertools library allow constructing efficient and lazy data flows. However, the nested syntax of calls results in pipelines that are difficult to understand and the library has no functionality specific to image processing and machine learning tasks. In the following sections, we introduce two novel libraries, nuts-flow and nuts-ml, that are based on itertools but describe data flows as a linear sequence of operations and provide functions that greatly simplify data preprocessing for deep learning.\n4 nuts-flow/ml\nnuts-flow/ml is composed of nuts-flow and nuts-ml. The former is a general-purpose data flow library in spirit of the functional programming paradigm and not specific to any application. It is lightweight and does not have any dependencies beyond Python and its standard libraries. The latter is an extension of nuts-flow, which adds application-specific functions for image processing and deep learning."
+    }, {
+      "heading" : "4.1 nuts-flow",
+      "text" : "Before discussing the details of nuts-flow we want to motivate its design and choice of syntax by reimplementing the simple itertools pipeline shown above and comparing it with the corresponding nuts-flow implementation (imports are omitted):\n1 # itertools 2 list(islice(ifilter(lambda x: x > 5, xrange(10)), 3))\n1 Python 3.x replaces next() with __next__().\n1 # nuts-flow 2 Range(10) >> Filter(_ > 5) >> Take(3) >> Collect()\nBoth implementations return the exact same result: a list with the numbers [6, 7, 8]. However, the nuts-flow code is easier to understand and the flow of data from left to right is clearly visible. The syntax is similar to many other language operators for function composition or data flows such as Unix pipes ’|’, C++ streams ’>>’, Haskell’s function composition ’$’ or dplyr’s chaining of operators ’%>%’, For nuts-flow we overload Python’s ’>>’ operator, which usually performs a right bit shift, since it is rarely used in the applications we are interested in and visually indicates the direction of the data flow."
+    }, {
+      "heading" : "4.1.1 Architecture",
+      "text" : "Data flows in nuts-flow are implemented as chains of processing components called nuts. With some exceptions discussed later, nuts take an iterable as input and return a Python iterator or generator. In addition, nuts can have parameters that control their function. All nuts are class objects derived from the following abstract base class:\n1 class Nut(): 2 3 def __rshift__(self, iterable): 4 pass\nCustom nuts need to override the special __rshift__() function [26], which represents the ’>>’ operator. An example of a custom nut that multiplies its input values by a given factor is shown below:\n1 class MultiplyBy(Nut): 2 3 def __init__(self, factor): 4 self.factor = factor 5 6 def __rshift__(self, iterable): 7 return (x * self.factor for x in iterable)\nThis custom nut could then be called in a data flow as follows, where Collect() collects the outputs of the nut in a list:\n1 >>> [1, 2, 3] >> MultiplyBy(2) >> Collect() 2 [2, 4, 6]\nNote that this is equivalent to the following code that is considerably less readable due to the nesting of function invocations. Using the ’>>’ operator syntax instead, untangles the nested function composition to a linear chain of processing steps.\n1 Collect().__rshift__(MultiplyBy(2).__rshift__([1, 2, 3]))\nThe nuts-flow library provides wrapper classes and decorators to simplify the definition of custom nuts and so facilitates the extension of the framework. For example, the MultiplyBy() nut could more succinctly be defined as follows,\n1 @nut_function 2 def MultiplyBy(x, factor): 3 return x * factor\nwhere the decorator @nut_function transforms the decorated function to a class implementation similar to the one shown in the example above.\nAll data flows require a source that emits data and a sink that consumes data and drives the flow. Between source and sink there is typically a sequence of processors such as functions or filters that transform the data flow (see Figure 2).\nSinks call next() on their inputs that are generated by processors, which themselves invoke next() on their inputs and so create a chain of iterator calls that lazily read data from the source. Without a sink, the flow is inactive and no data is processed.\nSince nuts flows are chained iterators without an underlying workflow engine, they do not automatically support concurrency. They are also not well suited to describe complex data flows that take the shape of directed acyclic graphs, where processing nodes can have multiple inputs and outputs that must be synchronized. However, data preprocessing pipelines for deep learning tend to be largely linear and individual processing steps can be parallelized within nuts-flow.\nThe restriction to iterator chains has the advantage of a simple implementation and enables the easy integration with plain Python or cluster frameworks. For instance, the following three examples are alternative implementations of the flow described above and demonstrate seamless integration with Python:\n1 >>> xrange(1, 4) >> Map(_ * 2) >> Collect() 2 [2, 4, 6]\n1 >>> list(xrange(1, 4) >> MultiplyBy(2)) 2 [2, 4, 6]\n1 >>> [MultiplyBy(2)(x) for x in [1, 2, 3]] 2 [2, 4, 6]\nIn addition to functional programming operations such as map, filter and reduce that are native to Python, and the iterator functions in itertools, nuts-flow provides many more nuts to construct flows. A description of the complete set is beyond the scope of this paper but noteworthy are nuts for reading and writing of CSV files, for printing and progress monitoring, for pre-fetching, caching and parallel processing, for exception handling, for chunking and grouping of data and for column-wise mapping of functions [21]."
+    }, {
+      "heading" : "4.2 nuts-ml",
+      "text" : "nuts-ml is based on nuts-flow but adds nuts for image preprocessing and machine learning, while nuts-flow is an extension of Python’s itertools library to implement generic data flows. Figure 4 depicts the overall architecture of the library."
+    }, {
+      "heading" : "Python iterators",
+      "text" : "In the following, we will first describe individually the nuts available in nuts-ml that serve as components of the Canonical Pipeline, and then demonstrate a complete pipeline. Assuming a data set data.csv is given as Pandas table (or CSV file) and contains data samples of the form (filepath, label), where filepath points to an image file and label is a class label:\n1 data.csv 2 ’image1.png’, ’plane’ 3 ’image2.png’, ’car’ 4 ...\nSuch a dataset can be read with the Pandas reader nut that returns an iterator over the samples. The following example shows a very short pipeline where the samples are collected in a list using the Collect nut:\n1 >>> dataset = ReadPandas(’data.csv’) >> Collect() 2 >>> print dataset 3 [(’image1.png’, ’plane’), (’image2.png’, ’car’), ...]\nAfter reading sample data the training, hyper-parameter optimization and performance evaluation of deep learning networks typically requires different data folds for training, validation and testing. The SplitRandom nut provides this functionality and divides a data set with given ratios. For instance, a 60% training, 20% validation and %20 test data split is common:\n1 trainset, valset, testset = dataset >> SplitRandom(ratio=(60,20,20))\nIn most practical applications, the class distribution within the data set is skewed. Data with balanced class frequencies, however, tend to result in better training and generalization and typically the class distribution of the training set is therefore stratified, ensuring equal numbers of samples for all classes. Stratification is based on the sample column that contains the class label and up-sampling or random down-sampling are supported:\n1 trainset = trainset >> Stratify(labelcol=1, mode=’up’)\nAfter splitting and stratification, the data set still contains filenames only but no actual images. The ReadImage nut reads image data from the given imagepath and replaces the filename in the given sample columns 2 by the image:\n1 imgsamples = trainset >> ReadImage(columns=0, imagepath=’images/*’)\nAs shown in Figure 3, part of the Canonical Pipeline is a Transformer that converts images to a format suitable for training or inference. Typical transformations include resizing images to a specific size, image cropping, or converting RGB images to gray-scale. The TransformImage nut transforms images in the given sample columns (imagecols) by applying the specified transformations in the defined order:\n1 imgtrans = (imgsamples >> TransformImage(imagecols=0) 2 .by(’resize’, 128, 128) 3 .by(’rgb2gray’))\nNote that transformations can be chained (here resizing and gray-scale conversion) and can be applied to multiple images of a sample simultaneously, e.g. image and mask or stereo images to name some common use cases. Also, user-defined transformation can be added easily by registering transformation functions.\nThe training of deep learning models usually requires large amounts of training data. A common strategy to enlarge the existing training set is through augmentation, for instance, by randomly flipping or rotating images. The AugmentImage nut takes images from the given sample columns and with given probability (here 0.5) augments images:\n1 imgaug = (imgtrans >> AugmentImage(imagecols=0) 2 .by(’fliplr’, 0.5) 3 .by(’rotate’, 0.5, [0, 360]))\nSimilar to transformations, augmentations can be applied synchronously to multiple images within a sample and user defined augmentations can be added.\nEfficient network training on GPUs demands the batching of training data. BuildBatch stacks multiple images to build tensors and can also perform one-hot encoding of class labels to construct training batches. Analogous to transformations and augmentations, data is extracted from given sample columns and converted into required data types. In the following example, batches of size 16 are created, where images in sample column 0 are converted to unsigned integer format, and class label in column 1 are encoded as one-hot vectors of length 10:\n1 batches = (imgaug >> BuildBatch(batchsize=16) 2 .by(0, ’image’, np.uint8, True) 3 .by(1, ’one_hot’, np.uint8, 10)))\nMost APIs for deep learning frameworks provide methods to train on batches. For instance, the batches generated by BuildBatch could directly be fed into a Keras model via model.fit_generator(). nuts-ml provides wrappers for Keras and Lasagne models that simplify network training, inference and evaluation further. For example, a given Keras model can be wrapped into a KerasNetwork nut and then trained on a flow of batches as follows:\n2 ReadImage can read multiple images and replace filepaths in multiple columns at once.\n1 losses = batches >> KerasNetwork(model).train()\nThe train() method returns an iterator over batch losses, which can continuously be written to a log file using a LogToFile:\n1 losses >> LogToFile(’losses.log’) >> Consume()\nor accumulated to the mean value and standard deviation via:\n1 loss, std = losses >> MeanStd()\nAbove we have introduced the individual nuts that are part of a typical deep learning pipeline. In the following final example, we demonstrate how to connect these nuts to form a fully functional pipeline. First, we re-define the nuts more succinctly and assign them to variables:\n1 read_data = ReadPandas(’data.csv’) 2 split_data = SplitRandom(ratio=(60,20,20)) 3 stratify = Stratify(labelcol=1, mode=’up’) 4 read_images = ReadImage(0, imagepath=’images/*’) 5 transform = TransformImage(0).by(’resize’, 128, 128).by(’rgb2gray’) 6 augment = AugmentImage(0).by(’fliplr’, 0.5).by(’rotate’, 0.5, [0, 360]) 7 network = KerasNetwork(model) 8 log = LogToFile(’losses.log’)\nIn the next step, we split the dataset into folds 3:\n1 trainset, valset, testset = read_data >> split_data\nTraining on the stratified samples can now be performed in a loop over epochs using the following pipeline, where Consume is a nut that consumes all data and drives the data flow:\n1 for epoch in EPOCHS: 2 (trainset >> stratify >> read_images >> transform >> augment >> 3 network.train() >> log >> Consume())\nNote that all steps in this pipeline are performed lazily. Only images required to build one batch at a time are read, transformed and augmented. Once the nuts are defined it is trivial to construct similar pipelines for validation or network evaluation [22]. In addition to the nuts shown here, nuts-ml provides nuts for image patching, generation of masks, display of images, boosting of samples, reading from label-directories and more [24]."
+    }, {
+      "heading" : "5 Conclusion",
+      "text" : "Data preprocessing is an essential part of any deep learning application. Existing APIs or libraries for preprocessing, however, are limited in functionality and often difficult to extend. Here, we introduced a novel software framework nuts-flow/ml that encapsulates common preprocessing functions as components that can flexibly be arranged to rapidly construct efficient data preprocessing pipelines.\nnuts-flow/ml are well tested and documented libraries for Python 2.7 and 3k that considerably simplify the construction and rapid modification of data preprocessing pipelines for deep learning. Both libraries are freely available on github [20, 23] under the Apache 2 license.\nFuture work will be focused on extending the library with preprocessing functionality for other data types than images such as audio, video and text. We also intend to provide additional network wrappers for other deep learning frameworks beyond Keras, with Theano or Tensorflow backend, and Lasagne, which are already supported.\n3 Note that this is a non-lazy operation but computationally inexpensive since samples at this stage contain file paths only but no actual image data."
+    } ],
+    "references" : [ {
+      "title" : "TensorFlow: Large-Scale Machine Learning on Heterogeneous Distributed Systems",
+      "author" : [ "M. Abadi" ],
+      "venue" : null,
+      "citeRegEx" : "1",
+      "shortCiteRegEx" : "1",
+      "year" : 2016
+    }, {
+      "title" : "Comparative Study of Caffe, Neon, Theano, and Torch for Deep Learning",
+      "author" : [ "S. Bahrampour", "N. Ramakrishnan", "L. Schott", "M. Shah" ],
+      "venue" : null,
+      "citeRegEx" : "2",
+      "shortCiteRegEx" : "2",
+      "year" : 2016
+    }, {
+      "title" : "Torch7: A Matlab-like Environment for Machine Learning",
+      "author" : [ "R. Collobert", "K. Kavukcuoglu", "C. Farabet" ],
+      "venue" : "http://publications.idiap.ch/downloads/papers/2011/Collobert_",
+      "citeRegEx" : "5",
+      "shortCiteRegEx" : "5",
+      "year" : 2011
+    }, {
+      "title" : "Delving Deep into Rectifiers: Surpassing Human-Level Performance on ImageNet Classification",
+      "author" : [ "K. He", "X. Zhang", "S. Ren", "J. Sun" ],
+      "venue" : "In Proceedings of the 2015 IEEE International Conference on Computer Vision (ICCV) (ICCV ’15)",
+      "citeRegEx" : "11",
+      "shortCiteRegEx" : "11",
+      "year" : 2015
+    }, {
+      "title" : "Caffe: Convolutional Architecture for Fast Feature Embedding",
+      "author" : [ "Y. Jia", "E. Shelhamer", "J. Donahue", "S. Karayev", "J. Long", "R. Girshick", "S. Guadarrama", "T. Darrell" ],
+      "venue" : "In Proceedings of the 22nd ACM international conference on Multimedia (MM ’14)",
+      "citeRegEx" : "12",
+      "shortCiteRegEx" : "12",
+      "year" : 2014
+    }, {
+      "title" : "In-Datacenter Performance Analysis of a Tensor Processing Unit",
+      "author" : [ "N.P. Jouppi" ],
+      "venue" : null,
+      "citeRegEx" : "13",
+      "shortCiteRegEx" : "13",
+      "year" : 2017
+    }, {
+      "title" : "Mastering Python Design Patterns",
+      "author" : [ "S. Kasampalis" ],
+      "venue" : "Packt Publishing",
+      "citeRegEx" : "14",
+      "shortCiteRegEx" : "14",
+      "year" : 2015
+    }, {
+      "title" : "ImageNet classification with deep convolutional neural networks",
+      "author" : [ "A. Krizhevsky", "I. Sutskever", "G.E. Hinton" ],
+      "venue" : "In Proceedings of the 25th International Conference on Neural Information Processing Systems (NIPS’12),",
+      "citeRegEx" : "15",
+      "shortCiteRegEx" : "15",
+      "year" : 2012
+    }, {
+      "title" : "pandas: a Foundational Python Library for Data Analysis and Statistics",
+      "author" : [ "W. McKinney" ],
+      "venue" : "PyHPC",
+      "citeRegEx" : "16",
+      "shortCiteRegEx" : "16",
+      "year" : 2011
+    }, {
+      "title" : "Blocks and Fuel: Frameworks for deep learning",
+      "author" : [ "B. Merriënboer" ],
+      "venue" : "https://arxiv.org/",
+      "citeRegEx" : "17",
+      "shortCiteRegEx" : "17",
+      "year" : 2015
+    }, {
+      "title" : "Scikit-learn: Machine Learning in Python",
+      "author" : [ "F. Pedregosa" ],
+      "venue" : "Journal of Machine Learning Research. no",
+      "citeRegEx" : "25",
+      "shortCiteRegEx" : "25",
+      "year" : 2011
+    }, {
+      "title" : "An overview of gradient descent optimization algorithms",
+      "author" : [ "S. Ruder" ],
+      "venue" : null,
+      "citeRegEx" : "27",
+      "shortCiteRegEx" : "27",
+      "year" : 2016
+    }, {
+      "title" : "TF.Learn: TensorFlow’s High-level Module for Distributed Machine Learning",
+      "author" : [ "Y. Tang" ],
+      "venue" : null,
+      "citeRegEx" : "28",
+      "shortCiteRegEx" : "28",
+      "year" : 2016
+    }, {
+      "title" : "Apache Spark: a unified engine for big data processing",
+      "author" : [ "M Zaharia et. al" ],
+      "venue" : "Commun. ACM 59,",
+      "citeRegEx" : "30",
+      "shortCiteRegEx" : "30",
+      "year" : 2016
+    } ],
+    "referenceMentions" : [ {
+      "referenceID" : 3,
+      "context" : "Human level performance and beyond have been achieved in many vision and other machine learning applications due to deep learning [11].",
+      "startOffset" : 130,
+      "endOffset" : 134
+    }, {
+      "referenceID" : 7,
+      "context" : "Deep learning describes a class of artificial neural networks characterized by many layers and weights [15].",
+      "startOffset" : 103,
+      "endOffset" : 107
+    }, {
+      "referenceID" : 5,
+      "context" : "The large number of parameters to be optimized during training requires large amounts of data and hardware accelerators such as Graphical Processing Units (GPUs) or dedicated hardware such as the Tensor Processing Unit (TPU) [13] for tensor computations.",
+      "startOffset" : 225,
+      "endOffset" : 229
+    }, {
+      "referenceID" : 11,
+      "context" : "Training is typically performed via Stochastic Gradient Descent (SGD) or variants thereof [27] which adjust network weights based on small batches (mini-batches) of data.",
+      "startOffset" : 90,
+      "endOffset" : 94
+    }, {
+      "referenceID" : 1,
+      "context" : "Deep learning frameworks [2] are composed of up to three software layers (see Figure 1).",
+      "startOffset" : 25,
+      "endOffset" : 28
+    }, {
+      "referenceID" : 0,
+      "context" : "Theano [29] and Tensorflow [1] are examples of such libraries or backends.",
+      "startOffset" : 27,
+      "endOffset" : 30
+    }, {
+      "referenceID" : 12,
+      "context" : "For instance, Keras [4], TFLearn [28], Blocks&Fuel [17] and Caffe [12] are libraries with Python APIs used for this purpose.",
+      "startOffset" : 33,
+      "endOffset" : 37
+    }, {
+      "referenceID" : 9,
+      "context" : "For instance, Keras [4], TFLearn [28], Blocks&Fuel [17] and Caffe [12] are libraries with Python APIs used for this purpose.",
+      "startOffset" : 51,
+      "endOffset" : 55
+    }, {
+      "referenceID" : 4,
+      "context" : "For instance, Keras [4], TFLearn [28], Blocks&Fuel [17] and Caffe [12] are libraries with Python APIs used for this purpose.",
+      "startOffset" : 66,
+      "endOffset" : 70
+    }, {
+      "referenceID" : 2,
+      "context" : "Torch [5] based on Lua, Mocha [18] based on Julia, and Deeplearing4J [8] based on Java are common non-Python alternatives.",
+      "startOffset" : 6,
+      "endOffset" : 9
+    }, {
+      "referenceID" : 10,
+      "context" : "They largely rely on NumPy [19], Scikit [25], pandas [16] and similar deep-learning-agnostic libraries, which are designed for in-memory processing and have limited support for lazy data flows as required for deep learning.",
+      "startOffset" : 40,
+      "endOffset" : 44
+    }, {
+      "referenceID" : 8,
+      "context" : "They largely rely on NumPy [19], Scikit [25], pandas [16] and similar deep-learning-agnostic libraries, which are designed for in-memory processing and have limited support for lazy data flows as required for deep learning.",
+      "startOffset" : 53,
+      "endOffset" : 57
+    }, {
+      "referenceID" : 0,
+      "context" : "The flow takes a list of feature values [1, 2, 3, 4] and a list of target values [-1, 1, -1, 1], constructs a dataset (IndexableDataset), multiplies all target values by 2 (Doubler) and returns an iterator (DataStream) over batches of size 2 (SequentialScheme): 1 >>> class Doubler(AgnosticSourcewiseTransformer): 2 .",
+      "startOffset" : 40,
+      "endOffset" : 52
+    }, {
+      "referenceID" : 1,
+      "context" : "The flow takes a list of feature values [1, 2, 3, 4] and a list of target values [-1, 1, -1, 1], constructs a dataset (IndexableDataset), multiplies all target values by 2 (Doubler) and returns an iterator (DataStream) over batches of size 2 (SequentialScheme): 1 >>> class Doubler(AgnosticSourcewiseTransformer): 2 .",
+      "startOffset" : 40,
+      "endOffset" : 52
+    }, {
+      "referenceID" : 0,
+      "context" : "The flow takes a list of feature values [1, 2, 3, 4] and a list of target values [-1, 1, -1, 1], constructs a dataset (IndexableDataset), multiplies all target values by 2 (Doubler) and returns an iterator (DataStream) over batches of size 2 (SequentialScheme): 1 >>> class Doubler(AgnosticSourcewiseTransformer): 2 .",
+      "startOffset" : 81,
+      "endOffset" : 95
+    }, {
+      "referenceID" : 0,
+      "context" : "The flow takes a list of feature values [1, 2, 3, 4] and a list of target values [-1, 1, -1, 1], constructs a dataset (IndexableDataset), multiplies all target values by 2 (Doubler) and returns an iterator (DataStream) over batches of size 2 (SequentialScheme): 1 >>> class Doubler(AgnosticSourcewiseTransformer): 2 .",
+      "startOffset" : 81,
+      "endOffset" : 95
+    }, {
+      "referenceID" : 0,
+      "context" : "array([1, 2, 3, 4])), 13 .",
+      "startOffset" : 6,
+      "endOffset" : 18
+    }, {
+      "referenceID" : 1,
+      "context" : "array([1, 2, 3, 4])), 13 .",
+      "startOffset" : 6,
+      "endOffset" : 18
+    }, {
+      "referenceID" : 0,
+      "context" : "array([-1, 1, -1, 1]))])) 14 15 >>> batch_scheme = SequentialScheme( 16 .",
+      "startOffset" : 6,
+      "endOffset" : 20
+    }, {
+      "referenceID" : 0,
+      "context" : "array([-1, 1, -1, 1]))])) 14 15 >>> batch_scheme = SequentialScheme( 16 .",
+      "startOffset" : 6,
+      "endOffset" : 20
+    }, {
+      "referenceID" : 0,
+      "context" : "get_epoch_iterator()] 25 [(array([1, 2]), array([-2, 2])), (array([3, 4]), array([-2, 2]))]",
+      "startOffset" : 33,
+      "endOffset" : 39
+    }, {
+      "referenceID" : 1,
+      "context" : "get_epoch_iterator()] 25 [(array([1, 2]), array([-2, 2])), (array([3, 4]), array([-2, 2]))]",
+      "startOffset" : 33,
+      "endOffset" : 39
+    }, {
+      "referenceID" : 1,
+      "context" : "get_epoch_iterator()] 25 [(array([1, 2]), array([-2, 2])), (array([3, 4]), array([-2, 2]))]",
+      "startOffset" : 48,
+      "endOffset" : 55
+    }, {
+      "referenceID" : 1,
+      "context" : "get_epoch_iterator()] 25 [(array([1, 2]), array([-2, 2])), (array([3, 4]), array([-2, 2]))]",
+      "startOffset" : 81,
+      "endOffset" : 88
+    }, {
+      "referenceID" : 0,
+      "context" : "The same pipeline can be realized in three lines (again omitting imports) using nuts-flow/ml: 1 >>> dataset = [1, 2, 3, 4] >> Zip([-1, 1, -1, 1]) 2 >>> build_batch = BuildBatch(2).",
+      "startOffset" : 110,
+      "endOffset" : 122
+    }, {
+      "referenceID" : 1,
+      "context" : "The same pipeline can be realized in three lines (again omitting imports) using nuts-flow/ml: 1 >>> dataset = [1, 2, 3, 4] >> Zip([-1, 1, -1, 1]) 2 >>> build_batch = BuildBatch(2).",
+      "startOffset" : 110,
+      "endOffset" : 122
+    }, {
+      "referenceID" : 0,
+      "context" : "The same pipeline can be realized in three lines (again omitting imports) using nuts-flow/ml: 1 >>> dataset = [1, 2, 3, 4] >> Zip([-1, 1, -1, 1]) 2 >>> build_batch = BuildBatch(2).",
+      "startOffset" : 130,
+      "endOffset" : 144
+    }, {
+      "referenceID" : 0,
+      "context" : "The same pipeline can be realized in three lines (again omitting imports) using nuts-flow/ml: 1 >>> dataset = [1, 2, 3, 4] >> Zip([-1, 1, -1, 1]) 2 >>> build_batch = BuildBatch(2).",
+      "startOffset" : 130,
+      "endOffset" : 144
+    }, {
+      "referenceID" : 0,
+      "context" : "by(1, ’number’, int) 3 >>> dataset >> MapCol(1, _ * 2) >> build_batch >> Collect() 4 [[array([1, 2]), array([-2, 2])], [array([3, 4]), array([-2, 2])]]",
+      "startOffset" : 93,
+      "endOffset" : 99
+    }, {
+      "referenceID" : 1,
+      "context" : "by(1, ’number’, int) 3 >>> dataset >> MapCol(1, _ * 2) >> build_batch >> Collect() 4 [[array([1, 2]), array([-2, 2])], [array([3, 4]), array([-2, 2])]]",
+      "startOffset" : 93,
+      "endOffset" : 99
+    }, {
+      "referenceID" : 1,
+      "context" : "by(1, ’number’, int) 3 >>> dataset >> MapCol(1, _ * 2) >> build_batch >> Collect() 4 [[array([1, 2]), array([-2, 2])], [array([3, 4]), array([-2, 2])]]",
+      "startOffset" : 108,
+      "endOffset" : 115
+    }, {
+      "referenceID" : 1,
+      "context" : "by(1, ’number’, int) 3 >>> dataset >> MapCol(1, _ * 2) >> build_batch >> Collect() 4 [[array([1, 2]), array([-2, 2])], [array([3, 4]), array([-2, 2])]]",
+      "startOffset" : 141,
+      "endOffset" : 148
+    }, {
+      "referenceID" : 0,
+      "context" : "array([[1, 2, 3, 4], [-1, 1, -1, 1]]) 2 >>> dataset[1,:] *= 2 3 >>> [list(b) for b in np.",
+      "startOffset" : 7,
+      "endOffset" : 19
+    }, {
+      "referenceID" : 1,
+      "context" : "array([[1, 2, 3, 4], [-1, 1, -1, 1]]) 2 >>> dataset[1,:] *= 2 3 >>> [list(b) for b in np.",
+      "startOffset" : 7,
+      "endOffset" : 19
+    }, {
+      "referenceID" : 0,
+      "context" : "array([[1, 2, 3, 4], [-1, 1, -1, 1]]) 2 >>> dataset[1,:] *= 2 3 >>> [list(b) for b in np.",
+      "startOffset" : 21,
+      "endOffset" : 35
+    }, {
+      "referenceID" : 0,
+      "context" : "array([[1, 2, 3, 4], [-1, 1, -1, 1]]) 2 >>> dataset[1,:] *= 2 3 >>> [list(b) for b in np.",
+      "startOffset" : 21,
+      "endOffset" : 35
+    }, {
+      "referenceID" : 0,
+      "context" : "split(dataset, 2, 1)] 4 [[array([1, 2]), array([-2, 2])], [array([3, 4]), array([-2, 2])]]",
+      "startOffset" : 32,
+      "endOffset" : 38
+    }, {
+      "referenceID" : 1,
+      "context" : "split(dataset, 2, 1)] 4 [[array([1, 2]), array([-2, 2])], [array([3, 4]), array([-2, 2])]]",
+      "startOffset" : 32,
+      "endOffset" : 38
+    }, {
+      "referenceID" : 1,
+      "context" : "split(dataset, 2, 1)] 4 [[array([1, 2]), array([-2, 2])], [array([3, 4]), array([-2, 2])]]",
+      "startOffset" : 47,
+      "endOffset" : 54
+    }, {
+      "referenceID" : 1,
+      "context" : "split(dataset, 2, 1)] 4 [[array([1, 2]), array([-2, 2])], [array([3, 4]), array([-2, 2])]]",
+      "startOffset" : 80,
+      "endOffset" : 87
+    }, {
+      "referenceID" : 13,
+      "context" : "Large scale, cluster computing frameworks such as Apache Spark [30] or Dask [7] also support lazy evaluation and have a concept of data flows.",
+      "startOffset" : 63,
+      "endOffset" : 67
+    }, {
+      "referenceID" : 6,
+      "context" : "2 Iterators and itertools A common design pattern to implement lazy evaluation is the Iterator [14], which ensures that data is processed on demand only.",
+      "startOffset" : 95,
+      "endOffset" : 99
+    }, {
+      "referenceID" : 0,
+      "context" : "This custom nut could then be called in a data flow as follows, where Collect() collects the outputs of the nut in a list: 1 >>> [1, 2, 3] >> MultiplyBy(2) >> Collect() 2 [2, 4, 6]",
+      "startOffset" : 129,
+      "endOffset" : 138
+    }, {
+      "referenceID" : 1,
+      "context" : "This custom nut could then be called in a data flow as follows, where Collect() collects the outputs of the nut in a list: 1 >>> [1, 2, 3] >> MultiplyBy(2) >> Collect() 2 [2, 4, 6]",
+      "startOffset" : 129,
+      "endOffset" : 138
+    }, {
+      "referenceID" : 1,
+      "context" : "This custom nut could then be called in a data flow as follows, where Collect() collects the outputs of the nut in a list: 1 >>> [1, 2, 3] >> MultiplyBy(2) >> Collect() 2 [2, 4, 6]",
+      "startOffset" : 171,
+      "endOffset" : 180
+    }, {
+      "referenceID" : 0,
+      "context" : "__rshift__([1, 2, 3]))",
+      "startOffset" : 11,
+      "endOffset" : 20
+    }, {
+      "referenceID" : 1,
+      "context" : "__rshift__([1, 2, 3]))",
+      "startOffset" : 11,
+      "endOffset" : 20
+    }, {
+      "referenceID" : 1,
+      "context" : "For instance, the following three examples are alternative implementations of the flow described above and demonstrate seamless integration with Python: 1 >>> xrange(1, 4) >> Map(_ * 2) >> Collect() 2 [2, 4, 6]",
+      "startOffset" : 201,
+      "endOffset" : 210
+    }, {
+      "referenceID" : 1,
+      "context" : "1 >>> list(xrange(1, 4) >> MultiplyBy(2)) 2 [2, 4, 6]",
+      "startOffset" : 44,
+      "endOffset" : 53
+    }, {
+      "referenceID" : 0,
+      "context" : "1 >>> [MultiplyBy(2)(x) for x in [1, 2, 3]] 2 [2, 4, 6]",
+      "startOffset" : 33,
+      "endOffset" : 42
+    }, {
+      "referenceID" : 1,
+      "context" : "1 >>> [MultiplyBy(2)(x) for x in [1, 2, 3]] 2 [2, 4, 6]",
+      "startOffset" : 33,
+      "endOffset" : 42
+    }, {
+      "referenceID" : 1,
+      "context" : "1 >>> [MultiplyBy(2)(x) for x in [1, 2, 3]] 2 [2, 4, 6]",
+      "startOffset" : 46,
+      "endOffset" : 55
+    } ],
+    "year" : 2017,
+    "abstractText" : "Data preprocessing is a fundamental part of any machine learning application and frequently the most time-consuming aspect when developing a machine learning solution. Preprocessing for deep learning is characterized by pipelines that lazily load data and perform data transformation, augmentation, batching and logging. Many of these functions are common across applications but require different arrangements for training, testing or inference. Here we introduce a novel software framework named nuts-flow/ml that encapsulates common preprocessing operations as components, which can be flexibly arranged to rapidly construct efficient preprocessing pipelines for deep learning.",
+    "creator" : "LaTeX with hyperref package"
+  }
+}

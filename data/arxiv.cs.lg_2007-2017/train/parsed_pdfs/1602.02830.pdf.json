@@ -1,0 +1,530 @@
+{
+  "name" : "1602.02830.pdf",
+  "metadata" : {
+    "source" : "META",
+    "title" : "BinaryNet: Training Deep Neural Networks with Weights and Activations Constrained to +1 or -1",
+    "authors" : [ "Matthieu Courbariaux", "Yoshua Bengio" ],
+    "emails" : [ "MATTHIEU.COURBARIAUX@GMAIL.COM", "YOSHUA.UMONTREAL@GMAIL.COM" ],
+    "sections" : [ {
+      "heading" : "Introduction",
+      "text" : "Deep Neural Networks (DNNs) have substantially pushed Artificial Intelligence (AI) limits in a wide range of tasks, including but not limited to object recognition from images (Krizhevsky et al., 2012; Szegedy et al., 2014), speech recognition (Hinton et al., 2012; Sainath et al., 2013), statistical machine translation (Devlin et al., 2014; Sutskever et al., 2014; Bahdanau et al., 2015), Atari and Go games (Mnih et al., 2015; Silver et al., 2016), and even abstract art (Mordvintsev et al., 2015).\nToday, DNNs are almost exclusively trained on one or many very fast and power-hungry Graphic Processing Units (GPUs) (Coates et al., 2013). As a result, it is often a challenge to run DNNs on target low-power devices, and\nmuch research work is done to speed-up DNNs at run-time on both general-purpose (Vanhoucke et al., 2011; Gong et al., 2014; Romero et al., 2014; Han et al., 2015) and specialized computer hardware (Farabet et al., 2011a;b; Pham et al., 2012; Chen et al., 2014a;b; Esser et al., 2015).\nWe believe that the contributions of our article are the following:\n• We introduce BinaryNet, a method which trains DNNs with binary weights and activations when computing the parameters’ gradient (see Section 1).\n• We show that it is possible to train a Multi Layer Perceptron (MLP) on MNIST and ConvNets on CIFAR10 and SVHN with BinaryNet and achieve nearly state-of-the-art results (see Section 2).\n• We show that, at run-time, BinaryNet drastically reduces memory usage and replaces most multiplications by 1-bit exclusive-not-or (XNOR) operations, which might have a big impact on both generalpurpose and dedicated Deep Learning hardware. We wrote a binary matrix multiplication GPU kernel with which it is possible to run our MNIST MLP 7 times faster than with an unoptimized GPU kernel, without suffering any loss in classification accuracy (see Section 3)."
+    }, {
+      "heading" : "1. BinaryNet",
+      "text" : "In this section, we detail our binarization function, how we use it to compute the parameters’ gradient and how we backpropagate through it."
+    }, {
+      "heading" : "Sign function",
+      "text" : "BinaryNet constrains both the weights and the activations to either +1 or −1. Those two values are very advantageous from a hardware perspective, as we explain in Section 3. Our binarization function is simply the sign func-\nar X\niv :1\n60 2.\n02 83\n0v 1\n[ cs\n.L G\n] 9\nF eb\n2 01\ntion:\nxb = Sign(x) = { +1 if x ≥ 0, −1 otherwise. (1)\nwhere xb is the binarized variable (weight or activation) and x the real-valued variable. It is very straightforward to implement and works quite well in practice (see Section 2). Stochastic binarization could be used, as in (Courbariaux et al., 2015), and is more theoretically appealing but is also a more costly alternative because it requires the hardware to generate random bits when quantizing."
+    }, {
+      "heading" : "Gradients computation and accumulation",
+      "text" : "A key point to understand about BinaryNet is that although we compute the parameters’ gradient using binary weights and activations, we nonetheless accumulate the weights’ real-valued gradient in real-valued variables, as per Algorithm 1. Real-valued weights are likely needed for Stochasic Gradient Descent (SGD) to work at all. SGD explores the space of parameters by making small and noisy steps and that noise is averaged out by the stochastic gradient contributions accumulated in each weight. Therefore, it is important to keep sufficient resolution for these accumulators, which at first sight suggests that high precision is absolutely required.\nBeside that, adding noise to weights and activations when computing the parameters’ gradient provides a form of regularization which can help to generalize better, as previously shown with variational weight noise (Graves, 2011), Dropout (Srivastava, 2013; Srivastava et al., 2014) and DropConnect (Wan et al., 2013). BinaryNet can be seen as a variant of Dropout, in which instead of randomly setting half of the activations to zero when computing the parameters’ gradient, we binarize both the activations and the weights."
+    }, {
+      "heading" : "Propagating Gradients Through Discretization",
+      "text" : "The derivative of the sign function is 0 almost everywhere, making it apparently incompatible with backpropagation, since exact gradients of the cost with respect to the quantities before the discretization (pre-activations or weights) would be zero. Note that this remains true even if stochastic quantization is used. Bengio (2013) studied the question of estimating or propagating gradients through stochastic discrete neurons. They found in their experiments that the fastest training was obtained when using the “straight-through estimator”, previously introduced in Hinton (2012)’s lectures.\nWe follow a similar approach but use the version of the straight-through estimator that takes into account the saturation effect and does use deterministic rather than stochastic sampling of the bit. Consider the sign function quanti-\nAlgorithm 1 Training a DNN with BinaryNet. C is the cost function for minibatch, λ the learning rate decay factor and L the number of layers. ◦ indicates element-wise multiplication. The function Sign() specifies how to binarize the activations and weights, Clip() how to clip the weights, BatchNorm() and BackBatchNorm() how to batch normalize and backpropagate through the normalization (See Algorithm 2), and Adam() how to update the parameters knowing their gradient (See Algorithm 3). Require: a minibatch of inputs and targets (a0, a∗), pre-\nvious weights W , previous BatchNorm parameters θ, weights initialization coefficients from (Glorot & Bengio, 2010) γ, and previous learning rate η. Ensure: updated weights W t+1, updated BatchNorm parameters θt+1 and updated learning rate ηt+1. {1. Computing the parameters’ gradient:} {1.1. Forward propagation:} for k = 1 to L do W bk ← Sign(Wk) sk ← abk−1W bk ak ← BatchNorm(sk, θk) if k < L then abk ← Sign(ak)\nend if end for {1.2. Backward propagation:} {Please note that the gradients are not binary.} Compute gaL = ∂C ∂aL knowing aL and a∗ for k = L to 1 do if k < L then gak ← gabk ◦ 1|ak|≤1\nend if (gsk , gθk)← BackBatchNorm(gak , sk, θk) gabk−1 ← gskW b k gW bk ← g > sk abk−1\nend for {2. Accumulating the parameters’ gradient:} for k = 1 to L do θt+1k ← Adam(θk, η, gθk) W t+1k ← Clip(Adam(Wk, γkη, gW bk ),−1, 1) ηt+1 ← λη end for\nAlgorithm 2 Batch Normalizing Transform (Ioffe & Szegedy, 2015), applied to activation x over a mini-batch. Require: Values of x over a mini-batch: B = {x1...m};\nParameters to be learned: γ, β Ensure: {yi = BNxiγ, β} µB ← 1m ∑m i=1 xi {mini-batch mean}\nσ2B ← 1m ∑m i=1(xi − µB)2 {mini-batch variance} x̂i ← xi−µB√ σ2B+\n{normalize} yi ← γx̂i + β ≡ BNxiγ, β {scale and shift}\nAlgorithm 3 ADAM learning rule (Kingma & Ba, 2014). g2t indicates the elementwise square gt ◦ gt. Good default settings are α = 0.001, β1 = 0.9, β2 = 0.999 and = 10−8. All operations on vectors are element-wise. With βt1 and βt2 we denote β1 and β2 to the power t. Require: Previous parameters θt−1 and their gradient gt,\nand learning rate α. Ensure: Updated parameters θt {Biased 1st and 2nd raw moment estimates:} mt ← β1 ·mt−1 + (1− β1) · gt vt ← β2 · vt−1 + (1− β2) · g2t {Bias-corrected 1st and 2nd raw moment estimates:} m̂← mt/(1− βt1) v̂ ← vt/(1− βt2) {Updated parameters:} θt ← θt−1 − α · m̂/( √ v̂ + )\nzation q = Sign(r)\nand assume that an estimator gq of the gradient ∂C∂q has been obtained (with the straight-through estimator when needed). Then, our straight-through estimator of ∂C∂r is simply\ngr = gq1|r|≤1. (2)\nNote that this preserves the gradient’s information and cancels the gradient when r is too large. The use of this straight-through estimator is illustrated in Algorithm 1. The derivative 1|r|≤1 can also be seen as propagating the gradient through hard tanh, which is the following piecewise linear activation function:\nHtanh(x) = Clip(x,−1, 1) = max(−1,min(1, x)) (3)\nFor hidden units, we use the sign function non-linearity to obtain binary activations, and for weights we combine two ingredients:\n• Constrain each real-valued weight between -1 and 1, by projecting wr to -1 or 1 when the weight update brings wr outside of [−1, 1], i.e., clipping the weights during training, as per Algorithm 1. The real-valued\nweights would otherwise grow very large without any impact on the binary weights.\n• When using a weight wr, quantize it using wb = Sign(wr).\nThis is consistent with the gradient canceling when |wr| > 1, according to Eq. 2."
+    }, {
+      "heading" : "A few helpful ingredients",
+      "text" : "A few elements of our experiments, although not absolutely necessary, significantly improve the accuracy of BinaryNets, as indicated in Algorithm 1:"
+    }, {
+      "heading" : "2. Benchmark results",
+      "text" : "We obtained near state-of-the-art results with BinaryNet on MNIST, CIFAR-10 and SVHN benchmarks. The code for reproducing these results is available 1."
+    }, {
+      "heading" : "MLP on MNIST",
+      "text" : "MNIST is a benchmark image classification dataset (LeCun et al., 1998). It consists in a training set of 60K and a test set of 10K 28 × 28 gray-scale images representing digits ranging from 0 to 9. In order for this benchmark to remain a challenge, we did not use any convolution, dataaugmentation, preprocessing or unsupervised learning.\nThe MLP we train on MNIST consists in 3 hidden layers of 4096 binary units (see Section 1) and a L2-SVM output layer; L2-SVM has been shown to perform better than Softmax on several classification benchmarks (Tang, 2013; Lee et al., 2014). We regularize the model with Dropout (Srivastava, 2013; Srivastava et al., 2014).\nThe square hinge loss is minimized with the ADAM adap-\n1https://github.com/MatthieuCourbariaux/ BinaryNet/tree/master/Train-time\ntive learning rate method (Kingma & Ba, 2014). We use an exponentially decaying global learning rate and also scale the weights learning rates with the weights initialization coefficients from (Glorot & Bengio, 2010), as per Algorithm 1. We use Batch Normalization with a minibatch of size 100 to speed up the training. As typically done, we use the last 10K samples of the training set as a validation set for early stopping and model selection. We report the test error rate associated with the best validation error rate after 1000 epochs (we do not retrain on the validation set). The results are in Table 1."
+    }, {
+      "heading" : "ConvNet on CIFAR-10",
+      "text" : "CIFAR-10 is a benchmark image classification dataset. It consists in a training set of 50K and a test set of 10K 32 × 32 color images representing airplanes, automobiles, birds, cats, deers, dogs, frogs, horses, ships and trucks. We do not use any preprocessing or data-augmentation (which can really be a game changer for this dataset (Graham, 2014)).\nThe architecture of our ConvNet is detailed in Table 4. It is the same architecture as Courbariaux et al. (2015)’s except for the activations binarization. Courbariaux et al. (2015)’s architecture is itself greatly inspired from VGG (Simonyan & Zisserman, 2015).\nThe square hinge loss is minimized with ADAM. We use an exponentially decaying learning rate, like for MNIST. We scale the weights learning rates with the weights initialization coefficients from (Glorot & Bengio, 2010). We use Batch Normalization with a minibatch of size 50 to speed up the training. We use the last 5000 samples of the train-\ning set as a validation set. We report the test error rate associated with the best validation error rate after 500 training epochs (we do not retrain on the validation set). The results are in Table 2 and Figure 1."
+    }, {
+      "heading" : "ConvNet on SVHN",
+      "text" : "SVHN is a benchmark image classification dataset. It consists in a training set of 604K examples and a test set of 26K 32 × 32 color images representing digits ranging from 0 to 9. We follow the same procedure that we used for CIFAR10, with a few notable exceptions: we use half the number of units in the convolution layers and we train for 200 epochs instead of 500 (because SVHN is a much bigger dataset than CIFAR-10). The results are shown in Table 3."
+    }, {
+      "heading" : "3. Much faster at run-time",
+      "text" : "Algorithm 4 Running a MLP trained with BinaryNet. L is the number of layers. Require: a vector of 8-bit inputs a0, the binary weights W b and the BatchNorm parameters θ. Ensure: the MLP output aL. {1. First layer:} a1 ← 0 for n = 1 to 8 do a1 ← a1 + 2n−1 ×XnorDotProduct(an0 ,Wb1)\nend for ab1 ← Sign(BatchNorm(a1, θ1)) {2. Remaining hidden layers:} for k = 2 to L− 1 do ak ← XnorDotProduct(abk−1,W bk) abk ← Sign(BatchNorm(ak, θk)) end for {3. Output layer:} aL ← XnorDotProduct(abL−1,W bL) aL ← BatchNorm(aL, θL)\nBinaryNet, by drastically reducing memory usage and also replacing most 32-bit multiplications by 1-bit exclusivenot-or (XNOR) operations, is much faster to run than 32-bit float neural networks, both on general-purpose and dedicated hardware. We wrote a binary matrix multiplication GPU kernel with which it is possible to run our MNIST MLP 7 times faster than with an unoptimized GPU kernel, without suffering any loss in classification accuracy. The code for reproducing these results is available 2.\n2https://github.com/MatthieuCourbariaux/ BinaryNet/tree/master/Run-time"
+    }, {
+      "heading" : "First layer",
+      "text" : "In a BinaryNet, both the weights and activations are binary. As the output of one layer is the input of the next, all the layers inputs are binary, with the exception of the first layer. However, we do not believe this to be a major issue. Firstly, in computer vision, the input representation typically has much fewer channels (e.g. Red, Green and Blue) than internal representations (e.g. 512). As a result, the first layer of a ConvNet is often the smallest convolution layer, both in terms of parameters and computations (Szegedy et al., 2014).\nSecondly, it is relatively easy to handle continuous-valued inputs as fixed point numbers, with m bit of precision. For\nexample, in the common case of 8-bit fixed point inputs:\ns = x · wb (4)\ns = 1024∑ i=1 xiw b i (5)\ns = 1024∑ i=1 ( 8∑ n=1 2n−1xni w b i ) (6)\ns = 8∑ n=1 (2n−1 1024∑ i=1 (xni w b i )) (7)\ns = 8∑ n=1 2n−1(xn · wb) (8)\nWhere x is a vector of 1024 8-bit inputs, x81 the most significant bit of the first input, wb a vector of 1024 1-bit weights and s the resulting weighted sum. This trick is used in Algorithm 4."
+    }, {
+      "heading" : "XNOR-accumulate",
+      "text" : "Applying a DNN mainly consists in convolutions and matrix multiplications. The key arithmetic operation of deep learning is thus the multiply-accumulate operation. Artificial neurons are basically multiply-accumulators computing weighted sums of their inputs. With BinaryNet, both the activations and the weights are constrained to either−1 or +1. As a result, most of the 32-bit floating point multiplications are replaced by 1-bit XNOR operations. This could have a huge impact on deep learning dedicated hardware. For instance, a 32-bit floating point multiplier costs about 200 FPGA slices (Govindu et al., 2004; Beauchamp et al., 2006), whereas a 1-bit XNOR gate only costs a single slice."
+    }, {
+      "heading" : "7 times faster on GPU at run-time",
+      "text" : "It is possible to speed-up GPU implementations of DNNs trained with BinaryNet, by using a method some people call SIMD (single instruction, multiple data) within a register (SWAR). The basic idea of SWAR is to concatenate groups of 32 binary variables into 32-bit registers, and thus obtain a 32 times speed-up on bitwise operations (e.g. XNOR). Using SWAR, it is possible to evaluate 32 connections with only 4 instructions:\na1+ = popcount(not(xor(a 32b 0 , w 32b 1 ))) (9)\nWhere a1 is the resulting weighted sum, and a32b0 and w 32b 1 the concatenated inputs and weights. Those 4 instructions take 7 clock cycles on recent Nvidia GPUs (and if they were to become a fused instruction, it would only take a single clock cycle). As a result, we get a theoretical Nvidia GPU speed-up of 32/7 ≈ 4.6. In practice, this speed-up is\nquite easy to obtain as the memory bandwidth to computation ratio is also increased by 7 times.\nIn order to validate those theoretical results, we wrote two GPU kernels:\n• The first kernel (baseline) is a quite unoptimized matrix multiplication kernel.\n• The second kernel (XNOR) is nearly identical to the baseline kernel, except that it uses the SWAR method, as in Equation 9.\nThe two GPU kernels return exactly the same output when their inputs are constrained to −1 or +1 (but not otherwise). The XNOR kernel is about 14 times faster than the baseline kernel and 2.5 times faster than Theano’s (Bergstra et al., 2010; Bastien et al., 2012), as shown in Figure 2. Last but not least, the MLP from Section 2 runs 7 times faster with the XNOR kernel than with the baseline kernel, without suffering any loss in classification accuracy (see Figure 2)."
+    }, {
+      "heading" : "4. Related work",
+      "text" : "Courbariaux et al. (2015); Lin et al. (2015) train DNNs with binary weights when computing the parameters’ gradient. In some of their experiments, they also exponentially quantize the activations during some parts (but not all) of the computations. By contrast, we train DNNs with binary weights and activations, which can be much more efficient in terms of hardware (see Section 3). Moreover, their method (BinaryConnect) is slower to train than ours (see Figure 1), yields worse results on MNIST (see Table 1) but better results on CIFAR-10 and SVHN (see Tables 2 and 3).\nSoudry et al. (2014); Cheng et al. (2015) do not train their DNN with Backpropagation (BP) but with a variant called Expectation Backpropagation (EBP). EBP is based on Expectation Propagation (EP) (Minka, 2001), which is a variational Bayes method used to do inference in probabilistic graphical models. Let us compare their method to ours:\n• Like ours, their method binarizes both the activations and the weights when computing the parameters’ gradient.\n• Their method optimizes the weights posterior distribution (which is not binary). In this regard, our method is quite similar as we accumulate the weights’ gradient in real-valued variables.\n• In order to obtain a good performance, their method requires to average over the output of a few binary neural networks sampled from the weights posterior distribution (which might be costly).\n• Their method (binary expectation backpropagation) yields a good classification accuracy for fully connected networks on MNIST (see Table 1), but not (yet) for ConvNets.\nHwang & Sung (2014); Kim et al. (2014) retrain neural networks with ternary weights and 3-bit activations, i.e.:\n• They train a neural network with high-precision,\n• After training, they ternarize the weights to three possible values−H , 0 and +H and adjustH to minimize the output error,\n• And eventually, they retrain with ternary weights and 3-bit activations when computing the parameters’ gradient.\nBy comparison, we train all the way with binary weights and activations, i.e., our training procedure could be hardware accelerated as it only needs very few multiplications, as in (Lin et al., 2015), and our binary DNNs are likely more efficient at run-time.\nSimilarly, Kim & Smaragdis (2016) retrain deep neural networks with binary weights and activations. Their method (bitwise neural networks) yields a good classification accuracy for fully connected networks on MNIST (see Table 1), but not (yet) for ConvNets."
+    }, {
+      "heading" : "Conclusion",
+      "text" : "We have introduced BinaryNet, a method which trains DNNs with binary weights and activations when computing the parameters’ gradient (see Section 1). We have shown that it is possible to train an MLP on MNIST and ConvNets on CIFAR-10 and SVHN with BinaryNet and achieve nearly state-of-the-art results (see Section 2). Moreover, at run-time, BinaryNet drastically reduces memory usage and replaces most multiplications by 1-bit exclusive-not-or (XNOR) operations, which could have a big impact on both general-purpose and dedicated deep learning hardware. We wrote a binary matrix multiplication GPU kernel with which it is possible to run our MNIST MLP 7 times faster than with an unoptimized GPU kernel, without suffering any loss in classification accuracy (see Section 3). Future works should explore how to extend the speed-up to train-time (e.g. by binarizing some gradients), and also extend benchmark results to other models (e.g. RNN) and datasets (e.g. ImageNet)."
+    }, {
+      "heading" : "Acknowledgments",
+      "text" : "We thank our fellow MILA lab members who took the time to read the article and give us some feedback. We thank the\ndevelopers of Theano (Bergstra et al., 2010; Bastien et al., 2012), a Python library which allowed us to easily develop a fast and optimized code for GPU. We also thank the developers of Pylearn2 (Goodfellow et al., 2013) and Lasagne (Dieleman et al., 2015), two Deep Learning libraries built on the top of Theano. We are also grateful for funding from CIFAR, NSERC, IBM, and Samsung."
+    } ],
+    "references" : [ {
+      "title" : "Neural machine translation by jointly learning to align and translate",
+      "author" : [ "Bahdanau", "Dzmitry", "Cho", "Kyunghyun", "Bengio", "Yoshua" ],
+      "venue" : "In ICLR’2015,",
+      "citeRegEx" : "Bahdanau et al\\.,? \\Q2015\\E",
+      "shortCiteRegEx" : "Bahdanau et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "Theano: new features and speed improvements",
+      "author" : [ "Bastien", "Frédéric", "Lamblin", "Pascal", "Pascanu", "Razvan", "Bergstra", "James", "Goodfellow", "Ian J", "Bergeron", "Arnaud", "Bouchard", "Nicolas", "Bengio", "Yoshua" ],
+      "venue" : "Deep Learning and Unsupervised Feature Learning NIPS 2012 Workshop,",
+      "citeRegEx" : "Bastien et al\\.,? \\Q2012\\E",
+      "shortCiteRegEx" : "Bastien et al\\.",
+      "year" : 2012
+    }, {
+      "title" : "Embedded floatingpoint units in FPGAs",
+      "author" : [ "Beauchamp", "Michael J", "Hauck", "Scott", "Underwood", "Keith D", "Hemmert", "K Scott" ],
+      "venue" : "In Proceedings of the 2006 ACM/SIGDA 14th international symposium on Field programmable gate arrays,",
+      "citeRegEx" : "Beauchamp et al\\.,? \\Q2006\\E",
+      "shortCiteRegEx" : "Beauchamp et al\\.",
+      "year" : 2006
+    }, {
+      "title" : "Estimating or propagating gradients through stochastic neurons",
+      "author" : [ "Bengio", "Yoshua" ],
+      "venue" : "Technical Report arXiv:1305.2982, Universite de Montreal,",
+      "citeRegEx" : "Bengio and Yoshua.,? \\Q2013\\E",
+      "shortCiteRegEx" : "Bengio and Yoshua.",
+      "year" : 2013
+    }, {
+      "title" : "Dadiannao: A machine-learning supercomputer",
+      "author" : [ "Chen", "Yunji", "Luo", "Tao", "Liu", "Shaoli", "Zhang", "Shijin", "He", "Liqiang", "Wang", "Jia", "Li", "Ling", "Tianshi", "Xu", "Zhiwei", "Sun", "Ninghui" ],
+      "venue" : "In Microarchitecture (MICRO),",
+      "citeRegEx" : "Chen et al\\.,? \\Q2014\\E",
+      "shortCiteRegEx" : "Chen et al\\.",
+      "year" : 2014
+    }, {
+      "title" : "Deep learning with COTS HPC systems",
+      "author" : [ "Coates", "Adam", "Huval", "Brody", "Wang", "Tao", "Wu", "David", "Catanzaro", "Bryan", "Andrew", "Ng" ],
+      "venue" : "In Proceedings of the 30th international conference on machine learning,",
+      "citeRegEx" : "Coates et al\\.,? \\Q2013\\E",
+      "shortCiteRegEx" : "Coates et al\\.",
+      "year" : 2013
+    }, {
+      "title" : "JeanPierre. Binaryconnect: Training deep neural networks with binary weights during propagations",
+      "author" : [ "Courbariaux", "Matthieu", "Bengio", "Yoshua", "David" ],
+      "venue" : "ArXiv e-prints,",
+      "citeRegEx" : "Courbariaux et al\\.,? \\Q2015\\E",
+      "shortCiteRegEx" : "Courbariaux et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "Fast and robust neural network joint models for statistical machine translation",
+      "author" : [ "Devlin", "Jacob", "Zbib", "Rabih", "Huang", "Zhongqiang", "Lamar", "Thomas", "Schwartz", "Richard", "Makhoul", "John" ],
+      "venue" : "In Proc. ACL’2014,",
+      "citeRegEx" : "Devlin et al\\.,? \\Q2014\\E",
+      "shortCiteRegEx" : "Devlin et al\\.",
+      "year" : 2014
+    }, {
+      "title" : "Backpropagation for energy-efficient neuromorphic computing",
+      "author" : [ "Esser", "Steve K", "Appuswamy", "Rathinakumar", "Merolla", "Paul", "Arthur", "John V", "Modha", "Dharmendra S" ],
+      "venue" : "In Advances in Neural Information Processing Systems,",
+      "citeRegEx" : "Esser et al\\.,? \\Q2015\\E",
+      "shortCiteRegEx" : "Esser et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "Large-scale FPGA-based convolutional networks",
+      "author" : [ "Farabet", "Clément", "LeCun", "Yann", "Kavukcuoglu", "Koray", "Culurciello", "Eugenio", "Martini", "Berin", "Akselrod", "Polina", "Talay", "Selcuk" ],
+      "venue" : "Machine Learning on Very Large Data Sets,",
+      "citeRegEx" : "Farabet et al\\.,? \\Q2011\\E",
+      "shortCiteRegEx" : "Farabet et al\\.",
+      "year" : 2011
+    }, {
+      "title" : "Neuflow: A runtime reconfigurable dataflow processor for vision",
+      "author" : [ "Farabet", "Clément", "Martini", "Berin", "Corda", "Benoit", "Akselrod", "Polina", "Culurciello", "Eugenio", "LeCun", "Yann" ],
+      "venue" : "In Computer Vision and Pattern Recognition Workshops (CVPRW),",
+      "citeRegEx" : "Farabet et al\\.,? \\Q2011\\E",
+      "shortCiteRegEx" : "Farabet et al\\.",
+      "year" : 2011
+    }, {
+      "title" : "Understanding the difficulty of training deep feedforward neural networks",
+      "author" : [ "Glorot", "Xavier", "Bengio", "Yoshua" ],
+      "venue" : "In AISTATS’2010,",
+      "citeRegEx" : "Glorot et al\\.,? \\Q2010\\E",
+      "shortCiteRegEx" : "Glorot et al\\.",
+      "year" : 2010
+    }, {
+      "title" : "Compressing deep convolutional networks using vector quantization",
+      "author" : [ "Gong", "Yunchao", "Liu", "Yang", "Ming", "Bourdev", "Lubomir" ],
+      "venue" : "arXiv preprint arXiv:1412.6115,",
+      "citeRegEx" : "Gong et al\\.,? \\Q2014\\E",
+      "shortCiteRegEx" : "Gong et al\\.",
+      "year" : 2014
+    }, {
+      "title" : "Pylearn2: a machine learning research",
+      "author" : [ "Goodfellow", "Ian J", "Warde-Farley", "David", "Lamblin", "Pascal", "Dumoulin", "Vincent", "Mirza", "Mehdi", "Pascanu", "Razvan", "Bergstra", "James", "Bastien", "Frédéric", "Bengio", "Yoshua" ],
+      "venue" : "library. arXiv preprint arXiv:1308.4214,",
+      "citeRegEx" : "Goodfellow et al\\.,? \\Q2013\\E",
+      "shortCiteRegEx" : "Goodfellow et al\\.",
+      "year" : 2013
+    }, {
+      "title" : "Analysis of high-performance floating-point arithmetic on FPGAs",
+      "author" : [ "Govindu", "Gokul", "Zhuo", "Ling", "Choi", "Seonil", "Prasanna", "Viktor" ],
+      "venue" : "In Parallel and Distributed Processing Symposium,",
+      "citeRegEx" : "Govindu et al\\.,? \\Q2004\\E",
+      "shortCiteRegEx" : "Govindu et al\\.",
+      "year" : 2004
+    }, {
+      "title" : "Spatially-sparse convolutional neural networks",
+      "author" : [ "Graham", "Benjamin" ],
+      "venue" : "arXiv preprint arXiv:1409.6070,",
+      "citeRegEx" : "Graham and Benjamin.,? \\Q2014\\E",
+      "shortCiteRegEx" : "Graham and Benjamin.",
+      "year" : 2014
+    }, {
+      "title" : "Practical variational inference for neural networks",
+      "author" : [ "Graves", "Alex" ],
+      "venue" : "In Advances in Neural Information Processing Systems,",
+      "citeRegEx" : "Graves and Alex.,? \\Q2011\\E",
+      "shortCiteRegEx" : "Graves and Alex.",
+      "year" : 2011
+    }, {
+      "title" : "Learning both weights and connections for efficient neural network",
+      "author" : [ "Han", "Song", "Pool", "Jeff", "Tran", "John", "Dally", "William" ],
+      "venue" : "In Advances in Neural Information Processing Systems,",
+      "citeRegEx" : "Han et al\\.,? \\Q2015\\E",
+      "shortCiteRegEx" : "Han et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "Neural networks for machine learning",
+      "author" : [ "Hinton", "Geoffrey" ],
+      "venue" : "Coursera, video lectures,",
+      "citeRegEx" : "Hinton and Geoffrey.,? \\Q2012\\E",
+      "shortCiteRegEx" : "Hinton and Geoffrey.",
+      "year" : 2012
+    }, {
+      "title" : "Fixed-point feedforward deep neural network design using weights+",
+      "author" : [ "Hwang", "Kyuyeon", "Sung", "Wonyong" ],
+      "venue" : "In Signal Processing Systems (SiPS),",
+      "citeRegEx" : "Hwang et al\\.,? \\Q2014\\E",
+      "shortCiteRegEx" : "Hwang et al\\.",
+      "year" : 2014
+    }, {
+      "title" : "Batch normalization: Accelerating deep network training by reducing internal covariate shift",
+      "author" : [ "Ioffe", "Sergey", "Szegedy", "Christian" ],
+      "venue" : null,
+      "citeRegEx" : "Ioffe et al\\.,? \\Q2015\\E",
+      "shortCiteRegEx" : "Ioffe et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "X1000 real-time phoneme recognition vlsi using feedforward deep neural networks",
+      "author" : [ "Kim", "Jonghong", "Hwang", "Kyuyeon", "Sung", "Wonyong" ],
+      "venue" : "In Acoustics, Speech and Signal Processing (ICASSP),",
+      "citeRegEx" : "Kim et al\\.,? \\Q2014\\E",
+      "shortCiteRegEx" : "Kim et al\\.",
+      "year" : 2014
+    }, {
+      "title" : "Adam: A method for stochastic optimization",
+      "author" : [ "Kingma", "Diederik", "Ba", "Jimmy" ],
+      "venue" : "arXiv preprint arXiv:1412.6980,",
+      "citeRegEx" : "Kingma et al\\.,? \\Q2014\\E",
+      "shortCiteRegEx" : "Kingma et al\\.",
+      "year" : 2014
+    }, {
+      "title" : "ImageNet classification with deep convolutional neural networks",
+      "author" : [ "A. Krizhevsky", "I. Sutskever", "G. Hinton" ],
+      "venue" : "In NIPS’2012",
+      "citeRegEx" : "Krizhevsky et al\\.,? \\Q2012\\E",
+      "shortCiteRegEx" : "Krizhevsky et al\\.",
+      "year" : 2012
+    }, {
+      "title" : "Gradient-based learning applied to document recognition",
+      "author" : [ "LeCun", "Yann", "Bottou", "Leon", "Bengio", "Yoshua", "Haffner", "Patrick" ],
+      "venue" : "Proceedings of the IEEE,",
+      "citeRegEx" : "LeCun et al\\.,? \\Q1998\\E",
+      "shortCiteRegEx" : "LeCun et al\\.",
+      "year" : 1998
+    }, {
+      "title" : "Generalizing pooling functions in convolutional neural networks: Mixed",
+      "author" : [ "Lee", "Chen-Yu", "Gallagher", "Patrick W", "Tu", "Zhuowen" ],
+      "venue" : "gated, and tree. arXiv preprint arXiv:1509.08985,",
+      "citeRegEx" : "Lee et al\\.,? \\Q2015\\E",
+      "shortCiteRegEx" : "Lee et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "Neural networks with few multiplications",
+      "author" : [ "Lin", "Zhouhan", "Courbariaux", "Matthieu", "Memisevic", "Roland", "Bengio", "Yoshua" ],
+      "venue" : "ArXiv e-prints,",
+      "citeRegEx" : "Lin et al\\.,? \\Q2015\\E",
+      "shortCiteRegEx" : "Lin et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "Expectation propagation for approximate bayesian inference",
+      "author" : [ "Minka", "Thomas P" ],
+      "venue" : "In UAI’2001,",
+      "citeRegEx" : "Minka and P.,? \\Q2001\\E",
+      "shortCiteRegEx" : "Minka and P.",
+      "year" : 2001
+    }, {
+      "title" : "Human-level control through deep reinforcement learning",
+      "author" : [ "len", "Kumaran", "Dharsan", "Wierstra", "Daan", "Legg", "Shane", "Hassabis", "Demis" ],
+      "venue" : "Nature, 518:529–533,",
+      "citeRegEx" : "len et al\\.,? \\Q2015\\E",
+      "shortCiteRegEx" : "len et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "Neuflow: dataflow vision processing system-on-a-chip",
+      "author" : [ "Pham", "Phi-Hung", "Jelaca", "Darko", "Farabet", "Clement", "Martini", "Berin", "LeCun", "Yann", "Culurciello", "Eugenio" ],
+      "venue" : "In Circuits and Systems (MWSCAS),",
+      "citeRegEx" : "Pham et al\\.,? \\Q2012\\E",
+      "shortCiteRegEx" : "Pham et al\\.",
+      "year" : 2012
+    }, {
+      "title" : "Fitnets: Hints for thin deep nets",
+      "author" : [ "Romero", "Adriana", "Ballas", "Nicolas", "Kahou", "Samira Ebrahimi", "Chassang", "Antoine", "Gatta", "Carlo", "Bengio", "Yoshua" ],
+      "venue" : "arXiv preprint arXiv:1412.6550,",
+      "citeRegEx" : "Romero et al\\.,? \\Q2014\\E",
+      "shortCiteRegEx" : "Romero et al\\.",
+      "year" : 2014
+    }, {
+      "title" : "Deep convolutional neural networks for LVCSR",
+      "author" : [ "Sainath", "Tara", "rahman Mohamed", "Abdel", "Kingsbury", "Brian", "Ramabhadran", "Bhuvana" ],
+      "venue" : null,
+      "citeRegEx" : "Sainath et al\\.,? \\Q2013\\E",
+      "shortCiteRegEx" : "Sainath et al\\.",
+      "year" : 2013
+    }, {
+      "title" : "Mastering the game of go with deep neural networks and tree",
+      "author" : [ "Kavukcuoglu", "Koray", "Graepel", "Thore", "Hassabis", "Demis" ],
+      "venue" : "search. Nature,",
+      "citeRegEx" : "Kavukcuoglu et al\\.,? \\Q2016\\E",
+      "shortCiteRegEx" : "Kavukcuoglu et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Very deep convolutional networks for large-scale image recognition",
+      "author" : [ "Simonyan", "Karen", "Zisserman", "Andrew" ],
+      "venue" : "In ICLR,",
+      "citeRegEx" : "Simonyan et al\\.,? \\Q2015\\E",
+      "shortCiteRegEx" : "Simonyan et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "Expectation backpropagation: Parameter-free training of multilayer neural networks with continuous or discrete weights",
+      "author" : [ "Soudry", "Daniel", "Hubara", "Itay", "Meir", "Ron" ],
+      "venue" : "In NIPS’2014,",
+      "citeRegEx" : "Soudry et al\\.,? \\Q2014\\E",
+      "shortCiteRegEx" : "Soudry et al\\.",
+      "year" : 2014
+    }, {
+      "title" : "Improving neural networks with dropout",
+      "author" : [ "Srivastava", "Nitish" ],
+      "venue" : "Master’s thesis, U. Toronto,",
+      "citeRegEx" : "Srivastava and Nitish.,? \\Q2013\\E",
+      "shortCiteRegEx" : "Srivastava and Nitish.",
+      "year" : 2013
+    }, {
+      "title" : "Dropout: A simple way to prevent neural networks from overfitting",
+      "author" : [ "Srivastava", "Nitish", "Hinton", "Geoffrey", "Krizhevsky", "Alex", "Sutskever", "Ilya", "Salakhutdinov", "Ruslan" ],
+      "venue" : "Journal of Machine Learning Research,",
+      "citeRegEx" : "Srivastava et al\\.,? \\Q1958\\E",
+      "shortCiteRegEx" : "Srivastava et al\\.",
+      "year" : 1958
+    }, {
+      "title" : "Sequence to sequence learning with neural networks",
+      "author" : [ "Sutskever", "Ilya", "Vinyals", "Oriol", "Le", "Quoc V" ],
+      "venue" : "In NIPS’2014,",
+      "citeRegEx" : "Sutskever et al\\.,? \\Q2014\\E",
+      "shortCiteRegEx" : "Sutskever et al\\.",
+      "year" : 2014
+    }, {
+      "title" : "Going deeper with convolutions",
+      "author" : [ "Szegedy", "Christian", "Liu", "Wei", "Jia", "Yangqing", "Sermanet", "Pierre", "Reed", "Scott", "Anguelov", "Dragomir", "Erhan", "Dumitru", "Vanhoucke", "Vincent", "Rabinovich", "Andrew" ],
+      "venue" : "Technical report,",
+      "citeRegEx" : "Szegedy et al\\.,? \\Q2014\\E",
+      "shortCiteRegEx" : "Szegedy et al\\.",
+      "year" : 2014
+    }, {
+      "title" : "Deep learning using linear support vector machines",
+      "author" : [ "Tang", "Yichuan" ],
+      "venue" : "Workshop on Challenges in Representation Learning,",
+      "citeRegEx" : "Tang and Yichuan.,? \\Q2013\\E",
+      "shortCiteRegEx" : "Tang and Yichuan.",
+      "year" : 2013
+    }, {
+      "title" : "Improving the speed of neural networks on CPUs",
+      "author" : [ "Vanhoucke", "Vincent", "Senior", "Andrew", "Mao", "Mark Z" ],
+      "venue" : "In Proc. Deep Learning and Unsupervised Feature Learning NIPS Workshop,",
+      "citeRegEx" : "Vanhoucke et al\\.,? \\Q2011\\E",
+      "shortCiteRegEx" : "Vanhoucke et al\\.",
+      "year" : 2011
+    }, {
+      "title" : "Regularization of neural networks using dropconnect",
+      "author" : [ "Wan", "Li", "Zeiler", "Matthew", "Zhang", "Sixin", "LeCun", "Yann", "Fergus", "Rob" ],
+      "venue" : "In ICML’2013,",
+      "citeRegEx" : "Wan et al\\.,? \\Q2013\\E",
+      "shortCiteRegEx" : "Wan et al\\.",
+      "year" : 2013
+    } ],
+    "referenceMentions" : [ {
+      "referenceID" : 23,
+      "context" : "Deep Neural Networks (DNNs) have substantially pushed Artificial Intelligence (AI) limits in a wide range of tasks, including but not limited to object recognition from images (Krizhevsky et al., 2012; Szegedy et al., 2014), speech recognition (Hinton et al.",
+      "startOffset" : 176,
+      "endOffset" : 223
+    }, {
+      "referenceID" : 38,
+      "context" : "Deep Neural Networks (DNNs) have substantially pushed Artificial Intelligence (AI) limits in a wide range of tasks, including but not limited to object recognition from images (Krizhevsky et al., 2012; Szegedy et al., 2014), speech recognition (Hinton et al.",
+      "startOffset" : 176,
+      "endOffset" : 223
+    }, {
+      "referenceID" : 31,
+      "context" : ", 2014), speech recognition (Hinton et al., 2012; Sainath et al., 2013), statistical machine translation (Devlin et al.",
+      "startOffset" : 28,
+      "endOffset" : 71
+    }, {
+      "referenceID" : 7,
+      "context" : ", 2013), statistical machine translation (Devlin et al., 2014; Sutskever et al., 2014; Bahdanau et al., 2015), Atari and Go games (Mnih et al.",
+      "startOffset" : 41,
+      "endOffset" : 109
+    }, {
+      "referenceID" : 37,
+      "context" : ", 2013), statistical machine translation (Devlin et al., 2014; Sutskever et al., 2014; Bahdanau et al., 2015), Atari and Go games (Mnih et al.",
+      "startOffset" : 41,
+      "endOffset" : 109
+    }, {
+      "referenceID" : 0,
+      "context" : ", 2013), statistical machine translation (Devlin et al., 2014; Sutskever et al., 2014; Bahdanau et al., 2015), Atari and Go games (Mnih et al.",
+      "startOffset" : 41,
+      "endOffset" : 109
+    }, {
+      "referenceID" : 5,
+      "context" : "Today, DNNs are almost exclusively trained on one or many very fast and power-hungry Graphic Processing Units (GPUs) (Coates et al., 2013).",
+      "startOffset" : 117,
+      "endOffset" : 138
+    }, {
+      "referenceID" : 40,
+      "context" : "As a result, it is often a challenge to run DNNs on target low-power devices, and much research work is done to speed-up DNNs at run-time on both general-purpose (Vanhoucke et al., 2011; Gong et al., 2014; Romero et al., 2014; Han et al., 2015) and specialized computer hardware (Farabet et al.",
+      "startOffset" : 162,
+      "endOffset" : 244
+    }, {
+      "referenceID" : 12,
+      "context" : "As a result, it is often a challenge to run DNNs on target low-power devices, and much research work is done to speed-up DNNs at run-time on both general-purpose (Vanhoucke et al., 2011; Gong et al., 2014; Romero et al., 2014; Han et al., 2015) and specialized computer hardware (Farabet et al.",
+      "startOffset" : 162,
+      "endOffset" : 244
+    }, {
+      "referenceID" : 30,
+      "context" : "As a result, it is often a challenge to run DNNs on target low-power devices, and much research work is done to speed-up DNNs at run-time on both general-purpose (Vanhoucke et al., 2011; Gong et al., 2014; Romero et al., 2014; Han et al., 2015) and specialized computer hardware (Farabet et al.",
+      "startOffset" : 162,
+      "endOffset" : 244
+    }, {
+      "referenceID" : 17,
+      "context" : "As a result, it is often a challenge to run DNNs on target low-power devices, and much research work is done to speed-up DNNs at run-time on both general-purpose (Vanhoucke et al., 2011; Gong et al., 2014; Romero et al., 2014; Han et al., 2015) and specialized computer hardware (Farabet et al.",
+      "startOffset" : 162,
+      "endOffset" : 244
+    }, {
+      "referenceID" : 29,
+      "context" : ", 2015) and specialized computer hardware (Farabet et al., 2011a;b; Pham et al., 2012; Chen et al., 2014a;b; Esser et al., 2015).",
+      "startOffset" : 42,
+      "endOffset" : 128
+    }, {
+      "referenceID" : 8,
+      "context" : ", 2015) and specialized computer hardware (Farabet et al., 2011a;b; Pham et al., 2012; Chen et al., 2014a;b; Esser et al., 2015).",
+      "startOffset" : 42,
+      "endOffset" : 128
+    }, {
+      "referenceID" : 6,
+      "context" : "Stochastic binarization could be used, as in (Courbariaux et al., 2015), and is more theoretically appealing but is also a more costly alternative because it requires the hardware to generate random bits when quantizing.",
+      "startOffset" : 45,
+      "endOffset" : 71
+    }, {
+      "referenceID" : 41,
+      "context" : ", 2014) and DropConnect (Wan et al., 2013).",
+      "startOffset" : 24,
+      "endOffset" : 42
+    }, {
+      "referenceID" : 6,
+      "context" : "• Lastly, scaling the weights’ learning rates with the weights’ initialization coefficients from (Glorot & Bengio, 2010) also seems to help, as suggested by Courbariaux et al. (2015).",
+      "startOffset" : 157,
+      "endOffset" : 183
+    }, {
+      "referenceID" : 6,
+      "context" : "33% BinaryConnect (Courbariaux et al., 2015) 1.",
+      "startOffset" : 18,
+      "endOffset" : 44
+    }, {
+      "referenceID" : 6,
+      "context" : "40% BinaryConnect (Courbariaux et al., 2015) 8.",
+      "startOffset" : 18,
+      "endOffset" : 44
+    }, {
+      "referenceID" : 25,
+      "context" : "27% Gated pooling (Lee et al., 2015) 7.",
+      "startOffset" : 18,
+      "endOffset" : 36
+    }, {
+      "referenceID" : 6,
+      "context" : "Intriguingly, BinaryNet is faster to train and yields worse results than BinaryConnect (Courbariaux et al., 2015), suggesting that it is slightly overfitting and might benefit from additional noise (e.",
+      "startOffset" : 87,
+      "endOffset" : 113
+    }, {
+      "referenceID" : 6,
+      "context" : "80% BinaryConnect (Courbariaux et al., 2015) 2.",
+      "startOffset" : 18,
+      "endOffset" : 44
+    }, {
+      "referenceID" : 25,
+      "context" : "15% Gated pooling (Lee et al., 2015) 1.",
+      "startOffset" : 18,
+      "endOffset" : 36
+    }, {
+      "referenceID" : 24,
+      "context" : "MNIST is a benchmark image classification dataset (LeCun et al., 1998).",
+      "startOffset" : 50,
+      "endOffset" : 70
+    }, {
+      "referenceID" : 6,
+      "context" : "It is the same architecture as Courbariaux et al. (2015)’s except for the activations binarization.",
+      "startOffset" : 31,
+      "endOffset" : 57
+    }, {
+      "referenceID" : 6,
+      "context" : "It is the same architecture as Courbariaux et al. (2015)’s except for the activations binarization. Courbariaux et al. (2015)’s architecture is itself greatly inspired from VGG (Simonyan & Zisserman, 2015).",
+      "startOffset" : 31,
+      "endOffset" : 126
+    }, {
+      "referenceID" : 1,
+      "context" : "We can see that our XNOR kernel is significantly faster than our baseline and Theano’s (Bergstra et al., 2010; Bastien et al., 2012) kernels.",
+      "startOffset" : 87,
+      "endOffset" : 132
+    }, {
+      "referenceID" : 38,
+      "context" : "As a result, the first layer of a ConvNet is often the smallest convolution layer, both in terms of parameters and computations (Szegedy et al., 2014).",
+      "startOffset" : 128,
+      "endOffset" : 150
+    }, {
+      "referenceID" : 14,
+      "context" : "For instance, a 32-bit floating point multiplier costs about 200 FPGA slices (Govindu et al., 2004; Beauchamp et al., 2006), whereas a 1-bit XNOR gate only costs a single slice.",
+      "startOffset" : 77,
+      "endOffset" : 123
+    }, {
+      "referenceID" : 2,
+      "context" : "For instance, a 32-bit floating point multiplier costs about 200 FPGA slices (Govindu et al., 2004; Beauchamp et al., 2006), whereas a 1-bit XNOR gate only costs a single slice.",
+      "startOffset" : 77,
+      "endOffset" : 123
+    }, {
+      "referenceID" : 1,
+      "context" : "5 times faster than Theano’s (Bergstra et al., 2010; Bastien et al., 2012), as shown in Figure 2.",
+      "startOffset" : 29,
+      "endOffset" : 74
+    }, {
+      "referenceID" : 21,
+      "context" : "Hwang & Sung (2014); Kim et al. (2014) retrain neural networks with ternary weights and 3-bit activations, i.",
+      "startOffset" : 21,
+      "endOffset" : 39
+    }, {
+      "referenceID" : 26,
+      "context" : ", our training procedure could be hardware accelerated as it only needs very few multiplications, as in (Lin et al., 2015), and our binary DNNs are likely more efficient at run-time.",
+      "startOffset" : 104,
+      "endOffset" : 122
+    }, {
+      "referenceID" : 1,
+      "context" : "We thank the developers of Theano (Bergstra et al., 2010; Bastien et al., 2012), a Python library which allowed us to easily develop a fast and optimized code for GPU.",
+      "startOffset" : 34,
+      "endOffset" : 79
+    }, {
+      "referenceID" : 13,
+      "context" : "We also thank the developers of Pylearn2 (Goodfellow et al., 2013) and Lasagne (Dieleman et al.",
+      "startOffset" : 41,
+      "endOffset" : 66
+    } ],
+    "year" : 2016,
+    "abstractText" : "We introduce BinaryNet, a method which trains DNNs with binary weights and activations when computing parameters’ gradient. We show that it is possible to train a Multi Layer Perceptron (MLP) on MNIST and ConvNets on CIFAR-10 and SVHN with BinaryNet and achieve nearly state-of-the-art results. At run-time, BinaryNet drastically reduces memory usage and replaces most multiplications by 1-bit exclusive-not-or (XNOR) operations, which might have a big impact on both general-purpose and dedicated Deep Learning hardware. We wrote a binary matrix multiplication GPU kernel with which it is possible to run our MNIST MLP 7 times faster than with an unoptimized GPU kernel, without suffering any loss in classification accuracy. The code for BinaryNet is available.",
+    "creator" : "LaTeX with hyperref package"
+  }
+}

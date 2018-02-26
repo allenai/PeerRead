@@ -1,0 +1,767 @@
+{
+  "name" : "1705.01626.pdf",
+  "metadata" : {
+    "source" : "CRF",
+    "title" : "Compressing DMA Engine: Leveraging Activation Sparsity for Training Deep Neural Networks",
+    "authors" : [ "Minsoo Rhu", "Mike O’Connor", "Niladrish Chatterjee", "Jeff Pool", "Stephen W. Keckler" ],
+    "emails" : [ "skeckler}@nvidia.com" ],
+    "sections" : [ {
+      "heading" : null,
+      "text" : "I. INTRODUCTION\nDeep neural networks (DNNs) are now the driving technology for numerous application domains, such as computer vision [1], speech recognition [2], and natural language processing [3]. To facilitate the design and study of DNNs, a large number of machine learning (ML) frameworks [4, 5, 6, 7, 8, 9, 10] have been developed in recent years. Most of these frameworks have strong backend support for GPUs. Thanks to their high compute power and memory bandwidth [11], GPUs can train DNNs orders of magnitude faster than CPUs. One of the key limitations of these frameworks however is that the limited physical memory capacity of the GPUs constrains the algorithm (e.g., the DNN layer width and depth) that can be trained.\nTo overcome the GPU memory capacity bottleneck of DNN training, prior work proposed to virtualize the memory usage of DNNs (vDNN) such that ML researchers can train larger and deeper neural networks beyond what is afforded by the physical limits of GPU memory [12]. By copying GPU-side memory allocations in and out of CPU memory via the PCIe link, vDNN exposes both CPU and GPU memory concurrently for memory allocations which improves user productivity and flexibility in studying DNN algorithms (detailed in Section III). However, in certain situations, this memoryscalability comes at the cost of performance overheads resulting from the movement of data across the PCIe link. When\nA version submitted to arXiv.org\nthe time needed to copy data back and forth through PCIe is smaller than the time the GPU spends computing the DNN forward and backward propagation operations, vDNN does not affect performance. For networks whose memory copying operation is bottlenecked by the data transfer bandwidth of PCIe however, vDNN can incur significant overheads with an average 31% performance loss (worst case 52%, Section III). The trend in deep learning is to employ larger and deeper networks that leads to large memory footprints that oversubscribe GPU memory [13, 14, 15]. Therefore, ensuring the performance scalability of the virtualization features offered by vDNN is vital for the continued success of deep learning training on GPUs.\nOur goal is to develop a virtualization solution for DNNs that simultaneously meets the dual requirements of memoryscalability and high performance. To this end, we present a compressing DMA engine (cDMA), a general purpose DMA architecture for GPUs that alleviates PCIe bottlenecks by reducing the size of the data structures copied in and out of GPU memory. Our cDMA architecture minimizes the design overhead by extending the (de)compression units already employed in GPU memory controllers as follows. First, cDMA requests the memory controller to fetch data from the GPU memory at a high enough rate (i.e., effective PCIe bandwidth × compression ratio) so that the compressed data can be generated at a throughput commensurate with the PCIe bandwidth. The cDMA copy-engine then initiates an on-the-fly compression operation on that data, streaming out the final compressed data to the CPU memory over PCIe. The key insight derived from our analysis in this paper is that the data (specifically the activation maps of each DNN layer) that are copied across PCIe contain significant sparsity (i.e., fraction of activations being zero-valued) and are highly compressible. Such sparsity of activations primarily comes from the ReLU [1] layers that are extensively used in DNNs. We demonstrate sparsity as well as compressibility of the activation maps through a data-driven application characterization study. Overall, this paper provides a detailed analysis of data sparsity in DNN activations during training and how our compression pipeline can be used to overcome the data transfer bandwidth bottlenecks of virtualized DNNs. We show that cDMA provides an average 2.6× (max 13.8×) compression ratio and improves performance by an average 32% (max 61%) over the previous vDNN approach.\nar X\niv :1\n70 5.\n01 62\n6v 1\n[ cs\n.L G\n] 3\nM ay\n2 01\n7\nII. BACKGROUND"
+    }, {
+      "heading" : "A. Deep Neural Networks",
+      "text" : "Today’s most popular deep neural networks can broadly be categorized as convolutional neural networks (CNNs) for image recognition, or recurrent neural networks (RNNs) for video captioning, speech recognition, and natural language processing. Both CNNs and RNNs are designed using a combination of multiple types of layers, most notably the convolutional layers (CONV), activation layers (ACTV), pooling layers (POOL), and fully-connected layers (FC). A deep neural network is divided into two functional modules: (a) the feature extraction layers that learn to extract meaningful features out of an input, and (b) the classification layers that use the extracted features to analyze and classify the input to a pre-designated output category. “Deep learning” refers to recent research trends where a neural network is designed using a large number of feature extraction layers to learn a deep hierarchy of features. The feature extraction layers of a CNN are generally composed of CONV/ACTV/POOL layers whereas the classification layers are designed using FC/ACTV layers.\nConvolutional layers. A convolutional layer contains a set of filters to identify meaningful features in the input data. For visual data such as images, 2-dimensional filters (or 3- dimensional when accounting for the multiple input channels within the input image) are employed which slide over the input of a layer to perform the convolution operation.\nActivation layers. An activation layer applies an elementwise activation function (e.g., sigmoid, tanh, and ReLU [1]) to the input feature maps. The ReLU activation function in particular is known to provide state-of-the-art performance for CNNs, which allows positive input values to pass through while thresholding all negative input values to zero.\nPooling layers. The pooling layers perform a spatialdownsampling operation on the input data, resulting in an output volume that is of smaller size. Downsampling is done via applying an average or max operation over a region of input elements and reducing it into a single element.\nFully-connected layers. The fully-connected layers (or classifier layers) constitute the final layers of the network. Popular choices for FC layers are multi-layer perceptrons, although other types of FC layers are based on multi-nomial logistic regression. The key functionality of this layer type is to find the correlation between the extracted features and the output category."
+    }, {
+      "heading" : "B. Training versus Inference",
+      "text" : "A neural network requires training to be deployed for an inference task. Training a DNN involves learning and updating the weights of the network, which is typically done using the backpropagation algorithm [16]. Figure 1 shows the three-step process for each training pass: (1) forward propagation, (2) deriving the magnitude of error between the\nnetwork’s inference and the ground truth, and (3) propagating the inference error backwards across the network using backward propagation.\nForward propagation. Forward propagation is a serialized, layer-wise computation process that is performed from the first (input) layer to the last (output) layer in a sequential manner (from left to right in Figure 1). Each layer applies a mathematical operation (such as a convolution operation for CONV layers) to the input activation maps1 (X) and generates/stores the results of this operation as output activation maps (Y).\nCalculating the loss value. The forward propagation calculation produces a classification of the input image which must be compared to the ground truth. The loss function is defined to calculate the magnitude of this error between classification and ground truth, deriving the gradients of the loss function with respect to the final layer’s output. In general, the loss value drops very quickly at the beginning of training, and then drops more slowly as the network becomes fully trained.\nBackward propagation. Backward propagation is performed in the inverse direction of forward propagation, from the last layer to the first layer (from right to left in Figure 1), again in a layer-wise sequential fashion. During this phase, the incoming gradients (dY) can conceptually be thought of as the inputs to this layer which generate output gradients (dX) to be sent to the previous layer. Using these gradients, each layer adjusts its own layer’s weights (W), if any (e.g., CONV and FC layers), so that for the next training pass, the overall loss value is incrementally reduced.\nWith sufficient training examples, which may number in the millions, the network becomes incrementally better at the task it is trying to learn. A detailed discussion of the backpropagation algorithm and how contemporary GPUs implement each layer’s DNN computations and memory allocations can be found in [17, 12]."
+    }, {
+      "heading" : "C. Data Layout for Activation Maps",
+      "text" : "For training CNNs, the (input/output) activation maps are organized into a 4-dimensional array; the number of images batched together (N), the number of feature map channels per image (C), and the height (H) and width (W) of each image. Because the way this 4-dimensional array is arranged in memory address space has a significant effect on data locality, different ML frameworks optimize the layout of their activation maps differently. For instance, the CNN backend library for Caffe [4] is optimized for NCHW (i.e., the N and\n1Following prior literature, we refer to the input/output feature maps of any given layer as input/output activation maps interchangeably.\nW in the outermost and innermost dimension of the array, respectively) whereas cuDNN [11] provides support for both NCHW and NHWC. Neon [8] and cuda-convnet [18] on the other hand is optimized for CHWN. We elaborate on the sensitivity of our proposal on activation data layout in Section VII-A.\nIII. MOTIVATION\nSeveral techniques have been proposed for supporting virtual memory on GPUs. Pichai et al. [19] and Power et al. [20] proposed TLB designs that leverage the unique memory access patterns of GPUs for optimizing the throughput of memory address translations. Zheng et al. [21] studied architectural solutions for closing the performance gap between page-migration based virtual memory and software-directed direct-memory-access (DMA) copy operations. Nonetheless, the performance overheads of these fine-grained, page-based virtual memory solutions are high because of the low throughput and high latency of page-migration on discrete GPU systems. Rhu et al. [12] therefore proposed an application-level virtual memory management solution specifically tailored for DNNs (vDNN). Figure 2 provides a high-level overview of a state-of-the-art DNN training platform containing CPUs and GPUs, and how the vDNN memory manager orchestrates the data copy operations across the CPU and GPU memory. Figure 2(a) illustrates a discrete GPU card (Maxwell Titan-X) with 336 GB/sec of GPU DRAM bandwidth, connected to a host CPU via a PCIe channel, which provides a maximum data transfer bandwidth of 16 GB/sec for PCIe gen3.\nFigure 2b shows how vDNN virtualizes memory by proactively offloading the inter-layer activation maps out to CPU memory during forward propagation and later prefetching them back into the GPU, just before they are reused during backward propagation. For training DNNs, these activation maps occupy more than 90% of the GPU-side memory allocations [12]. Thus vDNN offers significant reduction in\nthe average GPU memory usage by offloading activations to the CPU. vDNN also provides much higher PCIe bandwidth utilization and performance than page-migration based virtual memory (i.e., 12.8GB/sec [12] versus 200 MB/sec [21]) as the data movements are orchestrated by GPU’s DMA copyengine. However, when the time needed to move data in and out of the CPU memory takes longer than the time spent computing DNN’s backpropagation algorithm, vDNN can incur noticeable performance overheads by stalling the normal DNN computations.\nFigure 3 illustrates the extent of this bottleneck on the performance of DNNs. Figure 3(a) shows the performance improvements offered by successive versions of NVIDIA’s deep learning library cuDNN, which effectively reduces the time spent computing each CONV layer [11]. Figure 3(b) shows the performance overheads imposed by vDNN on each of these versions, as the window to overlap the data transfer with computation diminishes. The most recent version of cuDNN (v5) offers an average 2.2× the performance of the first version (v1) released in 2014 across a range of different DNNs. However, the data transfer bandwidth offered by the state-of-the-art PCIe link (gen3) has remained unchanged at 16 GB/sec. This divergence is the key reason behind the steadily increasing performance overheads of vDNN on successive generations of faster GPU backend libraries.\nOur compressing DMA engine is based on the key observation that the activation maps, which account for the majority of GPU-side memory allocations for training deep networks [12], are amenable for compression, which will drastically alleviate the PCIe bottleneck of virtualized DNNs. A significant fraction of each layer’s activations turn out to be zero-valued, meaning these data structures are sparse and are highly compressible. As noted by multiple prior works [22, 23, 24], such sparsity of activations are originated by the extensive use of ReLU [1] layers that follow (almost) every single layer in the feature extraction modules. We\nfirst provide a data-driven, in-depth DNN characterization study in Section IV that motivates our work, followed by our compressing DMA architecture in Section V. As the effectiveness of our proposition (i.e., compression) is highly correlated with the actual data that are input into the neural network, this paper primarily focuses on convolutional neural networks (CNNs) owing to their publicly available, realistic datasets (e.g., ImageNet [25]) for computer vision tasks. Nonetheless, we believe our proposal is equally applicable for some popular recurrent neural networks that extensively employ sparsity-inducing ReLU layers, including the GEMVbased (general-matrix-vector-multiplication) RNNs employed by Baidu for speech recognition [26, 27] and language translation [28] services. At present, we cannot study these RNN applications applications as there are no publicly available training datasets. cDMA is less well-suited for RNNs based on LSTMs [29] or GRUs [30], as they employ sigmoid and tanh activation functions rather than ReLUs.\nIV. SPARSITY OF DNN ACTIVATIONS\nThe focus of this paper is on DNN training, which involves learning and updating the weights of a neural network using the backpropagation algorithm. As discussed in Section II-B, the values in the output activation maps (Y) are derived as a function of both the input activation maps (X) and the layer weights (W). The sparsity of each layer’s output activations will therefore change as the training progresses, during which not only will the layer be continuously fed with new input activation maps, but the weights for the same layer will undergo changes as a result of backpropagation. For our compressing DMA engine to be effective, it is crucial that the activation sparsity, and accordingly its compressibility, remains consistently high throughout the entire training process. This section analyzes the effect of training on activation sparsity by using AlexNet [1] as a running example. We detail our training methodology in Section VI."
+    }, {
+      "heading" : "A. Case Study: Activation Sparsity in AlexNet",
+      "text" : "Figure 4 shows the change in each layer’s average output activation density over time, as the network is trained for better image classification. We define the per-layer average output activation density (AVGdensity) as the number of nonzero output activations divided by the total number of output\nactivations, which is measured across the minibatch of the same 50 images. Accordingly, average activation sparsity is equal to (1−AVGdensity). Figure 5 shows a visualization of sparsity across time (x-axis), layer (y-axis), and spatially within each activation map. For brevity, we only show the layers that are immediately followed by ReLU layers and would exhibit sparsity. For instance, the output activation maps of the first convolutional layer of AlexNet (conv0) contain 96 channels, each of which can conceptually be thought of as a 2-dimensional, (55× 55) array of activations per channel. The 96 channels are arranged as a (8 × 12) grid, with each grid corresponding to a single channel with (55×55) activations (i.e., the top-leftmost image in Figure 5). Each of the activations are displayed as black and white pixels depending on whether they are zero-valued (sparse, black) or not (dense, white).\nBased on this analysis, we can draw the following key observations. First, the first convolutional layer (conv0), regardless of the iterations of training it has gone through, is neither sparse nor dense, always falling within ±2% of 50% average activation sparsity (or density). Second, pooling layers always increase activation density, i.e., activation maps always get brighter after going through the pooling layers. This result is expected as pooling layers either pick the highest value (when we use max pooling) or derive the average value (average pooling) within the pooling window. Thus, a pooling layer is likely to generate a dense output unless all the input activations within the pooling window are all zero-valued. Third, with the exception of the first convolutional layer, the change in average activation density exhibits a U-shaped curve during training; the number of non-zero activations rapidly decreases during the initial training periods but gradually increases back during the latter stages of training as the model accuracy improves. This U-shaped curve is also reflected in Figure 5 where the activation maps quickly turn extremely dark during the first 40% of the training period but gradually becoming lighter as the layer enters the mid-to-end stages of the training process. Finally, layers located towards the end of the network are generally more sparse than the earlier layers with the fully-connected layers generally exhibiting much higher sparsity than the convolutional layers.\nOverall, AlexNet exhibits an average 49.4% activation sparsity across the entire network when accounting for the size of each of the layer’s activation maps (e.g., the sizes of the activation maps in the earlier layers are generally larger than those located at later layers). Thus, a compression algorithm that can perfectly compress out all the zeros can reduce the activation size by about half."
+    }, {
+      "heading" : "B. Effects of Training on Sparsity",
+      "text" : "In addition to AlexNet, we examined the sparsity of activations for larger, deeper, and more recent CNNs, including OverFeat [31], NiN [32], VGG [13], SqueezeNet [33], and GoogLeNet [14]. Figure 6 shows that the per-layer sparsity measurements of these networks are very similar in nature to AlexNet, reinforcing the observations listed above. In the six\nnetworks that we study in this paper, we observe an average 62% network-wide activation sparsity (maximum of 93%) across the entire training periods. Figure 7 shows the behavior of AlexNet as a function of training time, including the loss value computed by the loss function at the end of the network\nand the activation densities of the four convolutional layers. The graph demonstrates four key observations about the effect of training on per-layer activation density, as described below.\n• When training begins, activation density drops dramatically for all of the layers. This drop correlates with\nthe dramatic improvement in the loss function. We believe that this drop in density is due to the network quickly adapting from its randomly initialized weights to learning what features of the input data are not important for classification. • In the second regime, the activation density increases,\nfirst somewhat rapidly and then more slowly. We believe that this increase stems from two factors. First, during the middle stages of training, the network weights are iteratively optimized to extract features that it has previously neglected, gradually improving accuracy. Second, a common heuristic in training DNNs is to reduce the learning rate, typically multiplying the original learning rate by 0.5 or 0.1, when the validation accuracy stops increasing with the current learning rate [1, 34]. • During the final fine-tuning stages of training, the weights are already close to their respective optimal points so the effect on the overall average activation sparsity is minimal. • In general, convolution layers later in the network are sparser than earlier ones. Deep networks are known to build up a rich set of hierarchical feature extractors across the network layers. For instance, Zeiler and Fergus [34] observed that the first few layers of a CNN are generally trained to respond to corners, edges, and basic colors that commonly exist across all images in a class-invariant fashion. However, deeper layers are used to detect class-specific high-level abstractions such as common textures (e.g., mesh patterns), texts, faces of a dog, etc. Accordingly, we hypothesize that layers located deep down in the network are trained to respond to classspecific features and have activations that only respond to a subset of classes, leading to high sparsity. In contrast, because layers positioned early in a network respond in a class-invariant manner (e.g., activations will respond to all the classes that have red-colored regions of an image), they are likely to exhibit less sparsity."
+    }, {
+      "heading" : "V. COMPRESSING DMA ENGINE",
+      "text" : "To address the performance bottlenecks associated with moving activation maps between the GPU and CPU memory, we exploit the sparsity of activation maps to compress them before transferring them across the PCIe bus. The overall approach is somewhat similar to compressing pages prior to moving them to backing storage in a virtual memory system [35]. Our compressing DMA engine (cDMA) requires choosing an efficient and effective compression algorithm, and a mechanism to employ this algorithm to compress activation maps as they are transferred between the GPU and CPU memory."
+    }, {
+      "heading" : "A. Compression Algorithm",
+      "text" : "To compress activation maps, we need a simple compression algorithm which can sustain compression from and decompression into GPU memory at rates of 100’s of GB/sec while saturating PCIe bandwidth with compressed data.\nRun-length encoding compression. Early observations of the sparse activation maps demonstrated a clustering of zerovalued activations (Figure 5). As a result, we investigate a simple scheme using run-length encoding (RLE) [36] to compress the activation maps. Run-length encoding is simple to implement, and is well suited for high-bandwidth compression. Despite its simple design, the effectiveness of RLE highly depends on the sparsity patterns exhibited in the activation maps as compression is only effective for consecutive zeros or non-zeros. As a result, RLE does not offer good compression ratios across all of the activation layouts (detailed in Section VII-A).\nZero-value compression. As demonstrated in Section IV, approximately 50% to 90% of the activations are zerovalued. We therefore investigate a simple yet highly effective approach based on Frequent-value compression [37] that is used to compress out the zero-valued elements.\nFigure 8 provides a high-level overview of our zero-value compression (ZVC) algorithm which assumes a compression window sized as 32 consecutive elements. For every 32 activation values, a 32-bit mask is generated with a ‘0’ in a given bit position indicating the value is zero and a ‘1’ indicating a non-zero value. After this 32-bit mask is generated, the non-zero elements are appended. Thus, 32 consecutive zero valued activations can be compressed down to a single 32-bit all-zero mask (32× compression ratio). 32- consecutive non-zero elements will result in a 32-bit all-one mask, followed by the 32 non-zero activation values (a 3.1% metadata overhead, 1-bit per each single activation value). If 60% of the total activations are zero-valued, we would expect an overall compression ratio of 2.5×. Compared to RLE, the key advantage of ZVC is that it can compress out zeros equally well regardless of how the zero values are distributed in the data. Unlike RLE, ZVC works robustly across all the data layouts of the activation maps. ZVC can be implemented in high-bandwidth compression hardware in a straightforward manner. The hardware implementation complexity is dominated by the MUXes to gather/scatter the non-zero data elements to/from the compressed representation and the pop-count/prefix-sum operation on the mask to determine the offset to the next mask\nin the compressed stream. We detail the ZVC DMA engine microarchitecture in Section V-B and the area overhead in Section V-C.\nZlib compression. The compression scheme used in the popular gzip utility is based on the DEFLATE algorithm [38]. This algorithm has very good performance across a range of data, but designing a high-throughput hardware to perform the compression is quite complex. Dedicated FPGA and ASIC solutions [39, 40] are capable of reaching approximately 2.5 GB/sec of throughput. While processing multiple streams in parallel with multiple compression engines can improve throughput, the hardware costs escalate linearly with increased bandwidth. Supporting this compression algorithm is impractical when the system must be capable of compressing 100’s of GB/sec of data. Nonetheless, we include the results using this approach to demonstrate the upper-bound of the opportunity we may be leaving on the table by not compressing non-zero data and focusing solely on zero-value compression."
+    }, {
+      "heading" : "B. Compressing DMA Engine Architecture",
+      "text" : "Architecture overview. Figure 9 provides an overview of the cDMA architecture embedded into the memory system of a GPU. The additional hardware includes compression/decompression units adjacent to the GPU memory controllers (boxes labeled “C”) and a little more data buffering storage (box labeled “B”) in the existing DMA engine at the PCIe interface. GPUs already perform compression operations within the memory controllers today [41, 42, 43], but the compression operations of our cDMA are somewhat backwards compared to existing systems. The existing compression hardware in the GPU memory controllers compress data on the way into the GPU DRAM and decompress on the way out to the L2 and GPU cores (streaming multiprocessors, denoted as SMs in Figure 9) to save GPU DRAM bandwidth. Our cDMA architecture compresses the data coming out of the GPU DRAM on their way to the DMA unit, and decompresses data in the other direction. We provide a qualitative discussion on how the operation of cDMA can be designed to work in a conventional way (i.e., compression taking place on its way to the DRAM to save bandwidth) in Section IX.\nAn alternative implementation of cDMA would directly add the compression/decompression units inside the existing DMA unit so that it compresses the data just before sending\nit over PCIe, or alternatively, decompresses the data when received over PCIe from the CPU. One key concern with this design is its effect on the bandwidth requirements of the GPU on-chip crossbar which connects the memory controllers to the SMs and DMA engine.\nThe key design objective of our cDMA engine is to be able to saturate the PCIe bandwidth to the CPU with compressed data. Accordingly, the GPU crossbar bandwidth that routes uncompressed data from the L2 to the DMA engine must be high enough to generate compressed activation maps at a throughput commensurate to the PCIe link bandwidth. As detailed in Section VII-A, the maximum per-layer compression ratio observed is 13.8×. Assuming PCIe (gen3) with maximum 16 GB/sec data transfer bandwidth, up to (16× 13.8)=220.8 GB/sec crossbar bandwidth must be provisioned to fully exploit the potential of sparse compression. Since the baseline DMA engine need only serve the 16 GB/sec of PCIe bandwidth, providing over 200 GB/sec of crossbar bandwidth to the DMA engine for the purposes of data offloading is unattractive.\nOur cDMA design instead augments the GPU memory controllers with the (de)compression units to compress the data read from the DRAM before sending it over the crossbar to the DMA. Such design reduces the bandwidth demand on the crossbar during a compressed DMA operation back to levels similar to the baseline non-compressing DMA engine.\n(De)compression engine microarchitecture. Figure 10(a) shows the microarchitecture of the compression engine implementing the ZVC algorithm. This logic operates each cycle on a 32B (8 word) element which corresponds both to the internal data-path width in the memory controller and to one DRAM burst. On one cycle, these eight words are compared in parallel to zero, forming the mask bits for these 8 words. A prefix sum operation, requiring 11 3-bit adders, is performed on the mask bits to determine the number of zero-valued words in front of a given word. In the next pipeline cycle, the non-zero data elements are shifted to the correct resulting offset using the result of the prefix sum operation to drive the mux-selects. The final cycle in the pipeline steers the resulting zero-compressed data to append it to previous compressed data in the overall 128-bytes (cache-line sized) window on which we perform ZVC compression. The 8-bit mask is also appended to the mask from previous cycles. The total latency to compress a 128-bytes line is six cycles, four 32B sectors moving through a three-stage pipeline.\nFigure 10(b) shows the microarchitecture of the ZVC decompression engine which expands one compressed item into 128 bytes. The decompression logic also operates on 32B at a time, producing 32B of decompressed data each cycle. In the first cycle of the pipeline, an 8-bit segment of the mask is considered. A pop-count (number of ones) of this 8-bit segment of the mask determines the number of words that will be used in a given 32-byte sector. In parallel, the 8-bit segment of the mask is evaluated to determine the correct mux-selects (also a small prefix-sum operation). In the next cycle, the 32-byte decompressed value is formed by\nmuxing payload values (or a zero) into the correct locations. The pipeline requires only two additional cycles of latency to decompress a 128-bytes line, because decompression can start as soon as the first part of the data arrives from the crossbar."
+    }, {
+      "heading" : "C. Design Overheads",
+      "text" : "(De)compression units. While we expect that the existing GPU compression units can be leveraged for cDMA to minimize design overheads, we assume that the cDMA (de)compression hardware supplements existing hardware for a conservative area estimate. Nonetheless, our cDMA unit can allow existing DRAM compression schemes optimized to minimize DRAM bandwidth to also take place. We use the FreePDK [44] 45 nm process design kit and scaled the resulting area using a conservative cell size reduction of 0.46× from 45 nm to 28 nm. Assuming a 50% cell area utilization due to the design being dominated by wires and MUXes, the six (de)compression units are estimated to incur a 0.31mm2 area overhead.\nBuffer sizing. The DMA engine must also maintain a buffer large enough to hold the bandwidth-delay product of the memory sourcing the data to prevent bubbles in the output stream. As we detail in Section VII-B, DNN computations are highly compute-bound so the required average memory bandwidth is measured at less than 100 GB/sec, leaving\nmore than (336 − 100)=236 GB/sec for cDMA to fetch data without affecting performance. Our experiments show that provisioning 200 GB/sec of bandwidth for cDMA reaps most of the benefits of sparse compression. As a result, based on a 350 ns latency from the time the DMA engine requests data from GPU memory to the time it arrives at the DMA engine [45] and the 200GB/sec compression read bandwidth, the DMA engine needs a 70KB (200GB/sec×350 ns) buffer, shown as block “B” in Figure 9. It may seem counterintuitive that cDMA would need this large a buffer, since it is receiving only compressed requests at an overall rate of 16 GB/sec from the crossbar. The reason why the buffer needs to be overprovisioned is because the cDMA engine does not know a priori which responses will be compressed or not. Since it must launch sufficient requests to keep the PCIe bus busy even with highly-compressed data, a large number of requests will be in-flight. In the event that these requests are not compressed, the buffer is required to hold the large amount of data returned until it can be streamed out over the PCIe interface. This buffer size is not a significant source of area (approximately 0.21mm2 in 28 nm according to CACTI 5.3 [46]). Compared to the 600mm2 of a NVIDIA Titan X chip used for the evaluations in this paper, the added overheads of (de)compression units and DMA buffers are negligible."
+    }, {
+      "heading" : "D. Software Interface",
+      "text" : "The compression/decompression features of the DMA engine can be exposed to the programmer so that it can be adopted within ML frameworks and other applications. We envision that the compressed memory copy operation can be exposed to the SW level using a new cudaMemcpyCompressed() call that enables the compression (or decompression) in the DMA engine. We expect this API will be extended beyond the typical cudaMemcpy() to also return the compressed size of a region on completion of the copy operation. In our experimental framework, the cudaMemcpyCompressed calls would easily replace the cudaMemcpy calls already deployed in vDNN.\nVI. EVALUATION METHODOLOGY\nArchitectural exploration of cDMA in cycle-level simulation is challenging for two primary reasons. First, existing GPU architecture simulators (e.g., GPGPU-Sim [47] and GPUOcelot [48]) are not able to execute the cuDNN APIs as these GPU accelerated library routines are released as pre-compiled binaries. Second, a single iteration of training can take up to tens of seconds even on the fastest GPU, so running cycle-level simulations on these ML workloads within a reasonable timeframe is likely a research project on its own. We therefore take a hybrid approach in evaluating the effect of cDMA on training performance. Specifically, we measure DNN applications on a real GPU card while properly penalizing the system performance based on an analytical model of the GPU memory subsystem, as summarized below.\nVirtualized DNN. We faithfully model the vDNN memory management policy as described in [12], which is interfaced to the latest version of cuDNN (v5) [11]. vDNN is configured to offload all the layer’s activation maps for memoryscalability and to maximally stress the PCIe channel. The offload and prefetch operations to and from CPU memory are initiated using cudaMemcpyAsync(); the memory allocation size is determined by the compression ratio observed by the cDMA unit, as modeled below.\nCompression pipeline. We implemented our cDMA compression pipeline on top of Caffe [4]. We modified the Caffe Python interface (pycaffe) to checkpoint the target network’s activations so that they can be fed to our cDMA compression algorithm to compress and downsize the activation maps for each layer’s offloaded data. The compressed activation maps are then returned to the vDNN memory manager to measure the latency incurred during the memory copy operation to/from the CPU-side memory across the PCIe bus.\nEffect of cDMA on memory bandwidth. Compared to a baseline implementation of vDNN, cDMA affects system performance based on the following two factors. First, the reduced PCIe traffic helps improve the performance of vDNN because the latency to move data in/out of CPU memory is significantly reduced. However, to fully saturate the PCIe link bandwidth and maximize the benefits of DNN virtualization, the compressed activations must be generated at a throughput commensurate to the PCIe transfer bandwidth. Thus the second issue is that the average DRAM bandwidth utilization of cDMA can exceed that of vDNN by a factor of 2.6× (Section VII-A), potentially interfering with the cuDNN computation and decreasing performance.\nState-of-the-art DNN libraries refactor the convolution operations into a dense matrix-multiplication operation for GPU acceleration [17]. This approach allows the DNN computation to be completely compute-bound with high cache hit rates and low average DRAM bandwidth utilization. Using the NVIDIA CUDA profiler (nvprof), we observed less than an average of 100 GB/sec of off-chip memory bandwidth utilization across all six networks. These numbers are consistent with the results reported by Rhu et al. [12], leaving more than an average 336 − 100 = 236 GB/sec of memory bandwidth available for our cDMA engine to fetch activation maps from the GPU memory without affecting the throughput of DNN computations using cuDNN.\nAs we are not able to model cDMA inside an existing GPU, evaluating the performance of cuDNN with both vDNN and cDMA in silicon is impractical. Nonetheless, as long as the GPU memory bandwidth consumption of cDMA (i.e., a given layer’s compression ratio×PCIe transfer bandwidth, denoted as COMP_BW below) is smaller than the available 236 GB/sec of DRAM bandwidth (DRAM_BW), the compressed activations can be generated at a high enough rate to fully saturate the PCIe bandwidth while not affecting the performance of baseline cuDNN.\nTo model the bandwidth limitations on cDMA performance,\nwe restrict the memory bandwidth consumption of cDMA to never exceed the 236 GB/sec leftover bandwidth of Titan X. For the few layers that do require a DRAM bandwidth higher than 236 GB/sec (i.e., layers with compression ratio×PCIe transfer bandwidth higher than DRAM_BW), we assume that the compressed activations are not generated at a fast enough rate to saturate the PCIe channel. In other words, when evaluating system performance of vDNN, we increase the latency incurred when offloading the compressed activations by a factor of (COMP_BW/DRAM_BW), modeled in an existing GPU by inflating the volume of data transferred over the PCIe interface. For a conservative evaluation, we set the COMP_BW value, the maximum memory bandwidth cDMA is allowed to consume2, to 200 GB/sec.\nGPU node topology. Our DNN training platform contains an Intel i7-5930K CPU with 64 GB of DDR4 memory communicating with an NVIDIA Titan X (Maxwell) containing 12 GB of GDDR5 memory with a maximum of 336 GB/sec bandwidth [49]. The PCIe switch (gen3) provides a maximum of 16 GB/sec of data transfer bandwidth.\nTraining methodology. All networks are trained using stochastic gradient descent (SGD) with an initial learning rate of 0.01. We manually reduce the learning rate by factor of 0.1 or 0.5, choosing the value that provides higher improvements in validation accuracy when the validation error plateaus. Dropout [50] is employed for the fully-connected layers with a rate of 0.5. We terminate the training process when the validation accuracy does not improve further beyond a learning rate smaller than 1× 10−5. All of our compression algorithms are lossless and affects neither the functionality nor the algorithmic nature of SGD.\nNetworks evaluated. We study DNNs that show state-ofthe-art performance in ImageNet [25]: AlexNet [1], OverFeat [31], NiN [32], VGG [13], SqueezeNet [33], and GoogLeNet [14]. We configure these networks based on the .prototxt files available at Caffe Zoo [4] or ones available at the original authors’ websites [32, 33]. Table I summarizes each network’s fully trained top-1/top-5 classification accuracy, the minibatch sizes used for training, and the total number of training iterations taken to reach its final trained model.\n2Even though the peak memory bandwidth consumption of cDMA can be on the order of 200 GB/sec, the average memory bandwidth usage will not exceed 16×2.6 = 41.3 GB/sec, which is the PCIe bandwidth×average network-wide compression ratio of 2.6."
+    }, {
+      "heading" : "VII. RESULTS",
+      "text" : "This section evaluates the efficiency of cDMA compression, the savings in PCIe traffic, and the effect of cDMA on energy-efficiency and performance. The three compression algorithms discussed in Section V are denoted as RL (runlength encoding), ZV (zero-value compression), and ZL (zlib) in all of the figures discussed in this section. vDNN is evaluated with the memory management policy that provides memory-scalability, which offloads all activation maps. We also established an oracular baseline (orac) that completely removes the PCIe bottleneck by having the offload/prefetch latencies always be hidden inside the DNN computation when measuring performance."
+    }, {
+      "heading" : "A. Compression Efficiency",
+      "text" : "Figure 11 shows the the maximum per-layer compression ratio achieved across a given network and the average network-wide compression ratio for each of the three compression algorithms and three data layouts. While the results presented in this section assume a 4KB compression window, we also studied window sizes of up to 64KB and found that our results did not change much.\nThe maximum per-layer compression ratio determines how much DRAM bandwidth cDMA must provision to generate the compressed activations at a high enough rate to fully saturate the PCIe bandwidth. The average network-wide compression ratio reflects the reduction in PCIe traffic provided by cDMA . Overall, our ZVC algorithm provides the best average compression ratio across all the networks across the three data layouts (average 2.6×). Despite its simple design, the efficiency of ZVC is decoupled from the sparsity patterns in the activation maps and provides the same compression ratio regardless of how the activations are arranged in GPU memory. zlib shows the highest average compression ratio of 2.76× with NCHW but falls behind ZVC for all but GoogLeNet with NHWC and CHWN. Similar to zlib, RLE performs best with NCHW but provides the worst compression with high sensitivity to the underlying data layouts. As mentioned in Section V, zlib and RLE prefer NCHW because this layout makes it more likely to have the activation sparsity in a spatially clustered manner. In the rest of this paper, we assume the NCHW layout for both brevity and for a conservative evaluation of ZVC as both RLE and zlib perform best with NCHW.\nFigure 12 shows the reduction in the size of the activations offloaded to the CPU, which directly translates into PCIe traffic reduction. Although the sophisticated zlib algorithm provides a further 30% reduction in PCIe traffic for GoogLeNet (over ZVC), the average traffic reduction across all six networks is only 3% compared to ZVC."
+    }, {
+      "heading" : "B. Performance",
+      "text" : "Figure 13 summarizes the performance of cDMA compared to vDNN and the oracular baseline. While zlib provides the highest compression ratio for SqueezeNet and GoogLeNet\n(8% and 30% higher than ZVC), the resulting performance improvements are marginal, providing an average 0.7% speedup over ZVC (maximum 2.2% for GoogLeNet). The meager performance advantage of zlib is twofold: (1) a significant fraction of the offloading latency is already being hidden by the DNN forward and backward propagation operations, and (2) the higher compression ratios zlib achieves are for layers of which RLE and ZVC already are able to mostly hide the offloading latencies. Because of its simple compression algorithm and robustness across different data layouts, ZVC is the best option for DNN virtualization."
+    }, {
+      "heading" : "C. Energy Efficiency",
+      "text" : "The current CUDA software stack does not provide users the ability to change the DRAM read bandwidth or PCIe transfer bandwidth, making it difficult to precisely measure the effect of cDMA on energy-efficiency. Instead, we provide a qualitative comparison of cDMA’s energy-efficiency versus vDNN. The primary energy overheads cDMA imposes on vDNN are (1) the average 2.6× increase in DRAM read bandwidth, corresponding to ZVC’s average network-wide compression ratio, for fetching the activations from the DRAM for cDMA compression; and (2) the (de)compression units and buffers augmented inside the GPU. Based on the examination of overheads of cDMA in Section V-C, we expect the energy costs for the additional compression logic and its buffers to be negligible as cDMA primarily leverages (de)compression units already existing in GPU memory controllers.\nAlso, while vDNN’s offload/prefetch operations does incur 1–7% power overhead, as measured with nvprof, cDMA’s average 2.6× reduction in PCIe traffic will significantly reduce the energy-consumption on the PCIe link as well as in the CPU memory subsystem. When accounting for the\naverage 32% performance improvements (maximum 61%) provided by cDMA, we expect the overall energy consumption to be significantly improved compared to vDNN."
+    }, {
+      "heading" : "VIII. RELATED WORK",
+      "text" : "DNNs are generally over-parameterized, stemming from a significant redundancy in the way the parameters are used to represent the model they are trying to approximate. As a result, there have been series of proposals that try to reduce the memory usage of DNNs by alleviating network redundancy. Vanhoucke et al. [51] explored quantization in activations by fixing the data type to a 8-bit integer as opposed to 32-bit floating point. Gong et al. [52] proposed vector quantization methods for compressing the weights of DNNs. Network pruning strategies have also been explored extensively by prior literature [53, 54, 55, 56, 57]. Pruning helps reduce the memory allocated for model weights by removing redundant network connections that satisfy a given pruning criteria. These proposals provide limited opportunity for saving memory usage as weights only account for a small fraction of overall memory allocations needed for training DNNs.\nThe Network-in-Network [32] is an approach that tries to increase the representational power of DNNs by exploiting 1 × 1 convolutional layers. GoogLeNet [14] and SqueezeNet [33] extensively use these 1 × 1 layers for reducing the dimension of each layer’s output activations. This approach helps remove the computational bottlenecks while at the same time reducing each layer’s memory requirements.\nA series of accelerator designs have also been proposed for CNNs [58, 59, 60, 61, 62, 63, 64, 65, 66, 24, 67]. Although these ASIC designs improve the energy-efficiency of CNNs, these prior proposals focus on inference while cDMA focuses\non training. More importantly, none of these prior works address the communication bottleneck that arise due to DNN memory virtualization.\nIX. DISCUSSION AND FUTURE WORK\nFuture CPU-GPU interconnects. NVLINK is NVIDIA’s proprietary, high-bandwidth interconnect that enables fast communication between the GPU and CPU, and between GPUs [68]. When coupled with the IBM Power systems [69], the communication bandwidth between the CPU-GPU can be up to 80 GB/sec, greatly alleviating the communication bottleneck of virtualized DNNs. Nonetheless, with a multiGPU DNN platform [70, 71] where 4 to 8 GPUs share the same communication channel, the bandwidth allocated per each single GPU is still 10–20 GB/sec, similar to PCIe (gen3). As a result, reducing the offloading traffic between CPU and GPU is still extremely important. In addition, because NVLINK is not compatible with legacy x86 CPUs, the lower bandwidth PCIe interface between CPU and GPU continues to motivate cDMA for future x86+GPU systems.\nCompression for GPU footprint reduction. While our cDMA engine greatly reduces the PCIe traffic and CPU-side memory footprint, the amount of memory allocated inside the GPU is the same as the baseline vDNN. To reduce GPU DRAM bandwith and memory capacity requirements, the compression engine inside the GPU’s memory controllers could compress and store the activation maps inside the GPU’s DRAM. Implementing this optimization involves developing efficient memory addressing schemes that allow the memory controller to retrieve the data in its original, uncompressed form without disturbing overall performance and energy-efficiency. This future work is beyond the scope of this paper.\nX. CONCLUSION\nPrevious DNN virtualization solutions can incur significant performance overheads when the communication channel between the CPU and GPU is bottlenecked. We introduce a general purpose compressing DMA engine that can be used for high-performance DNN virtualization. Our proposal exploits the unique characteristics of DNNs to develop a costefficient compression algorithm, offering an average 2.6× (maximum 13.8×) savings in data movement on the CPU– GPU communication link. Overall, our cDMA engine improves the performance of virtualized DNNs by an average\n32% (maximum 61%) with a modest implementation overhead and can easily be adopted into existing ML frameworks."
+    } ],
+    "references" : [ {
+      "title" : "ImageNet Classification with Deep Convolutional Neural Networks",
+      "author" : [ "A. Krizhevsky", "I. Sutskever", "G. Hinton" ],
+      "venue" : "Proceedings of the International Conference on Neural Information Processing Systems (NIPS), December 2012.",
+      "citeRegEx" : "1",
+      "shortCiteRegEx" : null,
+      "year" : 2012
+    }, {
+      "title" : "Framewise Phoneme Classification With Bidirectional LSTM and Other Neural Network Architectures",
+      "author" : [ "A. Graves", "J. Schmidhuber" ],
+      "venue" : "Neural Networks, pp. 602–610, 2005.",
+      "citeRegEx" : "2",
+      "shortCiteRegEx" : null,
+      "year" : 2005
+    }, {
+      "title" : "MXNet: A Flexible and Efficient Machine Learning Library for Heterogeneous Distributed Systems",
+      "author" : [ "T. Chen", "M. Li", "Y. Li", "M. Lin", "N. Wang", "M. Wang", "T. Xiao", "B. Xu", "C. Zhang", "Z. Zhang" ],
+      "venue" : "Proceedings of the Workshop on Machine Learning Systems, December 2015.",
+      "citeRegEx" : "9",
+      "shortCiteRegEx" : null,
+      "year" : 2015
+    }, {
+      "title" : "vDNN: Virtualized Deep Neural Networks for Scalable, Memory-Efficient Neural Network Design",
+      "author" : [ "M. Rhu", "N. Gimelshein", "J. Clemons", "A. Zulfiqar", "S.W. Keckler" ],
+      "venue" : "Proceedings of the International Symposium on Microarchitecture (MICRO), October 2016.",
+      "citeRegEx" : "12",
+      "shortCiteRegEx" : null,
+      "year" : 2016
+    }, {
+      "title" : "Very Deep Convolutional Networks for Large-Scale Image Recognition.",
+      "author" : [ "K. Simonyan", "A. Zisserman" ],
+      "venue" : "https://arxiv. org/abs/1409.1556,",
+      "citeRegEx" : "13",
+      "shortCiteRegEx" : "13",
+      "year" : 2015
+    }, {
+      "title" : "Going Deeper with Convolutions",
+      "author" : [ "C. Szegedy", "W. Liu", "Y. Jia", "P. Sermanet", "S. Reed", "D. Anguelov", "D. Erhan", "V. Vanhoucke", "A. Rabinovich" ],
+      "venue" : "Proceedings of the Conference on Computer Vision and Pattern Recognition (CVPR), June 2015.",
+      "citeRegEx" : "14",
+      "shortCiteRegEx" : null,
+      "year" : 2015
+    }, {
+      "title" : "Gradient- Based Learning Applied to Document Recognition",
+      "author" : [ "Y. LeCun", "L. Bottou", "Y. Bengio", "P. Haffner" ],
+      "venue" : "Proceedings of the IEEE, vol. 86, pp. 2278–2324, November 1998.",
+      "citeRegEx" : "16",
+      "shortCiteRegEx" : null,
+      "year" : 1998
+    }, {
+      "title" : "cuDNN: Efficient Primitives for Deep Learning",
+      "author" : [ "S. Chetlur", "C. Woolley", "P. Vandermersch", "J. Cohen", "J. Tran", "B. Catanzaro", "E. Shelhamer" ],
+      "venue" : "Proceedings of the International Conference on Neural Information Processing Systems (NIPS), December 2014.",
+      "citeRegEx" : "17",
+      "shortCiteRegEx" : null,
+      "year" : 2014
+    }, {
+      "title" : "Architectural Support for Address Translation on GPUs: Designing Memory Manage- 12  ment Units for CPU/GPUs with Unified Address Spaces",
+      "author" : [ "B. Pichai", "L. Hsu", "A. Bhattacharjee" ],
+      "venue" : "Proceedings of the International Conference on Architectural Support for Programming Languages and Operation Systems (ASPLOS), March 2014.",
+      "citeRegEx" : "19",
+      "shortCiteRegEx" : null,
+      "year" : 2014
+    }, {
+      "title" : "Supporting x86-64 Address Translation for 100s of GPU Lanes",
+      "author" : [ "J. Power", "M. Hill", "D. Wood" ],
+      "venue" : "Proceedings of the International Symposium on High-Performance Computer Architecture (HPCA), February 2014.",
+      "citeRegEx" : "20",
+      "shortCiteRegEx" : null,
+      "year" : 2014
+    }, {
+      "title" : "Toward High-Performance Paged-Memory for GPUs",
+      "author" : [ "T. Zheng", "D. Nellans", "A. Zulfiqar", "M. Stephenson", "S.W. Keckler" ],
+      "venue" : "Proceedings of the International Symposium on High-Performance Computer Architecture (HPCA), March 2016.",
+      "citeRegEx" : "21",
+      "shortCiteRegEx" : null,
+      "year" : 2016
+    }, {
+      "title" : "Empirical Evaluation of Rectified Activations in Convolutional Network.",
+      "author" : [ "B. Xu", "N. Wang", "T. Chen", "M. Li" ],
+      "venue" : "https://arxiv. org/abs/1505.00853,",
+      "citeRegEx" : "22",
+      "shortCiteRegEx" : "22",
+      "year" : 2015
+    }, {
+      "title" : "Deeply Learned Face Representations Are Sparse, Selective, and Robust",
+      "author" : [ "Y. Sun", "X. Wang", "X. Tang" ],
+      "venue" : "Proceedings of the Conference on Computer Vision and Pattern Recognition (CVPR), June 2015.",
+      "citeRegEx" : "23",
+      "shortCiteRegEx" : null,
+      "year" : 2015
+    }, {
+      "title" : "Cnvlutin: Ineffectual-Neuron-Free Deep Convolutional Neural Network Computing",
+      "author" : [ "J. Albericio", "P. Judd", "T. Hetherington", "T. Aamodt", "N.E. Jerger", "A. Moshovos" ],
+      "venue" : "Proceedings of the International Symposium on Computer Architecture (ISCA), June 2016.",
+      "citeRegEx" : "24",
+      "shortCiteRegEx" : null,
+      "year" : 2016
+    }, {
+      "title" : "Deep Speech 2: End-To-En Speech Recognition in English and Mandarin.",
+      "author" : [ "D. Amodei", "R. Anubhai", "E. Battenberg", "C. Case", "J. Casper", "B. Catanzaro", "J. Chen", "M. Chrzanowski", "A. Coates", "G. Diamos", "E. Elsen", "J. Engel", "L. Fan", "C. Fougner", "T. Han", "A. Hannun", "B. Jun", "P. LeGresley", "L. Lin", "S. Narang", "A. Ng", "S. Ozair", "R. Prenger", "J. Raiman", "S. Satheesh", "D. Seetapun", "S. Sengupta", "Y. Wang", "Z. Wang", "C. Wang", "B. Xiao", "D. Yogatama", "J. Zhan", "Z. Zhu" ],
+      "venue" : null,
+      "citeRegEx" : "27",
+      "shortCiteRegEx" : "27",
+      "year" : 2015
+    }, {
+      "title" : "Persistent RNNs: Stashing Recurrent Weights On-Chip",
+      "author" : [ "G. Diamos", "S. Sengupta", "B. Catanzaro", "M. Chrzanowski", "A. Coates", "E. Elsen", "J. Engel", "A. Hannun", "S. Satheesh" ],
+      "venue" : "Proceedings of the International Conference on Machine Learning (ICML), June 2016.",
+      "citeRegEx" : "28",
+      "shortCiteRegEx" : null,
+      "year" : 2016
+    }, {
+      "title" : "Long Short Term Memory",
+      "author" : [ "S. Hochreiter", "J. Schmidhuber" ],
+      "venue" : "Neural Computation, vol. 9, pp. 1735–1780, November 1997.",
+      "citeRegEx" : "29",
+      "shortCiteRegEx" : null,
+      "year" : 1997
+    }, {
+      "title" : "OverFeat: Integrated Recognition, Localization and Detection using Convolutional Networks.",
+      "author" : [ "P. Sermanet", "D. Eigen", "X. Zhang", "M. Mathieu", "R. Fergus", "Y. LeCun" ],
+      "venue" : "https://arxiv.org/abs/ 1312.6229,",
+      "citeRegEx" : "31",
+      "shortCiteRegEx" : "31",
+      "year" : 2013
+    }, {
+      "title" : "Network in Network.",
+      "author" : [ "M. Lin", "Q. Chen", "S. Yan" ],
+      "venue" : "https: //arxiv.org/abs/1312.4400,",
+      "citeRegEx" : "32",
+      "shortCiteRegEx" : "32",
+      "year" : 2013
+    }, {
+      "title" : "SqueezeNet: AlexNet-level Accuracy with 50x Fewer Parameters and <0.5MB Model Size.",
+      "author" : [ "F. Iandola", "S. Han", "M. Moskewicz", "K. Ashraf", "W.J. Dally", "K. Keutzer" ],
+      "venue" : "https://arxiv.org/ abs/1602.07360,",
+      "citeRegEx" : "33",
+      "shortCiteRegEx" : "33",
+      "year" : 2016
+    }, {
+      "title" : "The Case for Compressed Cache in Virtual Memory Systems",
+      "author" : [ "P. Wilson", "S. Kaplan", "Y. Smaragdakis" ],
+      "venue" : "Proceedings of USENIX, June 1999.",
+      "citeRegEx" : "35",
+      "shortCiteRegEx" : null,
+      "year" : 1999
+    }, {
+      "title" : "Results of a Prototype Television Bandwidth Compression Scheme",
+      "author" : [ "A. Robinson", "C. Cherry" ],
+      "venue" : "Proceedings of the IEEE, vol. 55, pp. 356–364, March 1967.",
+      "citeRegEx" : "36",
+      "shortCiteRegEx" : null,
+      "year" : 1967
+    }, {
+      "title" : "Frequent Value Locality and  Value-centric Data Cache Design",
+      "author" : [ "Y. Zhang", "J. Yang", "R. Gupta" ],
+      "venue" : "Proceedings of the International Conference on Architectural Support for Programming Languages and Operation Systems (ASPLOS), November 2000.",
+      "citeRegEx" : "37",
+      "shortCiteRegEx" : null,
+      "year" : 2000
+    }, {
+      "title" : "Gzip on a Chip: High Performance Lossless Data Compression on FPGAs Using OpenCL",
+      "author" : [ "M. Abdelfattah", "A. Hagiescu", "D. Singh" ],
+      "venue" : "Proceedings of the International Workshop on OpenCL, May 2014.",
+      "citeRegEx" : "39",
+      "shortCiteRegEx" : null,
+      "year" : 2014
+    }, {
+      "title" : "Lossless and Lossy Memory I/O Link Compression for Improving Performance of GPGPU Workloads",
+      "author" : [ "V. Sathish", "M. Schulte", "N. Kim" ],
+      "venue" : "Proceedings of the International Conference on Parallel Architectures and Compilation Techniques (PACT), September 2012.",
+      "citeRegEx" : "41",
+      "shortCiteRegEx" : null,
+      "year" : 2012
+    }, {
+      "title" : "A Case for Toggle-Aware Compression for GPU Systems",
+      "author" : [ "G. Pekhimenko", "E. Bolotin", "N. Vijaykumar", "O. Mutlu", "T.C. Mowry", "S.W. Keckler" ],
+      "venue" : "Proceedings of the International Symposium on High-Performance Computer Architecture (HPCA), March 2016.",
+      "citeRegEx" : "42",
+      "shortCiteRegEx" : null,
+      "year" : 2016
+    }, {
+      "title" : "Demystifying GPU Microarchitecture Through Microbenchmarking",
+      "author" : [ "H. Wong", "M.M. Papadopoulou", "M. Sadooghi-Alvandi", "A. Moshovos" ],
+      "venue" : "Proceedings of the International Symposium on Performance Analysis of Systems Software (ISPASS), March 2010.",
+      "citeRegEx" : "45",
+      "shortCiteRegEx" : null,
+      "year" : 2010
+    }, {
+      "title" : "CACTI: An Integrated Cache and Memory Access Time, Cycle Time, Area, Leakage, and Dynamic Power Model.",
+      "author" : [ "HP Labs" ],
+      "venue" : null,
+      "citeRegEx" : "46",
+      "shortCiteRegEx" : "46",
+      "year" : 2016
+    }, {
+      "title" : "Dropout: A Simple Way to Prevent Neural Networks from Overfitting",
+      "author" : [ "N. Srivastava", "G. Hinton", "A. Krizhevsky", "I. Sutskever", "R. Salakhutdinov" ],
+      "venue" : "Journal of Machine Learning Research, vol. 15, pp. 1929–1958, June 2014.",
+      "citeRegEx" : "50",
+      "shortCiteRegEx" : null,
+      "year" : 1929
+    }, {
+      "title" : "Improving the Speed of Neural Networks on CPUs",
+      "author" : [ "V. Vanhoucke", "A. Senior", "M. Mao" ],
+      "venue" : "Deep Learning and Unsupervised Feature Learning Workshop, December 2011.",
+      "citeRegEx" : "51",
+      "shortCiteRegEx" : null,
+      "year" : 2011
+    }, {
+      "title" : "Compressing Deep Convolutional Networks Using Vector Quantization.",
+      "author" : [ "Y. Gong", "L. Liu", "M. Yang", "L. Bourdev" ],
+      "venue" : "https:// arxiv.org/abs/1412.6115,",
+      "citeRegEx" : "52",
+      "shortCiteRegEx" : "52",
+      "year" : 2014
+    }, {
+      "title" : "Comparing Biases for Minimal Network Construction with Back-propagation",
+      "author" : [ "S. Hanson", "L. Pratt" ],
+      "venue" : "Proceedings of the International Conference on Neural Information Processing Systems (NIPS), November 1989.",
+      "citeRegEx" : "53",
+      "shortCiteRegEx" : null,
+      "year" : 1989
+    }, {
+      "title" : "Optimal Brain Damage",
+      "author" : [ "Y. LeCun", "S. Denker", "S. Solla" ],
+      "venue" : "Proceedings of the International Conference on Neural Information Processing Systems (NIPS), November 1990.",
+      "citeRegEx" : "54",
+      "shortCiteRegEx" : null,
+      "year" : 1990
+    }, {
+      "title" : "Second Order Derivatives for Network Pruning: Optimal Brain Surgeon",
+      "author" : [ "B. Hassibi", "D. Stork" ],
+      "venue" : "Proceedings of the International Conference on Neural Information Processing Systems (NIPS), November 1993.",
+      "citeRegEx" : "55",
+      "shortCiteRegEx" : null,
+      "year" : 1993
+    }, {
+      "title" : "Learning Both Weights and Connections for Efficient Neural Networks",
+      "author" : [ "S. Han", "J. Pool", "J. Tran", "W. Dally" ],
+      "venue" : "Proceedings of the International Conference on Neural Information Processing Systems (NIPS), December 2015.",
+      "citeRegEx" : "56",
+      "shortCiteRegEx" : null,
+      "year" : 2015
+    }, {
+      "title" : "Deep Compression: Compressing Deep Neural Networks with Pruning, Trained Quantization 13  and Huffman Coding",
+      "author" : [ "S. Han", "H. Mao", "W. Dally" ],
+      "venue" : "Proceedings of the International Conference on Learning Representations (ICLR), May 2016.",
+      "citeRegEx" : "57",
+      "shortCiteRegEx" : null,
+      "year" : 2016
+    }, {
+      "title" : "DianNao: A Small-footprint High-throughput Accelerator for Ubiquitous Machine-learning",
+      "author" : [ "T. Chen", "Z. Du", "N. Sun", "J. Wang", "C. Wu", "Y. Chen", "O. Temam" ],
+      "venue" : "Proceedings of the International Conference on Architectural Support for Programming Languages and Operation Systems (ASPLOS), March 2014.",
+      "citeRegEx" : "58",
+      "shortCiteRegEx" : null,
+      "year" : 2014
+    }, {
+      "title" : "DaDianNao: A Machine-Learning Supercomputer",
+      "author" : [ "Y. Chen", "T. Luo", "S. Liu", "S. Zhang", "L. He", "J. Wang", "L. Li", "T. Chen", "Z. Xu", "N. Sun", "O. Temam" ],
+      "venue" : "Proceedings of the International Symposium on Microarchitecture (MICRO), December 2014.",
+      "citeRegEx" : "59",
+      "shortCiteRegEx" : null,
+      "year" : 2014
+    }, {
+      "title" : "Eyeriss: An Energy- Efficient Reconfigurable Accelerator for Deep Convolutional Neural Networks",
+      "author" : [ "Y. Chen", "T. Krishna", "J. Emer", "V. Sze" ],
+      "venue" : "Proceedings of the International Solid State Circuits Conference (ISSCC), February 2016.",
+      "citeRegEx" : "60",
+      "shortCiteRegEx" : null,
+      "year" : 2016
+    }, {
+      "title" : "EIE: Efficient Inference Engine on Compressed Deep Neural Network",
+      "author" : [ "S. Han", "X. Liu", "H. Mao", "J. Pu", "A. Pedram", "M. Horowitz", "W. Dally" ],
+      "venue" : "Proceedings of the International Symposium on Computer Architecture (ISCA), June 2016.",
+      "citeRegEx" : "61",
+      "shortCiteRegEx" : null,
+      "year" : 2016
+    }, {
+      "title" : "Eyeriss: A Spatial Architecture for Energy-Efficient Dataflow for Convolutional Neural Networks",
+      "author" : [ "Y. Chen", "J. Emer", "V. Sze" ],
+      "venue" : "Proceedings of the International Symposium on Computer Architecture (ISCA), June 2016.",
+      "citeRegEx" : "62",
+      "shortCiteRegEx" : null,
+      "year" : 2016
+    }, {
+      "title" : "RedEye: Analog ConvNet Image Sensor Architecture for Continuous Mobile Vision",
+      "author" : [ "R. LiKamWa", "Y. Hou", "M. Polansky", "Y. Gao", "L. Zhong" ],
+      "venue" : "Proceedings of the International Symposium on Computer Architecture (ISCA), June 2016.",
+      "citeRegEx" : "63",
+      "shortCiteRegEx" : null,
+      "year" : 2016
+    }, {
+      "title" : "Minerva: Enabling Low-Power, High-Accuracy Deep Neural Network Accelerators",
+      "author" : [ "B. Reagen", "P. Whatmough", "R. Adolf", "S. Rama", "H. Lee", "S. Lee", "J. Miguel", "H. Lobato", "G. Wei", "D. Brooks" ],
+      "venue" : "Proceedings of the International Symposium on Computer Architecture (ISCA), June 2016.",
+      "citeRegEx" : "64",
+      "shortCiteRegEx" : null,
+      "year" : 2016
+    }, {
+      "title" : "A Novel Processing-in-memory Architecture for Neural Network Computation in ReRAM-based Main Memory",
+      "author" : [ "P. Chi", "S. Li", "C. Xu", "T. Zhang", "J. Zhao", "Y. Liu", "Y. Wang", "Y. Xie" ],
+      "venue" : "Proceedings of the International Symposium on Computer Architecture (ISCA), June 2016.",
+      "citeRegEx" : "65",
+      "shortCiteRegEx" : null,
+      "year" : 2016
+    }, {
+      "title" : "ISAAC: A Convolutional Neural Network Accelerator with In-Situ Analog Arithmetic in Crossbars",
+      "author" : [ "A. Shafiee", "A. Nag", "N. Muralimanohar", "R. Balasubramonian", "J.P. Strachan", "M. Hu", "R.S. Williams", "V. Srikumar" ],
+      "venue" : "Proceedings of the International Symposium on Computer Architecture (ISCA), June 2016.",
+      "citeRegEx" : "66",
+      "shortCiteRegEx" : null,
+      "year" : 2016
+    }, {
+      "title" : "ShiDianNao: Shifting Vision Processing Closer to the Sensor",
+      "author" : [ "Z. Du", "R. Fasthuber", "T. Chen", "P. Ienne", "L. Li", "T. Luo", "X. Feng", "Y. Chen", "O. Temam" ],
+      "venue" : "Proceedings of the International Symposium on Computer Architecture (ISCA), June 2015.",
+      "citeRegEx" : "67",
+      "shortCiteRegEx" : null,
+      "year" : 2015
+    }, {
+      "title" : "One Weird Trick For Parallelizing Convolutional Neural Networks.",
+      "author" : [ "A. Krizhevsky" ],
+      "venue" : null,
+      "citeRegEx" : "70",
+      "shortCiteRegEx" : "70",
+      "year" : 2014
+    } ],
+    "referenceMentions" : [ {
+      "referenceID" : 0,
+      "context" : "Deep neural networks (DNNs) are now the driving technology for numerous application domains, such as computer vision [1], speech recognition [2], and natural language processing [3].",
+      "startOffset" : 117,
+      "endOffset" : 120
+    }, {
+      "referenceID" : 1,
+      "context" : "Deep neural networks (DNNs) are now the driving technology for numerous application domains, such as computer vision [1], speech recognition [2], and natural language processing [3].",
+      "startOffset" : 141,
+      "endOffset" : 144
+    }, {
+      "referenceID" : 2,
+      "context" : "To facilitate the design and study of DNNs, a large number of machine learning (ML) frameworks [4, 5, 6, 7, 8, 9, 10] have been developed in recent years.",
+      "startOffset" : 95,
+      "endOffset" : 117
+    }, {
+      "referenceID" : 3,
+      "context" : "training, prior work proposed to virtualize the memory usage of DNNs (vDNN) such that ML researchers can train larger and deeper neural networks beyond what is afforded by the physical limits of GPU memory [12].",
+      "startOffset" : 206,
+      "endOffset" : 210
+    }, {
+      "referenceID" : 4,
+      "context" : "The trend in deep learning is to employ larger and deeper networks that leads to large memory footprints that oversubscribe GPU memory [13, 14, 15].",
+      "startOffset" : 135,
+      "endOffset" : 147
+    }, {
+      "referenceID" : 5,
+      "context" : "The trend in deep learning is to employ larger and deeper networks that leads to large memory footprints that oversubscribe GPU memory [13, 14, 15].",
+      "startOffset" : 135,
+      "endOffset" : 147
+    }, {
+      "referenceID" : 0,
+      "context" : "comes from the ReLU [1] layers that are extensively used in DNNs.",
+      "startOffset" : 20,
+      "endOffset" : 23
+    }, {
+      "referenceID" : 0,
+      "context" : ", sigmoid, tanh, and ReLU [1]) to the input feature maps.",
+      "startOffset" : 26,
+      "endOffset" : 29
+    }, {
+      "referenceID" : 6,
+      "context" : "Training a DNN involves learning and updating the weights of the network, which is typically done using the backpropagation algorithm [16].",
+      "startOffset" : 134,
+      "endOffset" : 138
+    }, {
+      "referenceID" : 7,
+      "context" : "agation algorithm and how contemporary GPUs implement each layer’s DNN computations and memory allocations can be found in [17, 12].",
+      "startOffset" : 123,
+      "endOffset" : 131
+    }, {
+      "referenceID" : 3,
+      "context" : "agation algorithm and how contemporary GPUs implement each layer’s DNN computations and memory allocations can be found in [17, 12].",
+      "startOffset" : 123,
+      "endOffset" : 131
+    }, {
+      "referenceID" : 8,
+      "context" : "[19] and Power et al.",
+      "startOffset" : 0,
+      "endOffset" : 4
+    }, {
+      "referenceID" : 9,
+      "context" : "[20] proposed TLB designs that leverage the unique memory access patterns of GPUs for optimizing the throughput of memory address translations.",
+      "startOffset" : 0,
+      "endOffset" : 4
+    }, {
+      "referenceID" : 10,
+      "context" : "[21] studied architectural solutions for closing the performance gap between page-migration based virtual memory and software-directed direct-memory-access (DMA) copy operations.",
+      "startOffset" : 0,
+      "endOffset" : 4
+    }, {
+      "referenceID" : 3,
+      "context" : "[12] therefore proposed an application-level virtual memory management solution specifically tailored for",
+      "startOffset" : 0,
+      "endOffset" : 4
+    }, {
+      "referenceID" : 3,
+      "context" : "maps occupy more than 90% of the GPU-side memory allocations [12].",
+      "startOffset" : 61,
+      "endOffset" : 65
+    }, {
+      "referenceID" : 3,
+      "context" : "8GB/sec [12] versus 200 MB/sec [21]) as the data movements are orchestrated by GPU’s DMA copyengine.",
+      "startOffset" : 8,
+      "endOffset" : 12
+    }, {
+      "referenceID" : 10,
+      "context" : "8GB/sec [12] versus 200 MB/sec [21]) as the data movements are orchestrated by GPU’s DMA copyengine.",
+      "startOffset" : 31,
+      "endOffset" : 35
+    }, {
+      "referenceID" : 3,
+      "context" : "networks [12], are amenable for compression, which will drastically alleviate the PCIe bottleneck of virtualized DNNs.",
+      "startOffset" : 9,
+      "endOffset" : 13
+    }, {
+      "referenceID" : 11,
+      "context" : "As noted by multiple prior works [22, 23, 24], such sparsity of activations are originated",
+      "startOffset" : 33,
+      "endOffset" : 45
+    }, {
+      "referenceID" : 12,
+      "context" : "As noted by multiple prior works [22, 23, 24], such sparsity of activations are originated",
+      "startOffset" : 33,
+      "endOffset" : 45
+    }, {
+      "referenceID" : 13,
+      "context" : "As noted by multiple prior works [22, 23, 24], such sparsity of activations are originated",
+      "startOffset" : 33,
+      "endOffset" : 45
+    }, {
+      "referenceID" : 0,
+      "context" : "by the extensive use of ReLU [1] layers that follow (almost) every single layer in the feature extraction modules.",
+      "startOffset" : 29,
+      "endOffset" : 32
+    }, {
+      "referenceID" : 14,
+      "context" : "Nonetheless, we believe our proposal is equally applicable for some popular recurrent neural networks that extensively employ sparsity-inducing ReLU layers, including the GEMVbased (general-matrix-vector-multiplication) RNNs employed by Baidu for speech recognition [26, 27] and language translation [28] services.",
+      "startOffset" : 266,
+      "endOffset" : 274
+    }, {
+      "referenceID" : 15,
+      "context" : "Nonetheless, we believe our proposal is equally applicable for some popular recurrent neural networks that extensively employ sparsity-inducing ReLU layers, including the GEMVbased (general-matrix-vector-multiplication) RNNs employed by Baidu for speech recognition [26, 27] and language translation [28] services.",
+      "startOffset" : 300,
+      "endOffset" : 304
+    }, {
+      "referenceID" : 16,
+      "context" : "cDMA is less well-suited for RNNs based on LSTMs [29] or GRUs [30], as they employ sigmoid and tanh activation functions rather than ReLUs.",
+      "startOffset" : 49,
+      "endOffset" : 53
+    }, {
+      "referenceID" : 0,
+      "context" : "sparsity by using AlexNet [1] as a running example.",
+      "startOffset" : 26,
+      "endOffset" : 29
+    }, {
+      "referenceID" : 17,
+      "context" : "OverFeat [31], NiN [32], VGG [13], SqueezeNet [33], and GoogLeNet [14].",
+      "startOffset" : 9,
+      "endOffset" : 13
+    }, {
+      "referenceID" : 18,
+      "context" : "OverFeat [31], NiN [32], VGG [13], SqueezeNet [33], and GoogLeNet [14].",
+      "startOffset" : 19,
+      "endOffset" : 23
+    }, {
+      "referenceID" : 4,
+      "context" : "OverFeat [31], NiN [32], VGG [13], SqueezeNet [33], and GoogLeNet [14].",
+      "startOffset" : 29,
+      "endOffset" : 33
+    }, {
+      "referenceID" : 19,
+      "context" : "OverFeat [31], NiN [32], VGG [13], SqueezeNet [33], and GoogLeNet [14].",
+      "startOffset" : 46,
+      "endOffset" : 50
+    }, {
+      "referenceID" : 5,
+      "context" : "OverFeat [31], NiN [32], VGG [13], SqueezeNet [33], and GoogLeNet [14].",
+      "startOffset" : 66,
+      "endOffset" : 70
+    }, {
+      "referenceID" : 0,
+      "context" : "1, when the validation accuracy stops increasing with the current learning rate [1, 34].",
+      "startOffset" : 80,
+      "endOffset" : 87
+    }, {
+      "referenceID" : 20,
+      "context" : "The overall approach is somewhat similar to compressing pages prior to moving them to backing storage in a virtual memory system [35].",
+      "startOffset" : 129,
+      "endOffset" : 133
+    }, {
+      "referenceID" : 21,
+      "context" : "As a result, we investigate a simple scheme using run-length encoding (RLE) [36] to compress the activation maps.",
+      "startOffset" : 76,
+      "endOffset" : 80
+    }, {
+      "referenceID" : 22,
+      "context" : "We therefore investigate a simple yet highly effective approach based on Frequent-value compression [37] that is used to compress out the zero-valued elements.",
+      "startOffset" : 100,
+      "endOffset" : 104
+    }, {
+      "referenceID" : 23,
+      "context" : "Dedicated FPGA and ASIC solutions [39, 40] are capable of reaching approximately 2.",
+      "startOffset" : 34,
+      "endOffset" : 42
+    }, {
+      "referenceID" : 24,
+      "context" : "GPUs already perform compression operations within the memory controllers today [41, 42, 43], but the compression operations of our cDMA are somewhat backwards compared to existing systems.",
+      "startOffset" : 80,
+      "endOffset" : 92
+    }, {
+      "referenceID" : 25,
+      "context" : "GPUs already perform compression operations within the memory controllers today [41, 42, 43], but the compression operations of our cDMA are somewhat backwards compared to existing systems.",
+      "startOffset" : 80,
+      "endOffset" : 92
+    }, {
+      "referenceID" : 26,
+      "context" : "As a result, based on a 350 ns latency from the time the DMA engine requests data from GPU memory to the time it arrives at the DMA engine [45] and the 200GB/sec compression read bandwidth, the DMA engine needs a 70KB (200GB/sec×350 ns) buffer, shown as block “B” in Figure 9.",
+      "startOffset" : 139,
+      "endOffset" : 143
+    }, {
+      "referenceID" : 27,
+      "context" : "3 [46]).",
+      "startOffset" : 2,
+      "endOffset" : 6
+    }, {
+      "referenceID" : 3,
+      "context" : "We faithfully model the vDNN memory management policy as described in [12], which is interfaced to the latest version of cuDNN (v5) [11].",
+      "startOffset" : 70,
+      "endOffset" : 74
+    }, {
+      "referenceID" : 7,
+      "context" : "State-of-the-art DNN libraries refactor the convolution operations into a dense matrix-multiplication operation for GPU acceleration [17].",
+      "startOffset" : 133,
+      "endOffset" : 137
+    }, {
+      "referenceID" : 3,
+      "context" : "[12], leaving more than an average 336 − 100 = 236 GB/sec of memory bandwidth available for our cDMA engine to fetch activation maps from the GPU memory without affecting the throughput of DNN computations using cuDNN.",
+      "startOffset" : 0,
+      "endOffset" : 4
+    }, {
+      "referenceID" : 28,
+      "context" : "Dropout [50] is employed for the fully-connected layers with a rate of 0.",
+      "startOffset" : 8,
+      "endOffset" : 12
+    }, {
+      "referenceID" : 0,
+      "context" : "We study DNNs that show state-ofthe-art performance in ImageNet [25]: AlexNet [1], OverFeat [31], NiN [32], VGG [13], SqueezeNet [33], and GoogLeNet [14].",
+      "startOffset" : 78,
+      "endOffset" : 81
+    }, {
+      "referenceID" : 17,
+      "context" : "We study DNNs that show state-ofthe-art performance in ImageNet [25]: AlexNet [1], OverFeat [31], NiN [32], VGG [13], SqueezeNet [33], and GoogLeNet [14].",
+      "startOffset" : 92,
+      "endOffset" : 96
+    }, {
+      "referenceID" : 18,
+      "context" : "We study DNNs that show state-ofthe-art performance in ImageNet [25]: AlexNet [1], OverFeat [31], NiN [32], VGG [13], SqueezeNet [33], and GoogLeNet [14].",
+      "startOffset" : 102,
+      "endOffset" : 106
+    }, {
+      "referenceID" : 4,
+      "context" : "We study DNNs that show state-ofthe-art performance in ImageNet [25]: AlexNet [1], OverFeat [31], NiN [32], VGG [13], SqueezeNet [33], and GoogLeNet [14].",
+      "startOffset" : 112,
+      "endOffset" : 116
+    }, {
+      "referenceID" : 19,
+      "context" : "We study DNNs that show state-ofthe-art performance in ImageNet [25]: AlexNet [1], OverFeat [31], NiN [32], VGG [13], SqueezeNet [33], and GoogLeNet [14].",
+      "startOffset" : 129,
+      "endOffset" : 133
+    }, {
+      "referenceID" : 5,
+      "context" : "We study DNNs that show state-ofthe-art performance in ImageNet [25]: AlexNet [1], OverFeat [31], NiN [32], VGG [13], SqueezeNet [33], and GoogLeNet [14].",
+      "startOffset" : 149,
+      "endOffset" : 153
+    }, {
+      "referenceID" : 18,
+      "context" : "at the original authors’ websites [32, 33].",
+      "startOffset" : 34,
+      "endOffset" : 42
+    }, {
+      "referenceID" : 19,
+      "context" : "at the original authors’ websites [32, 33].",
+      "startOffset" : 34,
+      "endOffset" : 42
+    }, {
+      "referenceID" : 29,
+      "context" : "[51] explored quantization in activations by fixing the data type to a 8-bit integer as opposed to 32-bit floating point.",
+      "startOffset" : 0,
+      "endOffset" : 4
+    }, {
+      "referenceID" : 30,
+      "context" : "[52] proposed vector quantization methods for compressing the weights of DNNs.",
+      "startOffset" : 0,
+      "endOffset" : 4
+    }, {
+      "referenceID" : 31,
+      "context" : "Network pruning strategies have also been explored extensively by prior literature [53, 54, 55, 56, 57].",
+      "startOffset" : 83,
+      "endOffset" : 103
+    }, {
+      "referenceID" : 32,
+      "context" : "Network pruning strategies have also been explored extensively by prior literature [53, 54, 55, 56, 57].",
+      "startOffset" : 83,
+      "endOffset" : 103
+    }, {
+      "referenceID" : 33,
+      "context" : "Network pruning strategies have also been explored extensively by prior literature [53, 54, 55, 56, 57].",
+      "startOffset" : 83,
+      "endOffset" : 103
+    }, {
+      "referenceID" : 34,
+      "context" : "Network pruning strategies have also been explored extensively by prior literature [53, 54, 55, 56, 57].",
+      "startOffset" : 83,
+      "endOffset" : 103
+    }, {
+      "referenceID" : 35,
+      "context" : "Network pruning strategies have also been explored extensively by prior literature [53, 54, 55, 56, 57].",
+      "startOffset" : 83,
+      "endOffset" : 103
+    }, {
+      "referenceID" : 18,
+      "context" : "The Network-in-Network [32] is an approach that tries to increase the representational power of DNNs by exploiting 1 × 1 convolutional layers.",
+      "startOffset" : 23,
+      "endOffset" : 27
+    }, {
+      "referenceID" : 5,
+      "context" : "GoogLeNet [14] and SqueezeNet [33] extensively use these 1 × 1 layers for reducing the dimension of each layer’s output activations.",
+      "startOffset" : 10,
+      "endOffset" : 14
+    }, {
+      "referenceID" : 19,
+      "context" : "GoogLeNet [14] and SqueezeNet [33] extensively use these 1 × 1 layers for reducing the dimension of each layer’s output activations.",
+      "startOffset" : 30,
+      "endOffset" : 34
+    }, {
+      "referenceID" : 36,
+      "context" : "CNNs [58, 59, 60, 61, 62, 63, 64, 65, 66, 24, 67].",
+      "startOffset" : 5,
+      "endOffset" : 49
+    }, {
+      "referenceID" : 37,
+      "context" : "CNNs [58, 59, 60, 61, 62, 63, 64, 65, 66, 24, 67].",
+      "startOffset" : 5,
+      "endOffset" : 49
+    }, {
+      "referenceID" : 38,
+      "context" : "CNNs [58, 59, 60, 61, 62, 63, 64, 65, 66, 24, 67].",
+      "startOffset" : 5,
+      "endOffset" : 49
+    }, {
+      "referenceID" : 39,
+      "context" : "CNNs [58, 59, 60, 61, 62, 63, 64, 65, 66, 24, 67].",
+      "startOffset" : 5,
+      "endOffset" : 49
+    }, {
+      "referenceID" : 40,
+      "context" : "CNNs [58, 59, 60, 61, 62, 63, 64, 65, 66, 24, 67].",
+      "startOffset" : 5,
+      "endOffset" : 49
+    }, {
+      "referenceID" : 41,
+      "context" : "CNNs [58, 59, 60, 61, 62, 63, 64, 65, 66, 24, 67].",
+      "startOffset" : 5,
+      "endOffset" : 49
+    }, {
+      "referenceID" : 42,
+      "context" : "CNNs [58, 59, 60, 61, 62, 63, 64, 65, 66, 24, 67].",
+      "startOffset" : 5,
+      "endOffset" : 49
+    }, {
+      "referenceID" : 43,
+      "context" : "CNNs [58, 59, 60, 61, 62, 63, 64, 65, 66, 24, 67].",
+      "startOffset" : 5,
+      "endOffset" : 49
+    }, {
+      "referenceID" : 44,
+      "context" : "CNNs [58, 59, 60, 61, 62, 63, 64, 65, 66, 24, 67].",
+      "startOffset" : 5,
+      "endOffset" : 49
+    }, {
+      "referenceID" : 13,
+      "context" : "CNNs [58, 59, 60, 61, 62, 63, 64, 65, 66, 24, 67].",
+      "startOffset" : 5,
+      "endOffset" : 49
+    }, {
+      "referenceID" : 45,
+      "context" : "CNNs [58, 59, 60, 61, 62, 63, 64, 65, 66, 24, 67].",
+      "startOffset" : 5,
+      "endOffset" : 49
+    }, {
+      "referenceID" : 46,
+      "context" : "Nonetheless, with a multiGPU DNN platform [70, 71] where 4 to 8 GPUs share the same communication channel, the bandwidth allocated per each single GPU is still 10–20 GB/sec, similar to PCIe (gen3).",
+      "startOffset" : 42,
+      "endOffset" : 50
+    } ],
+    "year" : 2017,
+    "abstractText" : "Popular deep learning frameworks require users to fine-tune their memory usage so that the training data of a deep neural network (DNN) fits within the GPU physical memory. Prior work tries to address this restriction by virtualizing the memory usage of DNNs, enabling both CPU and GPU memory to be utilized for memory allocations. Despite its merits, virtualizing memory can incur significant performance overheads when the time needed to copy data back and forth from CPU memory is higher than the latency to perform the computations required for DNN forward and backward propagation. We introduce a high-performance virtualization strategy based on a “compressing DMA engine” (cDMA) that drastically reduces the size of the data structures that are targeted for CPU-side allocations. The cDMA engine offers an average 2.6× (maximum 13.8×) compression ratio by exploiting the sparsity inherent in offloaded data, improving the performance of virtualized DNNs by an average 32% (maximum 61%).",
+    "creator" : "LaTeX with hyperref package"
+  }
+}

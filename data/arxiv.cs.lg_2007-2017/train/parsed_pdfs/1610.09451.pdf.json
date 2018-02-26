@@ -1,0 +1,1019 @@
+{
+  "name" : "1610.09451.pdf",
+  "metadata" : {
+    "source" : "CRF",
+    "title" : "KeystoneML: Optimizing Pipelines for Large-Scale Advanced Analytics",
+    "authors" : [ "Evan R. Sparks", "Shivaram Venkataraman", "Tomer Kaftan", "Michael Franklin", "Benjamin Recht" ],
+    "emails" : [ "sparks@cs.berkeley.edu", "shivaram@cs.berkeley.edu", "tomerk11@cs.berkeley.edu", "franklin@cs.berkeley.edu", "brecht@cs.berkeley.edu" ],
+    "sections" : [ {
+      "heading" : "1 Introduction",
+      "text" : "Today’s advanced analytics applications increasingly use machine learning (ML) as a core technique in areas ranging from business intelligence to recommendation to natural language processing [39] and speech recognition [29]. Practitioners build complex, multi-stage pipelines involving feature extraction, dimensionality reduction, data transformations, and training supervised learning models to achieve high accuracy [52]. However, current systems provide little support for automating the construction and optimization of these pipelines.\nTo assemble such pipelines, developers typically piece together domain specific libraries1 for feature extraction and general purpose numerical optimization packages [34, 44] for supervised learning. This is often a cumbersome and error-prone process [53]. Further, these pipelines need to be completely re-engineered when the training data or features grow by an order of magnitude– often the difference between an application that provides good statistical accuracy and one that does not [23]. As\n1e.g. OpenCV for Images (http://opencv.org/), Kaldi for Speech (http://kaldi-asr.org/)\nno broader system has purview of the end-to-end application, only narrow optimizations can be applied.\nThese challenges motivate the need for a system that\n• Allows users to specify end-to-end ML applications in a single system using high level logical operators.\n• Scales out dynamically as data volumes and problem complexity change.\n• Automatically optimizes these applications given a library of ML operators and the user’s compute resources.\nWhile existing efforts in the data management community [27, 21, 44] and in the broader machine learning systems community [34, 45, 3] have built systems to address some of these problems, each of them misses the mark on at least one of the points above.\nWe present KeystoneML, a framework for ML pipelines designed to satisfy the above requirements. Fundamental to the design of KeystoneML is the observation that model training is only one component of an ML application. While a significant body of recent work has focused on high performance algorithms [61, 50],\nar X\niv :1\n61 0.\n09 45\n1v 1\n[ cs\n.L G\n] 2\n9 O\nct 2\n01 6\nand scalable implementations [17, 44] for model training, they do not capture the featurization process or the logical intent of the workflow. KeystoneML provides a high-level, type-safe API built around logical operators to capture end-to-end applications.\nTo optimize ML pipelines, database query optimization provides a natural motivation for the core design of such a system [32]. However, compared to relational database query optimization, ML applications present an additional set of concerns. First, ML operators are often iterative and may require multiple passes over their inputs, presenting opportunities for data reuse. Second, many ML operators provide only approximate answers to their inputs [50]. Third, numerical data properties such as sparsity and dimensionality are a necessary source of information when selecting optimal execution plans and conventional optimizers do not consider such measures. Finally, the system should be aware of the computationvs-communication tradeoffs inherent in distributed processing of ML workloads [21, 34] and choose appropriate execution strategies in this regime.\nTo address these challenges we develop techniques to do both per-operator optimization and end-to-end pipeline optimization for ML pipelines. We use a costbased optimizer that accounts for both computation and communication costs and our cost model can easily accommodate new operators and hardware configurations. To determine which intermediate states are materialized in memory during iterative execution, we formulate an optimization problem and present a greedy algorithm that works efficiently and accurately in practice.\nWe measure the importance of cost-based optimization and its associated overheads using real-world workloads from computer vision, speech and natural language processing. We find that end-to-end optimization can improve performance by 7× and that physical operator optimizations combined with end-to-end optimizations can improve performance by up to 15× versus unoptimized execution. We show that in our experiments, poor physical operator selection can result in up to a 260× slowdown. Using an image classification pipeline on over 1M images [52], we show that KeystoneML provides linear performance scalability across various cluster sizes, and statistical performance comparable to recent results [11, 52]. Additionally, KeystoneML can match the performance of a specialized phoneme classification system on a BlueGene supercomputer while using 8× fewer resources. In summary, we make the following contributions:\n• We present KeystoneML, a system for describing ML applications using high level logical operators. KeystoneML enables end-to-end optimization of ML applications at both the operator and pipeline level.\nval textClassifier = Trim andThen LowerCase andThen Tokenizer andThen NGramsFeaturizer(1 to 2) andThen TermFrequency(x => 1) andThen (CommonSparseFeatures(1e5), data) andThen (LinearSolver(), data, labels) val predictions = textClassifier(testData)\nKeystoneML is open source software2 and is being used in scientific applications in solar physics [30] and genomics [2]"
+    }, {
+      "heading" : "2 Pipeline Construction and Core APIs",
+      "text" : "In this section we introduce the KeystoneML API that can be used to express end-to-end ML pipelines. Each pipeline is composed a number of operators that are chained together. For example, Figure 2 shows the KeystoneML source code for a complete text classification pipeline. We next describe the building blocks of our API."
+    }, {
+      "heading" : "2.1 Logical ML Operators",
+      "text" : "Conventional analytics queries are typically composed using a small number of well studied relational database operators. This well-defined environment enables important optimizations. However, ML applications lack such an abstraction and practitioners typically piece together imperative libraries. Recent efforts have proposed\n2http://www.keystone-ml.org/\nusing linear algebra operators such as matrix multiplication [21], convex optimization routines [20] or multidimensional arrays as logical building blocks [57].\nIn contrast, with KeystoneML we propose a design where high-level ML operations (such as PCA, LinearSolver) are used as building blocks. Our approach has two major benefits: First, it simplifies building applications. Even complex pipelines can be built using just a handful of operators. Second, this higher level abstraction allows us to perform a wider range of optimizations. Our key insight here is that there are usually multiple well studied algorithms for a given ML operator, but that their performance and statistical characteristics vary based on the inputs and system configuration. We next describe the API for operators in KeystoneML.\nPipelines are composed of operators. Transformers and Estimators are two abstract types of operators in KeystoneML. An operator is a function which operates on zero or more inputs to produce some output. A logical operator satisfies some logical contract. For example, it takes an image and converts it to grayscale. Every logical operator must have at least one physical operator associated with it which implements its logic. Logical operators with multiple physical implementations are candidates for optimization. They are marked Optimizable and have a set of CostModels associated with them. Operators that are iterative with respect to their inputs are marked Iterative.\nA Transformer is an operator that can be applied to individual data items (or to a collection of items) and produces a new data item (or a collection of data items)– it is a deterministic unary function without side-effects.\nExamples of Transformers in KeystoneML include basic data transformations, feature extractors and model application. The deterministic and side-effect free properties affords the ability to reorder and optimize the execution of the functions without changing the result.\nAn Estimator is applied to a distributed collection of data items and produces a Transformer–it is a function generating function. ML algorithms provided by KeystoneML are Estimators, while featurizers are Transformers. For example, LinearSolver is an Estimator that takes a data set and labels, finds the linear model which minimizes the square loss between the training data and labels, and produces a Transformer that can apply this model to new data."
+    }, {
+      "heading" : "2.2 Pipeline Construction",
+      "text" : "Transformers and Estimators are chained together into a Pipeline using a consistent set of rules. The chaining methods are summarized in Figure 4. In addition to linear chaining of nodes using andThen, KeystoneML’s API allows for pipeline branching. When a developer calls andThen a new Pipeline object is returned. By calling andThen multiple times on the same pipeline, users can create multiple pipelines that branch out. Developers join the output of multiple pipelines of using gather. Redundancy is eliminated via common subexpression optimization detailed in Section 4. We find these APIs are sufficient for a number of ML applications (Section 5.1), but expect to extend them over time."
+    }, {
+      "heading" : "2.3 Pipeline Execution",
+      "text" : "KeystoneML is designed to run with large, distributed datasets on commodity clusters. Our high level API and optimizers can be executed using any distributed data-flow engine. The execution flow of KeystoneML is shown in Figure 1. First, developers specify pipelines using the KeystoneML APIs described above. As calls to these APIs are made, KeystoneML incrementally builds an operator DAG for the pipeline. An example operator DAG for image classification is shown in Figure 5. Once a pipeline is applied to some data, this DAG is then optimized using a set of optimizations described below–we call this stage optimization time. Once the application has been optimized, the DAG is traversed depth-first and operators are executed one at a time, with nodes up until pipeline breakers (i.e. Estimators) packed into the same job–this stage is runtime. This lazy optimization procedure gives the optimizer full information about the application in question. We now consider the optimizations made by KeystoneML."
+    }, {
+      "heading" : "3 Operator-Level Optimization",
+      "text" : "In this section we describe the operator-level optimization procedure used in KeystoneML. Similar to database query optimizers, the goal of the operator-level optimizer is to choose the best physical implementation for every machine learning operator in the pipeline. This is challenging to do because operators in KeystoneML are distributed i.e. they involve computation and communication across the cluster. Operator performance may also depend on statistical properties like sparsity of input data and level of accuracy desired. Finally, as discussed in Section 2, KeystoneML consists of a set of high-level operators. The advantage of having high-level operators is that we can perform more wide-ranging optimizations. But this makes designing an optimizer more challenging because unlike relational operators or linear algebra [21], the set of operators in KeystoneML is not closed. We next discuss how we address these challenges. Approach: The approach we take in KeystoneML is to develop a cost-based optimizer that splits the cost model into two parts: an operator-specific part and a clusterspecific part. The operator-specific part models the computation and communication time given statistics of the input data and number of workers and the cluster specific part is used to weigh their relative importance. More formally, the cost estimate for each physical operator, f can be expressed as:\nc(f,As, R) = Rexeccexec(f,As, Rw)+ (1) Rcoordccoord(f,As, Rw) (2)\nWhere f is the operator in question,As contains statistics of a dataset to be used as its input, and R, the cluster resource descriptor represents the cluster computing, memory, and networking resources available. The cluster resource descriptor is collected via configuration data and microbenchmarks. Statistics captured include pernode CPU throughput (in GFLOP/s), disk and memory bandwidth (GB/s), and network speed (GB/s), as well as information about the number of nodes available. As is determined through a process we will discuss in Section 4. Rw is the number of cluster nodes available.\nThe functions, cexec, and ccoord are developer-defined operator-specific functions (defined as part of the operator CostModel) that describe execution and coordination costs in terms of the longest critical path in the execution graph of the individual operators [59], e.g. the most FLOPS used by a node in the cluster or the amount of data transferred over the most loaded link. Such functions are also used in the analysis of parallel algorithms [6] and are well known for common linear algebra based operators. Rexec and Rcoord are determined by the optimizer from the cluster resource descriptor (R) and capture the relative speed of local and network resources on the cluster.\nSplitting the cost model in this fashion allows the the optimizer to easily adapt to new hardware (e.g., GPUs or Infiniband networks) and also for it to work with both existing and future operators. Operator developers only need to implement a CostModel and the system accounts for hardware properties. Finally we note that the cost model we use here is approximate and that the cost c need not be equal to the actual running time of the operator. Rather, as in conventional query optimizers, the goal of the cost model is to avoid bad decisions, which a roughly accurate model will do. At the boundary of two nearly equivalent operators, either should be acceptable in terms of runtime. We next illustrate the cost functions for three central operators in KeystoneML and the performance trade-offs that arise from varying input properties.\nLinear Solvers are supervised Estimators that learn a linear map X between an input dataset A in Rn×d to a labels dataset B in Rn×k by finding the X which minimizes the value ||AX−B||F . In a multi-class classification setting, n is the number of examples or data points, d the number of features and k the number of classes. In the KeystoneML Standard Library we have several implementations of linear solvers, distributed and local, including\n• Exact solvers [18] that compute closed form solutions to the least squares loss and return an X to extremely high precision.\n• Block solvers that partition the features into a set of blocks and use second-order Jacobi or GaussSeidel [9] updates to converge to the right solution.\n• Gradient based methods like SGD [50] or LBFGS [14] which perform iterative updates using the gradient and converge to a globally optimal solution.\nTable 1 summarizes the cost model for each method. Constants are omitted for readability but are necessary in practice.\nTo illustrate these cost tradeoffs empirically, we vary the number of features generated by the featurization stage of two different pipelines and measure the training time and the training loss. We compare the methods on a 16 node cluster.\nOn an Amazon Reviews dataset (see Table 3) with a text classification pipeline, as we increase the number of features from 1k to 16k we see in Figure 6 that L-BFGS performs 5-20× faster than the exact solver and 26-260× faster than the block-wise solver. Additionally the exact solver crashes for greater than 4k features as the memory requirements are too high. The reason for this speedup is that the features generated in text classification problems are sparse and the L-BFGS solver exploits the sparse inputs to calculate gradients cheaply.\nThe optimal solver choice does not always stay the same as we increase the problem size or as sparsity changes. For the TIMIT dataset, which has dense features, we see that the exact solver is 3-9× faster than L-BFGS for smaller number of features. However when the number of features goes beyond 8k we see that the exact solver becomes slower than the block-wise solver which is also 2-3× faster than L-BFGS.\nPrincipal Component Analysis (PCA) is an Estimator used for tasks ranging from dimensionality reduction to whitening to visualization. PCA takes an input dataset A in Rn×d, and a value k and produces a Transformer which can apply a matrix P in Rd×k, where P consists of the first k eigenvectors of the covariance matrix of A. The P matrix can be found using several techniques including the SVD or via an approximate algorithm, Trun-\ncated SVD [24]. In our cost model, SVD has runtime O(nd2) and offers an exact answer, while TSVD runs in O(nk2). Both methods may parallelized over a cluster.\nTo better illustrate how the choice of a PCA implementation affects the run time, we construct a microbenchmark that varies problem size along n, d, and k, and execute both local and distributed implementations of the approximate and exact algorithm on a 16-node cluster. In Table 2, we can see that as data volumes increase in n and d it makes sense to run PCA in a distributed fashion, while for relatively small values of k, it can make sense to use the approximate method.\nConvolution is a critical building block of Signal, Speech, and Image Processing pipelines. In image processing, the Transformer takes in an Image of size n×n× d and applies a bank of b filters (each of size k×k, where k < n) to the Image and returns the b resulting convolved images of size m × m, where m = n − k + 1. There are three main ways to implement convolutions: via\na matrix-vector product scheme when convolutions are separable, using BLAS matrix-matrix multiplication [5], or via a Fast Fourier Transform (FFT) [41].\nThe cost model for the matrix-vector product scheme takes O(dbk(n − k + 1)2 + bk3) time, but only works when filters are linearly separable. Meanwhile, the matrix-matrix multiplication scheme has a cost of O(dbk2(n − k + 1)2). Finally, the FFT based scheme takes O(6dbn2 log n + 4dbn2), and the time taken does not depend on k.\nTo illustrate the tradeoffs between these methods, in Figure 7, we vary the size of the convolution filter, k, and use representative input images and batch sizes. For small values of k, we see that BLAS the is fastest operator. However, as k grows, the algorithm’s dependence on k2 makes this approach inappropriate. If the filters are separable, it is faster to use the matrix-vector algorithm. The FFT algorithm does not depend on k and thus performs the same regardless of k. Cost Model Evaluation: To evaluate how well our costmodel works, we compared the physical operator chosen by our optimizer against the best choice from empirically measured values for linear solvers (Figure 6) and PCA (Table 2). We found that our optimizer made the right choice 90% of the time for linear solvers and 84% of the time for PCA. In both cases we found that the wrong choices were made when the running time of two operators were close to each other and thus the approximate cost model did not severely impact overall performance. For example, for the linear solver with 4096 dense features, the optimizer chooses the BlockSolver but empirically the Exact solver is about 30% faster.\nAs seen from the three examples above, the choice of optimal physical execution depends on hardware properties and on properties of the input data. Thus, choices made in support of operator-level optimization depend on upstream processing and cheaply estimating data properties at various points in the pipeline is an important problem. We next discuss how operator chaining semantics can help in achieving this."
+    }, {
+      "heading" : "4 Whole-Pipeline Optimization",
+      "text" : ""
+    }, {
+      "heading" : "4.1 Execution Subsampling",
+      "text" : "Operator optimization in KeystoneML requires the collection of statistics about input data at each pipeline stage. For example, a text featurization operator might map a string into a 10, 000-dimensional sparse feature vector. Without statistics about the input (e.g. vector sparsity) after featurization, a downstream operator will be unable to make its optimization decision. As such, dataset statistics (As) are determined by first estimating the size of the initial input dataset (in records), and optimizing the first operator in the pipeline with statistics derived from a sample of the input data. The optimized operator is then executed on the sample, and subsequent operators are optimized. This procedure continues until all nodes have been optimized. Along the way, we form a pipeline profile, which includes not just the information needed to form As at each step, but also information about operator execution time and memory consumption of each operator’s execution on the sample. We use the pipeline profile to inform the Automatic Materialization optimization described below. We also evaluate the overheads from profiling in Section 5.3."
+    }, {
+      "heading" : "4.2 Common Sub-expression Elimination",
+      "text" : "One of the whole-pipeline rewrites done by KeystoneML is a form of common sub-expression elimination. It is common for training data or the output of featurization stages to be used in several stages of a pipeline. As a concrete example, in a text classification pipeline we might first tokenize the training data then determine the 100, 000 most common bigrams in a text corpus, featurize the data to a binary vector indicating the presence of each bigram, and then train a classifier on the same training data. Thus, we need the bigrams of each document both in the most common features calculation as well as when training the classifier. KeystoneML identifies and merges such common sub-expressions to enable computation reuse."
+    }, {
+      "heading" : "4.3 Automatic Materialization",
+      "text" : "Cache management and automatic selection of materialized views are important optimizations used by database management systems [15] and they have been studied in the context of analytical query systems [63, 25], and feature selection [60]. For ML workloads, materialization of intermediate data is very important for performance because the iterative nature of these workloads means that recomputation costs are multiplied across iterations. By capturing the iterative nature of the pipelines in the DAG,\nour optimizer is capable of identifying opportunities for reuse, eliminating redundant computation. We next describe a formulation for the materialization problem in iterative pipelines and propose an algorithm to automatically select a good set of intermediate objects to materialize in order to speed up ML pipeline execution.\nGiven the depth-first execution model and the deterministic and side-effect free nature of KeystoneML operators, a natural strategy is materialization of operator outputs that are visited multiple times during the execution. This optimization works well in the absence of memory constraints.\nHowever, in many applications we have built with KeystoneML, intermediate output can grow to multiple terabytes in size, even for modestly sized inputs. On current hardware, this output is too big to fit in memory, even with hundreds of GB of memory per machine. Commonly used caching policies such as LRU can result in suboptimal run times because the decision to cache a large object (e.g. intermediate features) may evict a smaller object that is needed later in the pipeline and may be expensive to recompute (e.g. image features).\nWe propose an algorithm to automatically select the items to cache in the presence of memory constraints, given that we know how often the objects will be accessed, that we can estimate their size, and that we can estimate the runtime associated with materializing them.\nWe formulate the problem as follows: Given a memory budget, we want to find the set of nodes to include in the cache set that minimizes total execution time.\nLet v be our node of interest in a pipeline G, t(v) is the time taken to do the computation that is local to node v per iteration, C(v) is the number of times a node will by called by its direct successors during execution, and wv is the number of times a node iterates over its inputs. T (n), the total execution time of the pipeline up to and including node v is:\nT (v) =\nwv(t(v) + ∑\nc∈χ(v) T (c))\nC(v)κv\nwhere κv ∈ {0, 1} is a binary indicator variable signifying whether a node is cached or not, and χ(v) represents the direct predecessors of v in the DAG.\nWhere C(v) is defined as follows:\nC(v) =  ∑ p∈π(v) wpC(p) κp , |π(v)| > 0\n1, otherwise\nwhere π(v) represents the direct successors of v in the DAG. Because of the DAG structure of the pipeline graph, we are guaranteed to not have any cycles in this graph, thus both T (v) and C(v) are well-defined.\n1 Algorithm GreedyOptimizer: input : G, t, size, memSize output: cache 2 cache← ∅; 3 memLeft← memSize; 4 next← pickNext (G, cache, size, memLeft, t); 5 while nextNode 6= ∅ do 6 cache← cache ∪ next; 7 memLeft← memLeft - size(next); 8 next← pickNext (G, cache, size, memLeft, t); 9 end\n10 return cache; 11 end\n1 Procedure pickNext: input : G, cache, size, memLeft, t output: next 2 minTime←∞; 3 next← ∅; 4 for v ∈ nodes(G) do 5 runtime← estRuntime (G, cache ∪ v, t); 6 if runtime < minTime & size(v) < memLeft then 7 next← v; 8 minTime← runtime; 9 end\n10 end 11 return next; 12 end\nAlgorithm 1: The caching algorithm in KeystoneML builds a cache set by finding the node that will maximize time saved subject to memory constraints. estRuntime is a procedure that computes T (v) for a given DAG, cache set, and node.\nWe can state the problem of minimizing pipeline execution time formally as an optimization problem with linear constraints as follows:\nmin κ T (sink(G))\ns.t. ∑ v∈V size(v)κv ≤ memSize\nWhere sink(G) is the pipeline terminus, size(v) the size of v’s output, andmemSize the memory constraint.\nThis problem can also be thought of as problem of finding an optimal cache schedule. It is tempting to reach for classical results [7, 48] in the optimal paging literature to identify an optimal or near-optimal schedule for this problem. However, neither of these results matches our problem setting fully. In particular, Belady’s algorithm is only optimal when each item has a fixed cost to bring into cache (as is common in reads from a two-level memory hierarchy), while in our problem these costs are variable and depend heavily on the computation time to materialize them–in many cases recomputing may be two orders of magnitude faster than reading from disk but\nan order of magnitude slower than reading from memory, and each operator will have a different computational profile. Second, algorithms for the weighted paging problem don’t take into account weights that are dependent on the current state of the cache. e.g. it may be much faster to compute image features if images are already in cluster memory than if they need to be retrieved from disk.\nHowever, it is possible to rewrite the optimization problem above as a mixed-integer linear program (ILP), but in our experiments the cost of solving these problems for reasonably complex pipelines with high end ILP solvers was prohibitive for practical use [22] at optimization time. Instead, we implement the greedy Algorithm 1. Given an unoptimized pipeline DAG, the algorithm chooses to cache the node which will lead to the largest savings in terms of execution time but whose output fits in available memory. This process proceeds iteratively until either no benefit to additional caching is possible or all available memory has been used."
+    }, {
+      "heading" : "5 Evaluation",
+      "text" : "To evaluate the effectiveness of KeystoneML, we explore its ability to efficiently support large scale ML applications in three domains. We also compare KeystoneML with other systems for large scale ML and show how our high-level operators and optimizations can improve performance. Following that we break down the end-to-end benefits of the previously discussed optimizations. Finally, we assess the system’s ability to scale and show that KeystoneML scales well by enabling the development of scalable, composable components. Implementation: We implement KeystoneML on top of Apache Spark, a cluster computing engine that has been shown to have good scalability and performance for many iterative ML algorithms [44]. In KeystoneML we added an additional cache-management layer that is aware of the multiple Spark jobs that comprise a pipeline, and implemented ML operators in the KeystoneML Standard Library that are absent from Spark MLlib. While the current implementation of the system is Spark-specific, Spark is merely a distributed execution environment and our system can be ported to other backends.\nExperiments are run on Amazon EC2 r3.4xlarge instances. Each machine has 8 physical cores, 122 GB of memory, and a 320 GB SSD, and was running Apache Spark 1.3.1, Scala 2.10, and HDFS from the CDH4 distribution of Hadoop. We have also run KeystoneML on Apache Spark 1.5, 1.6 and not encountered any performance regressions. We use OpenBLAS for numerical operations and Vowpal Wabbit [34] v8.0 and SystemML [21] v0.9 in our comparisons. If not otherwise\nspecified, we run on a 16-node cluster."
+    }, {
+      "heading" : "5.1 End-to-End ML Applications",
+      "text" : "To demonstrate the flexibility and generality of the KeystoneML API, we implemented end-to-end machine learning pipelines in several domains including text classification, image classification and speech recognition. We next describe these pipelines and compare statistical accuracy and performance results obtained using KeystoneML to previously published results. We took every effort to recreate these pipelines as they were described by their authors, and made sure that our pipelines achieved comparable or better statistical results than those reported by each benchmark’s respective authors.\nThe operators used to implement these applications are outlined in Table 4, and the datasets used to train them are described in Table 3. In each case, the datasets significantly increase in size as part of the featurization process, so at model fitting time the size is substantially larger than the raw data, as shown in the last two columns of the table. The Solve Size is the size of the dataset that is input to a Linear Solver. This may be too large for available cluster memory, as is the case for TIMIT. Accuracy results on each dataset achieved with KeystoneML as well as those achieved with the original authors code or (where code was unavailable) as reported in their respective works, are reported in Table 5. Text Analytics: KeystoneML makes it simple for developers to scale their text pipelines to large datasets. Combined with libraries like CoreNLP [40], KeystoneML allows for scalable implementations of many text classification pipelines such as the one shown in Figure 2. We evaluated a text classification pipeline based on [39] on the Amazon Reviews dataset of 65m product reviews [42] with 100k sparse features. We find that KeystoneML matches the statistical performance of a Vowpal Wabbit [34] pipeline when run on identical resources\nwith the same solver, finishing in 440s. Kernel SVM for Speech Recognition: Kernel SVMs can be used in many classification scenarios as they can approximate any function. Often their performance has been shown to be much better than simpler generalized linear models [28]. Kernel evaluations can be efficiently approximated using random feature transformations [49, 55] and pipelines are a natural way to specify such transformations. Statistical operators like FFTs and cosine transformations and APIs to merge features help us succinctly describe the pipeline in KeystoneML. We evaluated a kernel SVM solver on the TIMIT dataset with 528k features. Using KeystoneML this pipeline runs in 138 minutes on 64 machines. By contrast, a 256 node IBM Blue Gene machine with 16 cores per machine takes around 120 minutes [55]. In this case, while KeystoneML may be 11% slower, it is using only 18 the number of cores to solve this computationally demanding problem. Image Classification: Image classification systems are useful in many settings. As images carry local information (i.e. information specific to where in the image a feature appears), locality sensitive techniques, e.g. convolutions or spatially-pooled fisher vectors [52], can be used to generate training features. KeystoneML makes it easy to modularize the pipeline to use efficient implementations of image processing operators like SIFT [38] and Fisher Vectors [52, 11]. Many of the same operators we consider here are necessary components of “deep-learning” pipelines [33] which typically train neural networks via stochastic gradient descent and backpropagation.\nUsing the VOC dataset, we implement the pipeline described in [11]. This pipeline executes end-to-end on 32 nodes using KeystoneML in just 7 minutes. Using the authors original source code the same workload takes 1 hour and 27 minutes to execute on a single 16-core machine with 256 GB of RAM–KeystoneML achieves a 12.4× speedup with 16× the cores. We evaluated a Fisher Vector based pipeline on ImageNet with 256k features. The KeystoneML pipeline runs in 4.5 hours on 100 machines. The original pipeline takes four days [51] to run using a highly specialized codebase on a 16-core ma-\nchine, a 21× speedup on 50× the cores. In summary, using KeystoneML we achieve one to two orders of magnitude improvement in end-to-end throughput versus a single node, and equivalent or better performance over cluster systems running similar workloads. These improvements mean much quicker ML application development which leads to higher developer productivity. Next we compare KeystoneML to other large scale learning systems."
+    }, {
+      "heading" : "5.2 KeystoneML vs. Other Systems",
+      "text" : "We compare runtimes for the KeystoneML solver with both a specialized system, Vowpal Wabbit [34], built to estimate linear models, and SystemML [21], a general purpose ML system, which optimizes the implementation of linear algebra operators used in specific algorithms (e.g., Conjugate Gradient Method), but does not choose among logically equivalent algorithms. We compare solver performance across different feature sizes for two binary classification problems: Amazon and a binary version of TIMIT. The systems were run with identical inputs and objective functions, and we report end-to-end solve time. For this comparison, we solve binary problems because SystemML does not include a multiclass linear solver.\nThe results are shown in Figure 8. The optimized\n3We report accuracy on 64k features for ImageNet, while time is reported on 256k features due to lack of consistent reporting by the original authors. The workloads are otherwise similar.\nsolver in KeystoneML outperforms both Vowpal Wabbit and SystemML because it selects an appropriate algorithm to solve the logical problem, as opposed to relying on a one-size fits all operator. At 1024 features for the Binary TIMIT problem, KeystoneML chooses to run an exact solve, while from 2048 to 32768 features it chooses a Dense L-BFGS implementation. At 65536 features (not pictured), KeystoneML finishes in 17 minutes, while SystemML takes 1 hour and 40 minutes to converge to worse training loss over 10 iterations, a speedup of 5.5×.\nThe reasons for these performance differences are twofold: first, since KeystoneML raises the level of abstraction to the logical level, the system can automatically select, for example, a sparse solver for sparse data or an exact algorithm when the number of features is low, or a block solver when the features are high. In the middle, particularly for KeystoneML vs. SystemML on the Binary TIMIT dataset, the algorithms are similar in terms of complexity and access patterns. In this case KeystoneML is faster because feature extraction is pipelined with the solver, while SystemML requires a conversion process for data to be fed into a format suitable for the solver. If we only consider the solve step of the pipeline, KeystoneML is roughly 1.5× faster than SystemML for this problem.\nTensorFlow is a newly open-sourced ML system developed by Google [3]. Developed concurrently to KeystoneML, TensorFlow also represents pipelines as graph of dataflow operators. However, the design goals of the two systems are fundamentally different. KeystoneML is designed to support horizontally scalable workloads to offer good scale out performance for conventional machine learning applications consisting of featurization and model estimation, while TensorFlow is designed to support neural network models trained via mini-batch SGD with back-propagation. We compare against TensorFlow v0.8 and adapt a multi-GPU example [1] to a distributed setting in a procedure similar to [13].\nTo illustrate the differences, we compare the systems’ performance on CIFAR-10 top-1 classification performance. While the learning tasks are identical (i.e., make good predictions on a test dataset, given a training dataset), the workloads are not identical. Specifically, TensorFlow implements a model similar to the one presented in [33], while in KeystoneML we implement a version of the model similar to [16]. TensorFlow was run with default parameters and we experimented with strong scaling (fixed 128 image batch size) and weak scaling (batch size of 128×Machines).\nFor this workload, TensorFlow achieves its best performance on 4-node cluster with 32 total CPU cores, running in 57 minutes. Meanwhile, KeystoneML surpasses its performance at 8 nodes and continues to improve in total runtime out to 32 nodes, achieving a minimum runtime of 29 minutes, or a 1.97× speedup. These results are summarized in Table 6. We ran TensorFlow on CPUs for the sake of comparability. Prior benchmarks [1] have shown that the speed of a single multi-core CPU is comparable to a single GPU; thus the same pipeline finishes in 50 minutes on a 4 GPU machine.\nTensorFlow’s lack of scalability on this task is fundamental to the chosen model and the algorithm being used to fit it. Minimizing a non-convex loss function via minibatch Stochastic Gradient Descent (SGD) requires coordination of the model parameters after a small number of examples are seen. In this case, the coordination requirements surpass the savings from parallelism at a small number of nodes. While TensorFlow has better scalability on some model architectures [58], it is not scalable for other architectures. By contrast, by using a communication-avoiding solver we are able to scale out KeystoneML’s performance on this task significantly further.\nFinally, a recent benchmark dataset from YouTube [4] describes learning pipelines involving featurization with a neural network [58] followed by a logistic regression model or SVM. The authors claim that “models train to convergence in less than a day on a single machine using the publicly-available TensorFlow framework.” We performed a best-effort replication of this pipeline us-\ning KeystoneML. We are unable to replicate the author’s claimed accuracy–our pipeline achieves 21% mAP while they report 28% mAP. KeystoneML trains a linear classifier on this dataset in 3 minutes, and a converged logistic regression model with worse accuracy in 90 minutes (31 batch gradient evaluations) on a 32-node cluster. The ability to choose an appropriate solver and readily scale out are the key enablers of KeystoneML’s performance.\nWe now study the impact of KeystoneML’s optimizations."
+    }, {
+      "heading" : "5.3 Optimization Levels",
+      "text" : "The end-to-end results reported earlier in this section are achieved by taking advantage of the complete set of optimizations available in KeystoneML. To understand how important the per-operator and whole-pipeline optimizations described in Sections 3 and 4 are we compare three different levels of optimization: a default unoptimized configuration (None), a configuration where only wholepipeline optimizations are used (Pipe Only) and a configuration with operator-level and whole-pipeline optimizations (KeystoneML).\nResults comparing these levels, with a breakdown of stage-level timings on the VOC, Amazon and TIMIT pipelines are shown in Figure 9. For the Amazon pipeline the whole-pipeline optimizations improve performance by 7×, but the operator optimizations do not help further, because the Amazon pipeline uses CoreNLP featurizers which do not have statistical optimizations associated with them, and the default L-BFGS solver turns out to be optimal. The performance gains come from caching intermediate features just before the L-BFGS solve. For the TIMIT pipeline, run with 16k features, we see that the end-to-end optimizations only give a 1.3× speedup but that selecting the appropriate solver results in a 8× speedup over the baseline. Finally in the VOC pipeline the whole pipeline optimization gives around 3× speedup. Operator-level optimization chooses good\nPCA, GMM and solver operators resulting in a 12× improvement over the baseline, or 15× if we amortize the optimization costs across many runs of a similar pipeline. Optimization overheads are insignificant except for the VOC pipeline. This dataset has relatively few examples, so the sampling strategy takes more time relative to the other datasets."
+    }, {
+      "heading" : "5.4 Automatic Materialization Strategies",
+      "text" : "As discussed in Section 4, one key optimization enabled by KeystoneML’s ability to capture the complete application DAG to dynamically determine where to materialize reused intermediate objects, particularly in the presence of memory constraints. In Figure 10 we demonstrate the effectiveness of the greedy caching algorithm proposed in Section 4. Since the algorithm needs local profiles of each node’s performance, we measured each node’s running time on two samples of 512 and 1024 examples. We extrapolate the node’s memory usage and runtime to\nfull scale using linear regression. We found that memory estimates from this process are highly accurate and runtime estimates were within 15% of actual runtimes. If estimates are inaccurate, we fall back to an LRU replacement policy for the cache set determined by this procedure. While this measurement process is imperfect, it is adequate at identifying relative running times and thus is sufficient for our purpose of resource management.\nWe compare this strategy with two alternatives–the first is a simple rule-based approach which only caches the results of Estimators. This is a sensible rule to follow, as the result of an Estimator (a Transformer or model) is computationally expensive to acquire and typically holds a small memory footprint. However, this is not sufficient for most practical pipelines because if a pipeline contains more than one Estimator, often the input to the first Estimator will be used downstream, thus presenting an opportunity for reuse. The second approach is a Least Recently Used (LRU) policy: in a regime where memory is unconstrained, LRU matches the ideal strategy and further, LRU is the default memory management strategy used by Apache Spark. However, LRU does not take into account that datasets from other jobs (even ones in the same pipeline) are vying for presence in cluster memory.\nFrom Figure 10 we notice several important trends. First, the KeystoneML strategy is nearly always better than either of the other strategies. In the unconstrained case, the algorithm is going to remember all reused items as late in their journey through the pipeline as possible. In the constrained case, it will do as least as well as remembering the (small) estimators which are by definition reused later in the pipeline. Additionally, the strategy degrades effectively, mixing between the best performance of the limited-memory rule-based strategy and the LRU based “cache everything” strategy which works well in unconstrained settings. Curiously, as we increased the memory available to caching per-node, the LRU strategy performed worse for the Amazon pipeline. Upon further investigation, this is because Spark has an implicit admission control policy which only allows objects under some proportion of the cache size to be admitted to the cache at runtime. As the cache size gets bigger in the LRU case, massive objects which are not then reused are admitted to the cache and evict smaller objects which are reused and thus need to be recomputed.\nTo give a concrete example of the optimizer in action, consider the VOC pipeline (Figure 11). When memory is not unconstrained (80 GB per node), the outputs from the SIFT, ReduceDimensions, Normalize and TrainingLabels are cached. When memory is restricted (5 GB per node) only the output from Normalize and TrainingLabels are cached.\nThese results show that both per-operator and wholepipeline optimizations are important for end-to-end per-\nformance improvements. We next study the scalability of the system on three workloads"
+    }, {
+      "heading" : "5.5 Scalability",
+      "text" : "As discussed in previous sections, KeystoneML’s API design encourages the construction of scalable operators. However, some estimators like linear solvers need coordination [18] among workers to compute correct results. In Figure 12 we demonstrate the scaling properties from 8 to 128 nodes of the text, image, and Kernel SVM pipelines on the Amazon, ImageNet (with 16k features) and TIMIT datasets (with 65k features) respectively. The ImageNet pipeline exhibits near-perfect horizontal scalability up to 128 nodes, while the Amazon and TIMIT pipeline scale well up to 64 nodes.\nTo understand why the Amazon and TIMIT pipeline do not scale linearly to 128 nodes, we further analyze the breakdown of time take by each stage. We see that each pipeline is dominated by a different part of its computation. The TIMIT pipeline is dominated by its solve stage, while featurization dominates the Amazon and ImageNet pipelines. Scaling linear solvers is known to require coordination [18], which leads directly to sub-linear scalability of the whole pipeline. Similarly, in the Amazon pipeline, one of the featurization steps uses an aggregation tree which does not scale linearly."
+    }, {
+      "heading" : "6 Related Work",
+      "text" : "ML Frameworks: ML researchers have traditionally used MATLAB or R packages to develop ML routines. The importance of feature engineering has led to tools like scikit-learn [45] and KNIME [8] adding support for featurization for small datasets. Further, existing libraries for large scale ML [10] like Vowpal Wabbit [34], GraphLab [37], MLlib [44], RIOT [62], DimmWitted [61] focus on efficient implementations of learning algorithms like regression, classification and linear alge-\nbra routines. In KeystoneML, we focus on pipelines that include featurization and show how to optimize performance with end-to-end information. Work in Parameter Servers [36] has studied how to share model updates. In KeystoneML we implement a high-level API for linear solvers and can leverage parameter servers in our architecture.\nClosely related to KeystoneML is SystemML [21] which also uses an optimization based approach to determine the physical execution strategy of ML algorithms. However, SystemML places less emphasis on support for UDFs and featurization, while instead focusing on linear algebra operators which have well specified semantics. To handle featurization we develop an extensible API in KeystoneML which allows for cost profiling of arbitrary nodes and uses these cost estimates to make node-level and whole-pipeline optimizations. Other work [60, 5] has looked at optimizing caching strategies and operator selection in the regime of feature selection and feature generation workloads. KeystoneML considers similar problems in the context of distributed ML operators and end-to-end learning pipelines. Developed concurrently to KeystoneML is TensorFlow [3]. While designed to support different learning workloads the optimizations that are a part of KeystoneML can also be applied to systems like TensorFlow.\nProjects such as Bismarck [20], MADLib [27], and GLADE [47] have proposed techniques to integrate ML algorithms inside database engines. In KeystoneML, we develop a high level API and show how we can achieve similar benefits of modularity and end-to-end optimization while also being scalable. These systems do not present cross-operator optimizations and do not consider tradeoffs at the operator level that we consider in KeystoneML. Finally, Spark ML [43] represents an early design of a similar high-level API for machine learning. We present a type safe API and optimization framework for such a system. The version we present in this paper differs in its use of type-safe operations, support for complex data flows, internal DAG representation and optimizations discussed in Sections 3 and 4. Finally, the concept of using a high-level programming model has been explored in a number of other contexts, including compilers [35] and networking [31]. In this paper we focus on machine learning workloads and propose nodelevel and end-to-end optimizations. Query Optimization, Modular Design, Caching: There are several similarities between the optimizations made by KeystoneML and traditional relational query optimizers. Even the earliest relational query optimizers [54] used multiple physical implementations of equivalent logical operators, and like many relational optimizers, the KeystoneML optimizer is cost-based. However, KeystoneML supports a much richer set of data\ntypes than a traditional relational query system, and our operators lack some relational algebra semantics, such as commutativity, limiting the system’s ability to perform certain optimizations. Further, KeystoneML switches among operators that provide exact answers vs approximate ones to save time due to the workload setting. Data characteristics such as sparsity are not traditionally considered by optimizers.\nThe caching strategy employed by KeystoneML can be viewed as a form of view selection for materialized view maintenance over queries with expensive userdefined functions [15, 26], we focus on materialization for intra-query optimization, as opposed to inter-query optimization [25, 12, 63, 19, 46]. While much of the related work focuses on the challenging problem of view maintenance in the presence of updates, KeystoneML we exploit the iterative nature and immutable properties of this state."
+    }, {
+      "heading" : "7 Future Work and Conclusion",
+      "text" : "KeystoneML represents a significant first step towards easy-to-use, robust, and efficient end-to-end ML at massive scale. We plan to investigate pipeline optimizations like node reordering to reduce data transfers and also look at how hyperparameter tuning [56] can be integrated into the system. The existing KeystoneML operator APIs are synchronous and our existing pipelines are acyclic. In the future we plan to study how algorithms like asynchronous SGD [36] or back-propagation can be integrated with the robustness and scalability that KeystoneML provides.\nWe have presented the design of KeystoneML, a system that enables the development end-to-end ML pipelines. By capturing the end-to-end application, KeystoneML can automatically optimize execution at both the operator and whole-pipeline levels, enabling solutions that automatically adapt to changes in data, hardware, and other environmental characteristics. Acknowledgements: We would like to thank Xiangrui Meng, Joseph Bradley for their help in design discussions and Henry Milner, Daniel Brucker, Gylfi Gudmundsson, Zongheng Yang, Vaishaal Shankar for their contributions to the KeystoneML source code. We would also like to thank Peter Alvaro, Peter Bailis, Joseph Gonzales, Nick Lanham, Aurojit Panda, Ameet Talwarkar for their feedback on earlier versions of this paper. This research is supported in part by NSF CISE Expeditions Award CCF-1139158, DOE Award SN10040 desc0012463, and DARPA XData Award FA8750-12-20331, and gifts from Amazon Web Services, Google, IBM, SAP, The Thomas and Stacey Siebel Foundation, Adatao, Adobe, Apple, Inc., Blue Goji, Bosch, Cisco,\nCray, Cloudera, EMC2, Ericsson, Facebook, Guavus, HP, Huawei, Informatica, Intel, Microsoft, NetApp, Pivotal, Samsung, Schlumberger, Splunk, Virdata and VMware."
+    } ],
+    "references" : [ {
+      "title" : "et al",
+      "author" : [ "M. Abadi", "A. Agarwal", "P. Barham", "E. Brevdo" ],
+      "venue" : "TensorFlow: Large-scale machine learning on heterogeneous systems",
+      "citeRegEx" : "3",
+      "shortCiteRegEx" : null,
+      "year" : 2015
+    }, {
+      "title" : "et al",
+      "author" : [ "S. Abu-El-Haija", "N. Kothari", "J. Lee", "P. Natsev" ],
+      "venue" : "YouTube-8M: A Large-Scale Video Classification Benchmark. arXiv preprint arXiv: 1609.08675",
+      "citeRegEx" : "4",
+      "shortCiteRegEx" : null,
+      "year" : 2016
+    }, {
+      "title" : "Caffe con Troll: Shallow Ideas to Speed Up Deep Learning",
+      "author" : [ "F. Abuzaid", "S. Hadjis", "C. Zhang", "C. Ré" ],
+      "venue" : "CoRR abs/1504.04343",
+      "citeRegEx" : "5",
+      "shortCiteRegEx" : null,
+      "year" : 2015
+    }, {
+      "title" : "Avoiding Communication in Dense Linear Algebra",
+      "author" : [ "G.M. Ballard" ],
+      "venue" : "PhD thesis, University of California, Berkeley",
+      "citeRegEx" : "6",
+      "shortCiteRegEx" : null,
+      "year" : 2013
+    }, {
+      "title" : "A study of replacement algorithms for a virtual-storage computer",
+      "author" : [ "L.A. Belady" ],
+      "venue" : "IBM Systems journal, 5(2):78– 101",
+      "citeRegEx" : "7",
+      "shortCiteRegEx" : null,
+      "year" : 1966
+    }, {
+      "title" : "et al",
+      "author" : [ "M.R. Berthold", "N. Cebron", "F. Dill", "T.R. Gabriel" ],
+      "venue" : "KNIME: The Konstanz information miner. In Data analysis, machine learning and applications, pages 319–326. Springer",
+      "citeRegEx" : "8",
+      "shortCiteRegEx" : null,
+      "year" : 2008
+    }, {
+      "title" : "Parallel and distributed computation: numerical methods",
+      "author" : [ "D.P. Bertsekas", "J.N. Tsitsiklis" ],
+      "venue" : "Prentice-Hall, Inc.",
+      "citeRegEx" : "9",
+      "shortCiteRegEx" : null,
+      "year" : 1989
+    }, {
+      "title" : "et al",
+      "author" : [ "Z. Cai", "Z.J. Gao", "S. Luo", "L.L. Perez" ],
+      "venue" : "A comparison of platforms for implementing and running very large scale machine learning algorithms. In SIGMOD 2014, pages 1371–1382",
+      "citeRegEx" : "10",
+      "shortCiteRegEx" : null,
+      "year" : 2014
+    }, {
+      "title" : "The devil is in the details: an evaluation of recent feature encoding methods",
+      "author" : [ "K. Chatfield", "V. Lempitsky", "A. Vedaldi", "A. Zisserman" ],
+      "venue" : "British Machine Vision Conference",
+      "citeRegEx" : "11",
+      "shortCiteRegEx" : null,
+      "year" : 2011
+    }, {
+      "title" : "AutoAdmin ’What-if’ Index Analysis Utility",
+      "author" : [ "S. Chaudhuri", "V.R. Narasayya" ],
+      "venue" : "SIGMOD",
+      "citeRegEx" : "12",
+      "shortCiteRegEx" : null,
+      "year" : 1998
+    }, {
+      "title" : "Revisiting distributed synchronous sgd",
+      "author" : [ "J. Chen", "R. Monga", "S. Bengio", "R. Jozefowicz" ],
+      "venue" : "arXiv preprint arxiv:1604.00981",
+      "citeRegEx" : "13",
+      "shortCiteRegEx" : null,
+      "year" : 2016
+    }, {
+      "title" : "Large-scale l-bfgs using mapreduce",
+      "author" : [ "W. Chen", "Z. Wang", "J. Zhou" ],
+      "venue" : "NIPS, pages 1332–1340",
+      "citeRegEx" : "14",
+      "shortCiteRegEx" : null,
+      "year" : 2014
+    }, {
+      "title" : "Materialized Views",
+      "author" : [ "R. Chirkova", "J. Yang" ],
+      "venue" : "Foundations and Trends in Databases",
+      "citeRegEx" : "15",
+      "shortCiteRegEx" : null,
+      "year" : 2012
+    }, {
+      "title" : "Learning Feature Representations with K-Means",
+      "author" : [ "A. Coates", "A.Y. Ng" ],
+      "venue" : "In Neural Networks: Tricks of the Trade",
+      "citeRegEx" : "16",
+      "shortCiteRegEx" : "16",
+      "year" : 2012
+    }, {
+      "title" : "Tupleware: Distributed machine learning on small clusters",
+      "author" : [ "A. Crotty", "A. Galakatos", "T. Kraska" ],
+      "venue" : "IEEE Data Eng. Bull, 37(3)",
+      "citeRegEx" : "17",
+      "shortCiteRegEx" : null,
+      "year" : 2014
+    }, {
+      "title" : "Communication-optimal parallel and sequential QR and LU factorizations",
+      "author" : [ "J. Demmel", "L. Grigori", "M. Hoemmen", "J. Langou" ],
+      "venue" : "SIAM Journal on Scientific Computing, 34(1):A206–A239",
+      "citeRegEx" : "18",
+      "shortCiteRegEx" : null,
+      "year" : 2012
+    }, {
+      "title" : "ReStore: reusing results of MapReduce jobs",
+      "author" : [ "I. Elghandour", "A. Aboulnaga" ],
+      "venue" : "PVLDB",
+      "citeRegEx" : "19",
+      "shortCiteRegEx" : null,
+      "year" : 2012
+    }, {
+      "title" : "Towards a unified architecture for in-rdbms analytics",
+      "author" : [ "X. Feng", "A. Kumar", "B. Recht", "C. Ré" ],
+      "venue" : "SIGMOD",
+      "citeRegEx" : "20",
+      "shortCiteRegEx" : null,
+      "year" : 2012
+    }, {
+      "title" : "et al",
+      "author" : [ "A. Ghoting", "R. Krishnamurthy", "E. Pednault", "B. Reinwald" ],
+      "venue" : "SystemML: Declarative machine learning on MapReduce. In ICDE, pages 231–242. IEEE",
+      "citeRegEx" : "21",
+      "shortCiteRegEx" : null,
+      "year" : 2011
+    }, {
+      "title" : "The unreasonable effectiveness of data",
+      "author" : [ "A. Halevy", "P. Norvig", "F. Pereira" ],
+      "venue" : "Intelligent Systems, IEEE, 24(2):8– 12",
+      "citeRegEx" : "23",
+      "shortCiteRegEx" : null,
+      "year" : 2009
+    }, {
+      "title" : "Finding Structure with Randomness: Probabilistic Algorithms for Constructing Approximate Matrix Decompositions",
+      "author" : [ "N. Halko", "P.G. Martinsson", "J.A. Tropp" ],
+      "venue" : "SIAM Review",
+      "citeRegEx" : "24",
+      "shortCiteRegEx" : null,
+      "year" : 2011
+    }, {
+      "title" : "Implementing Data Cubes Efficiently",
+      "author" : [ "V. Harinarayan", "A. Rajaraman", "J.D. Ullman" ],
+      "venue" : "SIGMOD, pages 205– 216",
+      "citeRegEx" : "25",
+      "shortCiteRegEx" : null,
+      "year" : 1996
+    }, {
+      "title" : "Query execution techniques for caching expensive methods",
+      "author" : [ "J.M. Hellerstein", "J.F. Naughton" ],
+      "venue" : "SIGMOD",
+      "citeRegEx" : "26",
+      "shortCiteRegEx" : null,
+      "year" : 1997
+    }, {
+      "title" : "et al",
+      "author" : [ "J.M. Hellerstein", "C. Ré", "F. Schoppmann", "D.Z. Wang" ],
+      "venue" : "The MADlib analytics library: or MAD skills, the SQL. PVLDB, 5(12):1700–1711",
+      "citeRegEx" : "27",
+      "shortCiteRegEx" : null,
+      "year" : 2012
+    }, {
+      "title" : "et al",
+      "author" : [ "C.-W. Hsu", "C.-C. Chang", "C.-J. Lin" ],
+      "venue" : "A practical guide to support vector classification. https://goo. gl/m68USr",
+      "citeRegEx" : "28",
+      "shortCiteRegEx" : null,
+      "year" : 2003
+    }, {
+      "title" : "Kernel methods match deep neural networks on timit",
+      "author" : [ "P.-S. Huang", "H. Avron", "T.N. Sainath", "V. Sindhwani", "B. Ramabhadran" ],
+      "venue" : "ICASSP, pages 205–209. IEEE",
+      "citeRegEx" : "29",
+      "shortCiteRegEx" : null,
+      "year" : 2014
+    }, {
+      "title" : "Flare prediction using photospheric and coronal image data",
+      "author" : [ "E. Jonas", "V. Shankar", "M. Bobra", "B. Recht" ],
+      "venue" : "AGU Fall Meeting",
+      "citeRegEx" : "30",
+      "shortCiteRegEx" : null,
+      "year" : 2016
+    }, {
+      "title" : "The Click modular router",
+      "author" : [ "E. Kohler", "R. Morris", "B. Chen", "J. Jannotti", "M.F. Kaashoek" ],
+      "venue" : "ACM Transactions on Computer Systems (TOCS)",
+      "citeRegEx" : "31",
+      "shortCiteRegEx" : null,
+      "year" : 2000
+    }, {
+      "title" : "et al",
+      "author" : [ "T. Kraska", "A. Talwalkar", "J.C. Duchi", "R. Griffith" ],
+      "venue" : "MLbase: A Distributed Machine-learning System. CIDR",
+      "citeRegEx" : "32",
+      "shortCiteRegEx" : null,
+      "year" : 2013
+    }, {
+      "title" : "Convolutional Deep Belief Networks on CIFAR-10",
+      "author" : [ "A. Krizhevsky", "G. Hinton" ],
+      "venue" : "Unpublished manuscript",
+      "citeRegEx" : "33",
+      "shortCiteRegEx" : null,
+      "year" : 2010
+    }, {
+      "title" : "and A",
+      "author" : [ "J. Langford", "L. Li" ],
+      "venue" : "Strehl. Vowpal wabbit online learning project",
+      "citeRegEx" : "34",
+      "shortCiteRegEx" : null,
+      "year" : 2007
+    }, {
+      "title" : "LLVM: A Compilation Framework for Lifelong Program Analysis & Transformation",
+      "author" : [ "C. Lattner", "V. Adve" ],
+      "venue" : "CGO",
+      "citeRegEx" : "35",
+      "shortCiteRegEx" : null,
+      "year" : 2004
+    }, {
+      "title" : "et al",
+      "author" : [ "M. Li", "D.G. Andersen", "J.W. Park", "A.J. Smola" ],
+      "venue" : "Scaling Distributed Machine Learning with the Parameter Server. OSDI",
+      "citeRegEx" : "36",
+      "shortCiteRegEx" : null,
+      "year" : 2014
+    }, {
+      "title" : "et al",
+      "author" : [ "Y. Low", "D. Bickson", "J. Gonzalez", "C. Guestrin" ],
+      "venue" : "Distributed graphlab: a framework for machine learning and data mining in the cloud. PVLDB, 5(8):716–727",
+      "citeRegEx" : "37",
+      "shortCiteRegEx" : null,
+      "year" : 2012
+    }, {
+      "title" : "Object recognition from local scale-invariant features",
+      "author" : [ "D.G. Lowe" ],
+      "venue" : "ICCV, volume 2, pages 1150–1157. IEEE",
+      "citeRegEx" : "38",
+      "shortCiteRegEx" : null,
+      "year" : 1999
+    }, {
+      "title" : "Optimization",
+      "author" : [ "C. Manning", "D. Klein" ],
+      "venue" : "maxent models, and conditional estimation without magic. In HLT- NAACL, Tutorial Vol 5",
+      "citeRegEx" : "39",
+      "shortCiteRegEx" : null,
+      "year" : 2003
+    }, {
+      "title" : "et al",
+      "author" : [ "C.D. Manning", "M. Surdeanu", "J. Bauer", "J. Finkel" ],
+      "venue" : "The Stanford CoreNLP natural language processing toolkit. In ACL",
+      "citeRegEx" : "40",
+      "shortCiteRegEx" : null,
+      "year" : 2014
+    }, {
+      "title" : "Fast Training of Convolutional Networks through FFTs",
+      "author" : [ "M. Mathieu", "M. Henaff", "Y. LeCun" ],
+      "venue" : "ICLR",
+      "citeRegEx" : "41",
+      "shortCiteRegEx" : null,
+      "year" : 2014
+    }, {
+      "title" : "Inferring networks of substitutable and complementary products",
+      "author" : [ "J. McAuley", "R. Pandey", "J. Leskovec" ],
+      "venue" : "KDD, pages 785–794",
+      "citeRegEx" : "42",
+      "shortCiteRegEx" : null,
+      "year" : 2015
+    }, {
+      "title" : "ML Pipelines: A New High-Level API for MLlib",
+      "author" : [ "X. Meng", "J. Bradley", "E. Sparks", "S. Venkataraman" ],
+      "venue" : "https: //goo.gl/pluhq0",
+      "citeRegEx" : "43",
+      "shortCiteRegEx" : null,
+      "year" : 2015
+    }, {
+      "title" : "et al",
+      "author" : [ "X. Meng", "J.K. Bradley", "B. Yavuz", "E.R. Sparks" ],
+      "venue" : "MLlib: Machine Learning in Apache Spark. CoRR, abs/1505.06807",
+      "citeRegEx" : "44",
+      "shortCiteRegEx" : null,
+      "year" : 2015
+    }, {
+      "title" : "et al",
+      "author" : [ "F. Pedregosa", "G. Varoquaux", "A. Gramfort" ],
+      "venue" : "Scikitlearn: Machine learning in Python. JMLR, 12:2825– 2830",
+      "citeRegEx" : "45",
+      "shortCiteRegEx" : null,
+      "year" : 2011
+    }, {
+      "title" : "History-aware query optimization with materialized intermediate views",
+      "author" : [ "L. Perez", "C. Jermaine" ],
+      "venue" : "In ICDE,",
+      "citeRegEx" : "46",
+      "shortCiteRegEx" : "46",
+      "year" : 2014
+    }, {
+      "title" : "Scalable I/O-bound Parallel Incremental Gradient Descent for Big Data Analytics in GLADE",
+      "author" : [ "C. Qin", "F. Rusu" ],
+      "venue" : "DanaC",
+      "citeRegEx" : "47",
+      "shortCiteRegEx" : null,
+      "year" : 2013
+    }, {
+      "title" : "Memory versus randomization in on-line algorithms",
+      "author" : [ "P. Raghavan", "M. Snir" ],
+      "venue" : "International Colloquium on Automata, Languages, and Programming, pages 687–703. Springer",
+      "citeRegEx" : "48",
+      "shortCiteRegEx" : null,
+      "year" : 1989
+    }, {
+      "title" : "Random features for large-scale kernel machines",
+      "author" : [ "A. Rahimi", "B. Recht" ],
+      "venue" : "NIPS, pages 1177–1184",
+      "citeRegEx" : "49",
+      "shortCiteRegEx" : null,
+      "year" : 2007
+    }, {
+      "title" : "Hogwild!: A lockfree approach to parallelizing stochastic gradient descent",
+      "author" : [ "B. Recht", "C. Re", "S. Wright", "F. Niu" ],
+      "venue" : "NIPS, pages 693–701",
+      "citeRegEx" : "50",
+      "shortCiteRegEx" : null,
+      "year" : 2011
+    }, {
+      "title" : "Improved fisher vector for large scale image classification. http://image-net.org/challenges/ LSVRC/2010/ILSVRC2010_XRCE.pdf",
+      "author" : [ "J. Sanchez", "F. Perronnin", "T. Mensink" ],
+      "venue" : null,
+      "citeRegEx" : "51",
+      "shortCiteRegEx" : "51",
+      "year" : 2010
+    }, {
+      "title" : "Image classification with the fisher vector: Theory and practice",
+      "author" : [ "J. Sánchez", "F. Perronnin", "T. Mensink", "J. Verbeek" ],
+      "venue" : "International journal of computer vision, 105(3):222–245",
+      "citeRegEx" : "52",
+      "shortCiteRegEx" : null,
+      "year" : 2013
+    }, {
+      "title" : "Machine learning: The high interest credit card of technical debt",
+      "author" : [ "D. Sculley", "G. Holt", "D. Golovin", "E. Davydov", "T. Phillips", "D. Ebner", "V. Chaudhary", "M. Young" ],
+      "venue" : "SE4ML: Software Engineering for Machine Learning ",
+      "citeRegEx" : "53",
+      "shortCiteRegEx" : null,
+      "year" : 2014
+    }, {
+      "title" : "Access path selection in a relational database management system",
+      "author" : [ "P.G. Selinger", "M.M. Astrahan", "D.D. Chamberlin", "R.A. Lorie", "T.G. Price" ],
+      "venue" : null,
+      "citeRegEx" : "54",
+      "shortCiteRegEx" : "54",
+      "year" : 1979
+    }, {
+      "title" : "High-performance kernel machines with implicit distributed optimization and randomization",
+      "author" : [ "V. Sindhwani", "H. Avron" ],
+      "venue" : "CoRR, abs/1409.0940",
+      "citeRegEx" : "55",
+      "shortCiteRegEx" : null,
+      "year" : 2014
+    }, {
+      "title" : "et al",
+      "author" : [ "E.R. Sparks", "A. Talwalkar", "D. Haas", "M.J. Franklin" ],
+      "venue" : "Automating model search for large scale machine learning. In SoCC ’15",
+      "citeRegEx" : "56",
+      "shortCiteRegEx" : null,
+      "year" : 2015
+    }, {
+      "title" : "Requirements for science data bases and scidb",
+      "author" : [ "M. Stonebraker", "J. Becla", "D.J. DeWitt", "K.-T. Lim", "D. Maier", "O. Ratzesberger", "S.B. Zdonik" ],
+      "venue" : "CIDR, volume 7, pages 173–184",
+      "citeRegEx" : "57",
+      "shortCiteRegEx" : null,
+      "year" : 2009
+    }, {
+      "title" : "et al",
+      "author" : [ "C. Szegedy", "V. Vanhoucke" ],
+      "venue" : "Rethinking the inception architecture for computer vision. arXiv preprint arXiv:1512.00567",
+      "citeRegEx" : "58",
+      "shortCiteRegEx" : null,
+      "year" : 2015
+    }, {
+      "title" : "Roofline: An Insightful Visual Performance Model for Multicore Architectures",
+      "author" : [ "S. Williams", "A. Waterman", "D. Patterson" ],
+      "venue" : "CACM",
+      "citeRegEx" : "59",
+      "shortCiteRegEx" : null,
+      "year" : 2009
+    }, {
+      "title" : "Materialization optimizations for feature selection workloads",
+      "author" : [ "C. Zhang", "A. Kumar", "C. Ré" ],
+      "venue" : "SIGMOD",
+      "citeRegEx" : "60",
+      "shortCiteRegEx" : null,
+      "year" : 2014
+    }, {
+      "title" : "Dimmwitted: A study of mainmemory statistical analytics",
+      "author" : [ "C. Zhang", "C. Ré" ],
+      "venue" : "PVLDB, 7(12):1283–1294",
+      "citeRegEx" : "61",
+      "shortCiteRegEx" : null,
+      "year" : 2014
+    }, {
+      "title" : "RIOT: I/O-Efficient Numerical Computing without SQL",
+      "author" : [ "Y. Zhang", "H. Herodotou", "J. Yang" ],
+      "venue" : "CIDR",
+      "citeRegEx" : "62",
+      "shortCiteRegEx" : null,
+      "year" : 2009
+    }, {
+      "title" : "Recommending Materialized Views and Indexes with IBM DB2 Design Advisor",
+      "author" : [ "D.C. Zilio", "C. Zuzarte", "G.M. Lohman", "H. Pirahesh" ],
+      "venue" : "ICAC",
+      "citeRegEx" : "63",
+      "shortCiteRegEx" : "63",
+      "year" : 2004
+    } ],
+    "referenceMentions" : [ {
+      "referenceID" : 35,
+      "context" : "Today’s advanced analytics applications increasingly use machine learning (ML) as a core technique in areas ranging from business intelligence to recommendation to natural language processing [39] and speech recognition [29].",
+      "startOffset" : 192,
+      "endOffset" : 196
+    }, {
+      "referenceID" : 25,
+      "context" : "Today’s advanced analytics applications increasingly use machine learning (ML) as a core technique in areas ranging from business intelligence to recommendation to natural language processing [39] and speech recognition [29].",
+      "startOffset" : 220,
+      "endOffset" : 224
+    }, {
+      "referenceID" : 48,
+      "context" : "Practitioners build complex, multi-stage pipelines involving feature extraction, dimensionality reduction, data transformations, and training supervised learning models to achieve high accuracy [52].",
+      "startOffset" : 194,
+      "endOffset" : 198
+    }, {
+      "referenceID" : 30,
+      "context" : "To assemble such pipelines, developers typically piece together domain specific libraries1 for feature extraction and general purpose numerical optimization packages [34, 44] for supervised learning.",
+      "startOffset" : 166,
+      "endOffset" : 174
+    }, {
+      "referenceID" : 40,
+      "context" : "To assemble such pipelines, developers typically piece together domain specific libraries1 for feature extraction and general purpose numerical optimization packages [34, 44] for supervised learning.",
+      "startOffset" : 166,
+      "endOffset" : 174
+    }, {
+      "referenceID" : 49,
+      "context" : "This is often a cumbersome and error-prone process [53].",
+      "startOffset" : 51,
+      "endOffset" : 55
+    }, {
+      "referenceID" : 19,
+      "context" : "Further, these pipelines need to be completely re-engineered when the training data or features grow by an order of magnitude– often the difference between an application that provides good statistical accuracy and one that does not [23].",
+      "startOffset" : 233,
+      "endOffset" : 237
+    }, {
+      "referenceID" : 23,
+      "context" : "While existing efforts in the data management community [27, 21, 44] and in the broader machine learning systems community [34, 45, 3] have built systems to address some of these problems, each of them misses the mark on at least one of the points above.",
+      "startOffset" : 56,
+      "endOffset" : 68
+    }, {
+      "referenceID" : 18,
+      "context" : "While existing efforts in the data management community [27, 21, 44] and in the broader machine learning systems community [34, 45, 3] have built systems to address some of these problems, each of them misses the mark on at least one of the points above.",
+      "startOffset" : 56,
+      "endOffset" : 68
+    }, {
+      "referenceID" : 40,
+      "context" : "While existing efforts in the data management community [27, 21, 44] and in the broader machine learning systems community [34, 45, 3] have built systems to address some of these problems, each of them misses the mark on at least one of the points above.",
+      "startOffset" : 56,
+      "endOffset" : 68
+    }, {
+      "referenceID" : 30,
+      "context" : "While existing efforts in the data management community [27, 21, 44] and in the broader machine learning systems community [34, 45, 3] have built systems to address some of these problems, each of them misses the mark on at least one of the points above.",
+      "startOffset" : 123,
+      "endOffset" : 134
+    }, {
+      "referenceID" : 41,
+      "context" : "While existing efforts in the data management community [27, 21, 44] and in the broader machine learning systems community [34, 45, 3] have built systems to address some of these problems, each of them misses the mark on at least one of the points above.",
+      "startOffset" : 123,
+      "endOffset" : 134
+    }, {
+      "referenceID" : 0,
+      "context" : "While existing efforts in the data management community [27, 21, 44] and in the broader machine learning systems community [34, 45, 3] have built systems to address some of these problems, each of them misses the mark on at least one of the points above.",
+      "startOffset" : 123,
+      "endOffset" : 134
+    }, {
+      "referenceID" : 57,
+      "context" : "While a significant body of recent work has focused on high performance algorithms [61, 50],",
+      "startOffset" : 83,
+      "endOffset" : 91
+    }, {
+      "referenceID" : 46,
+      "context" : "While a significant body of recent work has focused on high performance algorithms [61, 50],",
+      "startOffset" : 83,
+      "endOffset" : 91
+    }, {
+      "referenceID" : 14,
+      "context" : "and scalable implementations [17, 44] for model training, they do not capture the featurization process or the logical intent of the workflow.",
+      "startOffset" : 29,
+      "endOffset" : 37
+    }, {
+      "referenceID" : 40,
+      "context" : "and scalable implementations [17, 44] for model training, they do not capture the featurization process or the logical intent of the workflow.",
+      "startOffset" : 29,
+      "endOffset" : 37
+    }, {
+      "referenceID" : 28,
+      "context" : "To optimize ML pipelines, database query optimization provides a natural motivation for the core design of such a system [32].",
+      "startOffset" : 121,
+      "endOffset" : 125
+    }, {
+      "referenceID" : 46,
+      "context" : "Second, many ML operators provide only approximate answers to their inputs [50].",
+      "startOffset" : 75,
+      "endOffset" : 79
+    }, {
+      "referenceID" : 18,
+      "context" : "Finally, the system should be aware of the computationvs-communication tradeoffs inherent in distributed processing of ML workloads [21, 34] and choose appropriate execution strategies in this regime.",
+      "startOffset" : 132,
+      "endOffset" : 140
+    }, {
+      "referenceID" : 30,
+      "context" : "Finally, the system should be aware of the computationvs-communication tradeoffs inherent in distributed processing of ML workloads [21, 34] and choose appropriate execution strategies in this regime.",
+      "startOffset" : 132,
+      "endOffset" : 140
+    }, {
+      "referenceID" : 48,
+      "context" : "Using an image classification pipeline on over 1M images [52], we show that KeystoneML provides linear performance scalability across various cluster sizes, and statistical performance comparable to recent results [11, 52].",
+      "startOffset" : 57,
+      "endOffset" : 61
+    }, {
+      "referenceID" : 8,
+      "context" : "Using an image classification pipeline on over 1M images [52], we show that KeystoneML provides linear performance scalability across various cluster sizes, and statistical performance comparable to recent results [11, 52].",
+      "startOffset" : 214,
+      "endOffset" : 222
+    }, {
+      "referenceID" : 48,
+      "context" : "Using an image classification pipeline on over 1M images [52], we show that KeystoneML provides linear performance scalability across various cluster sizes, and statistical performance comparable to recent results [11, 52].",
+      "startOffset" : 214,
+      "endOffset" : 222
+    }, {
+      "referenceID" : 26,
+      "context" : "KeystoneML is open source software2 and is being used in scientific applications in solar physics [30] and genomics [2]",
+      "startOffset" : 98,
+      "endOffset" : 102
+    }, {
+      "referenceID" : 18,
+      "context" : "using linear algebra operators such as matrix multiplication [21], convex optimization routines [20] or multidimensional arrays as logical building blocks [57].",
+      "startOffset" : 61,
+      "endOffset" : 65
+    }, {
+      "referenceID" : 17,
+      "context" : "using linear algebra operators such as matrix multiplication [21], convex optimization routines [20] or multidimensional arrays as logical building blocks [57].",
+      "startOffset" : 96,
+      "endOffset" : 100
+    }, {
+      "referenceID" : 53,
+      "context" : "using linear algebra operators such as matrix multiplication [21], convex optimization routines [20] or multidimensional arrays as logical building blocks [57].",
+      "startOffset" : 155,
+      "endOffset" : 159
+    }, {
+      "referenceID" : 18,
+      "context" : "But this makes designing an optimizer more challenging because unlike relational operators or linear algebra [21], the set of operators in KeystoneML is not closed.",
+      "startOffset" : 109,
+      "endOffset" : 113
+    }, {
+      "referenceID" : 55,
+      "context" : "The functions, cexec, and ccoord are developer-defined operator-specific functions (defined as part of the operator CostModel) that describe execution and coordination costs in terms of the longest critical path in the execution graph of the individual operators [59], e.",
+      "startOffset" : 263,
+      "endOffset" : 267
+    }, {
+      "referenceID" : 3,
+      "context" : "Such functions are also used in the analysis of parallel algorithms [6] and are well known for common linear algebra based operators.",
+      "startOffset" : 68,
+      "endOffset" : 71
+    }, {
+      "referenceID" : 15,
+      "context" : "• Exact solvers [18] that compute closed form solutions to the least squares loss and return an X to extremely high precision.",
+      "startOffset" : 16,
+      "endOffset" : 20
+    }, {
+      "referenceID" : 6,
+      "context" : "• Block solvers that partition the features into a set of blocks and use second-order Jacobi or GaussSeidel [9] updates to converge to the right solution.",
+      "startOffset" : 108,
+      "endOffset" : 111
+    }, {
+      "referenceID" : 46,
+      "context" : "• Gradient based methods like SGD [50] or LBFGS [14] which perform iterative updates using the gradient and converge to a globally optimal solution.",
+      "startOffset" : 34,
+      "endOffset" : 38
+    }, {
+      "referenceID" : 11,
+      "context" : "• Gradient based methods like SGD [50] or LBFGS [14] which perform iterative updates using the gradient and converge to a globally optimal solution.",
+      "startOffset" : 48,
+      "endOffset" : 52
+    }, {
+      "referenceID" : 20,
+      "context" : "cated SVD [24].",
+      "startOffset" : 10,
+      "endOffset" : 14
+    }, {
+      "referenceID" : 2,
+      "context" : "a matrix-vector product scheme when convolutions are separable, using BLAS matrix-matrix multiplication [5], or via a Fast Fourier Transform (FFT) [41].",
+      "startOffset" : 104,
+      "endOffset" : 107
+    }, {
+      "referenceID" : 37,
+      "context" : "a matrix-vector product scheme when convolutions are separable, using BLAS matrix-matrix multiplication [5], or via a Fast Fourier Transform (FFT) [41].",
+      "startOffset" : 147,
+      "endOffset" : 151
+    }, {
+      "referenceID" : 12,
+      "context" : "Cache management and automatic selection of materialized views are important optimizations used by database management systems [15] and they have been studied in the context of analytical query systems [63, 25], and feature selection [60].",
+      "startOffset" : 127,
+      "endOffset" : 131
+    }, {
+      "referenceID" : 59,
+      "context" : "Cache management and automatic selection of materialized views are important optimizations used by database management systems [15] and they have been studied in the context of analytical query systems [63, 25], and feature selection [60].",
+      "startOffset" : 202,
+      "endOffset" : 210
+    }, {
+      "referenceID" : 21,
+      "context" : "Cache management and automatic selection of materialized views are important optimizations used by database management systems [15] and they have been studied in the context of analytical query systems [63, 25], and feature selection [60].",
+      "startOffset" : 202,
+      "endOffset" : 210
+    }, {
+      "referenceID" : 56,
+      "context" : "Cache management and automatic selection of materialized views are important optimizations used by database management systems [15] and they have been studied in the context of analytical query systems [63, 25], and feature selection [60].",
+      "startOffset" : 234,
+      "endOffset" : 238
+    }, {
+      "referenceID" : 4,
+      "context" : "It is tempting to reach for classical results [7, 48] in the optimal paging literature to identify an optimal or near-optimal schedule for this problem.",
+      "startOffset" : 46,
+      "endOffset" : 53
+    }, {
+      "referenceID" : 44,
+      "context" : "It is tempting to reach for classical results [7, 48] in the optimal paging literature to identify an optimal or near-optimal schedule for this problem.",
+      "startOffset" : 46,
+      "endOffset" : 53
+    }, {
+      "referenceID" : 40,
+      "context" : "Implementation: We implement KeystoneML on top of Apache Spark, a cluster computing engine that has been shown to have good scalability and performance for many iterative ML algorithms [44].",
+      "startOffset" : 185,
+      "endOffset" : 189
+    }, {
+      "referenceID" : 30,
+      "context" : "We use OpenBLAS for numerical operations and Vowpal Wabbit [34] v8.",
+      "startOffset" : 59,
+      "endOffset" : 63
+    }, {
+      "referenceID" : 18,
+      "context" : "0 and SystemML [21] v0.",
+      "startOffset" : 15,
+      "endOffset" : 19
+    }, {
+      "referenceID" : 36,
+      "context" : "Combined with libraries like CoreNLP [40], KeystoneML allows for scalable implementations of many text classification pipelines such as the one shown in Figure 2.",
+      "startOffset" : 37,
+      "endOffset" : 41
+    }, {
+      "referenceID" : 35,
+      "context" : "We evaluated a text classification pipeline based on [39] on the Amazon Reviews dataset of 65m product reviews [42] with 100k sparse features.",
+      "startOffset" : 53,
+      "endOffset" : 57
+    }, {
+      "referenceID" : 38,
+      "context" : "We evaluated a text classification pipeline based on [39] on the Amazon Reviews dataset of 65m product reviews [42] with 100k sparse features.",
+      "startOffset" : 111,
+      "endOffset" : 115
+    }, {
+      "referenceID" : 30,
+      "context" : "We find that KeystoneML matches the statistical performance of a Vowpal Wabbit [34] pipeline when run on identical resources",
+      "startOffset" : 79,
+      "endOffset" : 83
+    }, {
+      "referenceID" : 24,
+      "context" : "Often their performance has been shown to be much better than simpler generalized linear models [28].",
+      "startOffset" : 96,
+      "endOffset" : 100
+    }, {
+      "referenceID" : 45,
+      "context" : "Kernel evaluations can be efficiently approximated using random feature transformations [49, 55] and pipelines are a natural way to specify such transformations.",
+      "startOffset" : 88,
+      "endOffset" : 96
+    }, {
+      "referenceID" : 51,
+      "context" : "Kernel evaluations can be efficiently approximated using random feature transformations [49, 55] and pipelines are a natural way to specify such transformations.",
+      "startOffset" : 88,
+      "endOffset" : 96
+    }, {
+      "referenceID" : 51,
+      "context" : "By contrast, a 256 node IBM Blue Gene machine with 16 cores per machine takes around 120 minutes [55].",
+      "startOffset" : 97,
+      "endOffset" : 101
+    }, {
+      "referenceID" : 48,
+      "context" : "convolutions or spatially-pooled fisher vectors [52], can be used to generate training features.",
+      "startOffset" : 48,
+      "endOffset" : 52
+    }, {
+      "referenceID" : 34,
+      "context" : "KeystoneML makes it easy to modularize the pipeline to use efficient implementations of image processing operators like SIFT [38] and Fisher Vectors [52, 11].",
+      "startOffset" : 125,
+      "endOffset" : 129
+    }, {
+      "referenceID" : 48,
+      "context" : "KeystoneML makes it easy to modularize the pipeline to use efficient implementations of image processing operators like SIFT [38] and Fisher Vectors [52, 11].",
+      "startOffset" : 149,
+      "endOffset" : 157
+    }, {
+      "referenceID" : 8,
+      "context" : "KeystoneML makes it easy to modularize the pipeline to use efficient implementations of image processing operators like SIFT [38] and Fisher Vectors [52, 11].",
+      "startOffset" : 149,
+      "endOffset" : 157
+    }, {
+      "referenceID" : 29,
+      "context" : "Many of the same operators we consider here are necessary components of “deep-learning” pipelines [33] which typically train neural networks via stochastic gradient descent and backpropagation.",
+      "startOffset" : 98,
+      "endOffset" : 102
+    }, {
+      "referenceID" : 8,
+      "context" : "Using the VOC dataset, we implement the pipeline described in [11].",
+      "startOffset" : 62,
+      "endOffset" : 66
+    }, {
+      "referenceID" : 47,
+      "context" : "The original pipeline takes four days [51] to run using a highly specialized codebase on a 16-core maDataset KeystoneML Reported Accuracy Time (m) Accuracy Time (m)",
+      "startOffset" : 38,
+      "endOffset" : 42
+    }, {
+      "referenceID" : 35,
+      "context" : "Amazon [39] 91.",
+      "startOffset" : 7,
+      "endOffset" : 11
+    }, {
+      "referenceID" : 25,
+      "context" : "3 TIMIT [29] 66.",
+      "startOffset" : 8,
+      "endOffset" : 12
+    }, {
+      "referenceID" : 48,
+      "context" : "33% 120 ImageNet [52]3 67.",
+      "startOffset" : 17,
+      "endOffset" : 21
+    }, {
+      "referenceID" : 8,
+      "context" : "58% 5760 VOC 2007 [11] 57.",
+      "startOffset" : 18,
+      "endOffset" : 22
+    }, {
+      "referenceID" : 30,
+      "context" : "We compare runtimes for the KeystoneML solver with both a specialized system, Vowpal Wabbit [34], built to estimate linear models, and SystemML [21], a general purpose ML system, which optimizes the implementation of linear algebra operators used in specific algorithms (e.",
+      "startOffset" : 92,
+      "endOffset" : 96
+    }, {
+      "referenceID" : 18,
+      "context" : "We compare runtimes for the KeystoneML solver with both a specialized system, Vowpal Wabbit [34], built to estimate linear models, and SystemML [21], a general purpose ML system, which optimizes the implementation of linear algebra operators used in specific algorithms (e.",
+      "startOffset" : 144,
+      "endOffset" : 148
+    }, {
+      "referenceID" : 0,
+      "context" : "TensorFlow is a newly open-sourced ML system developed by Google [3].",
+      "startOffset" : 65,
+      "endOffset" : 68
+    }, {
+      "referenceID" : 10,
+      "context" : "8 and adapt a multi-GPU example [1] to a distributed setting in a procedure similar to [13].",
+      "startOffset" : 87,
+      "endOffset" : 91
+    }, {
+      "referenceID" : 29,
+      "context" : "Specifically, TensorFlow implements a model similar to the one presented in [33], while in KeystoneML we implement a version of the model similar to [16].",
+      "startOffset" : 76,
+      "endOffset" : 80
+    }, {
+      "referenceID" : 13,
+      "context" : "Specifically, TensorFlow implements a model similar to the one presented in [33], while in KeystoneML we implement a version of the model similar to [16].",
+      "startOffset" : 149,
+      "endOffset" : 153
+    }, {
+      "referenceID" : 54,
+      "context" : "While TensorFlow has better scalability on some model architectures [58], it is not scalable for other architectures.",
+      "startOffset" : 68,
+      "endOffset" : 72
+    }, {
+      "referenceID" : 1,
+      "context" : "Finally, a recent benchmark dataset from YouTube [4] describes learning pipelines involving featurization with a neural network [58] followed by a logistic regression model or SVM.",
+      "startOffset" : 49,
+      "endOffset" : 52
+    }, {
+      "referenceID" : 54,
+      "context" : "Finally, a recent benchmark dataset from YouTube [4] describes learning pipelines involving featurization with a neural network [58] followed by a logistic regression model or SVM.",
+      "startOffset" : 128,
+      "endOffset" : 132
+    }, {
+      "referenceID" : 15,
+      "context" : "However, some estimators like linear solvers need coordination [18] among workers to compute correct results.",
+      "startOffset" : 63,
+      "endOffset" : 67
+    }, {
+      "referenceID" : 15,
+      "context" : "Scaling linear solvers is known to require coordination [18], which leads directly to sub-linear scalability of the whole pipeline.",
+      "startOffset" : 56,
+      "endOffset" : 60
+    }, {
+      "referenceID" : 41,
+      "context" : "The importance of feature engineering has led to tools like scikit-learn [45] and KNIME [8] adding support for featurization for small datasets.",
+      "startOffset" : 73,
+      "endOffset" : 77
+    }, {
+      "referenceID" : 5,
+      "context" : "The importance of feature engineering has led to tools like scikit-learn [45] and KNIME [8] adding support for featurization for small datasets.",
+      "startOffset" : 88,
+      "endOffset" : 91
+    }, {
+      "referenceID" : 7,
+      "context" : "Further, existing libraries for large scale ML [10] like Vowpal Wabbit [34], GraphLab [37], MLlib [44], RIOT [62], DimmWitted [61] focus on efficient implementations of learning algorithms like regression, classification and linear alge-",
+      "startOffset" : 47,
+      "endOffset" : 51
+    }, {
+      "referenceID" : 30,
+      "context" : "Further, existing libraries for large scale ML [10] like Vowpal Wabbit [34], GraphLab [37], MLlib [44], RIOT [62], DimmWitted [61] focus on efficient implementations of learning algorithms like regression, classification and linear alge-",
+      "startOffset" : 71,
+      "endOffset" : 75
+    }, {
+      "referenceID" : 33,
+      "context" : "Further, existing libraries for large scale ML [10] like Vowpal Wabbit [34], GraphLab [37], MLlib [44], RIOT [62], DimmWitted [61] focus on efficient implementations of learning algorithms like regression, classification and linear alge-",
+      "startOffset" : 86,
+      "endOffset" : 90
+    }, {
+      "referenceID" : 40,
+      "context" : "Further, existing libraries for large scale ML [10] like Vowpal Wabbit [34], GraphLab [37], MLlib [44], RIOT [62], DimmWitted [61] focus on efficient implementations of learning algorithms like regression, classification and linear alge-",
+      "startOffset" : 98,
+      "endOffset" : 102
+    }, {
+      "referenceID" : 58,
+      "context" : "Further, existing libraries for large scale ML [10] like Vowpal Wabbit [34], GraphLab [37], MLlib [44], RIOT [62], DimmWitted [61] focus on efficient implementations of learning algorithms like regression, classification and linear alge-",
+      "startOffset" : 109,
+      "endOffset" : 113
+    }, {
+      "referenceID" : 57,
+      "context" : "Further, existing libraries for large scale ML [10] like Vowpal Wabbit [34], GraphLab [37], MLlib [44], RIOT [62], DimmWitted [61] focus on efficient implementations of learning algorithms like regression, classification and linear alge-",
+      "startOffset" : 126,
+      "endOffset" : 130
+    }, {
+      "referenceID" : 32,
+      "context" : "Work in Parameter Servers [36] has studied how to share model updates.",
+      "startOffset" : 26,
+      "endOffset" : 30
+    }, {
+      "referenceID" : 18,
+      "context" : "Closely related to KeystoneML is SystemML [21] which also uses an optimization based approach to determine the physical execution strategy of ML algorithms.",
+      "startOffset" : 42,
+      "endOffset" : 46
+    }, {
+      "referenceID" : 56,
+      "context" : "Other work [60, 5] has looked at optimizing caching strategies and operator selection in the regime of feature selection and feature generation workloads.",
+      "startOffset" : 11,
+      "endOffset" : 18
+    }, {
+      "referenceID" : 2,
+      "context" : "Other work [60, 5] has looked at optimizing caching strategies and operator selection in the regime of feature selection and feature generation workloads.",
+      "startOffset" : 11,
+      "endOffset" : 18
+    }, {
+      "referenceID" : 0,
+      "context" : "Developed concurrently to KeystoneML is TensorFlow [3].",
+      "startOffset" : 51,
+      "endOffset" : 54
+    }, {
+      "referenceID" : 17,
+      "context" : "Projects such as Bismarck [20], MADLib [27], and GLADE [47] have proposed techniques to integrate ML algorithms inside database engines.",
+      "startOffset" : 26,
+      "endOffset" : 30
+    }, {
+      "referenceID" : 23,
+      "context" : "Projects such as Bismarck [20], MADLib [27], and GLADE [47] have proposed techniques to integrate ML algorithms inside database engines.",
+      "startOffset" : 39,
+      "endOffset" : 43
+    }, {
+      "referenceID" : 43,
+      "context" : "Projects such as Bismarck [20], MADLib [27], and GLADE [47] have proposed techniques to integrate ML algorithms inside database engines.",
+      "startOffset" : 55,
+      "endOffset" : 59
+    }, {
+      "referenceID" : 39,
+      "context" : "Finally, Spark ML [43] represents an early design of a similar high-level API for machine learning.",
+      "startOffset" : 18,
+      "endOffset" : 22
+    }, {
+      "referenceID" : 31,
+      "context" : "Finally, the concept of using a high-level programming model has been explored in a number of other contexts, including compilers [35] and networking [31].",
+      "startOffset" : 130,
+      "endOffset" : 134
+    }, {
+      "referenceID" : 27,
+      "context" : "Finally, the concept of using a high-level programming model has been explored in a number of other contexts, including compilers [35] and networking [31].",
+      "startOffset" : 150,
+      "endOffset" : 154
+    }, {
+      "referenceID" : 50,
+      "context" : "Even the earliest relational query optimizers [54] used multiple physical implementations of equivalent logical operators, and like many relational optimizers, the KeystoneML optimizer is cost-based.",
+      "startOffset" : 46,
+      "endOffset" : 50
+    }, {
+      "referenceID" : 12,
+      "context" : "The caching strategy employed by KeystoneML can be viewed as a form of view selection for materialized view maintenance over queries with expensive userdefined functions [15, 26], we focus on materialization for intra-query optimization, as opposed to inter-query optimization [25, 12, 63, 19, 46].",
+      "startOffset" : 170,
+      "endOffset" : 178
+    }, {
+      "referenceID" : 22,
+      "context" : "The caching strategy employed by KeystoneML can be viewed as a form of view selection for materialized view maintenance over queries with expensive userdefined functions [15, 26], we focus on materialization for intra-query optimization, as opposed to inter-query optimization [25, 12, 63, 19, 46].",
+      "startOffset" : 170,
+      "endOffset" : 178
+    }, {
+      "referenceID" : 21,
+      "context" : "The caching strategy employed by KeystoneML can be viewed as a form of view selection for materialized view maintenance over queries with expensive userdefined functions [15, 26], we focus on materialization for intra-query optimization, as opposed to inter-query optimization [25, 12, 63, 19, 46].",
+      "startOffset" : 277,
+      "endOffset" : 297
+    }, {
+      "referenceID" : 9,
+      "context" : "The caching strategy employed by KeystoneML can be viewed as a form of view selection for materialized view maintenance over queries with expensive userdefined functions [15, 26], we focus on materialization for intra-query optimization, as opposed to inter-query optimization [25, 12, 63, 19, 46].",
+      "startOffset" : 277,
+      "endOffset" : 297
+    }, {
+      "referenceID" : 59,
+      "context" : "The caching strategy employed by KeystoneML can be viewed as a form of view selection for materialized view maintenance over queries with expensive userdefined functions [15, 26], we focus on materialization for intra-query optimization, as opposed to inter-query optimization [25, 12, 63, 19, 46].",
+      "startOffset" : 277,
+      "endOffset" : 297
+    }, {
+      "referenceID" : 16,
+      "context" : "The caching strategy employed by KeystoneML can be viewed as a form of view selection for materialized view maintenance over queries with expensive userdefined functions [15, 26], we focus on materialization for intra-query optimization, as opposed to inter-query optimization [25, 12, 63, 19, 46].",
+      "startOffset" : 277,
+      "endOffset" : 297
+    }, {
+      "referenceID" : 42,
+      "context" : "The caching strategy employed by KeystoneML can be viewed as a form of view selection for materialized view maintenance over queries with expensive userdefined functions [15, 26], we focus on materialization for intra-query optimization, as opposed to inter-query optimization [25, 12, 63, 19, 46].",
+      "startOffset" : 277,
+      "endOffset" : 297
+    }, {
+      "referenceID" : 52,
+      "context" : "We plan to investigate pipeline optimizations like node reordering to reduce data transfers and also look at how hyperparameter tuning [56] can be integrated into the system.",
+      "startOffset" : 135,
+      "endOffset" : 139
+    }, {
+      "referenceID" : 32,
+      "context" : "In the future we plan to study how algorithms like asynchronous SGD [36] or back-propagation can be integrated with the robustness and scalability that KeystoneML provides.",
+      "startOffset" : 68,
+      "endOffset" : 72
+    } ],
+    "year" : 2016,
+    "abstractText" : "Modern advanced analytics applications make use of machine learning techniques and contain multiple steps of domain-specific and general-purpose processing with high resource requirements. We present KeystoneML, a system that captures and optimizes the end-to-end largescale machine learning applications for high-throughput training in a distributed environment with a high-level API. This approach offers increased ease of use and higher performance over existing systems for large scale learning. We demonstrate the effectiveness of KeystoneML in achieving high quality statistical accuracy and scalable training using real world datasets in several domains. By optimizing execution KeystoneML achieves up to 15× training throughput over unoptimized execution on a real image classification application.",
+    "creator" : "LaTeX with hyperref package"
+  }
+}

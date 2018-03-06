@@ -1,4 +1,6 @@
+
 class Review:
+
   """A review class, contains all bunch of relevant fields"""
   def __init__(self, RECOMMENDATION, COMMENTS, REPLICABILITY=None, PRESENTATION_FORMAT=None, \
          CLARITY=None, MEANINGFUL_COMPARISON=None, SUBSTANCE=None, REVIEWER_CONFIDENCE=None, \

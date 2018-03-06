@@ -1,6 +1,4 @@
-import re,io
-import json
-import sys
+import re,io,json,sys
 from Review import Review
 
 class Paper:
@@ -66,18 +64,18 @@ class Paper:
     return papers
 
   @staticmethod
-  def from_json(json_filename):
+  def from_json(json_filename, from_annotated = False):
     paper = Paper('', '', None, [])
 
     datas = []
     with io.open(json_filename, mode='rt', encoding='utf8') as json_file:
       for line in json_file:
-      try:
-        data = json.loads(line.strip())
-        datas.append(data)
-      except Exception as e:
-        print line
-        continue
+        try:
+          data = json.loads(line.strip())
+          datas.append(data)
+        except Exception as e:
+          print line
+          continue
     if len(datas)==0: return None
     data = datas[-1]
 
@@ -175,8 +173,8 @@ class Paper:
     if self.HISTORIES is not None:
       for h in self.get_histories():
         if h is not None:
-        v,d,l,p = h
-        data["histories"].append((v,d,l, p if p else None))
+          v,d,l,p = h
+          data["histories"].append((v,d,l, p if p else None))
 
     return data
 

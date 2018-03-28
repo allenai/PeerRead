@@ -5,9 +5,10 @@ class Review:
   def __init__(self, RECOMMENDATION, COMMENTS, REPLICABILITY=None, PRESENTATION_FORMAT=None, \
          CLARITY=None, MEANINGFUL_COMPARISON=None, SUBSTANCE=None, REVIEWER_CONFIDENCE=None, \
          SOUNDNESS_CORRECTNESS=None, APPROPRIATENESS=None, IMPACT=None, ORIGINALITY=None, OTHER_KEYS=None, \
-         IS_META_REVIEW=False, TITLE=None, DATE=None, RECOMMENDATION_ORIGINAL=None):
+         IS_META_REVIEW=False, TITLE=None, DATE=None, RECOMMENDATION_UNOFFICIAL=None, IS_ANNOTATED=False):
     self.RECOMMENDATION = RECOMMENDATION
-    self.RECOMMENDATION_ORIGINAL = RECOMMENDATION_ORIGINAL #None # only for aspect prediction
+    self.RECOMMENDATION_UNOFFICIAL = RECOMMENDATION_UNOFFICIAL #None # only for aspect prediction
+    self.IS_ANNOTATED = IS_ANNOTATED
 
     self.COMMENTS = COMMENTS
     self.REPLICABILITY = REPLICABILITY
@@ -45,6 +46,12 @@ class Review:
       missing_fields = []
 
     recommendation = Review.get_json_string(json_object, "RECOMMENDATION", missing_fields)
+
+
+    recommendation_unofficial = Review.get_json_string(json_object, "RECOMMENDATION_UNOFFICIAL", missing_fields)
+
+    is_annotated = Review.get_json_string(json_object, "IS_ANNOTATED", missing_fields)
+
     replicability = Review.get_json_string(json_object, "REPLICABILITY", missing_fields)
     clarity = Review.get_json_string(json_object, "CLARITY", missing_fields)
     substance = Review.get_json_string(json_object, "SUBSTANCE", missing_fields)
@@ -55,7 +62,7 @@ class Review:
     reviewer_confidence = Review.get_json_string(json_object, "REVIEWER_CONFIDENCE", missing_fields)
     soundness_correctness = Review.get_json_string(json_object, "SOUNDNESS_CORRECTNESS", missing_fields)
     impact = Review.get_json_string(json_object, "IMPACT", missing_fields)
-    is_meta_review = Review.get_json_string(json_object, "is_meta_review", missing_fields)
+    is_meta_review = Review.get_json_string(json_object, "IS_META_REVIEW", missing_fields)
     date = Review.get_json_string(json_object, "DATE", missing_fields)
     title = Review.get_json_string(json_object, "TITLE", missing_fields)
     other_keys = Review.get_json_string(json_object, "OTHER_KEYS", missing_fields)
@@ -64,17 +71,22 @@ class Review:
       print("The following fields are missing in json input file:",missing_fields)
     return Review(recommendation, comments, replicability, presentation_format, clarity, meaningful_comparison, \
             substance, reviewer_confidence, soundness_correctness, appropriateness, impact, originality, \
-            other_keys, is_meta_review, title, date)
+            other_keys, is_meta_review, title, date, recommendation_unofficial, is_annotated )
 
   def to_json_object(self):
     data = dict()
 
     data["comments"] = self.get_comments()
-    data["is_meta_review"] = self.is_meta_review()
-
 
     if self.RECOMMENDATION is not None:
       data["RECOMMENDATION"] = self.get_recommendation()
+
+    if self.RECOMMENDATION_UNOFFICIAL is not None:
+      data["RECOMMENDATION_UNOFFICIAL"] = self.get_recommendation_unofficial()
+    if self.IS_ANNOTATED is not None:
+      data["IS_ANNOTATED"] = self.get_is_annotated()
+
+
     if self.REPLICABILITY is not None:
       data["REPLICABILITY"] = self.get_replicability()
     if self.PRESENTATION_FORMAT is not None:
@@ -109,6 +121,12 @@ class Review:
 
   def get_recommendation(self):
     return self.RECOMMENDATION
+
+  def get_recommendation_unofficial(self):
+    return self.RECOMMENDATION_UNOFFICIAL
+
+  def get_is_annotated(self):
+    return self.IS_ANNOTATED
 
   def get_comments(self):
     return self.COMMENTS

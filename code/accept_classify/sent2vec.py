@@ -4,12 +4,20 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from collections import defaultdict
 import dill
 
-def import_embeddings(filename="/data/word2vec/glove.840B.300d.w2v.bin"):
-	return gensim.models.KeyedVectors.load_word2vec_format(filename, binary=True)
+def import_embeddings(filename="./data/word2vec/glove.840B.300d.txt", binary=False):
+  """
+    Loading pre-trained word embeddings
+    For speed-up, you can convert the text file to binary and turn on the switch "binary=True"
+  """
+	return gensim.models.KeyedVectors.load_word2vec_format(filename, binary=binary)
 
 w2v = import_embeddings()
 
 class MeanEmbeddingVectorizer(object):
+  """
+   Given a input sentence, output averaged vector of word embeddings in the sentence
+  """
+
   def __init__(self, word2vec):
     self.word2vec = word2vec
     # if a text is empty we should return a vector of zeros
@@ -27,7 +35,12 @@ class MeanEmbeddingVectorizer(object):
       for words in X
     ])
 
+
+
 class TFIDFEmbeddingVectorizer(object):
+  """
+   Given a input sentence, output averaged vector of word embeddings weighted by TFIDF scores
+  """
   def __init__(self, word2vec):
     self.word2vec = word2vec
     self.word2weight = None

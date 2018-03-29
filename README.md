@@ -1,11 +1,15 @@
 # PeerReaD
-Data and code for Kang et al., 2018's paper titled "A Dataset of Peer Reviews (PeerReaD): Collection, Insights and NLP Applications"
+Data and code for ["A Dataset of Peer Reviews (PeerRead): Collection, Insights and NLP Applications"](http://arxiv.org) by Dongyeop Kang, Waleed Ammar, Bhavana Dalvi, Madeleine van Zuylen, Sebastian Kohlmeier, Eduard Hovy and Roy Schwartz, NAACL 2018
+
 
 # TODOs
 * Add a script for downloading the nips papers 2013-2017 (PDFs and reviews), splitting them similarly to the paper, as described [here](./data/nips_2013-2016/README.md)
 * Copy arxiv papers from each split in the old repo to one or more subdirectories in `data/arxiv.cs.ai_2007-2017/{train|dev|test}`.
 * Add Madeleine's annotations to ICLR 2017 reviews.
 * Move code from the old repo to new repo (see agreed upon structure below).
+
+
+### Structure for PeerRead dataset
 
 ```
 README.md
@@ -30,3 +34,26 @@ data/conll_2016/train/pdfs/$paper_id.pdf
 data/conll_2016/train/parsed_pdfs/$paper_id.pdf.json
 data/conll_2016/train/reviews/$paper_id.json
 ```
+
+
+### How-to-run two NLP tasks: acceptance classification and aspect prediction
+Please take a look at code/README.md for detail instructions.
+
+
+### Setup Configuration
+
+Simply running a following script will download necessary data and resolve dependencies:
+```
+  ./setup.sh
+```
+
+This repository has dependencies with:
+
+ * Python 2.7
+ * tensorflow 1.2
+ * gensim 2.3
+
+### Acknowledgement
+ - many codes for collecting accepted papers borrowed from [CanaanShen](https://github.com/CanaanShen/DataProcessor/tree/master/src/Crawler)
+ - many codes for aspect prediction borrowed from [jiegzhan](https://github.com/jiegzhan/multi-class-text-classification-cnn-rnn)
+

@@ -2,7 +2,9 @@ import spacy
 import re
 
 class ScienceParse:
-  """A review class, contains all bunch of relevant fields"""
+  """
+    A data structure for paper fields extracted by ScienceParse
+  """
   def __init__(self, title, abstract, sections, reference_titles, reference_venues, reference_years, reference_mention_contexts,
          reference_num_mentions, authors=None, emails = None, other_keys=None):
     self.title = title

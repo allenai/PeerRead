@@ -11,6 +11,9 @@ from ScienceParse import ScienceParse
 from sklearn.feature_extraction.text import TfidfVectorizer
 
 class ScienceParseReader:
+  """
+    This class reads the output of the science parse library and stores it in theScienceParseclass
+  """
 
   @staticmethod
   def read_science_parse(paperid, title, abstract, scienceparse_dir):

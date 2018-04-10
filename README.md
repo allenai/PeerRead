@@ -3,10 +3,6 @@ Data and code for ["A Dataset of Peer Reviews (PeerRead): Collection, Insights a
 
 
 # TODOs
-* Add a script for downloading the nips papers 2013-2017 (PDFs and reviews), splitting them similarly to the paper, as described [here](./data/nips_2013-2016/README.md)
-* Copy arxiv papers from each split in the old repo to one or more subdirectories in `data/arxiv.cs.ai_2007-2017/{train|dev|test}`.
-* Add Madeleine's annotations to ICLR 2017 reviews.
-* Move code from the old repo to new repo (see agreed upon structure below).
 
 
 ### Structure for PeerRead dataset

@@ -16,7 +16,7 @@ README.md
 requirement.txt
 data/
 data/conll_2016/
-data/nips_2013-2016/
+data/nips_2013-2017/
 data/arxiv.cs.ai_2007-2017/
 data/arxiv.cs.cs_2007-2017/
 data/arxiv.cs.lg_2007-2017/
@@ -37,12 +37,12 @@ data/conll_2016/train/reviews/$paper_id.json
 
 
 ### How-to-run two NLP tasks: acceptance classification and aspect prediction
-Please take a look at code/README.md for detail instructions.
+Please take a look at code/README.md for detailed instructions.
 
 
 ### Setup Configuration
 
-Simply running a following script will download necessary data and resolve dependencies:
+Running the following script will download the dataset and resolve all dependencies:
 ```
   ./setup.sh
 ```

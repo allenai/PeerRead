@@ -39,11 +39,7 @@ def main(args):
     n_papers = 0
     for l in lines:
         if l.find('<li><a href="/paper') != -1:
-            # print(l)
             n_papers +=1
-
-            #if n_papers < 176:
-             #   continue
 
             data = handle_paper(l, out_dir, http, int(year), no_pdf)
             # break
@@ -72,7 +68,6 @@ def handle_paper(l, out_dir, http, year, no_pdf):
         authors.append(match2.group(1))
 
     title = match.group(2)
-    # print("URL:",match.group(1),", title:",match.group(2),", author1: ",authors)
 
     data = handle_url2(match.group(1), out_dir, http, year, no_pdf)
 

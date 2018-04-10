@@ -29,7 +29,7 @@ To train and test our acceptance classification, please use the following comman
     echo
   done
 
-  echo "Classigying..." $DATASET $ENCODER $MAX_VOCAB $HAND
+  echo "Classifying..." $DATASET $ENCODER $MAX_VOCAB $HAND
   python classify.py \
     $DATADIR/train/$FEATDIR/features.svmlite_${MAX_VOCAB}_${ENCODER}_${HAND}.txt \
     $DATADIR/dev/$FEATDIR/features.svmlite_${MAX_VOCAB}_${ENCODER}_${HAND}.txt \
@@ -46,9 +46,9 @@ TODO add some information of each code (featurize.py, classifiy.py, sent2vec.py)
 
 
 
-#### (2) Acceptance Classificatio
+#### (2) Acceptance Classification
 
-To train and test our acceptance classification, please use the following command:
+To train and test our acceptance classifier, please use the following command:
 
 ```shell
  cd ./accept_classify/
@@ -57,10 +57,10 @@ To train and test our acceptance classification, please use the following comman
 
 TODO add some information of each code (pred_models.py, data_helper.py, config.py, predict.py, assign_annot_iclr_2017.py)
    - predict review scores of each aspect (e.g,, recommendation, clarity, impact, etc)
-   - train LSTM-CNN based (0-5] multi-class classifier for each aspect
+   - train LSTM-CNN based multi-class classifier for each aspect
 
 
-### (optional) Data Preparation
+### (optional) Data Preparation (from raw dataset)
 
 In case you like to crawl the raw dataset and make same data configuration as the paper, please use the following command:
 
@@ -74,12 +74,5 @@ Please make sure that pdfs/reviews directories exist and contain raw pdfs/review
 Also, download science parser from [here](https://github.com/allenai/science-parse) and locate the science-parse-cli-assembly-1.2.9-SNAPSHOT.jar file under ./code/lib/
 
 
-For NIPS crawler, use following crawler:
-
-```shell
- cd ./data_prepare/crawler
- python NIPS_crawl.py
-```
-
-All other crawlers would be available upon request.
+All of our dataset except NIPS are already preprocessed. For crawling and preprocessing NIPS data, please follow the instruction under ./data/nips_2013-2017/README.md. All other crawlers would be available upon request.
 

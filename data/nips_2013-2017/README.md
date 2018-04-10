@@ -1,10 +1,12 @@
 Papers and reviews in this section can be obtained from the NIPS website by running the commands below at the root directory of this repository.
 More details on the science-parse library can be found [here](https://github.com/allenai/science-parse/).
 
-```
+```shell
 #!/usr/bin/env bash
 
-python code/download-nips-2013-2016.py
+cd ./data_prepare/crawler
+python NIPS_crawl.py <year> <output directory> <flag to save pdfs (optional)>
+
 for split in train dev test; do
   mkdir data/nips_2013-2016/$split/parsed_pdfs/
   for pdf_filename in $( ls data/nips_2013-2016/$split/pdfs/*.pdf ); do

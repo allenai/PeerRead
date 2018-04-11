@@ -8,9 +8,9 @@ cd ./data_prepare/crawler
 python NIPS_crawl.py <year> <output directory> <flag to save pdfs (optional)>
 
 for split in train dev test; do
-  mkdir data/nips_2013-2016/$split/parsed_pdfs/
-  for pdf_filename in $( ls data/nips_2013-2016/$split/pdfs/*.pdf ); do
-    java -Xmx6g -jar lib/science-parse-cli-assembly-1.2.9-SNAPSHOT.jar $i > data/nips_2013-2016/$split/parsed_pdfs/$(basename ${pdf_filename}).json
+  mkdir data/nips_2013-2017/$split/parsed_pdfs/
+  for pdf_filename in $( ls data/nips_2013-2017/$split/pdfs/*.pdf ); do
+    java -Xmx6g -jar lib/science-parse-cli-assembly-1.2.9-SNAPSHOT.jar $i > data/nips_2013-2017/$split/parsed_pdfs/$(basename ${pdf_filename}).json
   done
 done
 ```

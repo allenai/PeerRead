@@ -39,31 +39,36 @@ To train and test our acceptance classification, please use the following comman
 
 ```
 
-TODO add some information of each code (featurize.py, classifiy.py, sent2vec.py)
-   - create features for baselines classifiers and save to under dataset folder in each split
-   - train linear classifier using CV and regularization parameters
-   - evaluate the best model on dev set
+Here is brief description of each code.
+ - "featurize.py" creates (hand-authored and lexical) features for baselines classifiers and save to under dataset folder in each split.
+ - "classifiy.py" trains linear classifier using CV and find the best model on dev set.
+ - "sent2vec.py" contains different embedding vectorizers and embedding loader.
 
 
 
-#### (2) Acceptance Classification
+#### (2) Aspect Prediction
 
-To train and test our acceptance classifier, please use the following command:
+To train and test our aspect predictor, please use the following command:
 
 ```shell
  cd ./accept_classify/
  python predict.py "../../data/iclr_2017" {"all","review","paper"} {"dan","rnn","cnn"} {0,1,2,3,4,5,6,7,8}
 ```
 
-TODO add some information of each code (pred_models.py, data_helper.py, config.py, predict.py, assign_annot_iclr_2017.py)
-   - predict review scores of each aspect (e.g,, recommendation, clarity, impact, etc)
-   - train LSTM-CNN based multi-class classifier for each aspect
+
+Here is brief description of each code.
+ - "pred_models.py" contains three prediction models such as RNN, DAN, CNN
+ - "data_helper.py" contains some utility functions for loading data
+ - "config.py" contains configurations for each prediction model
+ - "predict.py" trains a classifier for predicting review score of each aspect (e.g, recommendation, clarity, etc)
+ - "assign_annot_iclr_2017.py" aggregates annotated scores (i.e. annotation_full.tsv) into ICLR_2017 reviews.
 
 
-### (optional) Data Preparation (from raw dataset)
+### (optional) Data Preparation from your raw data
+
+All of our dataset except NIPS are already preprocessed. For crawling and preprocessing NIPS data, please follow the instruction under ./data/nips_2013-2017/README.md. All other crawlers would be available upon request.
 
 In case you like to crawl the raw dataset and make same data configuration as the paper, please use the following command:
-
 
 ```shell
   python prepare.py ../../data/arxiv/{arxiv.cs.cl_2007-2017,acl_2017,...}
@@ -73,6 +78,4 @@ Please make sure that pdfs/reviews directories exist and contain raw pdfs/review
 
 Also, download science parser from [here](https://github.com/allenai/science-parse) and locate the science-parse-cli-assembly-1.2.9-SNAPSHOT.jar file under ./code/lib/
 
-
-All of our dataset except NIPS are already preprocessed. For crawling and preprocessing NIPS data, please follow the instruction under ./data/nips_2013-2017/README.md. All other crawlers would be available upon request.
 

@@ -1,3 +1,6 @@
+"""
+ predict review scores of each aspect (e.g.,recommendation, clarity, impact, etc)
+"""
 import sys,os,json, glob,pickle,operator,re,time,logging,shutil,pdb,math
 from collections import Counter,OrderedDict,defaultdict
 from sklearn.feature_extraction.text import TfidfVectorizer

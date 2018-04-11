@@ -1,3 +1,7 @@
+"""
+ three prediction models: RNN, DAN, CNN
+"""
+
 import tensorflow as tf
 
 

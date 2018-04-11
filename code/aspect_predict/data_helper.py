@@ -1,3 +1,7 @@
+"""
+ some utility functions for loading data
+"""
+
 import os,re,sys,json,logging,itertools,gensim,pprint,functools, random
 import numpy as np
 

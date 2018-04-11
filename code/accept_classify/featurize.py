@@ -1,3 +1,7 @@
+"""
+create (hand-authored and lexical) features for baselines classifiers and save to under dataset folder in each split
+"""
+
 import sys,os,random,json,glob,operator,re
 import cPickle as pkl
 from collections import Counter

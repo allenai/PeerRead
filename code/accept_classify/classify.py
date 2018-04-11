@@ -1,3 +1,7 @@
+"""
+  train linear classifier using CV and find the best model on dev set
+"""
+
 import sys, pickle,random
 from collections import Counter
 from sklearn import datasets,preprocessing,model_selection

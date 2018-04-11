@@ -1,3 +1,7 @@
+"""
+contains different embedding vectorizers and embedding loader
+"""
+
 import numpy as np
 import gensim
 from sklearn.feature_extraction.text import TfidfVectorizer

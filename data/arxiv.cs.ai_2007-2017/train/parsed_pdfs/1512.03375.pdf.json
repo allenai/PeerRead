@@ -1,0 +1,402 @@
+{
+  "name" : "1512.03375.pdf",
+  "metadata" : {
+    "source" : "CRF",
+    "title" : "Convolutional Monte Carlo Rollouts in Go",
+    "authors" : [ "Peter H. Jin" ],
+    "emails" : [ "phj@eecs.berkeley.edu,", "keutzer@berkeley.edu" ],
+    "sections" : [ {
+      "heading" : null,
+      "text" : "ar X\niv :1\n51 2.\n03 37\n5v 1\n[ cs\n.L G\n] 1\n0 D\nec 2\nIn this work, we present a MCTS-based Go-playing program which uses convolutional networks in all parts. Our method performs MCTS in batches, explores the Monte Carlo search tree using Thompson sampling and a convolutional network, and evaluates convnet-based rollouts on the GPU. We achieve strong win rates against open source Go programs and attain competitive results against state of the art convolutional net-based Go-playing programs."
+    }, {
+      "heading" : "1 Introduction",
+      "text" : "The game of Go remains unsolved by computer algorithms despite advances in the past decade in Monte Carlo tree search (Kocsis & Szepesvári, 2006). Recent work in convolutional networks for playing Go (Tian & Zhu, 2015; Maddison et al., 2014; Clark & Storkey, 2015; Sutskever & Nair, 2008) have produced neural move predictors for Go with up to 57.3% accuracy on datasets of historical Go game records. However, in a modern competitive Go computer program, a move predictor is one component in a Monte Carlo tree search loop.\nPrevious work used an accurate move predictor built from a very deep convolutional network to guide the search tree exploration in MCTS (Tian & Zhu, 2015; Maddison et al., 2014). Exploration is only one half of MCTS; the other half consists of simulations or rollouts, which in their original form execute uniformly random moves starting from a leaf node in the search tree until reaching terminal states to produce fast and unbiased estimates of the optimal value function for states in the search tree. Nonuniformly random rollout policies can improve on the winning rate of MCTS compared to the uniformly random policy. An early non-uniform rollout policy was pioneered in the Go-playing program MoGo (Gelly et al., 2006), which matched 3 × 3 board patterns, first in the local vicinity of the previous move, and then in the rest of the board. Coulom (2007a) extended the pattern features by weighting them by relative strength using a minorization-maximization algorithm and choosing patterns with probability determined by a Bradley-Terry model.\nOne reasonable extension is to consider incorporating a convolutional network in place of traditional pattern-based rollouts. Because in practice there is a limit to the “thinking time” available to Monte Carlo rollouts, then given a fixed budget of rollouts and a fixed policy for executing rollouts, it is important to execute as many rollouts in the time allotted for play as possible. Simply combining a convolutional net with a sequential MCTS algorithm, such as UCT (Kocsis & Szepesvári, 2006), is impractical as inference in a convolutional net has too great a computation latency, even when executed on a high throughput GPU (ignoring the added communication latency between CPU and GPU) to performMonte Carlo backups rapidly enough in MCTS. Additionally, UCT is deterministic, meaning that its traversal of the tree is identical in between Monte Carlo backups. That kind of deterministic behavior is generally undesirable for batched execution of Monte Carlo rollouts.\nOur contribution is threefold: (1) we implement a MCTS-based Go-playing program that uses convolutional networks executed on the GPU in all parts; (2) we perform MCTS in batches to maximize the throughput of convolutions during rollouts; and (3) we demonstrate that Thompson sampling (Thompson, 1933) during exploration of the search tree in MCTS is a viable alternative to UCB1 (Auer et al., 2002).\nCombining those three techniques, we address the earlier concerns, and our program consistently wins against the open source Go program GNU Go1 and is also competitive against other deep convolutional net-based Go programs."
+    }, {
+      "heading" : "2 Related Work",
+      "text" : "Convolutional network-based move predictors have been used by themselves for greedy move selection, or have been applied to the exploration part of MCTS. Sutskever & Nair (2008) trained 2-layer convolutional networks for move prediction in Go. Clark & Storkey (2015) and Maddison et al. (2014) later extended the results to deep convolutional networks. More recently, Tian & Zhu (2015) showed that training with multiple labels for long term prediction further improved the accuracy and playing strength of deep convolutional move predictors. In the above works, the rollout part of MCTS, if implemented at all, consisted of traditional pattern-based rollouts.\nSeveral non-convolutional net-based methods for predicting or ranking moves have been introduced in the past. The pioneering Go-playing program MoGo featured pattern-based rollouts (Gelly et al., 2006). Stern et al. (2006) learned patterns and local features using Bayesian ranking. Coulom (2007a) computed the likelihood of patterns and local features with a Bradley-Terry model. Wistuba & Schmidt-Thieme (2013) used latent factor ranking to achieve move prediction accuracy of 41%.\nThompson sampling has been applied to Monte Carlo tree search in non-computer Go domains in Perick et al. (2012), Bai et al. (2013), and Imagawa & Kaneko (2015). In those previous works, Thompson sampling was compared with UCB1 or other bandit algorithms based on their performance on specific tasks (e.g., maximizing reward), rather than our focus of using Thompson sampling guide batch parallelism.\nCazenave & Jouandeau (2008) and Chaslot et al. (2008a) introduced approaches for parallelizing MCTS, including “root parallelism” and “tree parallelism.” Like root parallelism, our batching approach traverses the tree multiple times between consecutive backups; however, root parallelism does not share backups between parallel trees, whereas batched backups naturally do. Unlike tree parallelism which is asynchronous, batching is bulk-synchronous."
+    }, {
+      "heading" : "3 Terminology",
+      "text" : "First, we clarify some of the terminology that we will use throughout the rest of this paper. In the Monte Carlo tree search literature, the terms rollout, playout, and simulation are often used synonymously to define the randomly simulated plays. To avoid confusion, we try to exclusively use the term rollout.\nIn MCTS (see Figure 1 for pseudocode), neural networks can be applied in two different parts: (1) during exploration of the tree, and (2) during rollouts. Both of those parts are similar in that, given a state s, a classification neural network can be used to produce the probability of selecting any action a from the range of available actions at s (for example, when the network has a softmax probability output layer). Because such a neural network is effectively computing the policy probability π(s, a), we call that network a policy network.\nMore specifically, we call a neural net used to compute the prior knowledge probabilities of moves at a fixed game position during exploration of the tree by the term prior policy network (PPN). Similarly, a neural net used to compute probabilities of the next move to take from a single position during a rollout is called a rollout policy network (RPN).\nUsing the above terminology, we can briefly compare our method with those of state of the art convolutional net-based Go programs. In Table 1, we see that our method utilizes both a prior policy network and a rollout policy network. On the other hand, previous strong methods use only prior policy networks, supplementing it with traditional pattern-based Monte Carlo rollouts.\n1http://www.gnu.org/software/gnugo/"
+    }, {
+      "heading" : "4 Monte Carlo Tree Search",
+      "text" : "The strongest modern Go playing programs all use versions of MCTS. MCTS builds a search tree of game position nodes where each node keeps track of Monte Carlo values: the total number of trials that pass through the node, and the number of successful trials (wins). The search tree is updated through three repeating phases: exploration, rollout, and backup.2\nThe canonical version of MCTS is UCT (Kocsis & Szepesvári, 2006), where the selection criterion in the exploration phase is determined by the UCB1 multi-armed bandit algorithm (Auer et al., 2002). For a given node in the MC search tree, denote the total number of trials through the node’s j-th child as nj, the number of successful trials as wj , and the total number of trials through all the node’s children as n = ∑\nj nj. Then during the exploration phase, the UCB1 selection criterion chooses the next child to traverse by taking the argmax in (1):\nargmax j\n[\nwj nj + c\n√\nlog(n)\nnj\n]\n. (1)\nUCT is described with pseudocode in Figure 1. The original rollout policy of MCTS consisted of choosing an action according to the uniform distribution. However, it was quickly found that using nonuniformly random rollouts (for example, based on the probabilities of local features and patterns as in (Coulom, 2007a)) resulted in stronger play by MCTS-based Go-playing programs (Gelly et al., 2006).\nIn addition to the basics of MCTS, there are a number of widely used heuristic methods for biasing and pruning the search, including RAVE (Gelly & Silver, 2007), progressive bias (Chaslot et al., 2008b), and progressive widening (Coulom, 2007a). Each heuristic is associated with its own set of hyperparameters, and achieving strong play generally requires hyperparameter tuning."
+    }, {
+      "heading" : "5 Neural Move Prediction",
+      "text" : "Recent successful move predictors for Go have been trained using supervised learning on historical game records. Typically, the board position is preprocessed into a dense mask of relatively easy to compute binary and real features, which are then provided as the input to the convolutional network. Some common input features include the board configuration (stone positions), the ko point if one exists, the number of chain liberties, and the stone history or distance since last move. Using our earlier terminology, a neural network-based move predictor is a kind of policy network.\nThe most accurate convolutional network architectures for predicting moves in Go tend to be very deep, with at least a dozen layers (Tian & Zhu, 2015; Maddison et al., 2014). A typical architecture has a larger sized first convolutional layer, followed by many 3× 3 convolutional layers. The layers also have hundreds of convolution filters, and like most modern deep convolutional nets use rectified linear units as their nonlinearity (Krizhevsky et al., 2012).\nMCTS can incorporate a policy network to provide prior knowledge with equivalent experience into the search tree during exploration (Gelly & Silver, 2007). Again using our earlier terminology, a policy network providing prior knowledge probabilities is a prior policy network. While ideally the prior knowledge is derived\n2 Note that what we call exploration can further be split into two parts: the selection of nodes along a path, and expansion\nof the search tree.\nfrom a move evaluator (or a Q-network) that computes an approximation to the optimal value of the next position or the optimal action-value of the move, directly using the probabilities of the prior policy network is also a passable heuristic (Ikeda & Viennot, 2013). Intuitively, directly using the probabilities to bias Monte Carlo values makes sense when the probablities of moves are closely and positively correlated with the corresponding optimal action-values. Additionally, it helps that state values and action-values for Go lie in the unit interval [0, 1], so probabilities and values have comparable range."
+    }, {
+      "heading" : "6 Batch Thompson Sampling Tree Search",
+      "text" : "In theory, it is also possible to use a policy network to select the nonuniformly random moves during rollouts. Such a network can be called a rollout policy network and would take the place of traditional pattern-based rollout policies. However there are two related obstacles preventing convolutional rollout policy networks from working effectively: (1) convolutions are computationally expensive, and (2) UCB1 is a deterministic algorithm.\nWhen performing inference with a convolutional network, one prefers to evaluate the input in batches to maximize throughput on hardware platforms such as modern GPUs. While batching convolutions is a well known technique and forms the basis of modern minibatch stochastic gradient methods, for batching to be effective, the input states need to be sufficiently unique. If one were to naively explore the Monte Carlo search\ntree in batches using UCB1, then many of the states within a batch would be duplicate states. Asynchronous parallel versions of UCT have also encountered this problem, getting around it by using heuristic “virtual losses” to introduce variance during tree exploration (Chaslot et al., 2008a).\nInstead, we substitute for UCB1 the probabilistic bandit algorithm Thompson sampling (Thompson, 1933) as the search policy in MCTS, a choice justified by recent empirical evidence (Chapelle & Li, 2011), as well as proofs of its comparable regret bounds to those of UCB1 (Agrawal & Goyal, 2012; Kaufmann et al., 2012). Specifically, we use Thompson sampling with Bernoulli rewards (or beta prior) as described below in (2), in which the optimal action at each time step is selected by choosing the argmax of the randomly sampled values qj :\nargmax j qj where qj ∼ Beta(wj + 1, nj − wj + 1). (2)\nWe incorporate Thompson sampling into a batched MCTS algorithm, with pseudocode described in Figure 2.\nIn practice, we execute the game rule logic on the CPU and synchronously run the convolutional network\non the GPU. Although this incurs communication overhead between main memory and GPU memory, we believe that splitting the work between the two is optimal, especially on combined multicore and multi-GPU systems."
+    }, {
+      "heading" : "7 Experiments",
+      "text" : ""
+    }, {
+      "heading" : "7.1 Data",
+      "text" : "We used the GoGoD Winter 2014 dataset of professional Go game records to train our prior and rollout policies (Hall & Fairbairn, 2015). The dataset consists of 82,609 historical and modern games. We limited our experiments to a subset of games that satisfied the following criteria: 19 × 19 board, modern (played after 1950), “standard” komi (komi ∈ {2.75, 3.75, 5.5, 6.5}), and no handicap stones. We did not distinguish between rulesets (most games followed Chinese or Japanese rules). Our somewhat strict criteria produced a training set of over 57000 games.\nFor validation, we used a subset of over 1000 high level games from the KGS Go Server (Görtz, 2015)."
+    }, {
+      "heading" : "7.2 Architectures",
+      "text" : "We used a relatively concise input feature representation in the form of a stack of 16 planes of 19×19 features each. For each time step and for each player, we tracked (1) binary features marking the placement of stones on points, and (2) one-hot features denoting whether a point belongs to a chain with 1, 2, or ≥ 3 liberties. We tracked the last two time steps for a total of 16 feature planes.\nWe used a total of 5 different network architectures in our experiments. These architectures are described in Table 2. They consist of a first layer, followed by repeated inner layers, and completed by a last layer before a softmax probability output layer; this is the same architectural pattern used by Maddison et al. (2014) and Tian & Zhu (2015). Three of them (A, B, and C) are very deep nets and are prior policy networks. The other two (R-2 and R-3) consist of a shallow net and a minimally deep net, and are used as rollout policy networks. All convolution layers are zero-padded with unit stride, and the rectifying nonlinearity σReLU(x) = max(0, x) is used at all convolutional layers except the final one, which feeds into the softmax output instead."
+    }, {
+      "heading" : "7.3 Training",
+      "text" : "We train our convolutional networks to predict the next move given the current board position using stochastic gradient descent. We note that Tian & Zhu (2015) trained deep convolutional move predictors to predict the k next moves and found that k = 3 yielded stronger networks compared to using single-step labels (k = 1).\nFor architectures A and B, we initialized the learning rate at 0.01 and annealed the learning rate by a factor of 0.1 every 2 epochs. For architecture C, we set the learning rate to 0.05 and did not tune it. For A, B, and C, we used zero momentum and zero weight decay.\nFor architectures R-2 and R-3, we followed a similar training protocol as in (Sutskever & Nair, 2008). We initialized the training with learning rate 0.1, then annealed the learning rate to 0.01 after 3200 iterations, running SGD for at least 2 epochs. We used momentum of 0.9 and no weight decay."
+    }, {
+      "heading" : "7.4 Benchmarking",
+      "text" : "We compared the winning rates of our Go program against the open source programs: GNU Go version 3.8, a traditional Go program, at level 10; and Pachi version 11.00 “Retsugen” (Baudǐs & Gailly, 2012), a MCTS program, with fixed 104 playouts per move and pondering during its opponent’s turn disabled. The main reason we disable pondering in Pachi is that batched convolutional rollouts as we implemented them are quite expensive to execute: typical throughput is between 80 rollout/s to 170 rollout/s when executing on a single GPU. Parallelizing rollouts on multiple GPUs can significantly improve the throughput: for example, a system consisting of 8× high-end NVIDIA Maxwell GPUs can attain a peak throughput of approximately 1000 rollout/s."
+    }, {
+      "heading" : "7.5 Results",
+      "text" : "We show the winning rate of different variants of our Go program against GNU Go, where the variants differed in their combinations of prior policy network and rollout policy network. We also tested variants where we did not use MCTS and instead greedily played the prior policy network’s best softmax activation; these rows are marked with “none/greedy” under the “Rollouts” column. Our results are listed in Table 3. There are at least two interesting observations here. First, with a 6-layer prior policy network and 2-layer or 3-layer rollout policy network, we are able to obtain comparable results to 12-layer networks without MCTS (Tian & Zhu, 2015; Maddison et al., 2014). This by itself is a promising result and shows that sophistication in the rollout policy can make up for the weaker prior policies. Second, the winning rate of the variants with the 3-layer rollout policy network seems to be less than that of programs with the 2-layer rollout policy network, despite the 3-layer RPN having a higher accuracy than the 2-layer RPN. While counterintuitive, this is a known paradox that previous authors of MCTS Go programs have encountered (Gelly & Silver, 2007). One possible solution is to use Monte Carlo simulation balancing to de-bias the the rollout policy (Silver & Tesauro, 2009). We do not explore this idea further in this paper, and instead show remaining results using only the 2-layer rollout policy network.\nIn Table 4, we compare the winning rates of our method when playing against the MCTS-based program Pachi. The version of our MCTS-enabled method with a 6-layer prior policy network and a 2-layer rollout policy network perform comparably to our 12-layer prior policy network without MCTS, as well as to the\n12-layer network of Maddison et al. (2014) without MCTS. Our MCTS Go program with a 12-layer prior policy and 2-layer rollout policy is comparable to the larger 1-step darkforest 12-layer network without MCTS of Tian & Zhu (2015). Their network was trained using extra features, including ko point, stone history, and opponent rank, and also has 384 convolution filters compared to 128 filters in our network. The 3-step darkfores2 12-layer network with traditional pattern-based MCTS rollouts by Tian & Zhu (2015) performs the best against both GNU Go and Pachi, although they also employ an enhanced training method using 3-step lookahead for long-term prediction and tuned learning rate, whereas we only train our networks using single-step lookahead.\nWe explore the effect of different MCTS batch sizes on the overall winning rate of our program against Pachi, which are shown in Table 5. Interestingly, varying the batch size between 64 and 256 has little effect on the winning rate. This is a very promising result, as it suggests that given a fixed number of rollouts, increasing the batch size or equivalently decreasing the number of batch backups up to a limit does not penalize playing strength."
+    }, {
+      "heading" : "8 Discussion",
+      "text" : "In this work, we demonstrated that combining convolutional networks in the exploration phase of MCTS with convolutional nets in the rollout phase is practical and effective through Thompson sampling-based batched MCTS. We evaluated our Go program against the open source programs GNU Go and Pachi and found that they achieved win rates competitive with the state of the art among convolutional net-based implementations. We also found that the winning rate of batched MCTS with convolutional networks is fairly insensitive to reasonable values of the batch size, suggesting that further scaling can be done.\nWhile we compared the winning rate of our own Go program against open source Go programs and the reported results of convolutional net-based Go programs, there are commercial or otherwise closed source Go programs which are much stronger: these include the programs Zen, Crazy Stone (Coulom, 2007b), and Dol Baram, which have won handicap games against highly ranked professional Go players.\nFuture work includes incorporating batched MCTS with approaches for training stronger convolutional nets, such as using long-term prediction for training (Tian & Zhu, 2015) and applying deep reinforcement learning methods to approximate an optimal value or action-value function."
+    }, {
+      "heading" : "Acknowledgments",
+      "text" : "Thanks to Forrest Iandola for insightful discussions, and Kostadin Ilov for assistance with our computing systems."
+    } ],
+    "references" : [ {
+      "title" : "Analysis of Thompson Sampling for the Multi-armed Bandit Problem",
+      "author" : [ "Agrawal", "Shipra", "Goyal", "Navin" ],
+      "venue" : "COLT ’12,",
+      "citeRegEx" : "Agrawal et al\\.,? \\Q2012\\E",
+      "shortCiteRegEx" : "Agrawal et al\\.",
+      "year" : 2012
+    }, {
+      "title" : "Finite-time Analysis of the Multiarmed Bandit Problem",
+      "author" : [ "Auer", "Peter", "Cesa-Bianchi", "Nicolo", "Fischer", "Paul" ],
+      "venue" : "Machine Learning,",
+      "citeRegEx" : "Auer et al\\.,? \\Q2002\\E",
+      "shortCiteRegEx" : "Auer et al\\.",
+      "year" : 2002
+    }, {
+      "title" : "Bayesian Mixture Modeling and Inference based Thompson Sampling in Monte-Carlo Tree Search",
+      "author" : [ "Bai", "Aijun", "Wu", "Feng", "Chen", "Xiaoping" ],
+      "venue" : "In Advances in Neural Information Processing Systems",
+      "citeRegEx" : "Bai et al\\.,? \\Q2013\\E",
+      "shortCiteRegEx" : "Bai et al\\.",
+      "year" : 2013
+    }, {
+      "title" : "Pachi: State of the Art Open Source Go Program",
+      "author" : [ "Baudǐs", "Petr", "Gailly", "Jean-loup" ],
+      "venue" : "In Advances in Computer Games, pp",
+      "citeRegEx" : "Baudǐs et al\\.,? \\Q2012\\E",
+      "shortCiteRegEx" : "Baudǐs et al\\.",
+      "year" : 2012
+    }, {
+      "title" : "A Parallel Monte-Carlo Tree Search Algorithm",
+      "author" : [ "Cazenave", "Tristan", "Jouandeau", "Nicolas" ],
+      "venue" : "In Computers and Games, pp",
+      "citeRegEx" : "Cazenave et al\\.,? \\Q2008\\E",
+      "shortCiteRegEx" : "Cazenave et al\\.",
+      "year" : 2008
+    }, {
+      "title" : "An Empirical Evaluation of Thompson Sampling",
+      "author" : [ "Chapelle", "Olivier", "Li", "Lihong" ],
+      "venue" : "In Advances in Neural Information Processing Systems",
+      "citeRegEx" : "Chapelle et al\\.,? \\Q2011\\E",
+      "shortCiteRegEx" : "Chapelle et al\\.",
+      "year" : 2011
+    }, {
+      "title" : "Parallel Monte-Carlo Tree Search",
+      "author" : [ "Chaslot", "Guillaume M.J.-B", "Winands", "Mark H.H", "van den Herik", "H. Jaap" ],
+      "venue" : "In Computers and Games, pp",
+      "citeRegEx" : "Chaslot et al\\.,? \\Q2008\\E",
+      "shortCiteRegEx" : "Chaslot et al\\.",
+      "year" : 2008
+    }, {
+      "title" : "Progressive strategies for Monte-Carlo tree search",
+      "author" : [ "Chaslot", "Guillaume M.J.-B", "Winands", "Mark H.M", "van den Herik", "H. Jaap", "Uiterwijk", "Jos W.H.M", "Bouzy", "Bruno" ],
+      "venue" : "New Mathematics and Neural Computation,",
+      "citeRegEx" : "Chaslot et al\\.,? \\Q2008\\E",
+      "shortCiteRegEx" : "Chaslot et al\\.",
+      "year" : 2008
+    }, {
+      "title" : "Training Deep Convolutional Neural Networks to Play Go",
+      "author" : [ "Clark", "Christopher", "Storkey", "Amos" ],
+      "venue" : "In Proceedings of the 32nd International Conference on Machine Learning,",
+      "citeRegEx" : "Clark et al\\.,? \\Q2015\\E",
+      "shortCiteRegEx" : "Clark et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "Computing Elo Ratings of Move Patterns in the Game of Go",
+      "author" : [ "Coulom", "Rémi" ],
+      "venue" : "In Computer Games Workshop,",
+      "citeRegEx" : "Coulom and Rémi.,? \\Q2007\\E",
+      "shortCiteRegEx" : "Coulom and Rémi.",
+      "year" : 2007
+    }, {
+      "title" : "Efficient Selectivity and Backup Operators in Monte-Carlo Tree Search",
+      "author" : [ "Coulom", "Rémi" ],
+      "venue" : "In Computers and Games, pp",
+      "citeRegEx" : "Coulom and Rémi.,? \\Q2007\\E",
+      "shortCiteRegEx" : "Coulom and Rémi.",
+      "year" : 2007
+    }, {
+      "title" : "Combining Online and Offline Knowledge in UCT",
+      "author" : [ "Gelly", "Sylvain", "Silver", "David" ],
+      "venue" : "In Proceedings of the 24th International Conference on Machine Learning,",
+      "citeRegEx" : "Gelly et al\\.,? \\Q2007\\E",
+      "shortCiteRegEx" : "Gelly et al\\.",
+      "year" : 2007
+    }, {
+      "title" : "Modification of UCT with Patterns in Monte-Carlo Go",
+      "author" : [ "Gelly", "Sylvain", "Wang", "Yizao", "Munos", "Rémi", "Teytaud", "Olivier" ],
+      "venue" : "Technical report,",
+      "citeRegEx" : "Gelly et al\\.,? \\Q2006\\E",
+      "shortCiteRegEx" : "Gelly et al\\.",
+      "year" : 2006
+    }, {
+      "title" : "Efficiency of Static Knowledge Bias in Monte-Carlo Tree Search",
+      "author" : [ "Ikeda", "Kokolo", "Viennot", "Simon" ],
+      "venue" : "In Computers and Games, pp",
+      "citeRegEx" : "Ikeda et al\\.,? \\Q2013\\E",
+      "shortCiteRegEx" : "Ikeda et al\\.",
+      "year" : 2013
+    }, {
+      "title" : "Enhancements in Monte Carlo Tree Search Algorithms for Biased Game Trees",
+      "author" : [ "Imagawa", "Takahisa", "Kaneko", "Tomoyuki" ],
+      "venue" : "In 2015 IEEE Conference on Computational Intelligence in Games,",
+      "citeRegEx" : "Imagawa et al\\.,? \\Q2015\\E",
+      "shortCiteRegEx" : "Imagawa et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "Thompson Sampling: An Asymptotically Optimal Finite-Time Analysis",
+      "author" : [ "Kaufmann", "Emilie", "Korda", "Nathaniel", "Munos", "Rémi" ],
+      "venue" : "In Proceedings of the 23rd International Conference on Algorithmic Learning Theory, pp",
+      "citeRegEx" : "Kaufmann et al\\.,? \\Q2012\\E",
+      "shortCiteRegEx" : "Kaufmann et al\\.",
+      "year" : 2012
+    }, {
+      "title" : "Bandit Based Monte-Carlo Planning",
+      "author" : [ "Kocsis", "Levente", "Szepesvári", "Csaba" ],
+      "venue" : "In Proceedings of the 17th European Conference on Machine Learning,",
+      "citeRegEx" : "Kocsis et al\\.,? \\Q2006\\E",
+      "shortCiteRegEx" : "Kocsis et al\\.",
+      "year" : 2006
+    }, {
+      "title" : "ImageNet Classification with Deep Convolutional Neural Networks",
+      "author" : [ "Krizhevsky", "Alex", "Sutskever", "Ilya", "Hinton", "Geoffrey E" ],
+      "venue" : "In Advances in Neural Information Processing Systems",
+      "citeRegEx" : "Krizhevsky et al\\.,? \\Q2012\\E",
+      "shortCiteRegEx" : "Krizhevsky et al\\.",
+      "year" : 2012
+    }, {
+      "title" : "Move Evaluation in Go",
+      "author" : [ "Maddison", "Chris J", "Huang", "Aja", "Sutskever", "Ilya", "Silver", "David" ],
+      "venue" : "Using Deep Convolutional Neural Networks",
+      "citeRegEx" : "Maddison et al\\.,? \\Q2014\\E",
+      "shortCiteRegEx" : "Maddison et al\\.",
+      "year" : 2014
+    }, {
+      "title" : "Comparison of Different Selection Strategies in Monte-Carlo Tree Search for the Game of Tron",
+      "author" : [ "Perick", "Pierre", "St-Pierre", "David L", "Maes", "Francis", "Ernst", "Damien" ],
+      "venue" : "IEEE Conference on Computational Intelligence and Games, pp. 242–249,",
+      "citeRegEx" : "Perick et al\\.,? \\Q2012\\E",
+      "shortCiteRegEx" : "Perick et al\\.",
+      "year" : 2012
+    }, {
+      "title" : "Monte-Carlo Simulation Balancing",
+      "author" : [ "Silver", "David", "Tesauro", "Gerald" ],
+      "venue" : "In Proceedings of the 26th Annual International Conference on Machine Learning,",
+      "citeRegEx" : "Silver et al\\.,? \\Q2009\\E",
+      "shortCiteRegEx" : "Silver et al\\.",
+      "year" : 2009
+    }, {
+      "title" : "Bayesian Pattern Ranking for Move Prediction in the Game of Go",
+      "author" : [ "Stern", "David", "Herbrich", "Ralf", "Graepel", "Thore" ],
+      "venue" : "In Proceedings of the 23rd International Conference on Machine Learning,",
+      "citeRegEx" : "Stern et al\\.,? \\Q2006\\E",
+      "shortCiteRegEx" : "Stern et al\\.",
+      "year" : 2006
+    }, {
+      "title" : "Mimicking Go Experts with Convolutional Neural Networks",
+      "author" : [ "Sutskever", "Ilya", "Nair", "Vinod" ],
+      "venue" : "In Proceedings of the 18th International Conference on Artificial Neural Networks, Part II, pp",
+      "citeRegEx" : "Sutskever et al\\.,? \\Q2008\\E",
+      "shortCiteRegEx" : "Sutskever et al\\.",
+      "year" : 2008
+    }, {
+      "title" : "On the likelihood that one unknown probability exceeds another in view of the evidence of two samples",
+      "author" : [ "Thompson", "William R" ],
+      "venue" : null,
+      "citeRegEx" : "Thompson and R.,? \\Q1933\\E",
+      "shortCiteRegEx" : "Thompson and R.",
+      "year" : 1933
+    }, {
+      "title" : "Better Computer Go Player with Neural Network and Long-term Prediction",
+      "author" : [ "Tian", "Yuandong", "Zhu", "Yan" ],
+      "venue" : null,
+      "citeRegEx" : "Tian et al\\.,? \\Q2015\\E",
+      "shortCiteRegEx" : "Tian et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "Move Prediction in Go — Modeling Feature Interactions Using Latent Factors",
+      "author" : [ "Wistuba", "Martin", "Schmidt-Thieme", "Lars" ],
+      "venue" : "In KI 2013: Advances in Artificial Intelligence,",
+      "citeRegEx" : "Wistuba et al\\.,? \\Q2013\\E",
+      "shortCiteRegEx" : "Wistuba et al\\.",
+      "year" : 2013
+    } ],
+    "referenceMentions" : [ {
+      "referenceID" : 18,
+      "context" : "Recent work in convolutional networks for playing Go (Tian & Zhu, 2015; Maddison et al., 2014; Clark & Storkey, 2015; Sutskever & Nair, 2008) have produced neural move predictors for Go with up to 57.",
+      "startOffset" : 53,
+      "endOffset" : 141
+    }, {
+      "referenceID" : 18,
+      "context" : "Previous work used an accurate move predictor built from a very deep convolutional network to guide the search tree exploration in MCTS (Tian & Zhu, 2015; Maddison et al., 2014).",
+      "startOffset" : 136,
+      "endOffset" : 177
+    }, {
+      "referenceID" : 12,
+      "context" : "An early non-uniform rollout policy was pioneered in the Go-playing program MoGo (Gelly et al., 2006), which matched 3 × 3 board patterns, first in the local vicinity of the previous move, and then in the rest of the board.",
+      "startOffset" : 81,
+      "endOffset" : 101
+    }, {
+      "referenceID" : 1,
+      "context" : "Our contribution is threefold: (1) we implement a MCTS-based Go-playing program that uses convolutional networks executed on the GPU in all parts; (2) we perform MCTS in batches to maximize the throughput of convolutions during rollouts; and (3) we demonstrate that Thompson sampling (Thompson, 1933) during exploration of the search tree in MCTS is a viable alternative to UCB1 (Auer et al., 2002).",
+      "startOffset" : 379,
+      "endOffset" : 398
+    }, {
+      "referenceID" : 10,
+      "context" : "An early non-uniform rollout policy was pioneered in the Go-playing program MoGo (Gelly et al., 2006), which matched 3 × 3 board patterns, first in the local vicinity of the previous move, and then in the rest of the board. Coulom (2007a) extended the pattern features by weighting them by relative strength using a minorization-maximization algorithm and choosing patterns with probability determined by a Bradley-Terry model.",
+      "startOffset" : 82,
+      "endOffset" : 239
+    }, {
+      "referenceID" : 12,
+      "context" : "The pioneering Go-playing program MoGo featured pattern-based rollouts (Gelly et al., 2006).",
+      "startOffset" : 71,
+      "endOffset" : 91
+    }, {
+      "referenceID" : 13,
+      "context" : "Clark & Storkey (2015) and Maddison et al. (2014) later extended the results to deep convolutional networks.",
+      "startOffset" : 27,
+      "endOffset" : 50
+    }, {
+      "referenceID" : 13,
+      "context" : "Clark & Storkey (2015) and Maddison et al. (2014) later extended the results to deep convolutional networks. More recently, Tian & Zhu (2015) showed that training with multiple labels for long term prediction further improved the accuracy and playing strength of deep convolutional move predictors.",
+      "startOffset" : 27,
+      "endOffset" : 142
+    }, {
+      "referenceID" : 8,
+      "context" : "The pioneering Go-playing program MoGo featured pattern-based rollouts (Gelly et al., 2006). Stern et al. (2006) learned patterns and local features using Bayesian ranking.",
+      "startOffset" : 72,
+      "endOffset" : 113
+    }, {
+      "referenceID" : 8,
+      "context" : "The pioneering Go-playing program MoGo featured pattern-based rollouts (Gelly et al., 2006). Stern et al. (2006) learned patterns and local features using Bayesian ranking. Coulom (2007a) computed the likelihood of patterns and local features with a Bradley-Terry model.",
+      "startOffset" : 72,
+      "endOffset" : 188
+    }, {
+      "referenceID" : 8,
+      "context" : "The pioneering Go-playing program MoGo featured pattern-based rollouts (Gelly et al., 2006). Stern et al. (2006) learned patterns and local features using Bayesian ranking. Coulom (2007a) computed the likelihood of patterns and local features with a Bradley-Terry model. Wistuba & Schmidt-Thieme (2013) used latent factor ranking to achieve move prediction accuracy of 41%.",
+      "startOffset" : 72,
+      "endOffset" : 303
+    }, {
+      "referenceID" : 8,
+      "context" : "The pioneering Go-playing program MoGo featured pattern-based rollouts (Gelly et al., 2006). Stern et al. (2006) learned patterns and local features using Bayesian ranking. Coulom (2007a) computed the likelihood of patterns and local features with a Bradley-Terry model. Wistuba & Schmidt-Thieme (2013) used latent factor ranking to achieve move prediction accuracy of 41%. Thompson sampling has been applied to Monte Carlo tree search in non-computer Go domains in Perick et al. (2012), Bai et al.",
+      "startOffset" : 72,
+      "endOffset" : 487
+    }, {
+      "referenceID" : 2,
+      "context" : "(2012), Bai et al. (2013), and Imagawa & Kaneko (2015).",
+      "startOffset" : 8,
+      "endOffset" : 26
+    }, {
+      "referenceID" : 2,
+      "context" : "(2012), Bai et al. (2013), and Imagawa & Kaneko (2015). In those previous works, Thompson sampling was compared with UCB1 or other bandit algorithms based on their performance on specific tasks (e.",
+      "startOffset" : 8,
+      "endOffset" : 55
+    }, {
+      "referenceID" : 2,
+      "context" : "(2012), Bai et al. (2013), and Imagawa & Kaneko (2015). In those previous works, Thompson sampling was compared with UCB1 or other bandit algorithms based on their performance on specific tasks (e.g., maximizing reward), rather than our focus of using Thompson sampling guide batch parallelism. Cazenave & Jouandeau (2008) and Chaslot et al.",
+      "startOffset" : 8,
+      "endOffset" : 323
+    }, {
+      "referenceID" : 2,
+      "context" : "(2012), Bai et al. (2013), and Imagawa & Kaneko (2015). In those previous works, Thompson sampling was compared with UCB1 or other bandit algorithms based on their performance on specific tasks (e.g., maximizing reward), rather than our focus of using Thompson sampling guide batch parallelism. Cazenave & Jouandeau (2008) and Chaslot et al. (2008a) introduced approaches for parallelizing MCTS, including “root parallelism” and “tree parallelism.",
+      "startOffset" : 8,
+      "endOffset" : 350
+    }, {
+      "referenceID" : 18,
+      "context" : "Method Exploration Rollouts Our method (PPN+RPN) 12 layer PPN, 128 filters 2- or 3-layer RPN, 16 filters (Maddison et al., 2014) 12 layer PPN, 128 filters pattern-based (Tian & Zhu, 2015) 12 layer PPN, 384 filters, 1–3 step lookahead pattern-based",
+      "startOffset" : 105,
+      "endOffset" : 128
+    }, {
+      "referenceID" : 1,
+      "context" : "The canonical version of MCTS is UCT (Kocsis & Szepesvári, 2006), where the selection criterion in the exploration phase is determined by the UCB1 multi-armed bandit algorithm (Auer et al., 2002).",
+      "startOffset" : 176,
+      "endOffset" : 195
+    }, {
+      "referenceID" : 12,
+      "context" : "However, it was quickly found that using nonuniformly random rollouts (for example, based on the probabilities of local features and patterns as in (Coulom, 2007a)) resulted in stronger play by MCTS-based Go-playing programs (Gelly et al., 2006).",
+      "startOffset" : 225,
+      "endOffset" : 245
+    }, {
+      "referenceID" : 18,
+      "context" : "The most accurate convolutional network architectures for predicting moves in Go tend to be very deep, with at least a dozen layers (Tian & Zhu, 2015; Maddison et al., 2014).",
+      "startOffset" : 132,
+      "endOffset" : 173
+    }, {
+      "referenceID" : 17,
+      "context" : "The layers also have hundreds of convolution filters, and like most modern deep convolutional nets use rectified linear units as their nonlinearity (Krizhevsky et al., 2012).",
+      "startOffset" : 148,
+      "endOffset" : 173
+    }, {
+      "referenceID" : 15,
+      "context" : "Instead, we substitute for UCB1 the probabilistic bandit algorithm Thompson sampling (Thompson, 1933) as the search policy in MCTS, a choice justified by recent empirical evidence (Chapelle & Li, 2011), as well as proofs of its comparable regret bounds to those of UCB1 (Agrawal & Goyal, 2012; Kaufmann et al., 2012).",
+      "startOffset" : 270,
+      "endOffset" : 316
+    }, {
+      "referenceID" : 18,
+      "context" : "They consist of a first layer, followed by repeated inner layers, and completed by a last layer before a softmax probability output layer; this is the same architectural pattern used by Maddison et al. (2014) and Tian & Zhu (2015).",
+      "startOffset" : 186,
+      "endOffset" : 209
+    }, {
+      "referenceID" : 18,
+      "context" : "They consist of a first layer, followed by repeated inner layers, and completed by a last layer before a softmax probability output layer; this is the same architectural pattern used by Maddison et al. (2014) and Tian & Zhu (2015). Three of them (A, B, and C) are very deep nets and are prior policy networks.",
+      "startOffset" : 186,
+      "endOffset" : 231
+    }, {
+      "referenceID" : 18,
+      "context" : "0 (Maddison et al., 2014) 36 5× 5× 128 3× 3× 128× 10 3× 3× 2 12 layers 55.",
+      "startOffset" : 2,
+      "endOffset" : 25
+    }, {
+      "referenceID" : 18,
+      "context" : "The other two architectures (Maddison et al., 2014) and (Tian & Zhu, 2015) are state of the art deep convolutional nets for predicting moves in Go.",
+      "startOffset" : 28,
+      "endOffset" : 51
+    }, {
+      "referenceID" : 18,
+      "context" : "First, with a 6-layer prior policy network and 2-layer or 3-layer rollout policy network, we are able to obtain comparable results to 12-layer networks without MCTS (Tian & Zhu, 2015; Maddison et al., 2014).",
+      "startOffset" : 165,
+      "endOffset" : 206
+    }, {
+      "referenceID" : 18,
+      "context" : "3 GNU Go 12 layer PPN (Maddison et al., 2014) none/greedy 97.",
+      "startOffset" : 22,
+      "endOffset" : 45
+    }, {
+      "referenceID" : 18,
+      "context" : "12-layer network of Maddison et al. (2014) without MCTS.",
+      "startOffset" : 20,
+      "endOffset" : 43
+    }, {
+      "referenceID" : 18,
+      "context" : "12-layer network of Maddison et al. (2014) without MCTS. Our MCTS Go program with a 12-layer prior policy and 2-layer rollout policy is comparable to the larger 1-step darkforest 12-layer network without MCTS of Tian & Zhu (2015). Their network was trained using extra features, including ko point, stone history, and opponent rank, and also has 384 convolution filters compared to 128 filters in our network.",
+      "startOffset" : 20,
+      "endOffset" : 230
+    }, {
+      "referenceID" : 18,
+      "context" : "12-layer network of Maddison et al. (2014) without MCTS. Our MCTS Go program with a 12-layer prior policy and 2-layer rollout policy is comparable to the larger 1-step darkforest 12-layer network without MCTS of Tian & Zhu (2015). Their network was trained using extra features, including ko point, stone history, and opponent rank, and also has 384 convolution filters compared to 128 filters in our network. The 3-step darkfores2 12-layer network with traditional pattern-based MCTS rollouts by Tian & Zhu (2015) performs the best against both GNU Go and Pachi, although they also employ an enhanced training method using 3-step lookahead for long-term prediction and tuned learning rate, whereas we only train our networks using single-step lookahead.",
+      "startOffset" : 20,
+      "endOffset" : 515
+    }, {
+      "referenceID" : 18,
+      "context" : "5 Pachi 12 layer PPN (Maddison et al., 2014) 55.",
+      "startOffset" : 21,
+      "endOffset" : 44
+    } ],
+    "year" : 2015,
+    "abstractText" : "In this work, we present a MCTS-based Go-playing program which uses convolutional networks in all parts. Our method performs MCTS in batches, explores the Monte Carlo search tree using Thompson sampling and a convolutional network, and evaluates convnet-based rollouts on the GPU. We achieve strong win rates against open source Go programs and attain competitive results against state of the art convolutional net-based Go-playing programs.",
+    "creator" : "LaTeX with hyperref package"
+  }
+}

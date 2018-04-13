@@ -1,0 +1,330 @@
+{
+  "name" : "1608.05609.pdf",
+  "metadata" : {
+    "source" : "CRF",
+    "title" : "Implementing a Relevance Tracker Module",
+    "authors" : [ "Joachim Jansen", "Jo Devriendt", "Bart Bogaerts", "Gerda Janssens", "Marc Denecker" ],
+    "emails" : [ "first.lastname@kuleuven.be,", "bart.bogaerts@aalto.fi" ],
+    "sections" : [ {
+      "heading" : null,
+      "text" : "ar X\niv :1\n60 8.\n05 60\n9v 1\n[ cs\n.A I]\n1 9\nA ug"
+    }, {
+      "heading" : "1 Introduction",
+      "text" : "Since the addition of conflict-driven clause learning [Marques-Silva and Sakallah, 1999], SAT solvers have made huge leaps forward. Now that these highly-performant SAT-solvers exist, research often stretches beyond SAT by extending the language supported by SAT with richer language constructs. Research fields such as SAT Modulo Theories (SMT) [Barrett et al., 2009], Constraint Programming (CP) [Apt, 2003] in the form of lazy clause generation [Stuckey, 2010], or Answer Set Programming (ASP) [Marek and Truszczyński, 1999] could be seen as following this approach. In this paper, we focus on the logic PC(ID): the Propositional Calculus extended with Inductive Definitions [Mariën et al., 2007]. The satisfiability problem for PC(ID) encodings is called SAT(ID) [Mariën et al., 2008]. SAT(ID) can be formalised as SAT modulo a theory of inductive definitions and is closely related to answer set solving. In fact, all the work we introduce in this paper is also applicable to so-called generate-define-test answer set programs.\nRecently we [Jansen et al., 2016] defined a notion of relevance for SAT(ID). The idea is that we identify a set of literals that can contribute to a solution, and then limit the solver to only make choices on those literals. We call such literals relevant. Furthermore, instead of searching for a variable assignment that satisfies the PC(ID) theory, we search for a partial assignment that contains sufficient information to guarantee satisfiability. Our approach is based on the notion of justifications [Denecker and De Schreye, 1993; Denecker et al., 2015]. As a small example, consider the following theory.\npT . \n  \n   pT ← a ∧ b. a ← d ∨ ¬e ∨ f. b ← c ∨ ¬g ∨ h. e ← f ∨ ¬h ∨ i.\n\n  \n  \nThis theory contains one constraint, that pT must hold, and a definition (between ‘{’ and ‘}’) of pT in terms of variables a to i. One way to check satisfiability would be to generate an assignment of all variables that satisfies the above theory (this is the classical approach to solving such problems). What we do, on the other hand, is to search for a partial assignment to these variables such that pT is justified in that partial assignment. Consider for example the partial assignment where pT , a, b, c and d are true and everything else is unknown. In this assignment, a and b are justified because d and c hold respectively; pT is justified because both a and b are justified. This suffices to determine satisfiability of the theory, without considering the definition of e for instance.\nIntuitively, a literal is relevant if it can contribute to justifying the theory. In the above example, as soon as d is assigned true, the variable e becomes irrelevant. From that point onwards, search should not take e’s defining rule into account.\nJansen et al. [2016] have studied relevance extensively from the theoretical perspective and ran experiments to determine how relevance influences the number of choices and the number of conflicts a solver encounters. These experiments concluded that VSIDS chooses a significant number of relevant literals, and that prevention of decisions on irrelevant literals can lead to significant performance gains in some hand-constructed examples. The actual implementation has not yet been described in detail. That is exactly the goal of this paper. The insights presented in this paper should make it possible to implement relevance in other solvers as well, for instance in ASP solvers. In fact, our implementation heavily relies on components that are already present in modern ASP solvers. To be precise, we reuse propagation mechanisms for inductive definitions and an unfounded set detection algorithm.\nThe main contributions of this paper are (1) the introduction of a method to keep track of justification status in a SAT(ID) solver, (2) the introduction of a method to keep track of relevance status in a SAT(ID) solver, and (3) a discussion on the properties of these implementations."
+    }, {
+      "heading" : "2 Preliminiaries: SAT(ID), Relevance",
+      "text" : "Here we give a short introduction on PC(ID), SAT(ID), justifications, relevance, and recall how relevance can be exploited to improve PC(ID) solvers. For a more elaborate exposition we refer to Jansen et al. [2016]."
+    }, {
+      "heading" : "2.1 PC(ID)",
+      "text" : "We briefly recall the syntax and semantics of Propositional Calculus extended with Inductive Definitions (PC(ID)) [Mariën, 2009].\nA truth value is one of {t, f ,u}; t represents true, f false and u unknown. The truth order ≤t on truth values is given by f ≤t u ≤t t, the precision order ≤p is given by u ≤p f and u ≤p t. Let Σ be a finite set of symbols called atoms. A literal l is an atom p or its negation ¬p. In the former case, we call l positive, in the latter, we call l negative. We use Σ to denote the set of all literals over Σ. If l is a literal, we use |l| to denote the atom of l, i.e., to denote p whenever l = p or l = ¬p. We use ∼l to denote the literal that is the negation of l, i.e., ∼p = ¬p and ∼¬p = p. Propositional formulas are defined as usual. We use ϕ ⇒ ψ for material implication, i.e., as a shorthand for ¬ϕ ∨ ψ.\nA partial interpretation I is a mapping from Σ to truth values. We use the notation {pt1, . . . , p t n, q f 1, . . . , q f m} for the partial interpretation that maps the pi to t, the qi to f and all other atoms to u. We call a partial interpretation two-valued if it does not map any atom to u. If I and I ′ are partial interpretations, we say that I is less precise than I ′ (notation I ≤p I ′) if for all p ∈ Σ, I(p) ≤p I ′(p). If ϕ is a propositional formula, we use ϕI to denote the truth value (t, f or u) of ϕ in I, based on the Kleene truth tables [Kleene, 1938]. If I is a partial interpretation and l a literal, we use I[l : t] to denote the partial interpretation equal to I, except that it interprets l as t (and similar for f , u). If Σ′ ⊆ Σ, we use the notation I|Σ′ to indicate the restriction of I to symbols in Σ′. This restriction is a partial interpretation of Σ and satisfies I|Σ′(p) = u if p /∈ Σ′ and I|Σ′(p) = I(p) otherwise. In the rest of this text, when we just say interpretation, we mean a twovalued partial interpretation. An interpretation I is completely characterised by the set of atoms p such that I(p) = t. As such, slightly abusing notation, we often identify an interpretation with a set of atoms.\nAn inductive definition ∆ over Σ is a finite set of rules of the form p ← ϕ where p ∈ Σ and ϕ is a propositional formula over Σ. We call p the head of the rule and ϕ the body of the rule. We call p defined in ∆ if p occurs as the head of a rule in ∆. The set of all symbols defined in ∆ is denoted by defs(∆). All other symbols are called open in ∆. The set of open symbols in ∆ is denoted opens(∆). We say that a literal l is defined in ∆ if |l| ∈ defs(∆). We use the parametrised well-founded semantics for inductive definitions [Denecker and Vennekens, 2007]. That is, interpretation I is a model of∆ (denoted I |= ∆) if I is the well-founded model of ∆ in context I|opens(∆). We call an inductive definition total if for every interpretation I of the open symbols, the well-founded model in context I is a two-valued interpretation.\nA PC(ID) theory T over Σ is a set of propositional formulas, called constraints, and inductive definitions overΣ. Interpretation I is a model of T if I is a model of all definitions and constraints in T . Without loss of generality [Mariën, 2009], we assume that every PC(ID) theory is in Definition Normal Form (DEFNF), where T = {pT , ∆} and – pT is an atom,\n– ∆ is an inductive definition defining pT , – every rule in ∆ is of the form p ← l1 ⊙ · · · ⊙ ln, where ⊙ is either ∧ or ∨, p\nis an atom, and each of the li are literals, – every atom p is defined in at most one rule of ∆.\nA rule in which ⊙ is ∧, respectively ∨ is called a conjunctive, respectively disjunctive, rule. The rules in a definition ∆ impose a direct dependency relation, denoted dd∆, between literals, defined as follows. For every rule p← l1⊙· · ·⊙ ln in ∆, dd∆ contains (p, li) and (∼p,∼li) for all 1 ≤ i ≤ n. The dependency graph of ∆ is the graph G∆ = (Σ, dd∆).\nFor the remainder of the paper, we assume that some PC(ID) theory T = {pT , ∆} is fixed.\nIt has been argued many times before [Denecker, 1998; Denecker and Ternovska, 2008; Denecker and Vennekens, 2014] that all sensible definitions in mathematical texts are total definitions. Following these arguments, in the rest of this paper we assume ∆ to be a total definition.\nThe satisfiability problem for PC(ID), i.e., deciding whether a PC(ID) theory has a model, is called SAT(ID). This problem is NP-complete [Mariën et al., 2008]."
+    }, {
+      "heading" : "2.2 Justifications",
+      "text" : "Consider a directed graph G = (V,E), with V a set of nodes and E a set of edges. If G contains an edge from l to l′ (i.e., (l, l′) ∈ E), we say that l is a parent of l′ in G and that l′ is a child of l in G. A node l is called a leaf of G if it has no children in G; otherwise it is called internal in G. Let G′ = (V ′, E′) be another graph. We define the union of two graphs (denoted G ∪ G′) as the graph with vertices V ∪ V ′ and edges E ∪ E′.\nSuppose l is a literal with p = |l| and p ∈ defs(∆) with defining rule p ← l1 ⊙ · · · ⊙ ln. A set of literals Jd is a direct justification of l in ∆ if one of the following holds:\n– l = p, ⊙ is ∧, and Jd = {l1, . . . , ln}, – l = p, ⊙ is ∨, and Jd = {li} for some i, – l = ¬p, ⊙ is ∧, and Jd = {∼li} for some i, – l = ¬p, ⊙ is ∨, and Jd = {∼l1, . . . ,∼ln}.\nNote that a direct justification of a literal can only contain children of that literal in the dependency graph.\nA justification [Denecker and De Schreye, 1993; Denecker et al., 2015] J of a definition ∆ is a subgraph of G∆, such that each internal node l ∈ J is a defined literal and the set of its children is a direct justification of l in ∆. We say that J contains l if l occurs as node in J . A justification is total if none of its leaves are defined literals. A justification can contain cycles.1 A cycle is called positive\n1 In this text, we assume that ∆ is finite; in this case cycles are simply loops in the graph. The infinite case is a bit more subtle, and an adapted definition of cycle is required to maintain all results presented below.\n(resp. negative) if it contains only positive (resp. negative) literals. It is called a mixed cycle otherwise.\nIf J is a justification and I a (partial) interpretation, we define the value of J in I, denoted VI(J) as follows: – VI(J) = f if J contains a leaf l with l\nI = f or a positive cycle (or both). – VI(J) = u if VI(J) 6= f and J contains a leaf l with lI = u or a mixed cycle\n(or both). – VI(J) = t otherwise (all leaves are t and cycles, if any, are negative). A literal l is justified (in I, for T ) if there exists a total justification J (of ∆) that contains l such that VI(J) = t. In this case, we say that such a J justifies l (in I, for T ). It follows from the definition that it is not possible that both l and ¬l are justified in the same in the same interpretation.\nThe justification status of an atom p (in I, for T ) is defined as follows. The justification status of p is true if and only if the literal p is justified in I for T . The justification status of p is false if and only if the literal ¬p is justified in I for T . Otherwise the justification status of p is unknown.\nDenecker and De Schreye [1993] and later also Denecker et al. [2015] showed that many semantics of logic programs can be captured by justifications."
+    }, {
+      "heading" : "2.3 Relevance",
+      "text" : "Now, we recall the central definitions and theorems related to relevance. For a more detailed exposition of the theoretical foundations, we refer to Jansen et al. [2016].\nTheorem 1 ([Jansen et al., 2016]; Theorem 3.1). T is satisfiable if and only if there exists a partial interpretation I and a justification J that justifies pT in I.\nDefinition 1 ([Jansen et al., 2016]; Definition 3.2). Given a PC(ID) theory T = {pT , ∆} and a partial interpretation I, we inductively define the set of relevant literals, denoted RT ,I, as follows – pT is relevant if pT is not justified, – l is relevant if l is not justified and there exists some l′ such that (l′, l) ∈ dd∆\nand l′ is relevant.\nThe central theorem regarding relevance shows that any search algorithm that arrives in a state in which pT is justified by deciding on a literal l that is irrelevant can also arrive in such a state without deciding on l. Hence, if a literal l is irrelevant, choosing on l does not help justifying pT .\nTheorem 2 ([Jansen et al., 2016]; Theorem 3.5). Let T = {pT , ∆} be a PC(ID) theory. Suppose I is a partial interpretation and l a literal such that I(|l|) = u and l is not relevant in I. If pT is justified in some partial interpretation I ′ more precise than I, then pT is also justified in I ′[l : f ] and in I ′[l : t].\nConsequently, the work suggests adapting SAT(ID) solvers such that they (1) do not make decisions on irrelevant literals, and (2) stop searching when there are no relevant literals left. This requires the underlying solver to keep track of which literals are relevant. This task is incremental in nature: small changes to the state of the solver will result in small changes to the relevance of literals. Since modern solvers work with hunderds of thousands of variables and go through millions of assignment in quick succession, it is essential to do these changes as efficiently as possible."
+    }, {
+      "heading" : "3 The Basic Framework",
+      "text" : "The aim of this work is to discuss the implementation of an algorithm to keep track of relevant literals.\nAs said in Theorem 1, the solver aims to arrive at a state S where pT is justified in I. The solver does this by making decisions, performing propagation, and backtracking. To prevent the solver from making “useless” decisions, we need to know whether literals are relevant or not in I.\nWe consider the underlying solver to have an internal state S of the form S = 〈Σ, T , I〉, with (1) Σ denoting the set of literals used in the solver, (2) T = {pT , ∆} a DEFNF theory, and (3) I the current partial interpretation in the solver.\nDuring the search process, the (CDCL) solver adds learned conflict clauses to the theory. However, learned conflict clauses are logical consequences of the theory and because of this we do not consider them to be a part of the theory T in S. Instead, T is reserved for non-learned clauses. We assume T to remain static during the search process. This assumption is valid in most ground-andsolve systems. Recent work focuses on interleaving this process [De Cat et al., 2015]. Extending this work to allow for a changing theory is future work, but should be of limited complexity given the framework we present here.\nThe relevance tracker needs to take into account changes in the solver state, in particular in I. Before we define the interface between the relevance tracker and the solver, we discuss the solver state and its changes.\nDuring the search process, the solver iteratively performs one of the following state changes:\n– 〈Σ, T , I〉 7→ 〈Σ, T , I[l : t]〉 a literal l becomes true, or – 〈Σ, T , I〉 7→ 〈Σ, T , I[l : u]〉 a literal l becomes unknown.\nNote that this set of operations allows the solver to make a literal l false by making literal ∼l true.\nIn order to get the necessary information about the changes of the solver and to implement the above revision problem, the relevance tracker listens to notifications. The relevance tracker supports the following interface to the underlying solver.\nnotifyBecomesTrue a literal l becomes true in I\nnotifyBecomesUnknown a literal l becomes unknown in I isRelevant query whether a given literal l is relevant (returns a boolean value)\nMethods notifyBecomesTrue and notifyBecomesUnknownmust be called by the underlying solver when a literal has become true, respectively unknown. The isRelevant method is used by the solver to ask the module whether the given literal is relevant. The relevance information allows the solver to change its underlying heuristic, selecting only relevant literals."
+    }, {
+      "heading" : "4 Deriving the justification status of literals",
+      "text" : "The definition of relevance relies on knowledge about which literals are justified in the solver. In this section, we discuss how we implemented extraction of this information. We opted to implement a method that re-uses the underlying SAT(ID) solver to keep track of the justification status of literals. The method creates a new atom, called the “justification atom”, for each defined atom p, denoted as j(p). We call a literal j(p) or ¬j(p) a justification literal.\nThe intended interpretation of j(p) is that j(p) is true iff p is justified, j(p) is false iff ¬p is justified and j(p) is unknown otherwise. To ensure that justification literals indeed get the right value, an extra PC(ID) definition ∆j , denoted the “justification definition”, is added to the theory T . ∆j is constructed based on the original definition ∆ in the following manner. The existing definition ∆ is copied, except that every defined atom p is replaced with the newly created atom j(p). Thus, of all the atoms in the original definition, only the open atoms remain.\nExample 1. Transforming the original definition\n∆ =\n\n      \n       pT ← c1 ∧ c2 ∧ c3 ∧ c4 c1 ← ¬b ∨ ¬d c2 ← a ∨ b ∨ ¬c c3 ← ¬b ∨ e ∨ ¬f c4 ← d ∨ f ∨ ¬a f ← b ∨ d\n\n      \n      \nleads to the justification definition\n∆j =\n\n      \n      j(pT ) ← j(c1) ∧ j(c2) ∧ j(c3) ∧ j(c4) j(c1) ← ¬b ∨ ¬d j(c2) ← a ∨ b ∨ ¬c j(c3) ← ¬b ∨ e ∨ ¬j(f) j(c4) ← d ∨ j(f) ∨ ¬a j(f) ← b ∨ d\n\n      \n     \nIn addition to the creation of this new definition ∆j , we prohibit the solver from making choices on these justification atoms. Because of this, the value of all j(p) will be purely the result of the underlying propagation mechanism for definitions. Our claim is now that existing propagation mechanisms will propagate\nexactly those literals that are justified. We assume a solver that performs unit propagation and unfounded set propagation [Gebser et al., 2012; Mariën et al., 2007], i.e., propagation that makes all atoms in an unfounded set false.\nTheorem 3. Let ∆ be a (total) definition and I a partial interpretation in which all defined symbols of ∆ are interpreted as u. Let l be a defined literal in ∆. In this case l is justified in I if and only if l is derivable by unit propagation on the completion2[Clark, 1978] of ∆ and unfounded set propagations.\nProof (Sketch of the proof). Intuitively, from a sequence of propagations, we can create a justification and vice versa: each justification induces a sequence of propagations. The correspondence is as follows. First for the completion, if ∆ contains a rule p ← l1 ∧ · · · ∧ ln, then this rule propagates p = t if and only if each of the li is true. This corresponds to the justification\np\nl1 . . . ln\nAnd similar justification constructs can be defined for when ¬p is propagated or when the rule is disjunctive.\nUnfounded set propagation essentially corresponds to a justification of a set of negative facts by a negative cycle.\nThe condition that a justification can have no mixed or positive cycles corresponds to the fact that propagation must happen in order. E.g., from the rule p ← p ∨ q, p can only be propagated if q is true; p cannot be propagated “because p is true”. ⊓⊔\nThe previous theorem establishes that our approach works; a justification literal j(p) will be propagated to true if p is justified (note that p is justified iff j(p) is justified). It also explains why we use a duplicated definition: the theorem only holds if I is an opens(∆) interpretation. Since this cannot be enforced (we don’t want to intrude in the solver’s search), we make a copy and never make choices on the copied defined symbols.\nThus, we extend our solver state S = 〈Σ, T , I〉 to a S ′ = 〈Σ ′ , T ′, I ′, Σ′〉 with\n– Σ′ = set containing the newly introduced justification atoms that the solver cannot decide on – Σ ′ = Σ ∪Σ′ – T ′ = {pT , ∆′} if T = {pT , ∆} and ∆′ = ∆ ∪∆j – I ′ = a partial structure over Σ ′\nWith all this in place, we derive the interpretation for justified(l) as follows.\n– justified(p) is true if and only if j(p) is true in I ′, and – justified(¬p) is true if and only if j(p) is false in I ′.\n2 The completion of a rule p← q is the underapproximation using the first-order logic (FO) sentence p⇔ q, which demands that p and q hold equal truth values"
+    }, {
+      "heading" : "5 Implementing the relevance tracker",
+      "text" : "The source code that implements the techniques discussed here can be found at https://dtai.cs.kuleuven.be/static/krr/files/experiments/idp_relevance_ experiments.tar.gz .\nThe solver maintains a subgraph of the dependency graph in order to keep track of the set of relevant literals. This subgraph, denoted as the relevance graph contains all literals that are relevant and all edges between them (in the dependency graph). As such, the task of the tracker is to determine whether a given literal is a member of this graph or not. We store this graph using a data structure, denoted candidate parents(l) that associates a literal with a set of literals called “candidate parents”. The “candidate parents” of l are the literals that are parents of l in the relevance graph. I.e., if l is irrelevant, this set is empty, otherwise, it consists of all relevant parents of l in the dependency graph. As such, it can be seen that there is an edge (p, l) in the relevance graph iff p ∈ candidate parents(l). Thus, l is relevant if and only if l has a non-empty set of candidate parents. We now describe an incremental algorithm to update the set of candidate parents for all literals if the state of the solver changes. We prefer to keep these changes local, i.e., to not reconstruct the entire relevance graph with each solver change.\nWhen the solver state changes, and the set of candidate parents must be updated, care must be taken to detect and remove cyclic dependencies. These cyclic dependencies can arise when a candidate parent is removed from a literal l and the remaining candidate parents of that literal are not reachable from pT anymore but still have l as a candidate parent, creating a loop. A more detailed example is given in Example 2\nExample 2. The following definition has the cyclic dependency of p← q ← p.\n\n\n pT ← a ∨ p p← q q ← p\n\n\n\nInitially I = ∅, thus nothing is justified and all literals are relevant. Thus, p has candidate parents {pT , q}, and q has candidate parents {p}.\nConsider the case where a becomes true and hence pT becomes justified.\nSimply removing pT from the set of candidate parents of p means that p still has candidate parents {q}, which is actually just a loop leading back to p. Thus, a cycle detection algorithm is needed to force p and q to remain loop-free.\nThus, adding and removing candidate parents is a complicated matter. In Section 5.4 we discuss how this cycle detection is done. For now, we use the following interface for adjusting the set of a candidate parents.\nnotifyAddCandidateParent(l,l′) add l′ to the candidate parents of l notifyRemoveCandidateParent(l,l′) remove l′ from the candidate parents\nof l\nOur definition of candidate parents potentially changes when the following changes take place (note that we already assumed the dependency relation to be non-changeable).\n– A change in the justification status of l – A change in the relevance status of a parent literal l′\nThus, we extend the interface of the relevance tracker to also support the following methods.\nnotifyBecomesJustified(l) A literal l goes from unjustified to justified notifyBecomesUnjustified(l) A literal l goes from justified to unjustified notifyBecomesRelevant(l) A literal l goes from irrelevant to relevant notifyBecomesIrrelevant(l) A literal l goes from relevant to irrelevant\nIn the following subsections we present (1) an overview of the data structures in the relevance tracker and (2) the algorithms for the methods in our interface."
+    }, {
+      "heading" : "5.1 Data Structures",
+      "text" : "The data structures include sets and maps. Unless specified otherwise, we use hash sets and hash maps. The implementation uses std::unordered set and std::unordered map provided by the C++ standard library.\nInternally, we store the dependency relation dd∆ using two maps in our module, named children and parents. These data structures map a literal to a set of literals. The first map (children) maps a literal to its set of children in dd∆. The second map (parents) maps a literal to its set of parents in dd∆. They are initialised using the notifyNewRulemethod. Once they are initialised, they remain fixed.\nWe use a map (to just lit) to transform a normal literal to its justification literal (p 7→ j(p), ¬p 7→ ¬j(p)). For efficiency reasons, we also maintain the inverse map to nonjust lit = to just lit−1. These maps are initialised when the justification definition ∆j is created and do not change during execution afterwards.\nWe maintain a set of atoms (is just atom) to identify the justification atoms that were introduced. This set are initialised when the justification definition ∆j is created and does not change during execution afterwards.\nWe use round brackets to indicate the result of a map lookup, e.g.,\nto just lit(p) = j(p).\nWe use round brackets to do a containment check of sets. More precisely,\nis just atom(p) = true\nif and only if p is in the set is just atom. As mentioned before, the underlying solver is not allowed to make decisions on literals in this set.\nWe maintain a map candidate parents with the invariant that it maps a literal l to the set of candidate parents of l. This map is dynamic throughout execution and changes to this map are performed using the notifyAddCandidateParent and notifyRemoveCandidateParent methods."
+    }, {
+      "heading" : "5.2 Notification-based Algorithms",
+      "text" : "Given that the invariant of candidate parents is satisfied in solver state S = 〈Σ, T , I〉, we wish to perform the necessary changes such that they are satisfied in solver state S ′ = 〈Σ, T , I[p : tv]〉 with p some atom and tv one of {t, f ,u}.\nWe initiate our notification-based algorithm as follows. If tv = t, then we call notifyBecomesTrue(p). If tv = f , then we call notifyBecomesTrue(¬p). If tv = u, then we call notifyBecomesUnknown(p).\nThis call, in turn, can trigger other internal notifications. The implementation of these cascading notifications ensures that candidate parents will comply with its invariant in interpretation S ′ after the designated call to notifyBecomesTrue or notifyBecomesUnknown is complete.\nThe relevance tracker implements isRelevant(l) by checking whether candidate parents(l)maps to an empty set or not. This is a correct representation of the relevance status of l if the invariant of candidate parents is satisfied.\nFor methods notifyBecomesTrue(l), notifyBecomesUnknown(l): the given literal can be a normal literal (p or ¬p) or a justification literal (j(p) or ¬j(p)). The relevance tracker takes no action for normal literals. If the given literal is a justification literal, then we retrieve the original normal literal and notify the relevance tracker that this literal has become (un)justified. Note that we re-use the notation of |l| to indicate the atom of literal l. notifyBecomesTrue(l): if is just atom(|l|), then call notifyBecomesJustified(to nonjust lit(l)).\nnotifyBecomesUnknown(l): if is just atom(|l|), then call notifyBecomesUnjustified(to nonjust lit(l)). notifyBecomesJustified(l): call notifyRemoveAllCandidateParentsOf(l). notifyBecomesUnjustified(l): for all parents p of l that are relevant, call notifyAddCandidateParent(l,p). notifyBecomesRelevant(l): for all children c of l, call notifyAddCandidateParent(c,l). notifyBecomesIrrelevant(l): for all children c of l, call notifyRemoveCandidateParent(c,l)."
+    }, {
+      "heading" : "5.3 Maintaining watches instead of sets of candidates",
+      "text" : "The above methods dictate how the candidate parents map should be manipulated. For efficiency reasons, the relevance tracker does not actively maintain this set of candidate parents. Instead it keeps track of a single candidate parent as “watched” parent. This watched parent is maintained using a map called watched parent(l) that maps a literal to a single parent of l. The method isRelevant(l) now checks whether a given literal l has a watched parent or not.\nWe only keep track of a single watched parent in order to minimize how many times a cycle detection algorithm has to be invoked. The manipulation of the set of candidate parents, along with the invocation of a cycle detection algorithm is done as follows\nnotifyAddCandidateParent(l,l′) Check for the following criteria – l does not have a watched parent yet – l is not justified – l′ is relevant – l is a child of l′\nIf they are met, make watched parent(l) = l′ and call notifyBecomesRelevant(l). Note that a cyclic dependency check between l and l′ is not needed, since l could not have been a suitable watch for any other literal, as it was not relevant before. notifyRemoveCandidateParent(l,l′) If l had l′ as its watch, remove l′ as watched parent of l. Try to find an alternative candidate parent n such that the following hold. – n 6= l′\n– l is a child of n – l is not justified – n is relevant – Use a cycle detection algorithm to verify that setting watched parent(l)\n= n would not create a dependency cycle If such n can be found, set watched parent(l) = n. If such n cannot be found, call notifyBecomesIrrelevant(l).\nThe implementation for the search for an alternative watch is a re-use of an existing “unfounded set detection” algorithm. This algorithm is considered the fastest algorithm to achieve this task to date."
+    }, {
+      "heading" : "5.4 Detecting Cycles",
+      "text" : "For our implementation of the detection of cycles, we re-use parts of the existing unfounded set propagation algorithm [Gebser et al., 2012; Mariën et al., 2007]. This algorithm has a subcomponent that searches for cycles over negative literals."
+    }, {
+      "heading" : "6 Conclusion and Future Work",
+      "text" : "The notion of relevance is related to Magic Sets [Bancilhon et al., 1986; Beeri and Ramakrishnan, 1991] in the field of Logic Programming in the sense that the resulting program of the magic set transformation on a program P and query Q does not execute parts of P that do not contribute towards solving query Q.\nOne area where relevance should give great speedups is stable model counting. When pT is justified, the number of solutions that this partial assignment represents is equal to 2n with n the number of unassigned open atoms in ∆. Stable model counters generally stop when the justified residual program [Aziz et al., 2015] is empty. Whenever this occurs, pT is justified. However, this does not hold the other way round. There are other cases where pT is justified, but the justified residual program is non-empty. As such, exploiting relevance can ensure cutting out bigger parts of the search tree when model counting.\nIn this paper we have presented our implementation of a relevance tracker module on top of an existing SAT(ID) solver, which consists of two methods; one to keep track of the set of justified literals and one to keep track of the set of relevant literals. Each of them reuses existing techniques, namely the following.\n– Our method for keeping track of the justification status of literals. This method reuses existing propagation mechanisms. We also prove the correctness of this approach if the underlying solver guarantees completeness with respect to rule application and unfounded set propagation.\n– Our method for keeping track of the relevance status of literals reuses the existing unfounded set detection techniques [Gebser et al., 2012; Mariën et al., 2007] for detection of cyclic dependencies between “candidate parents”.\nGenerate-and-test ASP programs are the most common form of ASP programs, as can be witnessed, e.g., from the benchmarks in the latest ASP competitions [Calimeri et al., 2016]. Generate-and-test ASP programs closely correspond to PC(ID) theories [Denecker et al., 2012]. This paper imposes minimal assumptions on the underlying solver, thus making it possible to translate these ideas to an ASP context. Since experiments have shown [Jansen et al., 2016] that exploiting relevance during solving can reduce the number of decisions, as well as the number of conflicts, it would be interesting to see how relevance might possibly affects existing ASP solvers."
+    }, {
+      "heading" : "Acknowledgements",
+      "text" : "This research was supported by the project GOA 13/010 Research Fund KU Leuven and projects G.0489.10, G.0357.12 and G.0922.13 of FWO (Research Foundation - Flanders). Bart Bogaerts is supported by the Finnish Center of Excellence in Computational Inference Research (COIN) funded by the Academy of Finland (grant #251170)."
+    } ],
+    "references" : [ {
+      "title" : "Principles of Constraint Programming",
+      "author" : [ "Krzysztof R. Apt" ],
+      "venue" : null,
+      "citeRegEx" : "Apt.,? \\Q2003\\E",
+      "shortCiteRegEx" : "Apt.",
+      "year" : 2003
+    }, {
+      "title" : "Stable model counting and its application in probabilistic logic programming",
+      "author" : [ "Rehan Abdul Aziz", "Geoffrey Chu", "Christian J. Muise", "Peter James Stuckey" ],
+      "venue" : null,
+      "citeRegEx" : "Aziz et al\\.,? \\Q2015\\E",
+      "shortCiteRegEx" : "Aziz et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "Magic sets and other strange ways to implement logic programs (extended abstract)",
+      "author" : [ "Francois Bancilhon", "David Maier", "Yehoshua Sagiv", "Jeffrey D Ullman" ],
+      "venue" : "In Proceedings of the Fifth ACM SIGACT-SIGMOD Symposium on Principles of Database Systems,",
+      "citeRegEx" : "Bancilhon et al\\.,? \\Q1986\\E",
+      "shortCiteRegEx" : "Bancilhon et al\\.",
+      "year" : 1986
+    }, {
+      "title" : "Satisfiability modulo theories",
+      "author" : [ "Clark W. Barrett", "Roberto Sebastiani", "Sanjit A. Seshia", "Cesare Tinelli" ],
+      "venue" : "Handbook of Satisfiability,",
+      "citeRegEx" : "Barrett et al\\.,? \\Q2009\\E",
+      "shortCiteRegEx" : "Barrett et al\\.",
+      "year" : 2009
+    }, {
+      "title" : "Special issue: Database logic progamming on the power of magic",
+      "author" : [ "Catriel Beeri", "Raghu Ramakrishnan" ],
+      "venue" : "The Journal of Logic Programming,",
+      "citeRegEx" : "Beeri and Ramakrishnan.,? \\Q1991\\E",
+      "shortCiteRegEx" : "Beeri and Ramakrishnan.",
+      "year" : 1991
+    }, {
+      "title" : "Design and results of the fifth answer set programming competition",
+      "author" : [ "Francesco Calimeri", "Martin Gebser", "Marco Maratea", "Francesco Ricca" ],
+      "venue" : "Artif. Intell.,",
+      "citeRegEx" : "Calimeri et al\\.,? \\Q2016\\E",
+      "shortCiteRegEx" : "Calimeri et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Negation as failure. In Logic and Data Bases, pages 293–322",
+      "author" : [ "Keith L. Clark" ],
+      "venue" : null,
+      "citeRegEx" : "Clark.,? \\Q1978\\E",
+      "shortCiteRegEx" : "Clark.",
+      "year" : 1978
+    }, {
+      "title" : "Lazy model expansion: Interleaving grounding with search",
+      "author" : [ "Broes De Cat", "Marc Denecker", "Maurice Bruynooghe", "Peter J. Stuckey" ],
+      "venue" : "J. Artif. Intell. Res. (JAIR),",
+      "citeRegEx" : "Cat et al\\.,? \\Q2015\\E",
+      "shortCiteRegEx" : "Cat et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "The well-founded semantics is the principle of inductive definition",
+      "author" : [ "Marc Denecker" ],
+      "venue" : "JELIA, volume 1489 of LNCS,",
+      "citeRegEx" : "Denecker.,? \\Q1998\\E",
+      "shortCiteRegEx" : "Denecker.",
+      "year" : 1998
+    }, {
+      "title" : "Justification semantics: A unifying framework for the semantics of logic programs",
+      "author" : [ "Marc Denecker", "Danny De Schreye" ],
+      "venue" : "URL https:// lirias.kuleuven.be/handle/123456789/133075",
+      "citeRegEx" : "Denecker and Schreye.,? \\Q1993\\E",
+      "shortCiteRegEx" : "Denecker and Schreye.",
+      "year" : 1993
+    }, {
+      "title" : "A logic of nonmonotone inductive definitions",
+      "author" : [ "Marc Denecker", "Eugenia Ternovska" ],
+      "venue" : "ACM Trans. Comput. Log.,",
+      "citeRegEx" : "Denecker and Ternovska.,? \\Q2008\\E",
+      "shortCiteRegEx" : "Denecker and Ternovska.",
+      "year" : 2008
+    }, {
+      "title" : "Well-founded semantics and the algebraic theory of non-monotone inductive definitions",
+      "author" : [ "Marc Denecker", "Joost Vennekens" ],
+      "venue" : "LPNMR, volume 4483 of Lecture Notes in Computer Science,",
+      "citeRegEx" : "Denecker and Vennekens.,? \\Q2007\\E",
+      "shortCiteRegEx" : "Denecker and Vennekens.",
+      "year" : 2007
+    }, {
+      "title" : "The well-founded semantics is the principle of inductive definition, revisited",
+      "author" : [ "Marc Denecker", "Joost Vennekens" ],
+      "venue" : "URL http://www.aaai.org/ocs/index.php/KR/KR14/paper/view/7957",
+      "citeRegEx" : "Denecker and Vennekens.,? \\Q2014\\E",
+      "shortCiteRegEx" : "Denecker and Vennekens.",
+      "year" : 2014
+    }, {
+      "title" : "A Tarskian informal semantics for answer set programming",
+      "author" : [ "law Truszczyński", "Joost Vennekens" ],
+      "venue" : "ICLP (Technical Communications),",
+      "citeRegEx" : "Truszczyński and Vennekens.,? \\Q2012\\E",
+      "shortCiteRegEx" : "Truszczyński and Vennekens.",
+      "year" : 2012
+    }, {
+      "title" : "solving: From theory to practice",
+      "author" : [ "Joachim Jansen", "Bart Bogaerts", "Jo Devriendt", "Gerda Janssens", "Marc Denecker" ],
+      "venue" : null,
+      "citeRegEx" : "Jansen et al\\.,? \\Q2012\\E",
+      "shortCiteRegEx" : "Jansen et al\\.",
+      "year" : 2012
+    }, {
+      "title" : "Model Generation for ID-Logic",
+      "author" : [ "Maarten Mariën" ],
+      "venue" : "PhD thesis,",
+      "citeRegEx" : "Mariën.,? \\Q2009\\E",
+      "shortCiteRegEx" : "Mariën.",
+      "year" : 2009
+    }, {
+      "title" : "Integrating inductive definitions in SAT",
+      "author" : [ "Maarten Mariën", "Johan Wittocx", "Marc Denecker" ],
+      "venue" : "In Nachum Derschowitz and Andrei Voronkov, editors, LPAR,",
+      "citeRegEx" : "Mariën et al\\.,? \\Q2007\\E",
+      "shortCiteRegEx" : "Mariën et al\\.",
+      "year" : 2007
+    }, {
+      "title" : "SAT(ID): Satisfiability of propositional logic extended with inductive definitions",
+      "author" : [ "Maarten Mariën", "Johan Wittocx", "Marc Denecker", "Maurice Bruynooghe" ],
+      "venue" : "SAT, volume 4996 of LNCS,",
+      "citeRegEx" : "Mariën et al\\.,? \\Q2008\\E",
+      "shortCiteRegEx" : "Mariën et al\\.",
+      "year" : 2008
+    }, {
+      "title" : "GRASP: A search algorithm for propositional satisfiability",
+      "author" : [ "João P. Marques-Silva", "Karem A. Sakallah" ],
+      "venue" : "IEEE Transactions on Computers,",
+      "citeRegEx" : "Marques.Silva and Sakallah.,? \\Q1999\\E",
+      "shortCiteRegEx" : "Marques.Silva and Sakallah.",
+      "year" : 1999
+    }, {
+      "title" : "Lazy clause generation: Combining the power of SAT and CP (and MIP?) solving",
+      "author" : [ "Peter J. Stuckey" ],
+      "venue" : "In CPAIOR,",
+      "citeRegEx" : "Stuckey.,? \\Q2010\\E",
+      "shortCiteRegEx" : "Stuckey.",
+      "year" : 2010
+    } ],
+    "referenceMentions" : [ {
+      "referenceID" : 18,
+      "context" : "Since the addition of conflict-driven clause learning [Marques-Silva and Sakallah, 1999], SAT solvers have made huge leaps forward.",
+      "startOffset" : 54,
+      "endOffset" : 88
+    }, {
+      "referenceID" : 3,
+      "context" : "Research fields such as SAT Modulo Theories (SMT) [Barrett et al., 2009], Constraint Programming (CP) [Apt, 2003] in the form of lazy clause generation [Stuckey, 2010], or Answer Set Programming (ASP) [Marek and Truszczyński, 1999] could be seen as following this approach.",
+      "startOffset" : 50,
+      "endOffset" : 72
+    }, {
+      "referenceID" : 0,
+      "context" : ", 2009], Constraint Programming (CP) [Apt, 2003] in the form of lazy clause generation [Stuckey, 2010], or Answer Set Programming (ASP) [Marek and Truszczyński, 1999] could be seen as following this approach.",
+      "startOffset" : 37,
+      "endOffset" : 48
+    }, {
+      "referenceID" : 19,
+      "context" : ", 2009], Constraint Programming (CP) [Apt, 2003] in the form of lazy clause generation [Stuckey, 2010], or Answer Set Programming (ASP) [Marek and Truszczyński, 1999] could be seen as following this approach.",
+      "startOffset" : 87,
+      "endOffset" : 102
+    }, {
+      "referenceID" : 16,
+      "context" : "In this paper, we focus on the logic PC(ID): the Propositional Calculus extended with Inductive Definitions [Mariën et al., 2007].",
+      "startOffset" : 108,
+      "endOffset" : 129
+    }, {
+      "referenceID" : 17,
+      "context" : "The satisfiability problem for PC(ID) encodings is called SAT(ID) [Mariën et al., 2008].",
+      "startOffset" : 66,
+      "endOffset" : 87
+    }, {
+      "referenceID" : 14,
+      "context" : "Jansen et al. [2016] have studied relevance extensively from the theoretical perspective and ran experiments to determine how relevance influences the number of choices and the number of conflicts a solver encounters.",
+      "startOffset" : 0,
+      "endOffset" : 21
+    }, {
+      "referenceID" : 14,
+      "context" : "For a more elaborate exposition we refer to Jansen et al. [2016].",
+      "startOffset" : 44,
+      "endOffset" : 65
+    }, {
+      "referenceID" : 15,
+      "context" : "We briefly recall the syntax and semantics of Propositional Calculus extended with Inductive Definitions (PC(ID)) [Mariën, 2009].",
+      "startOffset" : 114,
+      "endOffset" : 128
+    }, {
+      "referenceID" : 11,
+      "context" : "We use the parametrised well-founded semantics for inductive definitions [Denecker and Vennekens, 2007].",
+      "startOffset" : 73,
+      "endOffset" : 103
+    }, {
+      "referenceID" : 15,
+      "context" : "Without loss of generality [Mariën, 2009], we assume that every PC(ID) theory is in Definition Normal Form (DEFNF), where T = {pT , ∆} and – pT is an atom,",
+      "startOffset" : 27,
+      "endOffset" : 41
+    }, {
+      "referenceID" : 8,
+      "context" : "It has been argued many times before [Denecker, 1998; Denecker and Ternovska, 2008; Denecker and Vennekens, 2014] that all sensible definitions in mathematical texts are total definitions.",
+      "startOffset" : 37,
+      "endOffset" : 113
+    }, {
+      "referenceID" : 10,
+      "context" : "It has been argued many times before [Denecker, 1998; Denecker and Ternovska, 2008; Denecker and Vennekens, 2014] that all sensible definitions in mathematical texts are total definitions.",
+      "startOffset" : 37,
+      "endOffset" : 113
+    }, {
+      "referenceID" : 12,
+      "context" : "It has been argued many times before [Denecker, 1998; Denecker and Ternovska, 2008; Denecker and Vennekens, 2014] that all sensible definitions in mathematical texts are total definitions.",
+      "startOffset" : 37,
+      "endOffset" : 113
+    }, {
+      "referenceID" : 17,
+      "context" : "This problem is NP-complete [Mariën et al., 2008].",
+      "startOffset" : 28,
+      "endOffset" : 49
+    }, {
+      "referenceID" : 8,
+      "context" : "Denecker and De Schreye [1993] and later also Denecker et al.",
+      "startOffset" : 0,
+      "endOffset" : 31
+    }, {
+      "referenceID" : 8,
+      "context" : "Denecker and De Schreye [1993] and later also Denecker et al. [2015] showed that many semantics of logic programs can be captured by justifications.",
+      "startOffset" : 0,
+      "endOffset" : 69
+    }, {
+      "referenceID" : 14,
+      "context" : "For a more detailed exposition of the theoretical foundations, we refer to Jansen et al. [2016].",
+      "startOffset" : 75,
+      "endOffset" : 96
+    }, {
+      "referenceID" : 16,
+      "context" : "We assume a solver that performs unit propagation and unfounded set propagation [Gebser et al., 2012; Mariën et al., 2007], i.",
+      "startOffset" : 80,
+      "endOffset" : 122
+    }, {
+      "referenceID" : 6,
+      "context" : "In this case l is justified in I if and only if l is derivable by unit propagation on the completion[Clark, 1978] of ∆ and unfounded set propagations.",
+      "startOffset" : 100,
+      "endOffset" : 113
+    }, {
+      "referenceID" : 16,
+      "context" : "For our implementation of the detection of cycles, we re-use parts of the existing unfounded set propagation algorithm [Gebser et al., 2012; Mariën et al., 2007].",
+      "startOffset" : 119,
+      "endOffset" : 161
+    }, {
+      "referenceID" : 2,
+      "context" : "The notion of relevance is related to Magic Sets [Bancilhon et al., 1986; Beeri and Ramakrishnan, 1991] in the field of Logic Programming in the sense that the resulting program of the magic set transformation on a program P and query Q does not execute parts of P that do not contribute towards solving query Q.",
+      "startOffset" : 49,
+      "endOffset" : 103
+    }, {
+      "referenceID" : 4,
+      "context" : "The notion of relevance is related to Magic Sets [Bancilhon et al., 1986; Beeri and Ramakrishnan, 1991] in the field of Logic Programming in the sense that the resulting program of the magic set transformation on a program P and query Q does not execute parts of P that do not contribute towards solving query Q.",
+      "startOffset" : 49,
+      "endOffset" : 103
+    }, {
+      "referenceID" : 1,
+      "context" : "Stable model counters generally stop when the justified residual program [Aziz et al., 2015] is empty.",
+      "startOffset" : 73,
+      "endOffset" : 92
+    }, {
+      "referenceID" : 16,
+      "context" : "– Our method for keeping track of the relevance status of literals reuses the existing unfounded set detection techniques [Gebser et al., 2012; Mariën et al., 2007] for detection of cyclic dependencies between “candidate parents”.",
+      "startOffset" : 122,
+      "endOffset" : 164
+    }, {
+      "referenceID" : 5,
+      "context" : ", from the benchmarks in the latest ASP competitions [Calimeri et al., 2016].",
+      "startOffset" : 53,
+      "endOffset" : 76
+    } ],
+    "year" : 2016,
+    "abstractText" : "PC(ID) extends propositional logic with inductive definitions: rule sets under the well-founded semantics. Recently, a notion of relevance was introduced for this language. This notion determines the set of undecided literals that can still influence the satisfiability of a PC(ID) formula in a given partial assignment. The idea is that the PC(ID) solver can make decisions only on relevant literals without losing soundness and thus safely ignore irrelevant literals. One important insight that the relevance of a literal is completely determined by the current solver state. During search, the solver state changes have an effect on the relevance of literals. In this paper, we discuss an incremental, lightweight implementation of a relevance tracker module that can be added to and interact with an out-of-the-box SAT(ID) solver.",
+    "creator" : "dvips(k) 5.991 Copyright 2011 Radical Eye Software"
+  }
+}

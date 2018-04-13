@@ -1,0 +1,831 @@
+{
+  "name" : "1705.11040.pdf",
+  "metadata" : {
+    "source" : "CRF",
+    "title" : "End-to-end Differentiable Proving",
+    "authors" : [ "Tim Rocktäschel", "Sebastian Riedel" ],
+    "emails" : [ "tim.rocktaschel@cs.ox.ac.uk", "s.riedel@cs.ucl.ac.uk" ],
+    "sections" : [ {
+      "heading" : "1 Introduction",
+      "text" : "Current state-of-the-art methods for automated Knowledge Base (KB) completion use neural link prediction models to learn distributed vector representations of symbols (i.e. subsymbolic representations) for scoring fact triples [1–7]. Such subsymbolic representations enable these models to generalize to unseen facts by encoding similarities: if the vector of the predicate symbol grandfatherOf is similar to the vector of the symbol grandpaOf, both predicates likely express a similar relation. Likewise, if the vector of the constant symbol LISA is similar to MAGGIE, similar relations likely hold for both constants (e.g. live in the same city, have the same parents etc.).\nThis simple form of reasoning based on similarities is remarkably effective for automatically completing large KBs. However, in practice it is often important to capture more complex reasoning patterns that involve several inference steps. For example, if ABE is the father of HOMER and HOMER is a parent of BART, we would like to infer that ABE is a grandfather of BART. Such transitive reasoning is inherently hard for neural link prediction models as they only learn to score facts locally. In contrast, symbolic theorem provers like Prolog [8] enable exactly this type of multi-hop reasoning. Furthermore, Inductive Logic Programming (ILP) [9] builds upon such provers to learn interpretable rules from data and exploit these for reasoning. However, symbolic provers lack the ability to learn similarities from large KBs, which limits their generalization abilities.\nWhile the connection between logic and machine learning has been addressed by statistical relational learning approaches, these models traditionally do not support reasoning with subsymbolic representations (e.g. [10]), and when using subsymbolic representations they are not trained end-to-end from training data (e.g. [11–13]). Neural multi-hop reasoning models [14–18] address the aforementioned limitations to some extent by encoding reasoning chains in a vector space or by iteratively refining subsymbolic representations of questions before comparison with answers. In many ways, these models operate like theorem provers, but they lack two of their most crucial ingredients: interpretability and straightforward ways of incorporating domain-specific knowledge in form of rules.\nar X\niv :1\n70 5.\n11 04\n0v 1\n[ cs\n.N E\n] 3\n1 M\nay 2\n01 7\nOur solution to this problem is inspired by recent neural network architectures like Neural Turing Machines [19], Memory Networks [20], Neural Stacks/Queues [21, 22], Neural Programmer [23], Neural Programmer-Interpreters [24], Hierarchical Attentive Memory [25] and the Differentiable Forth Interpreter [26]. These architectures replace discrete algorithms and data structures by end-toend differentiable counterparts that operate on real-valued vectors. At the heart of our approach is the idea to translate this concept to symbolic theorem provers, and hence combine their advantages (multi-hop reasoning, interpretability, easy integration of domain knowledge) with the ability to reason with vector representations of predicates and constants. Specifically, we keep variable binding symbolic but compare symbols using their subymbolic vector representation.\nConcretely, we introduce Neural Theorem Provers (NTPs): an implementation of end-to-end differentiable theorem provers that operate on subsymbolic representations. We use Prolog’s backward chaining algorithm as a recipe for recursively constructing neural networks that are capable of proving facts in a KB. The success score of such proofs is differentiable with respect to vector representations of symbols, which enables us to learn such representations for predicates and constants in ground atoms, as well as parameters of function-free first-order logic rules of predefined structure. NTPs learn to place representations of similar symbols in close proximity in a vector space and can induce rules given prior assumptions about the structure of logical relationships in a KB such as transitivity. Furthermore, NTPs can seamlessly reason with provided domain-specific rules. As NTPs operate on distributed representations of symbols, a single hand-crafted rule can be leveraged for many proofs of queries with symbols that have a similar representation. Finally, NTPs allow for a high degree of interpretability as they induce latent rules that we can decode to human-readable symbolic rules.\nOur contributions are threefold: (i) we present the construction of NTPs inspired by Prolog’s backward chaining algorithm and a differentiable unification operation using subsymbolic representations, (ii) we propose optimizations to this architecture by joint training with a neural link prediction model, batch proving, and approximate gradient calculation, and (iii) we experimentally show that NTPs can learn representations of symbols and function-free first-order rules of predefined structure, enabling them to learn complex multi-hop reasoning on benchmark KBs and to outperform ComplEx [7], a state-of-the-art neural link prediction model."
+    }, {
+      "heading" : "2 Background",
+      "text" : "In this section, we briefly introduce the syntax of KBs that we use in the remainder of the paper. An atom (short for atomic rule) consists of a predicate symbol and a list of terms. We will use lowercase names to refer to predicate and constant symbols (e.g. fatherOf and BART), and uppercase names for variables (e.g. X,Y, Z). As we only consider function-free first-order logic rules, a term can only be a constant or a variable. For instance, [grandfatherOf, Q, BART] is an atom with the predicate grandfatherOf, and two terms, the variableQ and the constant BART. We consider rules of the form HEAD :– BODY, where BODY is a possibly empty conjunction of atoms represented as a list, and HEAD is an atom. We call a rule with no free variables a ground rule. All variables are universally quantified. We call a ground rule with an empty body a fact. A substitution set ψ = {X1/t1, . . . , XN/tN} is an assignment of variable symbols Xi to terms ti, and applying substitutions to an atom replaces all occurrences of variables Xi by their respective term ti.\nGiven a goal such as [grandfatherOf, Q, BART], we can use Prolog’s backward chaining algorithm to find substitutions for Q [8]. On a high level, backward chaining is based on two functions called OR and AND. OR iterates through all rules (including rules with an empty body, i.e., facts) in a KB and unifies the goal with the respective rule head, thereby updating a substitution set. It is called OR since any successful proof suffices (disjunction). If unification succeeds, OR calls AND to prove all atoms (subgoals) in the body of the rule. To prove subgoals of a rule body, AND first applies substitutions to the first atom that is then proven by applying OR, before proving the remaining subgoals by recursively calling AND. This function is called AND as all atoms in the body need to be proven together (conjunction). As an example, a rule such as [grandfatherOf, X, Y ] :– [[fatherOf, X, Z], [parentOf, Z, Y ]] is used in OR for translating a goal like [grandfatherOf, Q, BART] into subgoals [fatherOf, Q, Z] and [parentOf, Z, BART] that are subsequently proven by AND.1\n1For clarity, we will sometimes omit lists when writing rules and atoms, e.g., grandfatherOf(X,Y ) :– fatherOf(X,Z), parentOf(Z, Y )."
+    }, {
+      "heading" : "3 Methods",
+      "text" : "In the following, we describe the recursive construction of NTPs – neural networks for end-to-end differentiable proving that allow us to calculate the gradient of proof successes with respect to vector representations of symbols. We define the construction of NTPs in terms of modules similar to dynamic neural module networks [27]. Each module takes as inputs discrete objects such as atoms and rules, and a proof state. A proof state S = (ψ, ρ) is a tuple consisting of the substitution set ψ constructed so far and a neural network ρ that outputs a real-valued success score of a (partial) proof. While discrete objects and the substitution set are only used during construction of the neural network (i.e. they define the topology of the network), once the network is constructed, a continuous proof success score can be calculated for many different goals at training and test time. In other words, discrete objects and the substitution set are used to instantiate modules, which construct a neural network representing the (partial) proof success score while also transforming discrete objects to recursively instantiate submodules.\nThe shared signature of modules isD×S → SN whereD is a domain that controls the construction of the network, S is the domain of proof states, and N is the number of output proof states. Furthermore, let Sψ denote the substitution set of the proof state and Sρ denote the neural network for calculating the proof success.\nWe use functional programming alike pseudocode to define the behavior of modules and auxiliary functions. Particularly, we are making use of pattern matching to check for properties of arguments passed to a module. We denote sets by Euler script letters (e.g. E), lists by boldface capital letters (e.g. E), and we use :: to refer to the concatenation of an element to a list (e.g. e :: E)."
+    }, {
+      "heading" : "3.1 Unification Module",
+      "text" : "Unification of two atoms, e.g., a goal that we want to prove and a rule head, is a central operation in backward chaining. Two non-variable symbols (predicates or constants) are checked for equality and the proof can be aborted if this check fails. However, we want to be able to apply rules even if symbols in the goal and head are not equal but similar in meaning (e.g. grandfatherOf and grandpaOf) and thus replace symbolic comparison with a computation that measures the similarity of both symbols in a vector space.\nThe module unify updates a substitution set and creates a neural network for comparing the vector representations of non-variable symbols in two sequences of terms. The signature of this module is L × L × S → S where L is the domain of lists of terms. unify takes two atoms represented as lists of terms and an upstream proof state, and maps these to a new proof state (substitution set and proof success). To this end, unify iterates through the list of terms of two atoms and compares their symbols. If one of the symbols is a variable, a substitution is added to the substitution set. Otherwise, the vector representations of the two non-variable symbols are compared using a Radial Basis Function (RBF) kernel [28] where µ is a hyperparameter that we set to 1√\n2 in our experiments.\nThe following pseudocode implements unify. Note that the order matters, i.e., if arguments match a line, subsequent lines are not evaluated.\n1. unifyθ([ ], [ ], S) = S 2. unifyθ([ ],G, S) = FAIL"
+    }, {
+      "heading" : "3. unifyθ(H, [ ], S) = FAIL",
+      "text" : "4. unifyθ(h ::H, g :: G, S) = unifyθ(H,G, S′)\nS′ψ = Sψ ∪  {h/g} if h ∈ V{g/h} if g ∈ V, h 6∈ V∅ otherwise  S′ρ = min ( Sρ, { exp ( −‖θh:−θg:‖2 2µ2 ) if h 6∈ V, g 6∈ V 1 otherwise })\nHere, S′ refers to the new proof state, V refers to the set of variable symbols, h/g is a substitution from the variable symbol h to the symbol g, and θg: denotes the embedding lookup of the non-variable symbol with index g. unify is parameterized by an embedding matrix θ ∈ R|Z|×k where Z is the set of non-variables symbols and k is the dimension of vector representations of symbols. Furthermore, FAIL represents a unification failure due to mismatching arity of two atoms. Once a failure is reached, we abort the creation of the neural network for this branch of proving.\nExample Assume we are unifying two atoms [grandpaOf, ABE, BART] and [s,Q, i] given an upstream proof state S = (∅, 0.7) where the latter input atom has placeholders for a predicate s and a constant i. Furthermore, assume grandpaOf, ABE and BART represent the indices of the respective symbols in a global symbol vocabulary. Then, the proof state constructed from unify is:\nunifyθ([grandpaOf, ABE, BART], [s,Q, i], (∅, 0.7)) = (S′ψ, S′ρ) =( {Q/ABE},min(0.7,−‖θgrandpaOf: − θs:‖2,−‖θBART: − θi:‖2 ) Thus, the output score of this neural network will be high if the subsymbolic representation of s\nis close to grandpaOf and i is close to BART. However, the score cannot be higher than 0.7 due to the upstream proof success score in the forward pass of the neural network. Note that this module also outputs a substitution set {Q/ABE} at graph creation time which will be used to instantiate submodules."
+    }, {
+      "heading" : "3.2 OR Module",
+      "text" : "Based on unify, we now define the or module which attempts to apply rules in a KB. The signature of or is L × N×S → SN where L is the domain of goal atoms and N is the domain of integers used for specifying the maximum proof depth of the neural network. Furthermore, N is the number of possible output proof states for a goal of a given structure and a provided KB.2 We implement or as 1. orKθ (G, d, S) = [S\n′ | S′ ∈ andKθ (B, d, unifyθ(H,G, S)),H :–B ∈ K] whereH :–B denotes a rule in a given KB K with a head atomH and a list of body atomsB. In\ncontrast to the symbolic OR method, the or module is able to use the grandfaterOf rule above for a query involving grandpaOf provided that the subsymbolic representations of both predicates are similar.\nExample For a goal [s,Q, i], or would instantiate an and submodule based on the rule [grandfatherOf, X, Y ] :– [[fatherOf, X, Z], [parentOf, Z, Y ]] as follows orKθ ([s,Q, i], d, S) = [S\n′|S′ ∈ andKθ ([[fatherOf, X, Z], [parentOf, Z, Y ]], d, ({X/Q, Y/i}, Ŝρ)︸ ︷︷ ︸ result of unify ), . . .]."
+    }, {
+      "heading" : "3.3 AND Module",
+      "text" : "For implementing and we first define an auxiliary function called substitute which applies substitutions to variables in an atom if possible. This is realized via 1. substitute([ ], ψ) = [ ]\n2. substitute(g :: G, S) = { x if g/x ∈ Sψ g otherwise } :: substitute(G, S)\nFor example, substitute([fatherOf, X, Z], {X/Q, Y/i}) results in [fatherOf, Q, Z]. The signature of and is L × N × S → SN where L is the domain of lists of atoms and N is the number of possible output proof states for a list of atoms with a known structure and a provided KB. This module is implemented as 1. andKθ (G, d, FAIL) = FAIL 2. andKθ (G, 0, S) = FAIL 3. andKθ ([ ], d, S) = S\n4. andKθ (G :: G, d, S) = [S′′ | S′′ ∈ andKθ (G, d, S′), S′ ∈ orKθ (substitute(G, S), d− 1, S)] where the first two lines define the failure of proof, either because of upstream unification failure which has been passed from the or module (line 1), or because the maximum proof depth has been reached (line 2). Line 3 specifies a proof success, i.e., the list of subgoals is empty before the maximum proof depth has been reached. Lastly, line 4 defines the recursion: the first subgoal is proven by instantiating an or module after substitutions are applied, and every resulting proof state is used for proving the remaining subgoals by instantiating an and module.\n2The creation of the neural network is dependent on the KB but also the structure of the goal. For instance, the goal s(Q, i) would result in a different neural network, and hence a different number of output proof states, than s(i, j).\nExample Continuing the example from or, the and module would instantiate submodules as follows: andKθ ([[fatherOf, X, Z], [parentOf, Z, Y ]], d, ({X/Q, Y/i}, Ŝρ)︸ ︷︷ ︸\nresult of unify in or\n) =\n[S′′|S′′ ∈ andKθ ([[parentOf, Z, Y ]], d, S′), S′ ∈ orKθ ([fatherOf, Q, Z]︸ ︷︷ ︸ result of substitute , d− 1, ({X/Q, Y/i}, Ŝρ)︸ ︷︷ ︸ result of unify in or )]."
+    }, {
+      "heading" : "3.4 Proof Aggregation",
+      "text" : "Finally, we define the overall success score of proving a goalG using a KB K with parameters θ as\nntpKθ (G, d) = argmax S ∈ orKθ (G,d,(∅,1))\nS 6=FAIL\nSρ\nwhere d is a predefined maximum proof depth and the initial proof state is set to an empty substitution set and a proof success score of 1.\nExample Figure 1 illustrates an examplary NTP computation graph constructed for a toy KB. Note that such an NTP is constructed once before training, and can then be used for proving goals of the structure [s, i, j] at training and test time where s is the index of an input predicate, and i and j are indices of input constants. Final proof states which are used in proof aggregation are underlined."
+    }, {
+      "heading" : "3.5 Training Objective",
+      "text" : "Let K be the set of known facts in a given KB. Usually, we do not observe negative facts and thus resort to sampling corrupted ground atoms as done in previous work [29]. Specifically, for every [s, i, j] ∈ K we obtain corrupted ground atoms [s, î, j], [s, i, ĵ], [s, ĩ, j̃] 6∈ K by sampling î, ĵ, ĩ and j̃ from the set of constants. These corrupted ground atoms are resampled in every iteration of training, and we denote the set of known and corrupted ground atoms together with their target score (1.0 for known ground atoms and 0.0 for corrupted ones) as T . We use the negative log-likelihood of the proof success score as loss function for an NTP with parameters θ and a given KB K\nLntpKθ = ∑\n([s,i,j],y) ∈ T\n−y log(ntpKθ ([s, i, j], d)ρ)− (1− y) log(1− ntpKθ ([s, i, j], d)ρ) (1)\nwhere [s, i, j] is a training ground atom and y its target proof success score. Note that since in our application all training facts are ground atoms, we only need the proof success score ρ and not the substitution list of the resulting proof state. We can prove known facts trivially by a unification with themselves, resulting in no parameter updates during training and hence no generalization. Therefore, during training we are masking the calculation of the unification success of a known ground atom that we want to prove, i.e., we set the unification score to 0 to temporarily hide that training fact."
+    }, {
+      "heading" : "3.6 Computational Optimizations",
+      "text" : "NTPs as described so far suffer from severe computational limitations since the neural network is representing all possible proofs up to some predefined depth. In contrast to symbolic backward chaining where a proof can be aborted as soon as unification fails, in differentiable proving we only get a unification failure for atoms whose arity does not match. We propose two optimizations to speed up NTPs in the Appendix. First, we make use of modern Graphics Processing Units (GPUs) by batch processing many proofs in parallel (Appendix B). Second, we exploit the sparseness of gradients caused by the min and max operations used in the unification and proof aggregation respectively to derive a heuristic for a truncated forward and backward pass that drastically reduces the number of proofs that have to be considered for calculating gradients (Appendix C)."
+    }, {
+      "heading" : "3.7 Neural Inductive Logic Programming",
+      "text" : "We can use NTPs for ILP [9] by gradient descent instead of a combinatorial search over the space of rules as, for example, done by the First Order Inductive Learner (FOIL) [30]. Specifically, we are using the concept of learning from entailment [9] to induce rules that let us prove known ground atoms, but that do not give high proof success scores to corrupted ground atoms.\nLet θr:,θs:,θt: ∈ Rk be representations of some unknown predicates with index r, s and t. The prior knowledge of a transitivity between three unknown predicates can be specified via r(X,Y ) :– s(X,Z), t(Z, Y ). We call this a parameterized rule as the corresponding predicates are unknown and their representations are learned from data. Such a rule can be used for proofs at training and test time in the same way as any other given rule. During training, the predicate representations of parameterized rules are optimized jointly with all other subsymbolic representations. Thus, the model can adapt parameterized rules such that proofs for known facts succeed while proofs for corrupted ground atoms fail, thereby inducing rules of predefined structures like the one above. Inspired by [31], we use rule templates for convenience which define the structure of multiple parameterized rules in a concise way by specifying the number of parameterized rules that should be instantiated for a given rule structure. For inspection after training, we decode a parameterized rule by searching for the closest representations of known predicates. In addition, we provide users with a rule confidence by taking the minimum similarity between unknown and decoded predicate representations using the RBF kernel in unify. This confidence score is an upper bound on the proof success score that can be achieved when the induced rule is used in proofs."
+    }, {
+      "heading" : "3.8 Regularization by Neural Link Predictor",
+      "text" : "At the beginning of training all subsymbolic representations are initialized randomly. When unifying a goal with all facts in a KB we consequently get very noisy success scores in early stages of training. Moreover, as only the maximum success score will result in gradient updates for the respective subsymbolic representations, it can take a long time until NTPs learn to place similar symbols close to each other in the vector space.\nTo speed up learning subsymbolic representations, we train NTPs jointly with ComplEx [7] (Appendix A). ComplEx and the NTP share the same parameters, which is feasible as the RBF kernel in unify is also defined for complex vectors. While the NTP is responsible for multi-hop reasoning, the neural link prediction model learns to score ground atoms locally. At test time, only the NTP is used for predictions. Thus, ComplEx can be seen as a regularizer. We term the resulting model NTPλ. Based on Eq. 1, the joint training loss is defined as\nLntpλKθ = LntpKθ + ∑\n([s,i,j],y) ∈ T\n−y log(complexθ(s, i, j))− (1− y) log(1− complexθ(s, i, j))\nwhere [s, i, j] is a training atom and y its ground truth."
+    }, {
+      "heading" : "4 Experiments",
+      "text" : "Consistent with previous work, we carry out experiments on four benchmark KBs and compare ComplEx with the NTP and NTPλ in terms of area under the Precision-Recall-curve (AUC-PR) on the Countries KB, and Mean Reciprocal Rank (MRR) and HITS@m [29] on the other KBs. Training details, including hyperparameters and rule templates, can be found in Appendix D.\nCountries The Countries KB is a dataset introduced by [32] for testing reasoning capabilities of neural link prediction models. It consists of 244 countries, 5 regions (e.g. EUROPE), 23 subregions (e.g. WESTERN EUROPE, NORTHERN AMERICA), and 1158 facts about the neighborhood of countries, and the location of countries and subregions. We follow [33] and split countries randomly into a training set of 204 countries (train), a development set of 20 countries (dev), and a test set of 20 countries (test), such that every dev and test country has at least one neighbor in the training set. Subsequently, three different task datasets are created. For all tasks, the goal is to predict locatedIn(c, r) for every test country c and all five regions r, but the access to training atoms in the KB varies. S1: All ground atoms locatedIn(c, r) where c is a test country and r is a region are removed from the KB. Since information about the subregion of test countries is still contained in the KB, this task can be solved by using the transitivity rule locatedIn(X,Y ) :– locatedIn(X,Z), locatedIn(Z, Y ). S2: In addition to S1, all ground atoms locatedIn(c, s) are removed where c is a test country and s is a subregion. The location of test countries needs to be inferred from the location of its neighboring countries: locatedIn(X,Y ) :– neighborOf(X,Z), locatedIn(Z, Y ). This task is more difficult than S1, as neighboring countries might not be in the same region, so the rule above will not always hold. S3: In addition to S2, also all ground atoms locatedIn(c, r) are removed where r is a region and c is a training country that has a test or dev country as a neighbor. The location of test countries can for instance be inferred using the three-hop rule locatedIn(X,Y ) :– neighborOf(X,Z), neighborOf(Z,W ), locatedIn(W,Y ).\nKinship, Nations & UMLS We use the Nations, Alyawarra kinship (Kinship) and Unified Medical Language System (UMLS) KBs from [10]. We left out the Animals dataset as it only contains unary predicate and cannot be used for assessing multi-hop reasoning. Nations contains 56 binary predicates, 111 unary predicates, 14 constants and 2565 true facts, Kinship contains 26 predicates, 104 constants and 10686 true facts, and UMLS contains 49 predicates, 135 constants and 6529 true facts. Since our baseline ComplEx cannot deal with unary predicates, we remove unary atoms from Nations. We split every KB into 80% training facts, 10% development facts and 10% test facts. For evaluation, we take a test fact and corrupt its first and second argument in all possible ways such that the corrupted fact is not in the original KB. Subsequently, we predict a ranking of every test fact and its corruptions to calculate MRR and HITS@m."
+    }, {
+      "heading" : "5 Results and Discussion",
+      "text" : "Results for the different model variants on the benchmark KBs are shown in Table 1. Another method for inducing rules in a differentiable way for automated KB completion has been introduced recently by [34] and our evaluation setup is equivalent to their Protocol II. However, our neural link prediction baseline ComplEx already achieves much higher HITS@10 results (0.80 vs. 0.49 on UMLS and 0.74 vs. 0.55 on Kinship). We thus focus on the comparison of NTPs with ComplEx.\nFirst, we note that vanilla NTPs alone do not always work well. They only outperform ComplEx on Countries S3 and Nations, but not on Kinship or UMLS. This demonstrates the difficulty of learning subsymbolic representations in a differentiable prover from unification alone, and the need for regularizing NTPs using a neural link prediction model such as ComplEx. The regularized NTPλ outperforms the other models in most settings. The difference in AUC-PR between ComplEx and NTPλ on all Countries tasks is significant (p < 0.0001).\nA major advantage of NTPs is that we can inspect induced logic rules which provide us with an interpretable representation of the abstractions that the model has learned. The right column in Table 1 shows examples of induced rules by NTPλ (note that predicates on Kinship are anonymized). For Countries, the NTP recovered those rules that are needed for solving the three different tasks. On\nUMLS, the NTP induced transitivity rules. Those relationships are particularly hard to encode by neural link prediction models like ComplEx, as they are optimized to locally predict the score of a fact."
+    }, {
+      "heading" : "6 Related Work",
+      "text" : "Combining neural and symbolic approaches to relational learning and reasoning has a long tradition and let to various proposed architectures over the past decades (see [35] for a review). Early proposals for neural-symbolic networks are limited to propositional rules (e.g., EBL-ANN [36], KBANN [37] and C-IL2P [38]). Other neural-symbolic approaches focus on first-order inference, but do not learn subsymbolic vector representations from training facts in a KB (e.g., SHRUTI [39], Neural Prolog [40], CLIP++ [41], Lifted Relational Neural Networks [42], and TensorLog [43]). Logic Tensor Networks [44] are in spirit similar to NTPs, but need to ground first-order logic rules. However, they support function terms, whereas NTPs currently only support function-free first-order logic.\nRecent question-answering architectures such as Neural Reasoner [15], Query-Answer Neural Networks [17] or ReasoNet [18] translate query representations implicitly in a vector space without explicit rule representations and can thus not easily incorporate domain-specific knowledge. Furthermore, NTPs are related to path encoding models [14, 16], but instead of encoding paths to predict a target predicate, reasoning steps in NTPs are explicit and only the comparison of symbols uses subsymbolic representations. This allows us to induce interpretable rules, as well as to incorporate prior knowledge either in the form of rules or in the form of rule templates which define the structure of logical relationships that we expect to hold in a KB. Another line of work [45–49] regularizes distributed representations via domain-specific rules, but does not learn such rules from data and only supports a restricted subset of first-order logic. NTPs are constructed from Prolog’s backward chaining and are thus related to Unification Neural Networks [50, 51]. However, NTPs operate on vector representations of symbols instead of scalar values, which allows for more expressive representations of symbols.\nAs NTPs can learn rules from data, they are related to ILP systems such as FOIL [30], Sherlock [52] and meta-interpretive learning of higher-order dyadic Datalog (Metagol) [53]. While these ILP systems operate on symbols and search over the discrete space of logical rules, NTPs work with subsymbolic representations and induce rules using gradient descent. Recently, [34] introduced a differentiable rule learning system based on TensorLog and a neural network controller similar to LSTMs [54]. Their method is more scalable than the NTPs that we introduced in this paper. However, on UMLS and Kinship our baseline already achieved stronger generalization by learning subsymbolic representations. Still, scaling NTPs to larger KBs for competing with more scalable relational learning methods is an open problem that we seek to address in future research."
+    }, {
+      "heading" : "7 Conclusion and Future Work",
+      "text" : "We proposed an end-to-end differentiable prover for automated KB completion that operates on subsymbolic representations. To this end, we used Prolog’s backward chaining algorithm as a recipe for recursively constructing neural networks that can be used to prove facts in a KB. Specifically, we introduced a differentiable unification operation between vector representations of symbols. The constructed neural network allowed us to compute the gradient of proof successes with respect to vector representations of symbols, and thus enabled us to train subsymbolic representations end-toend from facts in a KB. Furthermore, given templates for unknown rules of predefined structure, we were able to induce first-order logic rules using gradient descent. On benchmark KBs, our model outperformed ComplEx, a state-of-the-art neural link prediction model, while at the same time inducing interpretable rules.\nTo overcome computational limitations of end-to-end differentiable proving, we want to investigate the use of hierarchical attention [25] and recent reinforcement learning methods such as Monte Carlo tree search [55, 56] that have been used for learning to play Go [57] and chemical synthesis planning [58]. Orthogonal to that, more flexible individual components of end-to-end differentiable provers are conceivable. For instance, unification, rule selection, and rule application could be modeled as parameterized functions, and thus could potentially learn a more optimal behavior from data in a KB. In addition, we plan to support function terms in the future. Lastly, we are interested in applying NTPs to automated proving of mathematical theorems, either in logical or natural language form, similar to recent approaches by [59] and [60]."
+    }, {
+      "heading" : "Acknowledgements",
+      "text" : "We thank Matko Bosnjak and Johannes Welbl for comments on drafts of this paper. This work has been supported by a Google PhD Fellowship in Natural Language Processing, an Allen Distinguished Investigator Award, and a Marie Curie Career Integration Award."
+    }, {
+      "heading" : "A ComplEx",
+      "text" : "ComplEx [7] is a state-of-the-art neural link prediction model that represents symbols as complex vectors. Let real(θi:) denote the real part and imag(θi:) the imaginary part of a complex vector θi: ∈ Ck representing the symbol with the ith index. The scoring function defined by ComplEx is\ncomplexθ(s, i, j) = σ ( real(θs:)\n>(real(θi:) real(θj:)) + real(θs:)>(imag(θi:) imag(θj:)) + imag(θs:) >(real(θi:) imag(θj:))− imag(θs:)>(imag(θi:) real(θj:)) ) (2)\nwhere denotes the element-wise multiplication and σ the sigmoid function. The benefit of ComplEx over other neural link prediction models such as RESCAL [1] or DistMult [5] is that by using complex vectors as subsymbolic representations it can capture symmetric as well as asymmetric relations."
+    }, {
+      "heading" : "B Batch Proving",
+      "text" : "Let A ∈ RN×k be a matrix of N subsymbolic representations that are to be unified with M other representationsB ∈ RM×k. We can adapt the unification module to calculate the unification success in a batched way using\nexp − √√√√√√√   ∑k i=1 A 2 1i\n...∑k i=1 A 2 Ni\n1>M + 1N  ∑k i=1 B 2 1i\n...∑k i=1 B 2 Mi\n >− 2AB>  ∈ RN×M (3) where 1N and 1M are vectors of N and M ones respectively, and the square root is taken elementwise. In practice, we partition the KB into rules that have the same structure and batch-unify goals with all rule heads per partition at the same time on a GPU. Furthermore, substitution sets bind variables to vectors of symbol indices instead of single symbol indices, and min and max operations are taken per goal.\nC Kmax Gradient Approximation\nNTPs allow us to calculate the gradient of proof success scores with respect to subsymbolic representations and rule parameters. While backpropagating through this large computation graph will give us the exact gradient of the proof success, it is computationally infeasible for any reasonably-sized KB. Consider the parameterized rule θ1(X,Y ) :– θ2(X,Z),θ3(Z, Y ) and let us assume the given KB contains 1 000 facts with binary predicates. While X and Y will be bound to the respective representations in the goal, Z we will be substituted with every possible second argument of the 1 000 facts in the KB when proving the first atom in the body. Moreover, for each of these 1 000 substitutions, we will again need to compare with all facts in the KB when proving the second atom in the body of the rule, resulting in 1 000 000 substitution success scores. However, note that since we use the max operator for aggregating the success of different proofs, only subsymbolic representations in one out of 1 000 000 proofs will receive gradients.\nTo overcome this computational limitation, we propose the following heuristic. We assume that when unifying the first atom with facts in the KB, it is unlikely for any unification successes below the top K successes to attain the maximum proof success when unifying the remaining atoms in the body of a rule with facts in the KB. That is, after the unification of the first atom, we only keep the top K substitutions and their success scores, and continue proving only with those. This means that all other partial proofs will not contribute to the forward pass at this stage, and consequently not receive any gradients on the backward pass of backpropagation. We term this the Kmax heuristic. Note that we cannot guarantee anymore that the gradient of the proof success is the exact gradient, but for a large enough K we get a close approximation to the true gradient."
+    }, {
+      "heading" : "D Training Details",
+      "text" : "We use ADAM [61] with an initial learning rate of 0.001 and a mini-batch size of 50 (10 known and 40 corrupted atoms) for optimization. We apply an `2 regularization of 0.01 to all model parameters, and clip gradient values at [−1.0, 1.0]. All subsymbolic representations and rule parameters are initialized using Xavier initialization [62]. We train all models for 100 epochs and repeat every experiment on the Countries corpus ten times. Statistical significance is tested using the independent t-test. All models are implemented in TensorFlow [63]. We use a maximum proof depth of d = 2 and add the following rule templates where the number in front of the rule indicates how often a parameterized rule of the given structure will be instantiated. Note that a rule template such as #1(X,Y ) :– #2(X,Z),#2(Z, Y ) specifies that the two predicates in the body are shared.\nCountries S1 3 #1(X,Y ) :– #1(Y,X). 3 #1(X,Y ) :– #2(X,Z),#2(Z, Y ).\nCountries S2 3 #1(X,Y ) :– #1(Y,X). 3 #1(X,Y ) :– #2(X,Z),#2(Z, Y ). 3 #1(X,Y ) :– #2(X,Z),#3(Z, Y ).\nCountries S3 3 #1(X,Y ) :– #1(Y,X). 3 #1(X,Y ) :– #2(X,Z),#2(Z, Y ). 3 #1(X,Y ) :– #2(X,Z),#3(Z, Y ). 3 #1(X,Y ) :– #2(X,Z),#3(Z,W ),#4(W,Y ).\nKinship, Nations & UMLS 20 #1(X,Y ) :– #2(X,Y ). 20 #1(X,Y ) :– #2(Y,X). 20 #1(X,Y ) :– #2(X,Z),#3(Z, Y )."
+    } ],
+    "references" : [ {
+      "title" : "Factorizing YAGO: scalable machine learning for linked data",
+      "author" : [ "Maximilian Nickel", "Volker Tresp", "Hans-Peter Kriegel" ],
+      "venue" : "In Proceedings of the 21st World Wide Web Conference",
+      "citeRegEx" : "1",
+      "shortCiteRegEx" : "1",
+      "year" : 2012
+    }, {
+      "title" : "Relation extraction with matrix factorization and universal schemas",
+      "author" : [ "Sebastian Riedel", "Limin Yao", "Andrew McCallum", "Benjamin M. Marlin" ],
+      "venue" : "In Human Language Technologies: Conference of the North American Chapter of the Association of Computational Linguistics,",
+      "citeRegEx" : "2",
+      "shortCiteRegEx" : "2",
+      "year" : 2013
+    }, {
+      "title" : "Reasoning with neural tensor networks for knowledge base completion",
+      "author" : [ "Richard Socher", "Danqi Chen", "Christopher D. Manning", "Andrew Y. Ng" ],
+      "venue" : "In Advances in Neural Information Processing Systems 26: 27th Annual Conference on Neural Information Processing Systems",
+      "citeRegEx" : "3",
+      "shortCiteRegEx" : "3",
+      "year" : 2013
+    }, {
+      "title" : "Typed tensor decomposition of knowledge bases for relation extraction",
+      "author" : [ "Kai-Wei Chang", "Wen-tau Yih", "Bishan Yang", "Christopher Meek" ],
+      "venue" : "In Proceedings of the 2014 Conference on Empirical Methods in Natural Language Processing,",
+      "citeRegEx" : "4",
+      "shortCiteRegEx" : "4",
+      "year" : 2014
+    }, {
+      "title" : "Embedding entities and relations for learning and inference in knowledge bases",
+      "author" : [ "Bishan Yang", "Wen-tau Yih", "Xiaodong He", "Jianfeng Gao", "Li Deng" ],
+      "venue" : "In International Conference on Learning Representations (ICLR),",
+      "citeRegEx" : "5",
+      "shortCiteRegEx" : "5",
+      "year" : 2015
+    }, {
+      "title" : "Representing text for joint embedding of text and knowledge bases",
+      "author" : [ "Kristina Toutanova", "Danqi Chen", "Patrick Pantel", "Hoifung Poon", "Pallavi Choudhury", "Michael Gamon" ],
+      "venue" : "In Proceedings of the 2015 Conference on Empirical Methods in Natural Language Processing,",
+      "citeRegEx" : "6",
+      "shortCiteRegEx" : "6",
+      "year" : 2015
+    }, {
+      "title" : "Complex embeddings for simple link prediction",
+      "author" : [ "Théo Trouillon", "Johannes Welbl", "Sebastian Riedel", "Éric Gaussier", "Guillaume Bouchard" ],
+      "venue" : "In Proceedings of the 33nd International Conference on Machine Learning,",
+      "citeRegEx" : "7",
+      "shortCiteRegEx" : "7",
+      "year" : 2016
+    }, {
+      "title" : "Logic and Data Bases, Symposium on Logic and Data Bases, Centre d’études",
+      "author" : [ "Hervé Gallaire", "Jack Minker", "editors" ],
+      "venue" : "et de recherches de Toulouse,",
+      "citeRegEx" : "8",
+      "shortCiteRegEx" : "8",
+      "year" : 1977
+    }, {
+      "title" : "Inductive logic programming",
+      "author" : [ "Stephen Muggleton" ],
+      "venue" : "New Generation Comput.,",
+      "citeRegEx" : "9",
+      "shortCiteRegEx" : "9",
+      "year" : 1991
+    }, {
+      "title" : "Statistical predicate invention",
+      "author" : [ "Stanley Kok", "Pedro M. Domingos" ],
+      "venue" : "In Machine Learning, Proceedings of the Twenty-Fourth International Conference (ICML",
+      "citeRegEx" : "10",
+      "shortCiteRegEx" : "10",
+      "year" : 2007
+    }, {
+      "title" : "Improving learning and inference in a large knowledge-base using latent syntactic cues",
+      "author" : [ "Matt Gardner", "Partha Pratim Talukdar", "Bryan Kisiel", "Tom M. Mitchell" ],
+      "venue" : "In Proceedings of the 2013 Conference on Empirical Methods in Natural Language Processing,",
+      "citeRegEx" : "11",
+      "shortCiteRegEx" : "11",
+      "year" : 2013
+    }, {
+      "title" : "Incorporating vector space similarity in random walk inference over knowledge bases",
+      "author" : [ "Matt Gardner", "Partha Pratim Talukdar", "Jayant Krishnamurthy", "Tom M. Mitchell" ],
+      "venue" : "In Proceedings of the 2014 Conference on Empirical Methods in Natural Language Processing,",
+      "citeRegEx" : "12",
+      "shortCiteRegEx" : "12",
+      "year" : 2014
+    }, {
+      "title" : "Representing meaning with a combination of logical and distributional models",
+      "author" : [ "Islam Beltagy", "Stephen Roller", "Pengxiang Cheng", "Katrin Erk", "Raymond J Mooney" ],
+      "venue" : null,
+      "citeRegEx" : "13",
+      "shortCiteRegEx" : "13",
+      "year" : 2017
+    }, {
+      "title" : "Compositional vector space models for knowledge base completion",
+      "author" : [ "Arvind Neelakantan", "Benjamin Roth", "Andrew McCallum" ],
+      "venue" : "In Proceedings of the 53rd Annual Meeting of the Association for Computational Linguistics and the 7th International Joint Conference on Natural Language Processing of the Asian Federation of Natural Language Processing,",
+      "citeRegEx" : "14",
+      "shortCiteRegEx" : "14",
+      "year" : 2015
+    }, {
+      "title" : "Towards neural network-based reasoning",
+      "author" : [ "Baolin Peng", "Zhengdong Lu", "Hang Li", "Kam-Fai Wong" ],
+      "venue" : "CoRR, abs/1508.05508,",
+      "citeRegEx" : "15",
+      "shortCiteRegEx" : "15",
+      "year" : 2015
+    }, {
+      "title" : "Chains of reasoning over entities, relations, and text using recurrent neural networks",
+      "author" : [ "Rajarshi Das", "Arvind Neelakantan", "David Belanger", "Andrew McCallum" ],
+      "venue" : "In Conference of the European Chapter of the Association for Computational Linguistics (EACL),",
+      "citeRegEx" : "16",
+      "shortCiteRegEx" : "16",
+      "year" : 2017
+    }, {
+      "title" : "Separating answers from queries for neural reading",
+      "author" : [ "Dirk Weissenborn" ],
+      "venue" : "comprehension. CoRR,",
+      "citeRegEx" : "17",
+      "shortCiteRegEx" : "17",
+      "year" : 2016
+    }, {
+      "title" : "Learning to transduce with unbounded memory",
+      "author" : [ "Edward Grefenstette", "Karl Moritz Hermann", "Mustafa Suleyman", "Phil Blunsom" ],
+      "venue" : "In Advances in Neural Information Processing Systems 28: Annual Conference on Neural Information Processing Systems",
+      "citeRegEx" : "21",
+      "shortCiteRegEx" : "21",
+      "year" : 2015
+    }, {
+      "title" : "Inferring algorithmic patterns with stack-augmented recurrent nets",
+      "author" : [ "Armand Joulin", "Tomas Mikolov" ],
+      "venue" : "In Advances in Neural Information Processing Systems 28: Annual Conference on Neural Information Processing Systems",
+      "citeRegEx" : "22",
+      "shortCiteRegEx" : "22",
+      "year" : 2015
+    }, {
+      "title" : "Neural programmer: Inducing latent programs with gradient descent",
+      "author" : [ "Arvind Neelakantan", "Quoc V. Le", "Ilya Sutskever" ],
+      "venue" : "In International Conference on Learning Representations (ICLR),",
+      "citeRegEx" : "23",
+      "shortCiteRegEx" : "23",
+      "year" : 2016
+    }, {
+      "title" : "Neural programmer-interpreters",
+      "author" : [ "Scott E. Reed", "Nando de Freitas" ],
+      "venue" : "In International Conference on Learning Representations (ICLR),",
+      "citeRegEx" : "24",
+      "shortCiteRegEx" : "24",
+      "year" : 2016
+    }, {
+      "title" : "Learning to learn by gradient descent by gradient descent",
+      "author" : [ "Marcin Andrychowicz", "Misha Denil", "Sergio Gomez Colmenarejo", "Matthew W. Hoffman", "David Pfau", "Tom Schaul", "Nando de Freitas" ],
+      "venue" : "In Advances in Neural Information Processing Systems 29: Annual Conference on Neural Information Processing Systems",
+      "citeRegEx" : "25",
+      "shortCiteRegEx" : "25",
+      "year" : 2016
+    }, {
+      "title" : "Programming with a differentiable forth interpreter",
+      "author" : [ "Matko Bosnjak", "Tim Rocktäschel", "Jason Naradowsky", "Sebastian Riedel" ],
+      "venue" : "In International Conference on Machine Learning (ICML),",
+      "citeRegEx" : "26",
+      "shortCiteRegEx" : "26",
+      "year" : 2017
+    }, {
+      "title" : "Learning to compose neural networks for question answering",
+      "author" : [ "Jacob Andreas", "Marcus Rohrbach", "Trevor Darrell", "Dan Klein" ],
+      "venue" : "In NAACL HLT",
+      "citeRegEx" : "27",
+      "shortCiteRegEx" : "27",
+      "year" : 2016
+    }, {
+      "title" : "Radial basis functions, multi-variable functional interpolation and adaptive networks",
+      "author" : [ "David S Broomhead", "David Lowe" ],
+      "venue" : "Technical report, DTIC Document,",
+      "citeRegEx" : "28",
+      "shortCiteRegEx" : "28",
+      "year" : 1988
+    }, {
+      "title" : "Translating embeddings for modeling multi-relational data",
+      "author" : [ "Antoine Bordes", "Nicolas Usunier", "Alberto García-Durán", "Jason Weston", "Oksana Yakhnenko" ],
+      "venue" : "In Advances in Neural Information Processing Systems",
+      "citeRegEx" : "29",
+      "shortCiteRegEx" : "29",
+      "year" : 2013
+    }, {
+      "title" : "Learning logical definitions from relations",
+      "author" : [ "J. Ross Quinlan" ],
+      "venue" : "Machine Learning,",
+      "citeRegEx" : "30",
+      "shortCiteRegEx" : "30",
+      "year" : 1990
+    }, {
+      "title" : "Joint information extraction and reasoning: A scalable statistical relational learning approach",
+      "author" : [ "William Yang Wang", "William W. Cohen" ],
+      "venue" : "In Proceedings of the 53rd Annual Meeting of the Association for Computational Linguistics and the 7th International Joint Conference on Natural Language Processing of the Asian Federation of Natural Language Processing,",
+      "citeRegEx" : "31",
+      "shortCiteRegEx" : "31",
+      "year" : 2015
+    }, {
+      "title" : "On approximate reasoning capabilities of lowrank vector spaces",
+      "author" : [ "Guillaume Bouchard", "Sameer Singh", "Theo Trouillon" ],
+      "venue" : "In Proceedings of the 20015 AAAI Spring Symposium on Knowledge Representation and Reasoning (KRR): Integrating Symbolic and Neural Approaches. Citeseer,",
+      "citeRegEx" : "32",
+      "shortCiteRegEx" : "32",
+      "year" : 2015
+    }, {
+      "title" : "Holographic embeddings of knowledge graphs",
+      "author" : [ "Maximilian Nickel", "Lorenzo Rosasco", "Tomaso A. Poggio" ],
+      "venue" : null,
+      "citeRegEx" : "33",
+      "shortCiteRegEx" : "33",
+      "year" : 2016
+    }, {
+      "title" : "Differentiable learning of logical rules for knowledge base completion",
+      "author" : [ "Fan Yang", "Zhilin Yang", "William W. Cohen" ],
+      "venue" : null,
+      "citeRegEx" : "34",
+      "shortCiteRegEx" : "34",
+      "year" : 2017
+    }, {
+      "title" : "Neural-symbolic learning systems: foundations and applications",
+      "author" : [ "Artur S. d’Avila Garcez", "Krysia Broda", "Dov M. Gabbay" ],
+      "venue" : "Springer Science & Business Media,",
+      "citeRegEx" : "35",
+      "shortCiteRegEx" : "35",
+      "year" : 2012
+    }, {
+      "title" : "An approach to combining explanation-based and neural learning algorithms",
+      "author" : [ "Jude W Shavlik", "Geoffrey G Towell" ],
+      "venue" : "Connection Science,",
+      "citeRegEx" : "36",
+      "shortCiteRegEx" : "36",
+      "year" : 1989
+    }, {
+      "title" : "Knowledge-based artificial neural networks",
+      "author" : [ "Geoffrey G. Towell", "Jude W. Shavlik" ],
+      "venue" : "Artif. Intell.,",
+      "citeRegEx" : "37",
+      "shortCiteRegEx" : "37",
+      "year" : 1994
+    }, {
+      "title" : "The connectionist inductive learning and logic programming system",
+      "author" : [ "Artur S. d’Avila Garcez", "Gerson Zaverucha" ],
+      "venue" : "Appl. Intell.,",
+      "citeRegEx" : "38",
+      "shortCiteRegEx" : "38",
+      "year" : 1999
+    }, {
+      "title" : "Neurally motivated constraints on the working memory capacity of a production system for parallel processing: Implications of a connectionist model based on temporal synchrony",
+      "author" : [ "Lokendra Shastri" ],
+      "venue" : "In Proceedings of the Fourteenth Annual Conference of the Cognitive Science Society: July 29 to August",
+      "citeRegEx" : "39",
+      "shortCiteRegEx" : "39",
+      "year" : 1992
+    }, {
+      "title" : "Neural prolog-the concepts, construction and mechanism",
+      "author" : [ "Liya Ding" ],
+      "venue" : "In Systems, Man and Cybernetics,",
+      "citeRegEx" : "40",
+      "shortCiteRegEx" : "40",
+      "year" : 1995
+    }, {
+      "title" : "Fast relational learning using bottom clause propositionalization with artificial neural networks",
+      "author" : [ "Manoel V.M. França", "Gerson Zaverucha", "Artur S. d’Avila Garcez" ],
+      "venue" : "Machine Learning,",
+      "citeRegEx" : "41",
+      "shortCiteRegEx" : "41",
+      "year" : 2014
+    }, {
+      "title" : "Lifted relational neural networks",
+      "author" : [ "Gustav Sourek", "Vojtech Aschenbrenner", "Filip Zelezný", "Ondrej Kuzelka" ],
+      "venue" : "In Proceedings of the NIPS Workshop on Cognitive Computation: Integrating Neural and Symbolic Approaches co-located with the 29th Annual Conference on Neural Information Processing Systems (NIPS",
+      "citeRegEx" : "42",
+      "shortCiteRegEx" : "42",
+      "year" : 2015
+    }, {
+      "title" : "Tensorlog: A differentiable deductive database",
+      "author" : [ "William W. Cohen" ],
+      "venue" : "CoRR, abs/1605.06523,",
+      "citeRegEx" : "43",
+      "shortCiteRegEx" : "43",
+      "year" : 2016
+    }, {
+      "title" : "Logic tensor networks: Deep learning and logical reasoning from data and knowledge. In Proceedings of the 11th International Workshop on Neural-Symbolic Learning and Reasoning (NeSy’16) co-located with the Joint Multi-Conference on Human-Level Artificial Intelligence (HLAI 2016)",
+      "author" : [ "Luciano Serafini", "Artur S. d’Avila Garcez" ],
+      "venue" : null,
+      "citeRegEx" : "44",
+      "shortCiteRegEx" : "44",
+      "year" : 2016
+    }, {
+      "title" : "Low-Dimensional Embeddings of Logic",
+      "author" : [ "Tim Rocktäschel", "Matko Bosnjak", "Sameer Singh", "Sebastian Riedel" ],
+      "venue" : "In ACL Workshop on Semantic Parsing (SP’14),",
+      "citeRegEx" : "45",
+      "shortCiteRegEx" : "45",
+      "year" : 2014
+    }, {
+      "title" : "Injecting logical background knowledge into embeddings for relation extraction",
+      "author" : [ "Tim Rocktäschel", "Sameer Singh", "Sebastian Riedel" ],
+      "venue" : "In NAACL HLT",
+      "citeRegEx" : "46",
+      "shortCiteRegEx" : "46",
+      "year" : 2015
+    }, {
+      "title" : "Order-embeddings of images and language",
+      "author" : [ "Ivan Vendrov", "Ryan Kiros", "Sanja Fidler", "Raquel Urtasun" ],
+      "venue" : "In International Conference on Learning Representations (ICLR),",
+      "citeRegEx" : "47",
+      "shortCiteRegEx" : "47",
+      "year" : 2016
+    }, {
+      "title" : "Harnessing deep neural networks with logic rules. In Proceedings of the 54th Annual Meeting of the Association for Computational Linguistics, ACL 2016",
+      "author" : [ "Zhiting Hu", "Xuezhe Ma", "Zhengzhong Liu", "Eduard H. Hovy", "Eric P. Xing" ],
+      "venue" : "Long Papers,",
+      "citeRegEx" : "48",
+      "shortCiteRegEx" : "48",
+      "year" : 2016
+    }, {
+      "title" : "Lifted rule injection for relation embeddings",
+      "author" : [ "Thomas Demeester", "Tim Rocktäschel", "Sebastian Riedel" ],
+      "venue" : "In Proceedings of the 2016 Conference on Empirical Methods in Natural Language Processing,",
+      "citeRegEx" : "49",
+      "shortCiteRegEx" : "49",
+      "year" : 2016
+    }, {
+      "title" : "Unification neural networks: unification by error-correction learning",
+      "author" : [ "Ekaterina Komendantskaya" ],
+      "venue" : "Logic Journal of the IGPL,",
+      "citeRegEx" : "50",
+      "shortCiteRegEx" : "50",
+      "year" : 2011
+    }, {
+      "title" : "A structured connectionist unification algorithm",
+      "author" : [ "Steffen Hölldobler" ],
+      "venue" : "In Proceedings of the 8th National Conference on Artificial Intelligence. Boston, Massachusetts, July",
+      "citeRegEx" : "51",
+      "shortCiteRegEx" : "51",
+      "year" : 1990
+    }, {
+      "title" : "Learning first-order horn clauses from web text",
+      "author" : [ "Stefan Schoenmackers", "Jesse Davis", "Oren Etzioni", "Daniel S. Weld" ],
+      "venue" : "In Proceedings of the 2010 Conference on Empirical Methods in Natural Language Processing,",
+      "citeRegEx" : "52",
+      "shortCiteRegEx" : "52",
+      "year" : 2010
+    }, {
+      "title" : "Meta-interpretive learning of higher-order dyadic datalog: Predicate invention revisited",
+      "author" : [ "Stephen H Muggleton", "Dianhuan Lin", "Alireza Tamaddoni-Nezhad" ],
+      "venue" : "Machine Learning,",
+      "citeRegEx" : "53",
+      "shortCiteRegEx" : "53",
+      "year" : 2015
+    }, {
+      "title" : "Long short-term memory",
+      "author" : [ "Sepp Hochreiter", "Jürgen Schmidhuber" ],
+      "venue" : "Neural Computation,",
+      "citeRegEx" : "54",
+      "shortCiteRegEx" : "54",
+      "year" : 1997
+    }, {
+      "title" : "Efficient selectivity and backup operators in monte-carlo tree search",
+      "author" : [ "Rémi Coulom" ],
+      "venue" : "In Computers and Games, 5th International Conference,",
+      "citeRegEx" : "55",
+      "shortCiteRegEx" : "55",
+      "year" : 2006
+    }, {
+      "title" : "Bandit based monte-carlo planning",
+      "author" : [ "Levente Kocsis", "Csaba Szepesvári" ],
+      "venue" : "In Machine Learning: ECML 2006, 17th European Conference on Machine Learning, Berlin,",
+      "citeRegEx" : "56",
+      "shortCiteRegEx" : "56",
+      "year" : 2006
+    }, {
+      "title" : "Mastering the game of go with deep neural networks and tree",
+      "author" : [ "David Silver", "Aja Huang", "Chris J. Maddison", "Arthur Guez", "Laurent Sifre", "George van den Driessche", "Julian Schrittwieser", "Ioannis Antonoglou", "Vedavyas Panneershelvam", "Marc Lanctot", "Sander Dieleman", "Dominik Grewe", "John Nham", "Nal Kalchbrenner", "Ilya Sutskever", "Timothy P. Lillicrap", "Madeleine Leach", "Koray Kavukcuoglu", "Thore Graepel", "Demis Hassabis" ],
+      "venue" : "doi: 10.1038/nature16961",
+      "citeRegEx" : "57",
+      "shortCiteRegEx" : "57",
+      "year" : 2016
+    }, {
+      "title" : "Towards \"alphachem\": Chemical synthesis planning with tree search and deep neural network",
+      "author" : [ "Marwin H.S. Segler", "Mike Preuß", "Mark P. Waller" ],
+      "venue" : "policies. CoRR,",
+      "citeRegEx" : "58",
+      "shortCiteRegEx" : "58",
+      "year" : 2017
+    }, {
+      "title" : "Holstep: A machine learning dataset for higher-order logic theorem proving",
+      "author" : [ "Cezary Kaliszyk", "François Chollet", "Christian Szegedy" ],
+      "venue" : "In International Conference on Learning Representations (ICLR),",
+      "citeRegEx" : "59",
+      "shortCiteRegEx" : "59",
+      "year" : 2017
+    }, {
+      "title" : "Adam: A method for stochastic optimization",
+      "author" : [ "Diederik P. Kingma", "Jimmy Ba" ],
+      "venue" : "In International Conference on Learning Representations (ICLR),",
+      "citeRegEx" : "61",
+      "shortCiteRegEx" : "61",
+      "year" : 2015
+    }, {
+      "title" : "Understanding the difficulty of training deep feedforward neural networks",
+      "author" : [ "Xavier Glorot", "Yoshua Bengio" ],
+      "venue" : "In Proceedings of the Thirteenth International Conference on Artificial Intelligence and Statistics,",
+      "citeRegEx" : "62",
+      "shortCiteRegEx" : "62",
+      "year" : 2010
+    } ],
+    "referenceMentions" : [ {
+      "referenceID" : 0,
+      "context" : "subsymbolic representations) for scoring fact triples [1–7].",
+      "startOffset" : 54,
+      "endOffset" : 59
+    }, {
+      "referenceID" : 1,
+      "context" : "subsymbolic representations) for scoring fact triples [1–7].",
+      "startOffset" : 54,
+      "endOffset" : 59
+    }, {
+      "referenceID" : 2,
+      "context" : "subsymbolic representations) for scoring fact triples [1–7].",
+      "startOffset" : 54,
+      "endOffset" : 59
+    }, {
+      "referenceID" : 3,
+      "context" : "subsymbolic representations) for scoring fact triples [1–7].",
+      "startOffset" : 54,
+      "endOffset" : 59
+    }, {
+      "referenceID" : 4,
+      "context" : "subsymbolic representations) for scoring fact triples [1–7].",
+      "startOffset" : 54,
+      "endOffset" : 59
+    }, {
+      "referenceID" : 5,
+      "context" : "subsymbolic representations) for scoring fact triples [1–7].",
+      "startOffset" : 54,
+      "endOffset" : 59
+    }, {
+      "referenceID" : 6,
+      "context" : "subsymbolic representations) for scoring fact triples [1–7].",
+      "startOffset" : 54,
+      "endOffset" : 59
+    }, {
+      "referenceID" : 7,
+      "context" : "In contrast, symbolic theorem provers like Prolog [8] enable exactly this type of multi-hop reasoning.",
+      "startOffset" : 50,
+      "endOffset" : 53
+    }, {
+      "referenceID" : 8,
+      "context" : "Furthermore, Inductive Logic Programming (ILP) [9] builds upon such provers to learn interpretable rules from data and exploit these for reasoning.",
+      "startOffset" : 47,
+      "endOffset" : 50
+    }, {
+      "referenceID" : 9,
+      "context" : "[10]), and when using subsymbolic representations they are not trained end-to-end from training data (e.",
+      "startOffset" : 0,
+      "endOffset" : 4
+    }, {
+      "referenceID" : 10,
+      "context" : "[11–13]).",
+      "startOffset" : 0,
+      "endOffset" : 7
+    }, {
+      "referenceID" : 11,
+      "context" : "[11–13]).",
+      "startOffset" : 0,
+      "endOffset" : 7
+    }, {
+      "referenceID" : 12,
+      "context" : "[11–13]).",
+      "startOffset" : 0,
+      "endOffset" : 7
+    }, {
+      "referenceID" : 13,
+      "context" : "Neural multi-hop reasoning models [14–18] address the aforementioned limitations to some extent by encoding reasoning chains in a vector space or by iteratively refining subsymbolic representations of questions before comparison with answers.",
+      "startOffset" : 34,
+      "endOffset" : 41
+    }, {
+      "referenceID" : 14,
+      "context" : "Neural multi-hop reasoning models [14–18] address the aforementioned limitations to some extent by encoding reasoning chains in a vector space or by iteratively refining subsymbolic representations of questions before comparison with answers.",
+      "startOffset" : 34,
+      "endOffset" : 41
+    }, {
+      "referenceID" : 15,
+      "context" : "Neural multi-hop reasoning models [14–18] address the aforementioned limitations to some extent by encoding reasoning chains in a vector space or by iteratively refining subsymbolic representations of questions before comparison with answers.",
+      "startOffset" : 34,
+      "endOffset" : 41
+    }, {
+      "referenceID" : 16,
+      "context" : "Neural multi-hop reasoning models [14–18] address the aforementioned limitations to some extent by encoding reasoning chains in a vector space or by iteratively refining subsymbolic representations of questions before comparison with answers.",
+      "startOffset" : 34,
+      "endOffset" : 41
+    }, {
+      "referenceID" : 17,
+      "context" : "Our solution to this problem is inspired by recent neural network architectures like Neural Turing Machines [19], Memory Networks [20], Neural Stacks/Queues [21, 22], Neural Programmer [23], Neural Programmer-Interpreters [24], Hierarchical Attentive Memory [25] and the Differentiable Forth Interpreter [26].",
+      "startOffset" : 157,
+      "endOffset" : 165
+    }, {
+      "referenceID" : 18,
+      "context" : "Our solution to this problem is inspired by recent neural network architectures like Neural Turing Machines [19], Memory Networks [20], Neural Stacks/Queues [21, 22], Neural Programmer [23], Neural Programmer-Interpreters [24], Hierarchical Attentive Memory [25] and the Differentiable Forth Interpreter [26].",
+      "startOffset" : 157,
+      "endOffset" : 165
+    }, {
+      "referenceID" : 19,
+      "context" : "Our solution to this problem is inspired by recent neural network architectures like Neural Turing Machines [19], Memory Networks [20], Neural Stacks/Queues [21, 22], Neural Programmer [23], Neural Programmer-Interpreters [24], Hierarchical Attentive Memory [25] and the Differentiable Forth Interpreter [26].",
+      "startOffset" : 185,
+      "endOffset" : 189
+    }, {
+      "referenceID" : 20,
+      "context" : "Our solution to this problem is inspired by recent neural network architectures like Neural Turing Machines [19], Memory Networks [20], Neural Stacks/Queues [21, 22], Neural Programmer [23], Neural Programmer-Interpreters [24], Hierarchical Attentive Memory [25] and the Differentiable Forth Interpreter [26].",
+      "startOffset" : 222,
+      "endOffset" : 226
+    }, {
+      "referenceID" : 21,
+      "context" : "Our solution to this problem is inspired by recent neural network architectures like Neural Turing Machines [19], Memory Networks [20], Neural Stacks/Queues [21, 22], Neural Programmer [23], Neural Programmer-Interpreters [24], Hierarchical Attentive Memory [25] and the Differentiable Forth Interpreter [26].",
+      "startOffset" : 258,
+      "endOffset" : 262
+    }, {
+      "referenceID" : 22,
+      "context" : "Our solution to this problem is inspired by recent neural network architectures like Neural Turing Machines [19], Memory Networks [20], Neural Stacks/Queues [21, 22], Neural Programmer [23], Neural Programmer-Interpreters [24], Hierarchical Attentive Memory [25] and the Differentiable Forth Interpreter [26].",
+      "startOffset" : 304,
+      "endOffset" : 308
+    }, {
+      "referenceID" : 6,
+      "context" : "Our contributions are threefold: (i) we present the construction of NTPs inspired by Prolog’s backward chaining algorithm and a differentiable unification operation using subsymbolic representations, (ii) we propose optimizations to this architecture by joint training with a neural link prediction model, batch proving, and approximate gradient calculation, and (iii) we experimentally show that NTPs can learn representations of symbols and function-free first-order rules of predefined structure, enabling them to learn complex multi-hop reasoning on benchmark KBs and to outperform ComplEx [7], a state-of-the-art neural link prediction model.",
+      "startOffset" : 594,
+      "endOffset" : 597
+    }, {
+      "referenceID" : 7,
+      "context" : "Given a goal such as [grandfatherOf, Q, BART], we can use Prolog’s backward chaining algorithm to find substitutions for Q [8].",
+      "startOffset" : 123,
+      "endOffset" : 126
+    }, {
+      "referenceID" : 23,
+      "context" : "We define the construction of NTPs in terms of modules similar to dynamic neural module networks [27].",
+      "startOffset" : 97,
+      "endOffset" : 101
+    }, {
+      "referenceID" : 24,
+      "context" : "Otherwise, the vector representations of the two non-variable symbols are compared using a Radial Basis Function (RBF) kernel [28] where μ is a hyperparameter that we set to 1 √ 2 in our experiments.",
+      "startOffset" : 126,
+      "endOffset" : 130
+    }, {
+      "referenceID" : 25,
+      "context" : "Usually, we do not observe negative facts and thus resort to sampling corrupted ground atoms as done in previous work [29].",
+      "startOffset" : 118,
+      "endOffset" : 122
+    }, {
+      "referenceID" : 8,
+      "context" : "We can use NTPs for ILP [9] by gradient descent instead of a combinatorial search over the space of rules as, for example, done by the First Order Inductive Learner (FOIL) [30].",
+      "startOffset" : 24,
+      "endOffset" : 27
+    }, {
+      "referenceID" : 26,
+      "context" : "We can use NTPs for ILP [9] by gradient descent instead of a combinatorial search over the space of rules as, for example, done by the First Order Inductive Learner (FOIL) [30].",
+      "startOffset" : 172,
+      "endOffset" : 176
+    }, {
+      "referenceID" : 8,
+      "context" : "Specifically, we are using the concept of learning from entailment [9] to induce rules that let us prove known ground atoms, but that do not give high proof success scores to corrupted ground atoms.",
+      "startOffset" : 67,
+      "endOffset" : 70
+    }, {
+      "referenceID" : 27,
+      "context" : "Inspired by [31], we use rule templates for convenience which define the structure of multiple parameterized rules in a concise way by specifying the number of parameterized rules that should be instantiated for a given rule structure.",
+      "startOffset" : 12,
+      "endOffset" : 16
+    }, {
+      "referenceID" : 6,
+      "context" : "To speed up learning subsymbolic representations, we train NTPs jointly with ComplEx [7] (Appendix A).",
+      "startOffset" : 85,
+      "endOffset" : 88
+    }, {
+      "referenceID" : 25,
+      "context" : "Consistent with previous work, we carry out experiments on four benchmark KBs and compare ComplEx with the NTP and NTPλ in terms of area under the Precision-Recall-curve (AUC-PR) on the Countries KB, and Mean Reciprocal Rank (MRR) and HITS@m [29] on the other KBs.",
+      "startOffset" : 242,
+      "endOffset" : 246
+    }, {
+      "referenceID" : 28,
+      "context" : "Countries The Countries KB is a dataset introduced by [32] for testing reasoning capabilities of neural link prediction models.",
+      "startOffset" : 54,
+      "endOffset" : 58
+    }, {
+      "referenceID" : 29,
+      "context" : "We follow [33] and split countries randomly into a training set of 204 countries (train), a development set of 20 countries (dev), and a test set of 20 countries (test), such that every dev and test country has at least one neighbor in the training set.",
+      "startOffset" : 10,
+      "endOffset" : 14
+    }, {
+      "referenceID" : 9,
+      "context" : "Kinship, Nations & UMLS We use the Nations, Alyawarra kinship (Kinship) and Unified Medical Language System (UMLS) KBs from [10].",
+      "startOffset" : 124,
+      "endOffset" : 128
+    }, {
+      "referenceID" : 30,
+      "context" : "Another method for inducing rules in a differentiable way for automated KB completion has been introduced recently by [34] and our evaluation setup is equivalent to their Protocol II.",
+      "startOffset" : 118,
+      "endOffset" : 122
+    }, {
+      "referenceID" : 31,
+      "context" : "Combining neural and symbolic approaches to relational learning and reasoning has a long tradition and let to various proposed architectures over the past decades (see [35] for a review).",
+      "startOffset" : 168,
+      "endOffset" : 172
+    }, {
+      "referenceID" : 32,
+      "context" : ", EBL-ANN [36], KBANN [37] and C-ILP [38]).",
+      "startOffset" : 10,
+      "endOffset" : 14
+    }, {
+      "referenceID" : 33,
+      "context" : ", EBL-ANN [36], KBANN [37] and C-ILP [38]).",
+      "startOffset" : 22,
+      "endOffset" : 26
+    }, {
+      "referenceID" : 34,
+      "context" : ", EBL-ANN [36], KBANN [37] and C-ILP [38]).",
+      "startOffset" : 37,
+      "endOffset" : 41
+    }, {
+      "referenceID" : 35,
+      "context" : ", SHRUTI [39], Neural Prolog [40], CLIP++ [41], Lifted Relational Neural Networks [42], and TensorLog [43]).",
+      "startOffset" : 9,
+      "endOffset" : 13
+    }, {
+      "referenceID" : 36,
+      "context" : ", SHRUTI [39], Neural Prolog [40], CLIP++ [41], Lifted Relational Neural Networks [42], and TensorLog [43]).",
+      "startOffset" : 29,
+      "endOffset" : 33
+    }, {
+      "referenceID" : 37,
+      "context" : ", SHRUTI [39], Neural Prolog [40], CLIP++ [41], Lifted Relational Neural Networks [42], and TensorLog [43]).",
+      "startOffset" : 42,
+      "endOffset" : 46
+    }, {
+      "referenceID" : 38,
+      "context" : ", SHRUTI [39], Neural Prolog [40], CLIP++ [41], Lifted Relational Neural Networks [42], and TensorLog [43]).",
+      "startOffset" : 82,
+      "endOffset" : 86
+    }, {
+      "referenceID" : 39,
+      "context" : ", SHRUTI [39], Neural Prolog [40], CLIP++ [41], Lifted Relational Neural Networks [42], and TensorLog [43]).",
+      "startOffset" : 102,
+      "endOffset" : 106
+    }, {
+      "referenceID" : 40,
+      "context" : "Logic Tensor Networks [44] are in spirit similar to NTPs, but need to ground first-order logic rules.",
+      "startOffset" : 22,
+      "endOffset" : 26
+    }, {
+      "referenceID" : 14,
+      "context" : "Recent question-answering architectures such as Neural Reasoner [15], Query-Answer Neural Networks [17] or ReasoNet [18] translate query representations implicitly in a vector space without explicit rule representations and can thus not easily incorporate domain-specific knowledge.",
+      "startOffset" : 64,
+      "endOffset" : 68
+    }, {
+      "referenceID" : 16,
+      "context" : "Recent question-answering architectures such as Neural Reasoner [15], Query-Answer Neural Networks [17] or ReasoNet [18] translate query representations implicitly in a vector space without explicit rule representations and can thus not easily incorporate domain-specific knowledge.",
+      "startOffset" : 99,
+      "endOffset" : 103
+    }, {
+      "referenceID" : 13,
+      "context" : "Furthermore, NTPs are related to path encoding models [14, 16], but instead of encoding paths to predict a target predicate, reasoning steps in NTPs are explicit and only the comparison of symbols uses subsymbolic representations.",
+      "startOffset" : 54,
+      "endOffset" : 62
+    }, {
+      "referenceID" : 15,
+      "context" : "Furthermore, NTPs are related to path encoding models [14, 16], but instead of encoding paths to predict a target predicate, reasoning steps in NTPs are explicit and only the comparison of symbols uses subsymbolic representations.",
+      "startOffset" : 54,
+      "endOffset" : 62
+    }, {
+      "referenceID" : 41,
+      "context" : "Another line of work [45–49] regularizes distributed representations via domain-specific rules, but does not learn such rules from data and only supports a restricted subset of first-order logic.",
+      "startOffset" : 21,
+      "endOffset" : 28
+    }, {
+      "referenceID" : 42,
+      "context" : "Another line of work [45–49] regularizes distributed representations via domain-specific rules, but does not learn such rules from data and only supports a restricted subset of first-order logic.",
+      "startOffset" : 21,
+      "endOffset" : 28
+    }, {
+      "referenceID" : 43,
+      "context" : "Another line of work [45–49] regularizes distributed representations via domain-specific rules, but does not learn such rules from data and only supports a restricted subset of first-order logic.",
+      "startOffset" : 21,
+      "endOffset" : 28
+    }, {
+      "referenceID" : 44,
+      "context" : "Another line of work [45–49] regularizes distributed representations via domain-specific rules, but does not learn such rules from data and only supports a restricted subset of first-order logic.",
+      "startOffset" : 21,
+      "endOffset" : 28
+    }, {
+      "referenceID" : 45,
+      "context" : "Another line of work [45–49] regularizes distributed representations via domain-specific rules, but does not learn such rules from data and only supports a restricted subset of first-order logic.",
+      "startOffset" : 21,
+      "endOffset" : 28
+    }, {
+      "referenceID" : 46,
+      "context" : "NTPs are constructed from Prolog’s backward chaining and are thus related to Unification Neural Networks [50, 51].",
+      "startOffset" : 105,
+      "endOffset" : 113
+    }, {
+      "referenceID" : 47,
+      "context" : "NTPs are constructed from Prolog’s backward chaining and are thus related to Unification Neural Networks [50, 51].",
+      "startOffset" : 105,
+      "endOffset" : 113
+    }, {
+      "referenceID" : 26,
+      "context" : "As NTPs can learn rules from data, they are related to ILP systems such as FOIL [30], Sherlock [52] and meta-interpretive learning of higher-order dyadic Datalog (Metagol) [53].",
+      "startOffset" : 80,
+      "endOffset" : 84
+    }, {
+      "referenceID" : 48,
+      "context" : "As NTPs can learn rules from data, they are related to ILP systems such as FOIL [30], Sherlock [52] and meta-interpretive learning of higher-order dyadic Datalog (Metagol) [53].",
+      "startOffset" : 95,
+      "endOffset" : 99
+    }, {
+      "referenceID" : 49,
+      "context" : "As NTPs can learn rules from data, they are related to ILP systems such as FOIL [30], Sherlock [52] and meta-interpretive learning of higher-order dyadic Datalog (Metagol) [53].",
+      "startOffset" : 172,
+      "endOffset" : 176
+    }, {
+      "referenceID" : 30,
+      "context" : "Recently, [34] introduced a differentiable rule learning system based on TensorLog and a neural network controller similar to LSTMs [54].",
+      "startOffset" : 10,
+      "endOffset" : 14
+    }, {
+      "referenceID" : 50,
+      "context" : "Recently, [34] introduced a differentiable rule learning system based on TensorLog and a neural network controller similar to LSTMs [54].",
+      "startOffset" : 132,
+      "endOffset" : 136
+    }, {
+      "referenceID" : 21,
+      "context" : "To overcome computational limitations of end-to-end differentiable proving, we want to investigate the use of hierarchical attention [25] and recent reinforcement learning methods such as Monte Carlo tree search [55, 56] that have been used for learning to play Go [57] and chemical synthesis planning [58].",
+      "startOffset" : 133,
+      "endOffset" : 137
+    }, {
+      "referenceID" : 51,
+      "context" : "To overcome computational limitations of end-to-end differentiable proving, we want to investigate the use of hierarchical attention [25] and recent reinforcement learning methods such as Monte Carlo tree search [55, 56] that have been used for learning to play Go [57] and chemical synthesis planning [58].",
+      "startOffset" : 212,
+      "endOffset" : 220
+    }, {
+      "referenceID" : 52,
+      "context" : "To overcome computational limitations of end-to-end differentiable proving, we want to investigate the use of hierarchical attention [25] and recent reinforcement learning methods such as Monte Carlo tree search [55, 56] that have been used for learning to play Go [57] and chemical synthesis planning [58].",
+      "startOffset" : 212,
+      "endOffset" : 220
+    }, {
+      "referenceID" : 53,
+      "context" : "To overcome computational limitations of end-to-end differentiable proving, we want to investigate the use of hierarchical attention [25] and recent reinforcement learning methods such as Monte Carlo tree search [55, 56] that have been used for learning to play Go [57] and chemical synthesis planning [58].",
+      "startOffset" : 265,
+      "endOffset" : 269
+    }, {
+      "referenceID" : 54,
+      "context" : "To overcome computational limitations of end-to-end differentiable proving, we want to investigate the use of hierarchical attention [25] and recent reinforcement learning methods such as Monte Carlo tree search [55, 56] that have been used for learning to play Go [57] and chemical synthesis planning [58].",
+      "startOffset" : 302,
+      "endOffset" : 306
+    }, {
+      "referenceID" : 55,
+      "context" : "Lastly, we are interested in applying NTPs to automated proving of mathematical theorems, either in logical or natural language form, similar to recent approaches by [59] and [60].",
+      "startOffset" : 166,
+      "endOffset" : 170
+    } ],
+    "year" : 2017,
+    "abstractText" : "We introduce neural networks for end-to-end differentiable theorem proving that operate on dense vector representations of symbols. These neural networks are constructed recursively by taking inspiration from the backward chaining algorithm as used in Prolog. Specifically, we replace symbolic unification with a differentiable computation on vector representations of symbols using a radial basis function kernel, thereby combining symbolic reasoning with learning subsymbolic vector representations. By using gradient descent, the resulting neural network can be trained to infer facts from a given incomplete knowledge base. It learns to (i) place representations of similar symbols in close proximity in a vector space, (ii) make use of such similarities to prove facts, (iii) induce logical rules, and (iv) use provided and induced logical rules for complex multi-hop reasoning. We demonstrate that this architecture outperforms ComplEx, a state-of-the-art neural link prediction model, on four benchmark knowledge bases while at the same time inducing interpretable function-free first-order logic rules.",
+    "creator" : "LaTeX with hyperref package"
+  }
+}

@@ -1,0 +1,127 @@
+{
+  "name" : "1501.06633.pdf",
+  "metadata" : {
+    "source" : "CRF",
+    "title" : "maxDNN: An Efficient Convolution Kernel for Deep Learning with Maxwell GPUs",
+    "authors" : [ "Andrew Lavin" ],
+    "emails" : [ "alavin@acm.org" ],
+    "sections" : [ {
+      "heading" : null,
+      "text" : "ar X\niv :1\n50 1.\n06 63\n3v 1\n[ cs\n.N E\n] 2\n7 Ja"
+    }, {
+      "heading" : "1 Introduction",
+      "text" : "The central algorithm of convolutional neural networks is the 2D convolution of a bank of multi-channel filters against a minibatch of multi-channel 2D maps [7]. Modern GPUs have demonstrated the ability to compute convolutions significantly faster than CPUs [5]. cuda-convnet2 and cuDNN are the leading GPU implementations of spatial domain convolution [2]. fbcunn is a GPU implementation of frequency domain convolution that has a speed advantage for many useful convolution shapes [8].\nWhen comparing convolution kernels, it is customary to report execution time or throughput. The problem with these measurements is that they conflate the separate issues of algorithm complexity, computational efficiency, and device peak throughput.\nThe question of device peak throughput is not as simple as one might hope. The effective peak throughput for single precision floating point operations on NVIDIA Kepler GPUs is only 68.75% of the TFLOPS number reported on spec sheets [6].\nComputational efficiency is an interesting problem by itself, because it is in practice very difficult to write highly efficient GPU kernels. Anecdotal evidence suggests that for many real world problems such as SGEMM and convolution, it is not possible to create a GPU kernel with greater than 80% computational efficiency using the CUDA Toolkit. The fact that the cuBLAS SGEMM kernel reaches 91% computational efficiency on NVIDIA Maxwell GPUs using assembly optimization suggests that efficient kernels are possible on Maxwell, but that the CUDA Toolkit does not provide the necessary tools to create them.\nThe Maxas project is an open source assembler for NVIDIA Maxwell GPUs, created by Scott Gray [3]. It includes as a programming example an assembly implementation of SGEMM that reaches 96% computational efficiency.\nWe created maxDNN to demonstrate that the same techniques used by Maxas for generating efficient SGEMM machine code are also effective for convolution."
+    }, {
+      "heading" : "2 Convolution",
+      "text" : "The convolution used in deep learning takes a minibatch of Nb 2D multi-channel maps of size Wi × Hi × Nc and a bank of No 2D multi-channel filters of size Sk×Sk×Nc. Convolution of Nb maps against No filters is performed separately in corresponding channels and the result is summed over all channels. A stride, possibly equal to 1, is chosen that yields the desired output map size, Wo × Ho × No. The origin of the convolution can be offset by an optional padding parameter, and the image is assumed to be wrapped in an apron of zeros to handle boundary spills. We also scale the results by a scalar, α.\nThe algorithmic complexity of convolution is:\nC(Nb,Wo, Ho, Nc, No, Sk) = 2NbWoHo(NcS 2 k + 1)No FLOPs\nwhere a single multiply-accumulate operation counts as 2 FLOPs."
+    }, {
+      "heading" : "3 cuda-convnet2",
+      "text" : "cuda-convnet2 [4] is perhaps the most efficient convolution across a wide variety of popular network shapes [2]. It uses an interesting strategy for implementing direct convolution: the map and filter data is ordered in memory so that the inner dimension is the number of batches or filters. The outer dimensions are the width, height, and channels of the maps.\nThe calculation of Nb×No output values for a single output map coordinate is just a matrix multiply between an unrolled input map patch, of sizeNb×S 2 k Nc, and the filter matrix, of size S2 k Nc ×No.\nEach of the No columns of the filter matrix contains the S 2 k Nc weights for a\nsingle filter. The S2\nk Nc columns of the input matrix must be gathered from non-contiguous\nsegments of the input map. Column offset calculations used in the gather operation require extra integer instructions compared with the code used in general matrix multiply, which operates on contiguous blocks of matrix data.\ncuda-convnet2 also employs effective GPU programming techniques, including:\n• Textures to load global memory, reducing indexing arithmetic.\n• Loads and processes a tile of 8 columns of data per iteration, amortizing global load latency.\nIt is worth noting that cuda-convnet2 targeted the Kepler GPU, which has half (48K) the shared memory of the Maxwell GPU (96K). Extra shared memory makes possible additional latency hiding strategies."
+    }, {
+      "heading" : "3.1 Maxas: The Maxwell Assembler",
+      "text" : "Maxas is an open source assembler for the NVIDIA Maxwell architecture, created by Scott Gray [3]. It gives the developer complete control over the scheduling of instructions and allocation of registers. The project includes an SGEMM implementation that reaches 96% computational efficiency on Maxwell GM204 GPUs.\nThe project is interesting not just for the the assembler itself, but also for the SGEMM implementation and accompanying documentation, which is the best sample program published so far for creating high efficiency kernels. Several advanced techniques are used, including:\n• Use of 128 bit texture load instructions to reduce number of global loads, to increase size of maximum array to 4GB (due to max texture index 228), and to reduce indexing calculations\n• Double buffering of global memory loads to hide global memory latency.\n• Double buffering of shared memory loads to hide shared memory latency and reduce number of warp synchronizations per iteration\n• Coalesced storing to global memory by reorganizing output values through shared memory.\n• Zero initialization of registers using 128 bit shared memory loads.\nThe inner loop of Maxas SGEMM64 is 98.8% floating point instructions (texture and shared memory load instructions are dual issued with arithmetic instructions and therefore are not counted). Occupancy is just 25%, limited by the use of 127 registers per warp, so the high computational efficiency demonstrates the latency hiding power of instruction level parallelism.\nThe project contains SGEMM variants that perform 64× 64 and 128× 128 shared memory blocking. Both use 8 × 8 register blocking and load 8 columns of data per iteration."
+    }, {
+      "heading" : "3.2 maxDNN",
+      "text" : "The strategy behind our maxDNN kernel combines the style of cuda-convnet2 convolution with the matrix multiply assembly code of Maxas SGEMM. Maxas SGEMM64 was modified so that each block traverses a patch of the input map to compute a 64×64 filter-image block for a single output map coordinate. The z-coordinate of the block index is used to enumerate the filter-image blocks.\nBasically this just required adjusting the indexing calculations in the existing SGEMM64 code. To reduce the number of indexing calculations required to traverse the input map patch, we lifted the calculation of pixel/channel offset locations into constant memory. The pixel offset is just added to the patch offset to compute the input map offset. This replaces the 3 nested loops over channels, rows, and columns of a patch with a single loop over all the precomputed offset locations. The result is an inner loop that is 98.3% floating point instructions.\nWe also physically zero padded the input map to handle boundary overruns. We believe this restriction could be removed with a modest decrease in the percentage of floating point instructions."
+    }, {
+      "heading" : "3.3 Experiments",
+      "text" : "We compare the performance of maxDNN to cuDNN v.2 RC1 on a GEFORCE GTX980 graphics card which uses the NVIDIA Maxwell GM204 GPU. cudaconvnet2 was not used because it has not been optimized for the Maxwell architecture.\ncuDNN v.2 RC2 was also available, but showed significantly worse performance, so we reverted to RC1.\nWe measure performance using computational efficiency, which is the ratio of the actual throughput of the program to the peak throughput of the device. The GM204 consists of 16 processors each with 128 cores. Each core is capable of executing 1 multiply-accumulate per clock cycle. So one can calculate the device peak throughput by\nPeak Throughput = 2FLOPs · 128 · 16 ·GPU Clock Speed\nThe factor of 2 is due to the custom of counting a single multiply accumnulate operation as 2 FLOPs.\nAnother way to measure computational efficiency is to divide the number of executed floating point instructions by 128, and then divide again by the number of processor clock cycles:\nCE = 1\n128\nfp instructions\nprocessor clocks\nThis appears to be the formula used by the flop sp efficiency metric in the nvprof profiling program in the CUDA Toolkit. It has the advantage of being independent of the clock speed, which can vary during kernel execution.\nUsing the above measure of efficiency, a kernel can get credit for unnecessary work by performing more floating point instructions than are strictly necessary. We see this arise as a modest effect in maxDNN when the filter size (Sk2Nc) is not a multiple of the tile size (8). It has a more pronounced effect when the number of filters or mini-batch size is not a multiple of shared memory blocking size (64× 64).\nTherefore we modify the computational efficiency function to only give credit for the number of FLOPs actually required by the direct convolution algorithm:\nCE = 1\n2 · 128\nC(Nb,Wo, Ho, Nc, No, Sk)\nprocessor clocks\nWe report efficiency for two recent Imagenet contest winners, Alexnet (v.2) and Overfeat. The minibatch size for both networks is 128."
+    }, {
+      "heading" : "3.4 Results",
+      "text" : "Table 1 compares the computational efficiency of cuDNN and maxDNN for FPROP convolution on the layers of Alexnet and Overfeat.\nmaxDNN efficiency for Alexnet v.2 ranges between 93.4% and 95.5%. The worst performance is on the input layer, where a patch only has 11 × 11 × 3 elements. This reduces the size of the main loop, where almost all of the FLOPs are performed, compared with the initialization and storage code sections, which can be thought of as fixed overhead.\nmaxDNN efficiency for Overfeat reaches 96.3%, and is over 94.4% for all layers but the first, which scores just 70.3%. This is due to the fact that the number of filters in this layer, 96, is not a multiple of the block size, 64× 64.\nWe believe this could be addressed with a kernel that uses a block size of 64× 32. This would reduce the computational intensity with respect to global memory loads, but the high L2 cache hit rate of our kernel suggests there is a surplus of device memory bandwidth. Additional block sizes could be developed to accommodate small minibatch sizes. At a certain block size the computational intensity would be too low and the kernel would be device memory bandwidth limited, experiments are required to determine this threshold.\ncuDNN efficiency on Alexnet varies between 32.5% and 57.6%. Not only are these numbers significantly lower, but the variance is much higher. For Overfeat the cuDNN efficiency varies from 39.6% to 74.0%. The first layer in each network is the least efficient, apparently due to a larger number of integer instructions used in indexing calculations.\nOne of the stated design goals of cuDNN was to achieve consistently high efficiency on a variety of convolution shapes using a single kernel [1]. Although cuDNN reports flexibility with respect to minibatch size [1], we can see that in practice the performance varies a lot with respect to map dimensions."
+    }, {
+      "heading" : "3.5 Conclusion",
+      "text" : "We developed an efficient convolution kernel for Maxwell GPUs using the Maxas assembler, Maxas SGEMM64 source code, and the cuda-convnet2 approach to convolution. We believe the same approach could be applied to the BPROP operation of convolutional neural networks.\nThe efficiency of maxDNN convolution rivals that of the best SGEMM implementations. Therefore maxDNN represents an existence proof that high efficiency GPU convolution is possible."
+    }, {
+      "heading" : "Acknowledgement",
+      "text" : "The author would like to thank eBay Research Labs Machine Learning Director Dennis DeCoste for his guidance during the course of this project."
+    } ],
+    "references" : [ {
+      "title" : "cudnn: Efficient primitives for deep learning",
+      "author" : [ "Sharan Chetlur", "Cliff Woolley", "Philippe Vandermersch", "Jonathan Cohen", "John Tran", "Bryan Catanzaro", "Evan Shelhamer" ],
+      "venue" : "CoRR, abs/1410.0759,",
+      "citeRegEx" : "1",
+      "shortCiteRegEx" : "1",
+      "year" : 2014
+    }, {
+      "title" : "Maxas: Assembler for nvidia maxwell architecture",
+      "author" : [ "Scott Gray" ],
+      "venue" : "https://github.com/NervanaSystems/maxas,",
+      "citeRegEx" : "3",
+      "shortCiteRegEx" : "3",
+      "year" : 2014
+    }, {
+      "title" : "Imagenet classification with deep convolutional neural networks. In Advances in neural information processing",
+      "author" : [ "Alex Krizhevsky", "Ilya Sutskever", "Geoffrey E Hinton" ],
+      "venue" : null,
+      "citeRegEx" : "5",
+      "shortCiteRegEx" : "5",
+      "year" : 2012
+    }, {
+      "title" : "Performance upper bound analysis and optimization of sgemm on fermi and kepler gpus",
+      "author" : [ "Junjie Lai", "André Seznec" ],
+      "venue" : "In Code Generation and Optimization (CGO),",
+      "citeRegEx" : "6",
+      "shortCiteRegEx" : "6",
+      "year" : 2013
+    }, {
+      "title" : "Learning methods for generic object recognition with invariance to pose and lighting",
+      "author" : [ "Yann LeCun", "Fu Jie Huang", "Leon Bottou" ],
+      "venue" : "In Computer Vision and Pattern Recognition,",
+      "citeRegEx" : "7",
+      "shortCiteRegEx" : "7",
+      "year" : 2004
+    }, {
+      "title" : "Fast convolutional nets with fbfft: A GPU performance evaluation",
+      "author" : [ "Nicolas Vasilache", "Jeff Johnson", "Michaël Mathieu", "Soumith Chintala", "Serkan Piantino", "Yann LeCun" ],
+      "venue" : "CoRR, abs/1412.7580,",
+      "citeRegEx" : "8",
+      "shortCiteRegEx" : "8",
+      "year" : 2014
+    } ],
+    "referenceMentions" : [ {
+      "referenceID" : 4,
+      "context" : "The central algorithm of convolutional neural networks is the 2D convolution of a bank of multi-channel filters against a minibatch of multi-channel 2D maps [7].",
+      "startOffset" : 157,
+      "endOffset" : 160
+    }, {
+      "referenceID" : 2,
+      "context" : "Modern GPUs have demonstrated the ability to compute convolutions significantly faster than CPUs [5].",
+      "startOffset" : 97,
+      "endOffset" : 100
+    }, {
+      "referenceID" : 5,
+      "context" : "fbcunn is a GPU implementation of frequency domain convolution that has a speed advantage for many useful convolution shapes [8].",
+      "startOffset" : 125,
+      "endOffset" : 128
+    }, {
+      "referenceID" : 3,
+      "context" : "75% of the TFLOPS number reported on spec sheets [6].",
+      "startOffset" : 49,
+      "endOffset" : 52
+    }, {
+      "referenceID" : 1,
+      "context" : "The Maxas project is an open source assembler for NVIDIA Maxwell GPUs, created by Scott Gray [3].",
+      "startOffset" : 93,
+      "endOffset" : 96
+    }, {
+      "referenceID" : 1,
+      "context" : "Maxas is an open source assembler for the NVIDIA Maxwell architecture, created by Scott Gray [3].",
+      "startOffset" : 93,
+      "endOffset" : 96
+    }, {
+      "referenceID" : 0,
+      "context" : "One of the stated design goals of cuDNN was to achieve consistently high efficiency on a variety of convolution shapes using a single kernel [1].",
+      "startOffset" : 141,
+      "endOffset" : 144
+    }, {
+      "referenceID" : 0,
+      "context" : "Although cuDNN reports flexibility with respect to minibatch size [1], we can see that in practice the performance varies a lot with respect to map dimensions.",
+      "startOffset" : 66,
+      "endOffset" : 69
+    } ],
+    "year" : 2015,
+    "abstractText" : "This paper describes maxDNN, a computationally efficient convolution kernel for deep learning with the NVIDIA Maxwell GPU. maxDNN reaches 96.3% computational efficiency on typical deep learning network architectures using a single kernel. The design combines ideas from cudaconvnet2 with the Maxas SGEMM assembly code. We only address forward propagation (FPROP) operation of the network, but we believe that the same techniques used here will be effective for backward propagation (BPROP) as well.",
+    "creator" : "LaTeX with hyperref package"
+  }
+}

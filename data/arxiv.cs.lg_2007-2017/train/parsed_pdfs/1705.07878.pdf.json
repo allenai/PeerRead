@@ -1,0 +1,663 @@
+{
+  "name" : "1705.07878.pdf",
+  "metadata" : {
+    "source" : "CRF",
+    "title" : "TernGrad: Ternary Gradients to Reduce Communication in Distributed Deep Learning",
+    "authors" : [ "Wei Wen", "Cong Xu", "Feng Yan" ],
+    "emails" : [ "wei.wen@duke.edu", "cong.xu@hpe.com", "fyan@unr.edu", "chunpeng.wu@duke.edu", "yaw46@pitt.edu", "yiran.chen@duke.edu", "hai.li@duke.edu" ],
+    "sections" : [ {
+      "heading" : "1 Introduction",
+      "text" : "The remarkable advances in deep learning is driven by data explosion and increase of model size. The training of large-scale models with huge amounts of data are often carried on distributed systems [1][2][3][4][5][6][7][8][9], where data parallelism is adopted to exploit the compute capability empowered by multiple workers [10]. Stochastic Gradient Descent (SGD) is usually selected as the optimization method because of its high computation efficiency. In realizing the data parallelism of SGD, model copies in computing workers are trained in parallel by applying different subsets of data. A centralized parameter server performs gradient synchronization by collecting all gradients and averaging them to update parameters. The updated parameters will be sent back to workers, that is, parameter synchronization. Increasing the number of workers helps reduce the computation time dramatically. However, as the scale of distributed systems grows up, the extensive gradient and parameter synchronizations prolong the communication time and even amortize the savings of computation time [4][11][12]. A common approach to overcome such a network bottleneck is asynchronous SGD [1][4][7][12][13][14], which continues computation by using stale values without waiting for the completeness of synchronization. The inconsistency of parameters across computing workers, however, can degrade training accuracy and incur occasional divergence [15][16].\nFrom the perspective of inference acceleration, sparse and quantized Deep Neural Networks (DNNs) have been widely studied, such as [17][18][19][20][21][22]. However, these methods generally\nar X\niv :1\n70 5.\n07 87\n8v 1\n[ cs\n.L G\naggravate the training effort. Researches such as sparse logistic regression and Lasso optimization problems [4][12][23] took advantage of the sparsity inherent in models and achieved remarkable speedup for distributed training. A more generic and important topic is how to accelerate the distributed training of dense models by utilizing sparsity and quantization techniques. For instance, Aji and Heafield [24] proposed to heuristically sparsify dense gradients by dropping off small values in order to reduce gradient communication. For the same purpose, quantizing gradients to low-precision values with smaller bit width has also been extensively studied [22][25][26][27].\nOur work belongs to the category of gradient quantization, which is an orthogonal approach to sparsity methods. We propose TernGrad that quantizes gradients to ternary levels {−1, 0, 1} to reduce the overhead of gradient synchronization. Furthermore, we propose scaler sharing and parameter localization, which can replace parameter synchronization with a low-precision gradient pulling. Comparing with previous works, our major contributions include: (1) we mathematically prove the convergence of TernGrad in general by proposing a statistical bound on gradients; (2) we propose layer-wise ternarizing and gradient clipping to move this bound closer toward the bound of standard SGD. These simple techniques successfully improve the convergence; (3) we build a performance model to evaluate the speed of training methods with compressed gradients, like TernGrad. Our source code is available at https://github.com/wenwei202/terngrad."
+    }, {
+      "heading" : "2 Related work",
+      "text" : "Gradient sparsification. Aji and Heafield [24] proposed a heuristic gradient sparsification method that truncated the smallest gradients and transmitted only the remaining large ones. The method greatly reduced the gradient communication and achieved 22% speed gain on 4 GPUs for a neural machine translation, without impacting the translation quality. An earlier study by Garg et al. [28] adopted the similar approach, but targeted at sparsity recovery instead of training acceleration. Our proposed TernGrad is orthogonal to these sparsity-based methods.\nGradient quantization. DoReFa-Net [22] derived from AlexNet reduced the bit widths of weights, activations and gradients to 1, 2 and 6, respectively. However, DoReFa-Net showed 9.8% accuracy loss as it targeted at acceleration on single worker. S. Gupta et al. [27] successfully trained neural networks on MNIST and CIFAR-10 datasets using 16-bit numerical precision for an energy-efficient hardware accelerator. Our work, instead, tends to speedup the distributed training by decreasing the communicated gradients to three numerical levels {−1, 0, 1}. F. Seide et al. [25] applied 1-bit SGD to accelerate distributed training and empirically verified its effectiveness in speech applications. As the gradient quantization is conducted by columns, a floating-point scaler per column is required. So it cannot yield any speed benefit on convolutional neural networks [26]. Moreover, “cold start” of the method [25] requires floating-point gradients to converge to a good initial point for the following 1-bit SGD. More importantly, it is unknown what conditions can guarantee its convergence. Comparably, our TernGrad can start the DNN training from scratch and we prove the conditions that promise the convergence of TernGrad.\nVery recently, a preprint by R. Tomioka et al. [26] presented QSGD that explores the trade-off between accuracy and gradient precision. The effectiveness of gradient quantization was justified and the convergence of QSGD was provably guaranteed. Compared to QSGD developed simultaneously, our TernGrad shares the same concept but advances in the following three aspects: (1) we prove the convergence from the perspective of statistic bound on gradients. The bound also explains why multiple quantization buckets are necessary in QSGD; (2) the bound is used to guide practices and inspires techniques of layer-wise ternarizing and gradient clipping; (3) TernGrad using only 3-level gradients achieves 0.92% top-1 accuracy improvement for AlexNet, while 1.73% top-1 accuracy loss is observed in QSGD with 4 levels. The accuracy loss in QSGD can be eliminated by paying the cost of increasing the precision to 4 bits (16 levels) and beyond."
+    }, {
+      "heading" : "3 Problem Formulation and Our Approach",
+      "text" : "3.1 Problem Formulation and TernGrad Figure 1 formulates the distributed training problem of synchronous SGD using data parallelism. At iteration t, a mini-batch of training samples are split and fed into multiple workers (i ∈ {1, ..., N}). Worker i computes the gradients g(i)t of parameters w.r.t. its input samples z (i) t . All gradients are first synchronized and averaged at parameter server, and then sent back to update workers.\nNote that parameter server in most implementations [1][12] are used to preserve shared parameters, while here we utilize it in a slightly different way to maintain shared gradients. In Figure 1, each worker keeps a copy of parameters locally. We name this technique as parameter localization. The parameter consistency among workers can be maintained by random initialization with an identical seed. Parameter localization changes the communication of parameters in floating-point form to the transfer of quantized gradients that require much lighter traffic. Note that our proposed TernGrad can be integrated with many settings like Asynchronous SGD [1][4], even though the scope of this paper only focuses on the distributed SGD in Figure 1.\nAlgorithm 1 formulates the t-th iteration of TernGrad algorithm according to Figure 1. Most steps of TernGrad remain the same as traditional distributed training, except that gradients shall be quantized into ternary precision before sending to parameter server. More specific, ternarize(·) aims to reduce the communication volume of gradients. It randomly quantizes gradient gt 1 to a ternary vector with values ∈ {−1, 0,+1}. Formally, with a random binary vector bt, gt is ternarized as\ng̃t = ternarize(gt) = st · sign (gt) ◦ bt, (1) where st , max (abs (gt)) is a scaler that can shrink ±1 to a much smaller amplitude. ◦ is the Hadamard product. sign(·) and abs(·) respectively returns the sign and absolute value of each element. Giving a gt, each element of bt independently follows the Bernoulli distribution{\nP (btk = 1 | gt) = |gtk|/st P (btk = 0 | gt) = 1− |gtk|/st , (2)\nwhere btk and gtk is the k-th element of bt and gt, respectively. This stochastic rounding, instead of deterministic one, is chosen by both our study and QSGD [26], as stochastic rounding has an unbiased expectation and has been successfully studied for low-precision processing [20][27].\nOptimally, ternary gradients reduces the worker-to-server traffic by a factor of 32/log2(3) = 20.18×. Even using 2 bits to encode a ternary gradient, the reduction factor is still 16×. As aforementioned, parameter localization reduces server-to-worker traffic by pulling quantized gradients from servers. However, summing up ternary values in ∑ i g̃ (i) t will produce more possible levels and thereby the final averaged gradient gt is no longer ternary as shown in Figure 2(d). It emerges as a critical issue when workers use different scalers s(i)t . To minimize the number of levels, we propose a shared scaler st = max({s(i)t } : i = 1...N) across all the workers. We name this technique as scaler sharing. The sharing process has a small overhead of transferring 2N floating scalars. By integrating parameter localization and scaler sharing, the maximum number of levels in gt decreases to 2N+1. As a result, the server-to-worker communication reduces by a factor of 32/log2(1 + 2N), unless N ≥ 230.\nParameter server\nWorker 1 \uD835\uDC98\"#$ ← \uD835\uDC98\" − \uD835\uDC88\"\nWorker 2 \uD835\uDC98\"#$ ← \uD835\uDC98\" − \uD835\uDC88\"\nWorker N \uD835\uDC98\"#$ ← \uD835\uDC98\" − \uD835\uDC88\"\n……\uD835\uDC88\" ($)\n\uD835\uDC88\" (*)\n\uD835\uDC88\" (+)\n\uD835\uDC88\" \uD835\uDC88\" \uD835\uDC88\""
+    }, {
+      "heading" : "3.2 Convergence Analysis and Gradient Bound",
+      "text" : "We analyze the convergence of TernGrad in the framework of online learning systems. An online learning system adapts its parameter w to a sequence of observations to maximize performance. Each observation z is drawn from an unknown distribution, and a loss function Q(z,w) is used to measure the performance of current system with parameter w and input z. The minimization target then is the loss expectation\nC(w) , E {Q(z,w)} . (3) 1Here, the superscript of gt is omitted for simplicity.\nIn General Online Gradient Algorithm (GOGA) [29], parameter is updated at learning rate γt as\nwt+1 = wt − γtgt = wt − γt · ∇wQ(zt,wt), (4)\nwhere g , ∇wQ(z,w) and the subscript t denotes observing step t. In GOGA, E {g} is the gradient of the minimization target in Eq. (3).\nAccording to Eq. (1), the parameter in TernGrad is updated, such as\nwt+1 = wt − γt (st · sign (gt) ◦ bt) , (5)\nwhere st , max (abs (gt)) is a random variable depending on zt and wt. As gt is known for given zt and wt, Eq. (2) is equivalent to{\nP (btk = 1 | zt,wt) = |gtk|/st P (btk = 0 | zt,wt) = 1− |gtk|/st . (6)\nAt any given wt, the expectation of ternary gradient satisfies\nE {st · sign (gt) ◦ bt} = E {st · sign (gt) ◦E {bt|zt}} = E {gt} = ∇wC(wt), (7)\nwhich is an unbiased gradient of minimization target in Eq. (3). The convergence analysis of TernGrad is adapted from the convergence proof of GOGA presented in [29], which uses the following two assumptions. Without explicit mention, vectors indicate column vectors here.\nAssumption 1. C(w) has a single minimum w∗ and gradient−∇wC(w) always points to w∗, i.e.,\n∀ > 0, inf ||w−w∗||2> (w −w∗)T ∇wC(w) > 0. (8)\nConvexity is a subset of Assumption 1, and we can easily find non-convex functions satisfying it. Assumption 2. Learning rate γt is positive and constrained as ∑+∞ t=0 γ 2 t < +∞ and ∑+∞ t=0 γt = +∞, which ensures γt decreases neither very fast nor very slow respectively.\nWe define the distance between current parameter wt and the minimum w∗ as ht , ||wt −w∗||2, where || · || is `2 norm. We also define the set of all random variables before step t as Xt , (z1...t−1, b1...t−1). Under Assumption 1 and Assumption 2, using Lyapunov process and QuasiMartingales convergence theorem, L. Bottou [29] proved\nLemma 1. If ∃A,B > 0 s.t. E {( ht+1 − ( 1 + γ2tB ) ht ) |Xt } ≤ −2γt(wt − w∗)T∇wC(wt) + γ2tA, then C(z,w) converges almost surely toward minimum w∗, i.e., P (limt→+∞wt = w∗) = 1.\nWe assume the gradient is bounded as\nAssumption 3 (Gradient Bound). The gradient g is bounded as E {max(abs(g)) · ||g||1} ≤ A + B ||w −w∗||2, where A,B > 0 and || · ||1 is `1 norm.\nWith Assumption 3 and Lemma 1, we prove (refer to Supplementary Material for details) Theorem 1. When online learning systems update as wt+1 = wt − γt (st · sign (gt) ◦ bt) using stochastic ternary gradients, they converge almost surely toward minimum w∗, i.e., P (limt→+∞wt = w ∗) = 1.\nComparing with the gradient bound of standard GOGA E { ||g||2 } ≤ A+B ||w −w∗||2 [29], the\nbound in Assumption 3 is stronger because max(abs(g)) · ||g||1 ≥ ||g||2. We propose layer-wise ternarizing and gradient clipping to make two bounds closer, which shall be explained in Section 3.3. A side benefit of our work is that, by following the similar proof procedure, we can prove the convergence of GOGA when Gaussian noise N (0, σ2) is added to gradients [30], under the gradient bound of E { ||g||2 } ≤ A + B ||w −w∗||2 − σ2. Although the bound is also stronger, Gaussian noise encourages active exploration of parameter space and improves accuracy as was empirically studied in [30]. Similarly, the randomness of ternary gradients also encourages space exploration and improves accuracy for some models, as shall be presented in Section 4."
+    }, {
+      "heading" : "3.3 Feasibility Considerations",
+      "text" : "The gradient bound of TernGrad in Assumption 3 is stronger than the bound in standard GOGA. Pushing the two bounds closer can improve the convergence of TernGrad. In Assumption 3,max (abs (g)) is the maximum absolute value of all the gradients in the DNN. So max (abs (g)) could be relatively much larger than most gradients in a large DNN, implying that the bound in TernGrad becomes much stronger. Considering the situation, we propose layer-wise ternarizing and gradient clipping to reduce max (abs (g)) and therefore shrink the gap between these two bounds.\nLayer-wise ternarizing is proposed based on the observation that the range of gradients in each layer changes as gradients are back propagated. Instead of adopting a large global maximum scaler, we independently ternarize gradients in each layer using the layer-wise scalers. More specific, we separately ternarize the gradients of biases and weights by using Eq. (1), where gt could be the gradients of biases or weights in each layer. To approach the standard bound more closely, we can split gradients to more buckets and ternarize each bucket independently. However, this will introduce more floating scalers and increase communication.\nLayer-wise ternarizing can shrink the bound gap resulted from the dynamic ranges of the gradients across layers. However, the dynamic range within a layer still remains as a problem. We propose gradient clipping, which limits the magnitude of each gradient gi in g as\nf(gi) = { gi |gi| ≤ cσ sign(gi) · cσ |gi| > cσ . (9)\nWhere σ is the standard derivation of gradients in g. In distributed training, gradient clipping is applied to every worker before ternarizing. c is a hyper-parameter to select, but we cross validate it only once and use the constant in all our experiments. Specifically, we used a CNN [31] trained on CIFAR-10 by momentum SGD with staircase learning rate and obtained the optimal c = 2.5. Suppose the distribution of gradients is close to Gaussian distribution as shown in Figure 2(a), very few gradients can drop out of [−2.5σ, 2.5σ]. Clipping these gradients in Figure 2(b) can significantly reduce the scaler but slightly changes the length and direction of original g. Numerical analysis shows that gradient clipping with c = 2.5 only changes the length of g by 1.0% − 1.5% and its direction by 2◦ − 3◦, In our experiments, c = 2.5 remains valid across multiple databases (MNIST, CIFAR-10 and ImageNet), various network structures (LeNet, CifarNet, AlexNet, GoogLeNet, etc) and training schemes (momentum, vanilla SGD, adam, etc).\nThe effectiveness of layer-wise ternarizing and gradient clipping can also be explained as follows. When the scalar st in Eq. (1) and Eq. (2) is very large, most gradients have a high possibility to be ternarized to zeros, leaving only a few gradients to large-magnitude values. The scenario raises a severe parameter update pattern: most parameters keep unchanged while others likely overshoot. This will introduce large training variance. Our experiments on AlexNet show that by applying both layer-wise ternarizing and gradient clipping techniques, TernGrad can converge to the same accuracy as standard SGD. Removing any of the two techniques can result in accuracy degradation, e.g., 3% top-1 accuracy loss without applying gradient clipping as we shall show in Table 2."
+    }, {
+      "heading" : "4 Experiments",
+      "text" : "We first investigate the convergence of TernGrad under various training schemes on relatively small databases and show the results in Section 4.1. Then the scalability of TernGrad to large-scale distributed deep learning is explored and discussed in Section 4.2. The experiments are performed by TensorFlow[2]. We maintain the exponential moving average of parameters by employing an exponential decay of 0.9999 [15]. The accuracy is evaluated by the final averaged parameters. This gives slightly better accuracy in our experiments. For fair comparison, in each pair of comparative experiments using either floating or ternary gradients, all the other training hyper-parameters are same unless differences are explicitly pointed out. In experiments, when SGD with momentum is adopted, momentum value of 0.9 is used. When polynomial decay is applied to decay the learning rate (LR), the power of 0.5 is used to decay LR from the base LR to zero."
+    }, {
+      "heading" : "4.1 Integrating with Various Training Schemes",
+      "text" : "We study the convergence of TernGrad using LeNet on MNIST and a ConvNet [31] (named as CifarNet) on CIFAR-10. LeNet is trained without data augmentation. While training CifarNet, images are randomly cropped to 24× 24 images and mirrored. Brightness and contrast are also randomly adjusted. During the testing of CifarNet, only center crop is used. Our experiments cover the scope of SGD optimizers over vanilla SGD, SGD with momentum [32] and Adam [33].\nFigure 3 shows the results of LeNet. All are trained using polynomial LR decay with weight decay of 0.0005. The base learning rates of momentum SGD and vanilla SGD are 0.01 and 0.1, respectively. Given the total mini-batch size M and the worker number N , the mini-batch size per worker is M/N . Without explicit mention, mini-batch size refers to the total mini-batch size in this work. Figure 3 shows that TernGrad can converge to the similar accuracy within the same iterations, using momentum SGD or vanilla SGD. The maximum accuracy gain is 0.15% and the maximum accuracy loss is 0.22%. Very importantly, the communication time per iteration can be reduced. The figure also shows that TernGrad generalizes well to distributed training with large N . No degradation is observed even for N = 64, which indicates one training sample per iteration per worker.\nTable 1 summarizes the results of CifarNet, where all trainings terminate after the same epochs. Adam SGD is used for training. Instead of keeping total mini-batch size unchanged, we maintain the mini-batch size per worker. Therefore, the total mini-batch size linearly increases as the number of workers grows. Though the base learning rate of 0.0002 seems small, it can achieve better accuracy than larger ones like 0.001. In each pair of experiments, TernGrad can converge to the accuracy level with less than 1% degradation. The accuracy degrades under a large mini-batch size in both baseline and TernGrad. This is because parameters are updated less frequently and large-batch training tends to converge to poorer sharp minima [34]. However, the noise inherent in TernGrad can help converge to better flat minimizers [34], which could explain the smaller accuracy gap between the baseline and TernGrad when the mini-batch size is 2048. In our experiments of AlexNet in Section 4.2, TernGrad even improves the accuracy in the large-batch scenario. This attribute is beneficial for distributed training as a large mini-batch size is usually required."
+    }, {
+      "heading" : "4.2 Scaling to Large-scale Deep Learning",
+      "text" : "We also evaluate TernGrad by AlexNet and GoogLeNet trained on ImageNet. It is more challenging to apply TernGrad to large-scale DNNs. It may result in some accuracy loss when simply replacing the floating gradients with ternary gradients while keeping other hyper-parameters unchanged. However, we are able to train large-scale DNNs by TernGrad successfully after making some or all of the following changes: (1) decreasing dropout ratio to keep more neurons; (2) using smaller weight decay; and (3) disabling ternarizing in the last classification layer. Dropout can regularize DNNs by adding randomness, while TernGrad also introduces randomness. Thus, dropping fewer neurons helps avoid over-randomness. Similarly, as the randomness of TernGrad introduces regularization, smaller weight decay may be adopted. We suggest not to apply ternarizing to the last layer, considering that the one-hot encoding of labels generates a skew distribution of gradients and the symmetric ternary encoding {−1, 0, 1} is not optimal for such a skew distribution. Though asymmetric ternary levels could be an option, we decide to stick to floating gradients in the last layer for simplicity. The overhead of communicating these floating gradients is small, as the last layer occupies only a small percentage of total parameters, like 6.7% in AlexNet and 3.99% in ResNet-152 [35].\nAll DNNs are trained by momentum SGD with Batch Normalization [36] on convolutional layers. AlexNet is trained by the hyper-parameters and data augmentation depicted in Caffe. GoogLeNet is trained by polynomial LR decay and data augmentation in [37]. Our implementation of GoogLeNet does not utilize any auxiliary classifiers, that is, the loss from the last softmax layer is the total loss. More training hyper-parameters are reported in corresponding tables and published source code. Validation accuracy is evaluated using only the central crops of images.\nThe results of AlexNet are shown in Table 2. Mini-batch size per worker is fixed to 128. For fast development, all DNNs are trained through the same epochs of images. In this setting, when there are more workers, the number of iterations becomes smaller and parameters are less frequently updated. To overcome this problem, we increase the learning rate for large-batch scenario [10]. Using this scheme, SGD with floating gradients successfully trains AlexNet to similar accuracy, for mini-batch size of 256 and 512. However, when mini-batch size is 1024, the top-1 accuracy drops 0.71% for the same reason as we point out in Section 4.1.\nTernGrad converges to approximate accuracy levels regardless of mini-batch size. Notably, it improves the top-1 accuracy by 0.92% when mini-batch size is 1024, because its inherent randomness encourages to escape from poorer sharp minima [30][34]. Figure 4 plots training details vs. iteration when mini-batch size is 512. Figure 4(a) shows that the convergence curve of TernGrad matches well with the baseline’s, demonstrating the effectiveness of TernGrad. The training efficiency can be further improved by reducing communication time as shall be discussed in Section 5. The training data loss in Figure 4(b) shows that TernGrad converges to a slightly lower level, which further proves\n0% 10% 20% 30% 40% 50% 60% 70%\n0 50000 100000 150000\nbaseline terngrad\n0\n2\n4\n6\n8\n0 50000 100000 150000\nbaseline terngrad\n0%\n20%\n40%\n60%\n80%\n0 50000 100000 150000\n(c) gradient sparsity of terngrad in fc6(b) training loss vs iteration(a) top-1 accuracy vs iteration\nFigure 4: AlexNet trained on 4 workers with mini-batch size 512: (a) top-1 validation accuracy, (b) training data loss and (c) sparsity of gradients in first fully-connected layer (fc6) vs. iteration.\nthe capability of TernGrad to minimize the target function even with ternary gradients. A smaller dropout ratio in TernGrad can be another reason of the lower loss. Figure 4(c) simply illustrate that on average 71.32% gradients of a fully-connected layer (fc6) are ternarized to zeros.\nFinally, we summarize the results of GoogLeNet in Table 3. On average, the accuracy loss is less than 2%. In TernGrad, we adopted all that hyper-parameters (except dropout ratio and weight decay) that are well tuned for the baseline [38]. Tuning these hyper-parameters could further optimize TernGrad and obtain higher accuracy."
+    }, {
+      "heading" : "5 Performance Model and Discussion",
+      "text" : "Our proposed TernGrad requires only three numerical levels {−1, 0, 1}, which can aggressively reduce the communication time. Moreover, our experiments in Section 4 demonstrate that within the same iterations, TernGrad can converge to approximately the same accuracy as its corresponding baseline. Consequently, a dramatical throughput improvement on the distributed DNN training is expected. Due to the resource and time constraint, unfortunately, we aren’t able to perform the training of more DNN models like VggNet-A [39] and distributed training beyond 8 workers. We plan to continue the experiments in our future work. We opt for using a performance model to conduct the scalability analysis of DNN models when utilizing up to 512 GPUs, with and without applying TernGrad. Three neural network models—AlexNet, GoogLeNet and VggNet-A—are investigated. In discussions of performance model, performance refers to training speed. Here, we extend the performance model that was initially developed for CPU-based deep learning systems [40] to estimate the performance of distributed GPUs/machines. The key idea is combining the lightweight profiling on single machine with analytical modeling for accurate performance estimation. In the interest of space, please refer to Supplementary Material for details of the performance model.\nFigure 5 presents the training throughput on two different GPUs clusters. Our results show that TernGrad effectively increases the training throughput for the three DNNs. The speedup depends on the communication-to-computation ratio of the DNN, the number of GPUs, and the communication bandwidth. DNNs with larger communication-to-computation ratios (e.g. AlexNet and VggNet-A) can benefit more from TernGrad than those with smaller ratios (e.g., GoogLeNet). Even on a very high-end HPC system with InfiniBand and NVLink, TernGrad is still able to double the training speed of VggNet-A on 128 nodes as shown in Figure 5(b). Moreover, the TernGrad becomes more efficient when the bandwidth becomes smaller, such as 1Gbps Ethernet and PCI switch in Figure 5(a) where TernGrad can have 3.04× training speedup for AlexNet on 8 GPUs."
+    } ],
+    "references" : [ {
+      "title" : "Large scale distributed deep networks",
+      "author" : [ "Jeffrey Dean", "Greg Corrado", "Rajat Monga", "Kai Chen", "Matthieu Devin", "Mark Mao", "Marc'aurelio Ranzato", "Andrew Senior", "Paul Tucker", "Ke Yang", "Quoc V. Le", "Andrew Y. Ng" ],
+      "venue" : "In Advances in Neural Information Processing Systems,",
+      "citeRegEx" : "1",
+      "shortCiteRegEx" : "1",
+      "year" : 2012
+    }, {
+      "title" : "Tensorflow: Large-scale machine learning on heterogeneous distributed systems",
+      "author" : [ "Martín Abadi", "Ashish Agarwal", "Paul Barham", "Eugene Brevdo", "Zhifeng Chen", "Craig Citro", "Greg S Corrado", "Andy Davis", "Jeffrey Dean", "Matthieu Devin" ],
+      "venue" : "arXiv preprint:1603.04467,",
+      "citeRegEx" : "2",
+      "shortCiteRegEx" : "2",
+      "year" : 2016
+    }, {
+      "title" : "Deep learning with cots hpc systems",
+      "author" : [ "Adam Coates", "Brody Huval", "Tao Wang", "David Wu", "Bryan Catanzaro", "Ng Andrew" ],
+      "venue" : "In International Conference on Machine Learning,",
+      "citeRegEx" : "3",
+      "shortCiteRegEx" : "3",
+      "year" : 2013
+    }, {
+      "title" : "Hogwild: A lock-free approach to parallelizing stochastic gradient descent",
+      "author" : [ "Benjamin Recht", "Christopher Re", "Stephen Wright", "Feng Niu" ],
+      "venue" : "In Advances in Neural Information Processing Systems,",
+      "citeRegEx" : "4",
+      "shortCiteRegEx" : "4",
+      "year" : 2011
+    }, {
+      "title" : "Project adam: Building an efficient and scalable deep learning training system",
+      "author" : [ "Trishul M Chilimbi", "Yutaka Suzue", "Johnson Apacible", "Karthik Kalyanaraman" ],
+      "venue" : "In OSDI,",
+      "citeRegEx" : "5",
+      "shortCiteRegEx" : "5",
+      "year" : 2014
+    }, {
+      "title" : "Petuum: A new platform for distributed machine learning on big data",
+      "author" : [ "Eric P Xing", "Qirong Ho", "Wei Dai", "Jin Kyu Kim", "Jinliang Wei", "Seunghak Lee", "Xun Zheng", "Pengtao Xie", "Abhimanu Kumar", "Yaoliang Yu" ],
+      "venue" : "IEEE Transactions on Big Data,",
+      "citeRegEx" : "6",
+      "shortCiteRegEx" : "6",
+      "year" : 2015
+    }, {
+      "title" : "Sparknet: Training deep networks in spark",
+      "author" : [ "Philipp Moritz", "Robert Nishihara", "Ion Stoica", "Michael I Jordan" ],
+      "venue" : "arXiv preprint:1511.06051,",
+      "citeRegEx" : "7",
+      "shortCiteRegEx" : "7",
+      "year" : 2015
+    }, {
+      "title" : "Mxnet: A flexible and efficient machine learning library for heterogeneous distributed systems",
+      "author" : [ "Tianqi Chen", "Mu Li", "Yutian Li", "Min Lin", "Naiyan Wang", "Minjie Wang", "Tianjun Xiao", "Bing Xu", "Chiyuan Zhang", "Zheng Zhang" ],
+      "venue" : "arXiv preprint:1512.01274,",
+      "citeRegEx" : "8",
+      "shortCiteRegEx" : "8",
+      "year" : 2015
+    }, {
+      "title" : "Deep learning with elastic averaging sgd",
+      "author" : [ "Sixin Zhang", "Anna E Choromanska", "Yann LeCun" ],
+      "venue" : "In Advances in Neural Information Processing Systems,",
+      "citeRegEx" : "9",
+      "shortCiteRegEx" : "9",
+      "year" : 2015
+    }, {
+      "title" : "Scaling Distributed Machine Learning with System and Algorithm Co-design",
+      "author" : [ "Mu Li" ],
+      "venue" : "PhD thesis,",
+      "citeRegEx" : "10",
+      "shortCiteRegEx" : "10",
+      "year" : 2017
+    }, {
+      "title" : "Scaling distributed machine learning with the parameter server",
+      "author" : [ "Mu Li", "David G Andersen", "Jun Woo Park", "Alexander J Smola", "Amr Ahmed", "Vanja Josifovski", "James Long", "Eugene J Shekita", "Bor-Yiing Su" ],
+      "venue" : "In OSDI,",
+      "citeRegEx" : "11",
+      "shortCiteRegEx" : "11",
+      "year" : 2014
+    }, {
+      "title" : "Communication efficient distributed machine learning with the parameter server",
+      "author" : [ "Mu Li", "David G Andersen", "Alexander J Smola", "Kai Yu" ],
+      "venue" : "In Advances in Neural Information Processing Systems,",
+      "citeRegEx" : "12",
+      "shortCiteRegEx" : "12",
+      "year" : 2014
+    }, {
+      "title" : "More effective distributed ml via a stale synchronous parallel parameter server",
+      "author" : [ "Qirong Ho", "James Cipar", "Henggang Cui", "Seunghak Lee", "Jin Kyu Kim", "Phillip B Gibbons", "Garth A Gibson", "Greg Ganger", "Eric P Xing" ],
+      "venue" : "In Advances in neural information processing systems,",
+      "citeRegEx" : "13",
+      "shortCiteRegEx" : "13",
+      "year" : 2013
+    }, {
+      "title" : "Parallelized stochastic gradient descent",
+      "author" : [ "Martin Zinkevich", "Markus Weimer", "Lihong Li", "Alex J Smola" ],
+      "venue" : "In Advances in neural information processing systems,",
+      "citeRegEx" : "14",
+      "shortCiteRegEx" : "14",
+      "year" : 2010
+    }, {
+      "title" : "Revisiting distributed synchronous sgd",
+      "author" : [ "Xinghao Pan", "Jianmin Chen", "Rajat Monga", "Samy Bengio", "Rafal Jozefowicz" ],
+      "venue" : "arXiv preprint:1702.05800,",
+      "citeRegEx" : "15",
+      "shortCiteRegEx" : "15",
+      "year" : 2017
+    }, {
+      "title" : "Deep compression: Compressing deep neural networks with pruning, trained quantization and huffman coding",
+      "author" : [ "Song Han", "Huizi Mao", "William J Dally" ],
+      "venue" : "arXiv preprint arXiv:1510.00149,",
+      "citeRegEx" : "17",
+      "shortCiteRegEx" : "17",
+      "year" : 2015
+    }, {
+      "title" : "Learning structured sparsity in deep neural networks",
+      "author" : [ "Wei Wen", "Chunpeng Wu", "Yandan Wang", "Yiran Chen", "Hai Li" ],
+      "venue" : "In Advances in Neural Information Processing Systems,",
+      "citeRegEx" : "18",
+      "shortCiteRegEx" : "18",
+      "year" : 2016
+    }, {
+      "title" : "Faster cnns with direct sparse convolutions and guided pruning",
+      "author" : [ "J Park", "S Li", "W Wen", "PTP Tang", "H Li", "Y Chen", "P Dubey" ],
+      "venue" : "In International Conference on Learning Representations (ICLR),",
+      "citeRegEx" : "19",
+      "shortCiteRegEx" : "19",
+      "year" : 2017
+    }, {
+      "title" : "Binarized neural networks",
+      "author" : [ "Itay Hubara", "Matthieu Courbariaux", "Daniel Soudry", "Ran El-Yaniv", "Yoshua Bengio" ],
+      "venue" : "In Advances in Neural Information Processing Systems,",
+      "citeRegEx" : "20",
+      "shortCiteRegEx" : "20",
+      "year" : 2016
+    }, {
+      "title" : "Xnor-net: Imagenet classification using binary convolutional neural networks",
+      "author" : [ "Mohammad Rastegari", "Vicente Ordonez", "Joseph Redmon", "Ali Farhadi" ],
+      "venue" : "In European Conference on Computer Vision,",
+      "citeRegEx" : "21",
+      "shortCiteRegEx" : "21",
+      "year" : 2016
+    }, {
+      "title" : "Dorefa-net: Training low bitwidth convolutional neural networks with low bitwidth gradients",
+      "author" : [ "Shuchang Zhou", "Yuxin Wu", "Zekun Ni", "Xinyu Zhou", "He Wen", "Yuheng Zou" ],
+      "venue" : "arXiv preprint arXiv:1606.06160,",
+      "citeRegEx" : "22",
+      "shortCiteRegEx" : "22",
+      "year" : 2016
+    }, {
+      "title" : "Parallel coordinate descent for l1-regularized loss minimization",
+      "author" : [ "Joseph K Bradley", "Aapo Kyrola", "Danny Bickson", "Carlos Guestrin" ],
+      "venue" : "arXiv preprint arXiv:1105.5379,",
+      "citeRegEx" : "23",
+      "shortCiteRegEx" : "23",
+      "year" : 2011
+    }, {
+      "title" : "Sparse communication for distributed gradient descent",
+      "author" : [ "Alham Fikri Aji", "Kenneth Heafield" ],
+      "venue" : "arXiv preprint:1704.05021,",
+      "citeRegEx" : "24",
+      "shortCiteRegEx" : "24",
+      "year" : 2017
+    }, {
+      "title" : "1-bit stochastic gradient descent and its application to data-parallel distributed training of speech dnns",
+      "author" : [ "Frank Seide", "Hao Fu", "Jasha Droppo", "Gang Li", "Dong Yu" ],
+      "venue" : "In Interspeech,",
+      "citeRegEx" : "25",
+      "shortCiteRegEx" : "25",
+      "year" : 2014
+    }, {
+      "title" : "Qsgd: Communication-optimal stochastic gradient descent, with applications to training neural networks",
+      "author" : [ "Ryota Tomioka", "Milan Vojnovic" ],
+      "venue" : "arXiv preprint:1610.02132,",
+      "citeRegEx" : "26",
+      "shortCiteRegEx" : "26",
+      "year" : 2017
+    }, {
+      "title" : "Deep learning with limited numerical precision",
+      "author" : [ "Suyog Gupta", "Ankur Agrawal", "Kailash Gopalakrishnan", "Pritish Narayanan" ],
+      "venue" : "In ICML,",
+      "citeRegEx" : "27",
+      "shortCiteRegEx" : "27",
+      "year" : 2015
+    }, {
+      "title" : "Gradient descent with sparsification: an iterative algorithm for sparse recovery with restricted isometry property",
+      "author" : [ "Rahul Garg", "Rohit Khandekar" ],
+      "venue" : "In Proceedings of the 26th Annual International Conference on Machine Learning,",
+      "citeRegEx" : "28",
+      "shortCiteRegEx" : "28",
+      "year" : 2009
+    }, {
+      "title" : "Online learning and stochastic approximations. On-line learning in neural networks",
+      "author" : [ "Léon Bottou" ],
+      "venue" : null,
+      "citeRegEx" : "29",
+      "shortCiteRegEx" : "29",
+      "year" : 1998
+    }, {
+      "title" : "Adding gradient noise improves learning for very deep networks",
+      "author" : [ "Arvind Neelakantan", "Luke Vilnis", "Quoc V Le", "Ilya Sutskever", "Lukasz Kaiser", "Karol Kurach", "James Martens" ],
+      "venue" : "arXiv preprint:1511.06807,",
+      "citeRegEx" : "30",
+      "shortCiteRegEx" : "30",
+      "year" : 2015
+    }, {
+      "title" : "Imagenet classification with deep convolutional neural networks",
+      "author" : [ "Alex Krizhevsky", "Ilya Sutskever", "Geoffrey E. Hinton" ],
+      "venue" : "In Advances in Neural Information Processing Systems,",
+      "citeRegEx" : "31",
+      "shortCiteRegEx" : "31",
+      "year" : 2012
+    }, {
+      "title" : "On the momentum term in gradient descent learning algorithms",
+      "author" : [ "Ning Qian" ],
+      "venue" : "Neural networks,",
+      "citeRegEx" : "32",
+      "shortCiteRegEx" : "32",
+      "year" : 1999
+    }, {
+      "title" : "Adam: A method for stochastic optimization",
+      "author" : [ "Diederik Kingma", "Jimmy Ba" ],
+      "venue" : "arXiv preprint:1412.6980,",
+      "citeRegEx" : "33",
+      "shortCiteRegEx" : "33",
+      "year" : 2014
+    }, {
+      "title" : "On large-batch training for deep learning: Generalization gap and sharp minima",
+      "author" : [ "Nitish Shirish Keskar", "Dheevatsa Mudigere", "Jorge Nocedal", "Mikhail Smelyanskiy", "Ping Tak Peter Tang" ],
+      "venue" : "In International Conference on Learning Representations,",
+      "citeRegEx" : "34",
+      "shortCiteRegEx" : "34",
+      "year" : 2017
+    }, {
+      "title" : "Deep residual learning for image recognition",
+      "author" : [ "Kaiming He", "Xiangyu Zhang", "Shaoqing Ren", "Jian Sun" ],
+      "venue" : "In Proceedings of the IEEE Conference on Computer Vision and Pattern Recognition,",
+      "citeRegEx" : "35",
+      "shortCiteRegEx" : "35",
+      "year" : 2016
+    }, {
+      "title" : "Batch normalization: Accelerating deep network training by reducing internal covariate shift",
+      "author" : [ "Sergey Ioffe", "Christian Szegedy" ],
+      "venue" : "arXiv preprint:1502.03167,",
+      "citeRegEx" : "36",
+      "shortCiteRegEx" : "36",
+      "year" : 2015
+    }, {
+      "title" : "Rethinking the inception architecture for computer vision",
+      "author" : [ "Christian Szegedy", "Vincent Vanhoucke", "Sergey Ioffe", "Jon Shlens", "Zbigniew Wojna" ],
+      "venue" : "In Proceedings of the IEEE Conference on Computer Vision and Pattern Recognition,",
+      "citeRegEx" : "37",
+      "shortCiteRegEx" : "37",
+      "year" : 2016
+    }, {
+      "title" : "Very deep convolutional networks for large-scale image recognition",
+      "author" : [ "Karen Simonyan", "Andrew Zisserman" ],
+      "venue" : "arXiv preprint:1409.1556,",
+      "citeRegEx" : "39",
+      "shortCiteRegEx" : "39",
+      "year" : 2014
+    }, {
+      "title" : "Performance modeling and scalability optimization of distributed deep learning systems",
+      "author" : [ "Feng Yan", "Olatunji Ruwase", "Yuxiong He", "Trishul M. Chilimbi" ],
+      "venue" : "In Proceedings of the 21th ACM SIGKDD International Conference on Knowledge Discovery and Data",
+      "citeRegEx" : "40",
+      "shortCiteRegEx" : "40",
+      "year" : 2015
+    } ],
+    "referenceMentions" : [ {
+      "referenceID" : 0,
+      "context" : "The training of large-scale models with huge amounts of data are often carried on distributed systems [1][2][3][4][5][6][7][8][9], where data parallelism is adopted to exploit the compute capability empowered by multiple workers [10].",
+      "startOffset" : 102,
+      "endOffset" : 105
+    }, {
+      "referenceID" : 1,
+      "context" : "The training of large-scale models with huge amounts of data are often carried on distributed systems [1][2][3][4][5][6][7][8][9], where data parallelism is adopted to exploit the compute capability empowered by multiple workers [10].",
+      "startOffset" : 105,
+      "endOffset" : 108
+    }, {
+      "referenceID" : 2,
+      "context" : "The training of large-scale models with huge amounts of data are often carried on distributed systems [1][2][3][4][5][6][7][8][9], where data parallelism is adopted to exploit the compute capability empowered by multiple workers [10].",
+      "startOffset" : 108,
+      "endOffset" : 111
+    }, {
+      "referenceID" : 3,
+      "context" : "The training of large-scale models with huge amounts of data are often carried on distributed systems [1][2][3][4][5][6][7][8][9], where data parallelism is adopted to exploit the compute capability empowered by multiple workers [10].",
+      "startOffset" : 111,
+      "endOffset" : 114
+    }, {
+      "referenceID" : 4,
+      "context" : "The training of large-scale models with huge amounts of data are often carried on distributed systems [1][2][3][4][5][6][7][8][9], where data parallelism is adopted to exploit the compute capability empowered by multiple workers [10].",
+      "startOffset" : 114,
+      "endOffset" : 117
+    }, {
+      "referenceID" : 5,
+      "context" : "The training of large-scale models with huge amounts of data are often carried on distributed systems [1][2][3][4][5][6][7][8][9], where data parallelism is adopted to exploit the compute capability empowered by multiple workers [10].",
+      "startOffset" : 117,
+      "endOffset" : 120
+    }, {
+      "referenceID" : 6,
+      "context" : "The training of large-scale models with huge amounts of data are often carried on distributed systems [1][2][3][4][5][6][7][8][9], where data parallelism is adopted to exploit the compute capability empowered by multiple workers [10].",
+      "startOffset" : 120,
+      "endOffset" : 123
+    }, {
+      "referenceID" : 7,
+      "context" : "The training of large-scale models with huge amounts of data are often carried on distributed systems [1][2][3][4][5][6][7][8][9], where data parallelism is adopted to exploit the compute capability empowered by multiple workers [10].",
+      "startOffset" : 123,
+      "endOffset" : 126
+    }, {
+      "referenceID" : 8,
+      "context" : "The training of large-scale models with huge amounts of data are often carried on distributed systems [1][2][3][4][5][6][7][8][9], where data parallelism is adopted to exploit the compute capability empowered by multiple workers [10].",
+      "startOffset" : 126,
+      "endOffset" : 129
+    }, {
+      "referenceID" : 9,
+      "context" : "The training of large-scale models with huge amounts of data are often carried on distributed systems [1][2][3][4][5][6][7][8][9], where data parallelism is adopted to exploit the compute capability empowered by multiple workers [10].",
+      "startOffset" : 229,
+      "endOffset" : 233
+    }, {
+      "referenceID" : 3,
+      "context" : "However, as the scale of distributed systems grows up, the extensive gradient and parameter synchronizations prolong the communication time and even amortize the savings of computation time [4][11][12].",
+      "startOffset" : 190,
+      "endOffset" : 193
+    }, {
+      "referenceID" : 10,
+      "context" : "However, as the scale of distributed systems grows up, the extensive gradient and parameter synchronizations prolong the communication time and even amortize the savings of computation time [4][11][12].",
+      "startOffset" : 193,
+      "endOffset" : 197
+    }, {
+      "referenceID" : 11,
+      "context" : "However, as the scale of distributed systems grows up, the extensive gradient and parameter synchronizations prolong the communication time and even amortize the savings of computation time [4][11][12].",
+      "startOffset" : 197,
+      "endOffset" : 201
+    }, {
+      "referenceID" : 0,
+      "context" : "A common approach to overcome such a network bottleneck is asynchronous SGD [1][4][7][12][13][14], which continues computation by using stale values without waiting for the completeness of synchronization.",
+      "startOffset" : 76,
+      "endOffset" : 79
+    }, {
+      "referenceID" : 3,
+      "context" : "A common approach to overcome such a network bottleneck is asynchronous SGD [1][4][7][12][13][14], which continues computation by using stale values without waiting for the completeness of synchronization.",
+      "startOffset" : 79,
+      "endOffset" : 82
+    }, {
+      "referenceID" : 6,
+      "context" : "A common approach to overcome such a network bottleneck is asynchronous SGD [1][4][7][12][13][14], which continues computation by using stale values without waiting for the completeness of synchronization.",
+      "startOffset" : 82,
+      "endOffset" : 85
+    }, {
+      "referenceID" : 11,
+      "context" : "A common approach to overcome such a network bottleneck is asynchronous SGD [1][4][7][12][13][14], which continues computation by using stale values without waiting for the completeness of synchronization.",
+      "startOffset" : 85,
+      "endOffset" : 89
+    }, {
+      "referenceID" : 12,
+      "context" : "A common approach to overcome such a network bottleneck is asynchronous SGD [1][4][7][12][13][14], which continues computation by using stale values without waiting for the completeness of synchronization.",
+      "startOffset" : 89,
+      "endOffset" : 93
+    }, {
+      "referenceID" : 13,
+      "context" : "A common approach to overcome such a network bottleneck is asynchronous SGD [1][4][7][12][13][14], which continues computation by using stale values without waiting for the completeness of synchronization.",
+      "startOffset" : 93,
+      "endOffset" : 97
+    }, {
+      "referenceID" : 14,
+      "context" : "The inconsistency of parameters across computing workers, however, can degrade training accuracy and incur occasional divergence [15][16].",
+      "startOffset" : 129,
+      "endOffset" : 133
+    }, {
+      "referenceID" : 15,
+      "context" : "From the perspective of inference acceleration, sparse and quantized Deep Neural Networks (DNNs) have been widely studied, such as [17][18][19][20][21][22].",
+      "startOffset" : 131,
+      "endOffset" : 135
+    }, {
+      "referenceID" : 16,
+      "context" : "From the perspective of inference acceleration, sparse and quantized Deep Neural Networks (DNNs) have been widely studied, such as [17][18][19][20][21][22].",
+      "startOffset" : 135,
+      "endOffset" : 139
+    }, {
+      "referenceID" : 17,
+      "context" : "From the perspective of inference acceleration, sparse and quantized Deep Neural Networks (DNNs) have been widely studied, such as [17][18][19][20][21][22].",
+      "startOffset" : 139,
+      "endOffset" : 143
+    }, {
+      "referenceID" : 18,
+      "context" : "From the perspective of inference acceleration, sparse and quantized Deep Neural Networks (DNNs) have been widely studied, such as [17][18][19][20][21][22].",
+      "startOffset" : 143,
+      "endOffset" : 147
+    }, {
+      "referenceID" : 19,
+      "context" : "From the perspective of inference acceleration, sparse and quantized Deep Neural Networks (DNNs) have been widely studied, such as [17][18][19][20][21][22].",
+      "startOffset" : 147,
+      "endOffset" : 151
+    }, {
+      "referenceID" : 20,
+      "context" : "From the perspective of inference acceleration, sparse and quantized Deep Neural Networks (DNNs) have been widely studied, such as [17][18][19][20][21][22].",
+      "startOffset" : 151,
+      "endOffset" : 155
+    }, {
+      "referenceID" : 3,
+      "context" : "Researches such as sparse logistic regression and Lasso optimization problems [4][12][23] took advantage of the sparsity inherent in models and achieved remarkable speedup for distributed training.",
+      "startOffset" : 78,
+      "endOffset" : 81
+    }, {
+      "referenceID" : 11,
+      "context" : "Researches such as sparse logistic regression and Lasso optimization problems [4][12][23] took advantage of the sparsity inherent in models and achieved remarkable speedup for distributed training.",
+      "startOffset" : 81,
+      "endOffset" : 85
+    }, {
+      "referenceID" : 21,
+      "context" : "Researches such as sparse logistic regression and Lasso optimization problems [4][12][23] took advantage of the sparsity inherent in models and achieved remarkable speedup for distributed training.",
+      "startOffset" : 85,
+      "endOffset" : 89
+    }, {
+      "referenceID" : 22,
+      "context" : "For instance, Aji and Heafield [24] proposed to heuristically sparsify dense gradients by dropping off small values in order to reduce gradient communication.",
+      "startOffset" : 31,
+      "endOffset" : 35
+    }, {
+      "referenceID" : 20,
+      "context" : "For the same purpose, quantizing gradients to low-precision values with smaller bit width has also been extensively studied [22][25][26][27].",
+      "startOffset" : 124,
+      "endOffset" : 128
+    }, {
+      "referenceID" : 23,
+      "context" : "For the same purpose, quantizing gradients to low-precision values with smaller bit width has also been extensively studied [22][25][26][27].",
+      "startOffset" : 128,
+      "endOffset" : 132
+    }, {
+      "referenceID" : 24,
+      "context" : "For the same purpose, quantizing gradients to low-precision values with smaller bit width has also been extensively studied [22][25][26][27].",
+      "startOffset" : 132,
+      "endOffset" : 136
+    }, {
+      "referenceID" : 25,
+      "context" : "For the same purpose, quantizing gradients to low-precision values with smaller bit width has also been extensively studied [22][25][26][27].",
+      "startOffset" : 136,
+      "endOffset" : 140
+    }, {
+      "referenceID" : 22,
+      "context" : "Aji and Heafield [24] proposed a heuristic gradient sparsification method that truncated the smallest gradients and transmitted only the remaining large ones.",
+      "startOffset" : 17,
+      "endOffset" : 21
+    }, {
+      "referenceID" : 26,
+      "context" : "[28] adopted the similar approach, but targeted at sparsity recovery instead of training acceleration.",
+      "startOffset" : 0,
+      "endOffset" : 4
+    }, {
+      "referenceID" : 20,
+      "context" : "DoReFa-Net [22] derived from AlexNet reduced the bit widths of weights, activations and gradients to 1, 2 and 6, respectively.",
+      "startOffset" : 11,
+      "endOffset" : 15
+    }, {
+      "referenceID" : 25,
+      "context" : "[27] successfully trained neural networks on MNIST and CIFAR-10 datasets using 16-bit numerical precision for an energy-efficient hardware accelerator.",
+      "startOffset" : 0,
+      "endOffset" : 4
+    }, {
+      "referenceID" : 23,
+      "context" : "[25] applied 1-bit SGD to accelerate distributed training and empirically verified its effectiveness in speech applications.",
+      "startOffset" : 0,
+      "endOffset" : 4
+    }, {
+      "referenceID" : 24,
+      "context" : "So it cannot yield any speed benefit on convolutional neural networks [26].",
+      "startOffset" : 70,
+      "endOffset" : 74
+    }, {
+      "referenceID" : 23,
+      "context" : "Moreover, “cold start” of the method [25] requires floating-point gradients to converge to a good initial point for the following 1-bit SGD.",
+      "startOffset" : 37,
+      "endOffset" : 41
+    }, {
+      "referenceID" : 24,
+      "context" : "[26] presented QSGD that explores the trade-off between accuracy and gradient precision.",
+      "startOffset" : 0,
+      "endOffset" : 4
+    }, {
+      "referenceID" : 0,
+      "context" : "Note that parameter server in most implementations [1][12] are used to preserve shared parameters, while here we utilize it in a slightly different way to maintain shared gradients.",
+      "startOffset" : 51,
+      "endOffset" : 54
+    }, {
+      "referenceID" : 11,
+      "context" : "Note that parameter server in most implementations [1][12] are used to preserve shared parameters, while here we utilize it in a slightly different way to maintain shared gradients.",
+      "startOffset" : 54,
+      "endOffset" : 58
+    }, {
+      "referenceID" : 0,
+      "context" : "Note that our proposed TernGrad can be integrated with many settings like Asynchronous SGD [1][4], even though the scope of this paper only focuses on the distributed SGD in Figure 1.",
+      "startOffset" : 91,
+      "endOffset" : 94
+    }, {
+      "referenceID" : 3,
+      "context" : "Note that our proposed TernGrad can be integrated with many settings like Asynchronous SGD [1][4], even though the scope of this paper only focuses on the distributed SGD in Figure 1.",
+      "startOffset" : 94,
+      "endOffset" : 97
+    }, {
+      "referenceID" : 24,
+      "context" : "This stochastic rounding, instead of deterministic one, is chosen by both our study and QSGD [26], as stochastic rounding has an unbiased expectation and has been successfully studied for low-precision processing [20][27].",
+      "startOffset" : 93,
+      "endOffset" : 97
+    }, {
+      "referenceID" : 18,
+      "context" : "This stochastic rounding, instead of deterministic one, is chosen by both our study and QSGD [26], as stochastic rounding has an unbiased expectation and has been successfully studied for low-precision processing [20][27].",
+      "startOffset" : 213,
+      "endOffset" : 217
+    }, {
+      "referenceID" : 25,
+      "context" : "This stochastic rounding, instead of deterministic one, is chosen by both our study and QSGD [26], as stochastic rounding has an unbiased expectation and has been successfully studied for low-precision processing [20][27].",
+      "startOffset" : 217,
+      "endOffset" : 221
+    }, {
+      "referenceID" : 27,
+      "context" : "In General Online Gradient Algorithm (GOGA) [29], parameter is updated at learning rate γt as wt+1 = wt − γtgt = wt − γt · ∇wQ(zt,wt), (4)",
+      "startOffset" : 44,
+      "endOffset" : 48
+    }, {
+      "referenceID" : 27,
+      "context" : "The convergence analysis of TernGrad is adapted from the convergence proof of GOGA presented in [29], which uses the following two assumptions.",
+      "startOffset" : 96,
+      "endOffset" : 100
+    }, {
+      "referenceID" : 27,
+      "context" : "Bottou [29] proved Lemma 1.",
+      "startOffset" : 7,
+      "endOffset" : 11
+    }, {
+      "referenceID" : 27,
+      "context" : "Comparing with the gradient bound of standard GOGA E { ||g|| } ≤ A+B ||w −w∗|| [29], the bound in Assumption 3 is stronger because max(abs(g)) · ||g||1 ≥ ||g||.",
+      "startOffset" : 79,
+      "endOffset" : 83
+    }, {
+      "referenceID" : 28,
+      "context" : "A side benefit of our work is that, by following the similar proof procedure, we can prove the convergence of GOGA when Gaussian noise N (0, σ) is added to gradients [30], under the gradient bound of E { ||g|| } ≤ A + B ||w −w∗|| − σ.",
+      "startOffset" : 166,
+      "endOffset" : 170
+    }, {
+      "referenceID" : 28,
+      "context" : "Although the bound is also stronger, Gaussian noise encourages active exploration of parameter space and improves accuracy as was empirically studied in [30].",
+      "startOffset" : 153,
+      "endOffset" : 157
+    }, {
+      "referenceID" : 29,
+      "context" : "Specifically, we used a CNN [31] trained on CIFAR-10 by momentum SGD with staircase learning rate and obtained the optimal c = 2.",
+      "startOffset" : 28,
+      "endOffset" : 32
+    }, {
+      "referenceID" : 1,
+      "context" : "The experiments are performed by TensorFlow[2].",
+      "startOffset" : 43,
+      "endOffset" : 46
+    }, {
+      "referenceID" : 14,
+      "context" : "9999 [15].",
+      "startOffset" : 5,
+      "endOffset" : 9
+    }, {
+      "referenceID" : 29,
+      "context" : "1 Integrating with Various Training Schemes We study the convergence of TernGrad using LeNet on MNIST and a ConvNet [31] (named as CifarNet) on CIFAR-10.",
+      "startOffset" : 116,
+      "endOffset" : 120
+    }, {
+      "referenceID" : 30,
+      "context" : "Our experiments cover the scope of SGD optimizers over vanilla SGD, SGD with momentum [32] and Adam [33].",
+      "startOffset" : 86,
+      "endOffset" : 90
+    }, {
+      "referenceID" : 31,
+      "context" : "Our experiments cover the scope of SGD optimizers over vanilla SGD, SGD with momentum [32] and Adam [33].",
+      "startOffset" : 100,
+      "endOffset" : 104
+    }, {
+      "referenceID" : 32,
+      "context" : "This is because parameters are updated less frequently and large-batch training tends to converge to poorer sharp minima [34].",
+      "startOffset" : 121,
+      "endOffset" : 125
+    }, {
+      "referenceID" : 32,
+      "context" : "However, the noise inherent in TernGrad can help converge to better flat minimizers [34], which could explain the smaller accuracy gap between the baseline and TernGrad when the mini-batch size is 2048.",
+      "startOffset" : 84,
+      "endOffset" : 88
+    }, {
+      "referenceID" : 33,
+      "context" : "99% in ResNet-152 [35].",
+      "startOffset" : 18,
+      "endOffset" : 22
+    }, {
+      "referenceID" : 34,
+      "context" : "All DNNs are trained by momentum SGD with Batch Normalization [36] on convolutional layers.",
+      "startOffset" : 62,
+      "endOffset" : 66
+    }, {
+      "referenceID" : 35,
+      "context" : "GoogLeNet is trained by polynomial LR decay and data augmentation in [37].",
+      "startOffset" : 69,
+      "endOffset" : 73
+    }, {
+      "referenceID" : 9,
+      "context" : "To overcome this problem, we increase the learning rate for large-batch scenario [10].",
+      "startOffset" : 81,
+      "endOffset" : 85
+    }, {
+      "referenceID" : 28,
+      "context" : "92% when mini-batch size is 1024, because its inherent randomness encourages to escape from poorer sharp minima [30][34].",
+      "startOffset" : 112,
+      "endOffset" : 116
+    }, {
+      "referenceID" : 32,
+      "context" : "92% when mini-batch size is 1024, because its inherent randomness encourages to escape from poorer sharp minima [30][34].",
+      "startOffset" : 116,
+      "endOffset" : 120
+    }, {
+      "referenceID" : 36,
+      "context" : "Due to the resource and time constraint, unfortunately, we aren’t able to perform the training of more DNN models like VggNet-A [39] and distributed training beyond 8 workers.",
+      "startOffset" : 128,
+      "endOffset" : 132
+    }, {
+      "referenceID" : 37,
+      "context" : "Here, we extend the performance model that was initially developed for CPU-based deep learning systems [40] to estimate the performance of distributed GPUs/machines.",
+      "startOffset" : 103,
+      "endOffset" : 107
+    } ],
+    "year" : 2017,
+    "abstractText" : "High network communication cost for synchronizing gradients and parameters is the well-known bottleneck of distributed training. In this work, we propose TernGrad that uses ternary gradients to accelerate distributed deep learning in data parallelism. Our approach requires only three numerical levels {−1, 0, 1}, which can aggressively reduce the communication time. We mathematically prove the convergence of TernGrad under the assumption of a bound on gradients. Guided by the bound, we propose layer-wise ternarizing and gradient clipping to improve its convergence. Our experiments show that applying TernGrad on AlexNet doesn’t incur any accuracy loss and can even improve accuracy. The accuracy loss of GoogLeNet induced by TernGrad is less than 2% on average. Finally, a performance model is proposed to study the scalability of TernGrad. Experiments show significant speed gains for various deep neural networks.",
+    "creator" : "LaTeX with hyperref package"
+  }
+}

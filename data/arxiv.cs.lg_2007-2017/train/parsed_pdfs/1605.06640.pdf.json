@@ -1,0 +1,324 @@
+{
+  "name" : "1605.06640.pdf",
+  "metadata" : {
+    "source" : "CRF",
+    "title" : "Programming with a Differentiable Forth Interpreter",
+    "authors" : [ "Sebastian Riedel", "Matko Bošnjak", "Tim Rocktäschel" ],
+    "emails" : [ "t.rocktaschel}@cs.ucl.ac.uk" ],
+    "sections" : [ {
+      "heading" : "1 Introduction",
+      "text" : "A central goal of Artificial Intelligence are machines we can not just program but also teach. A recent and important step towards this goal are neural architectures that can learn to perform algorithms akin to traditional computers, using primitives such as memory access and stack manipulation [5, 9, 10, 14, 19]. These architectures can be trained through standard gradient descent methods, and enable machines to learn complex behaviors from input-output pairs or program traces. In this context the role of the human programmer is often limited to providing training data. However, for many tasks training data is scarce. In these cases the programmer may have partial procedural background knowledge: she could know the rough structure of the program, or how to implement several sub-routines that are likely necessary to solve the task. For example, in visual programming [7], a user often knows a rough sketch of what she wants to do, and needs to fit in the specific components. In programming by demonstration [15] and programming with query languages [17] a user conforms to a larger set of conditions on the data, and needs to settle details. In all these scenarios, the question then becomes how to exploit this type of prior knowledge when learning algorithms.\nTo address the above question we present an approach that enables programmers to inject their procedural background knowledge into a neural network. In this approach the programmer specifies a program sketch [20] in a traditional programming language. This sketch defines one part of the neural network behaviour. The other part is learned using training data. The core insight that enables this approach is the fact that programming languages can usually be formulated in terms of an abstract machine that executes the commands of the language. If we can implement these machines as neural networks, and constrain parts of the networks to follow the sketched behaviour, we can\nar X\niv :1\n60 5.\n06 64\n0v 1\n[ cs\n.N E\n] 2\n1 M\nay 2\n01 6\nlearn neural programs consistent with our prior knowledge and optimised with respect to the training data.\nIn this paper we focus on the programming language Forth [2], a simple yet powerful stack-based language that is relatively close to machine code but enables modular programs and facilitates abstraction. We introduce Forth sketches, underspecified programs that define only parts of the machine behaviour. In a Forth sketch a programmer offers choices the program interpreter can make, from simple stack manipulation and function calls to any neural net transition function that operates on the full machine state. While Forth sketches are conceptually similar to program sketches in previous work, and to probabilistic programs, they can be trained through backpropagation and easily integrated in any larger computation graph. For example, the input heap of the program could be filled with the output of an LSTM [8], and its output could be connected to the neural network of an reinforcement learning agent.\nForth’s semantics are defined in terms of an abstract machine operating a data stack, a return pointer stack, and a random access memory structure. We introduce the Forth Neural Abstract Machine (∂4), an implementation of this machine that is differentiable with respect to the transition it executes at each time step, as well as distributed input representations in the machine buffers. In a Forth sketch some of these transitions will be given by the programmer, and correspond to predefined Forth commands. Others, however, will correspond to transition functions with learnable parameters, and we can use backpropagation to train them using any differentiable loss on the final output of the machine.\nWe model ∂4 execution with an RNN. This RNN executes transitions, or weighted sums of transitions, based on the current program counter representation. When executing consecutive subsequences of Forth words in the sketch the RNN would require as many time steps as there are Forth commands in the sequence. We show how this can be substantially improved through symbolic execution and the compilation of symbolic machine states into neural networks.\nFor two neural programming tasks introduced in previous work [19] we present Forth sketches that capture different degrees of prior knowledge. For example, we define only the general recursive structure of a sorting problem. We show that given only input-output pairs, ∂4 can learn to fill the sketch and generalise well to problems of unseen size. We also use ∂4 to investigate the type and degree of structure necessary when solving tasks, and show how symbolic execution and compilation into neural networks improves execution speed significantly when compared to direct compilation.\nThe contribution of our work is fourfold: i) we present a neural implementation of a dual stack machine underlying Forth, ii) we introduce Forth sketches for programming with partial procedural background knowledge, iii) we apply Forth sketches as a procedural prior on learning algorithms from data, and iv) we introduce program code optimisations based symbolic execution that can speed up neural execution."
+    }, {
+      "heading" : "2 The Forth Programming Language",
+      "text" : "Forth is a simple but Turing-complete stack-based programming language [3, 2]. We chose Forth as host language primarily due to the simplicity of its underlying abstract machine which is powerful enough to support function calls, yet easy enough to be implemented in an end-to-end differentiable manner. Forth programs are sequences of commands, or so called words, that operate on a machine state S = (D,R,H, c) with two stacks – a data stack D, and a return stack R – as well as a heap or random memory access buffer H , and a program counter c.\nThe code in Listing 1 shows a Forth implementation of BubbleSort using a stack. We refer the reader to the appendix for more examples of Forth code and a description of the Forth words used in this paper. Line 11 first puts the sequence [2 4 2 7] on the data stack D, followed by the sequence length 4, and then calls the SORT word.1 SORT performs a do-loop in line 9 that calls the BUBBLE sub-routine n− 1 times where n is the sequence length provided on the top of D (4 in our case). It does so by first decrementing n by one using the word 1-. Subsequently, n− 1 is duplicated on D (using DUP) and afterwards 0 is pushed onto D. On the data stack we now have [e1 . . . en (n − 1) (n − 1) 0]. DO consumes the top two stack elements (n − 1) and 0 as the limit and starting point of the loop, leaving the stack D to be [e1 . . . en (n − 1)]. We use the return stack R as a\n1Notice that Forth uses Polish notation and that the top of the data stack is 4 in this example.\n0 : BUBBLE ( a1 ... an n-1 -- one pass ) 1 DUP IF >R 2 OVER OVER < IF SWAP THEN 3 R> SWAP >R 1- BUBBLE R> 4 ELSE 5 DROP 6 THEN 7 ; 8 : SORT ( a1 .. an n -- sorted ) 9 1- DUP 0 DO >R R@ BUBBLE R> LOOP DROP\n10 ; 11 2 4 2 7 4 SORT \\ Example call\nListing 1: BubbleSort in Forth.\n0 : BUBBLE ( a1 ... an n-1 -- one pass ) 1 DUP IF >R 2 { observe D0 D-1 -> permute D-1 D0 R0 } 3 1- BUBBLE R> 4 \\ ** Alternative sketch ** 5 \\ { observe D0 D-1 -> choose NOP SWAP } 6 \\ R> SWAP >R 1- BUBBLE R> 7 ELSE 8 DROP 9 THEN\n10 ;\nListing 2: BUBBLE sketch with trainable permutation (trainable comparison in comments).\ntemporary variable buffer and push (n− 1) onto it using the word >R. This drops (n− 1) from D, which we retrieve with R@. With [e1 . . . en (n − 1)] still on the data stack we call BUBBLE to perform one iteration of the bubble pass, calling BUBBLE (n − 1) times internally, and consuming (n − 1). Notice that this call puts the current program counter onto R, to be used for the program counter c when exiting BUBBLE. To prepare for the next call to BUBBLE we move (n − 1) back from the return stack R to the data stack D via R>. If we reach the loop limit we drop (n − 1) and exit SORT using the ; word. At this point the stack should contain the ordered sequence [7 4 2 2].\nNotice that while Forth provides all common control structures such as if-then-else and loops, these can always be reduced to code that uses jumps and conditional jumps (using the words branch and branch0, respectively). Likewise, we can think of sub-routine definitions as code blocks tagged with a label. This allows us to understand, and formally define, a Forth Program P as a flat sequence of words P = w1 . . . wn."
+    }, {
+      "heading" : "3 Differentiable Forth",
+      "text" : "When a programmer writes a Forth program, she defines a sequence of Forth words, and hence of known state transition functions. In other words, she knows exactly how computation should proceed. To accommodate for cases when the developer’s procedural background knowledge is incomplete, we extend Forth to support the definition of a program sketch. Just as Forth programs, sketches are lists of transition functions, but the behaviour of some of these transition functions need to be learned from data.\nTo learn the behaviour of transition functions within a program we would like the machine output to be differentiable with respect to these functions (and possibly representations of inputs to the program). This enables us to choose transition functions such as neural networks, and efficiently train their parameters through backpropagation and gradient algorithms. To this end we first provide a continuous representation of the state of a Forth abstract machine. Then we present an RNN that models program execution on this machine, parametrised by the transition functions at each program index. Lastly, we discuss optimizations based on symbolic execution and collapsing of parallel branches."
+    }, {
+      "heading" : "3.1 Machine State Encoding",
+      "text" : "We map the symbolic machine state S = (D,R,H, c) to a continuous representation S = (D,R,H, c) in the following way. Since the data D and return stack R are both represented using the same mechanism, we will only describe D. Its continuous representation D is a tuple (DB,dt) where DB ∈ Rl×v is a matrix that serves as a buffer of length l and value width v and dt ∈ Rl points to the current top element in the stack as contained in the buffer. To access the top element of the stack we use the product DBdt. Pushing and popping is implemented straightforwardly by writing into the buffer matrix and incrementing and decrementing dt, respectively. The heap representation H ∈ Rh×v is a matrix that serves as a random memory access buffer of length h and width v. The equal widths of H and D allow us to directly move values from heap to stack and vice versa. Finally, the program counter c ∈ Rp is a vector that, when one-hot, points to a single command in a program of length p. We will use S to denote the space of all continuous representations S (assuming given buffer lengths and widths).\nNeural Forth Words It is easy to convert Forth words, defined as functions on discrete machine states, to functions operating on the continuous space S. For example, for DROP we simply multiply the stack top pointer dt with a circular permutation matrix T that circularly shifts the vector. Likewise, for DUP we calculate the top stack element e = DBdt, increase the stack pointer dt by multiplying it with the transpose of T , and then inserting e into DB at the new top pointer position."
+    }, {
+      "heading" : "3.2 The Execution RNN",
+      "text" : "Let us define a differentiable program P as a sequence of continuous transition functions P = w1 . . .wn with wi ∈ S → S. If each of these functions corresponds to a Forth word, we call it a differentiable Forth program. Our goal is to define a neural version of the Forth abstract machine that can execute such programs and guarantees that the execution of differentiable Forth programs leads to a final state equivalent to the final state of the corresponding symbolic execution.\nWe model execution using an RNN which produces a state Si+1 conditioned on a previous state Si. It does so by first passing the current state to each function wi in the program, and then weighing each of the produced next states by the component of the program counter vector ci that corresponds to program index i, effectively using c as an attention vector over code. Formally we have:\nSi+1 = ∑ i ciwi(Si).\nClearly this recursion, and its final state, are differentiable with respect to the program code P, and its inputs. Furthermore, for differentiable Forth programs it is easy to show that the final state of this RNN will correspond to the final state of a symbolic execution."
+    }, {
+      "heading" : "3.3 Forth Sketches",
+      "text" : "A Forth Sketch F is a differentiable program in which for some program indices i the function wi is learnable. We will call these learnable functions slots, as they correspond to underspecified “slots” in the program code that need to be filled by learning.\nWe allow users to define a slot w by specifying a pair of a state encoder wenc that produces a latent representation h using a multi-layer perceptron, and a decoder wdec that consumes this representation to produce the next machine state. We hence have w = wdec ◦ wenc. To inject slots into Forth program code we introduce a notation that reflects this decomposition. In particular, slots are defined using the syntax { encoder -> decoder } where encoder and decoder are specifications of the corresponding slot parts.\nEncoders We provide the following options for encoders:\n• static: produces a static representation, independent of the actual machine state. • observe e1 . . . em: concatenates the elements e1 . . . em of the machine state. An element\ncan be a stack item Di at relative index i, a return stack item Ri, etc.\nDecoders Users can specify the following decoders:\n• choose w1 . . . wm: chooses from the Forth words w1 . . . wm. Takes an input vector h of length m to produce ∑m i hiτ(wi)(S).\n• manipulate e1 . . . em: directly manipulates the machine state elements e1 . . . em. • permute e1 . . . em: permutes the machine state elements e1 . . . em.\nListing 2 defines the BUBBLE word as a sketch capturing several types of prior knowledge. For instance, we assume BUBBLE involves a recursive call, it terminates at length 1 and the next BUBBLE call takes as input some function of the current length and the top two elements. In the sketch the sequence to bubble through and its length minus 1, n − 1, is provided on the data stack. After we duplicate n − 1 for further use we test whether n − 1 is non-zero (using IF that consumes the top of the stack during the check). If n − 1 > 0 we subtract n − 1 further and remember it by pushing it onto the R stack. At this point the programmer only knows that the top two stack elements D0 and D-1, and the top return stack element R0 need to be observed and based on this observation, permuted to produce the input state to the recursive BUBBLE call (line 2 in Listing 2). After the call we put whatever currently is on the return stack (as manipulated by the slot) onto the data stack using R>, and then move on.\nFigure 1 illustrates parts of this sketch and its execution on the ∂4 RNN. The program counter at this point resides at 1- (line 3 in Listing 2), as indicated by the one-hot vector c next to program P. Both data and return stack are currently partially filled, and we show the content both through horizontal one-hot vectors and their corresponding integer values. The vectors d and r point to the top of both stacks, and are in a one-hot state as well. In this execution trace the slot at line 5 is already showing optimal behaviour: it remembers the larger element (4) on the return stack, and executes BUBBLE on the remaining sequence with the counter n subtracted by one, to 1."
+    }, {
+      "heading" : "3.4 Program Code Optimizations",
+      "text" : "The ∂4 RNN requires one time step per transition. After each time step the program counter is either incremented by one, or set to jump. In turn a new machine state is calculated by executing all words in the program, and then weighting the result states by the activation of the program counter at the given word. This parallel execution of all words is expensive, and we would hence like to avoid full RNN steps wherever possible. We use two strategies to significantly speed-up ∂4.\nSymbolic Execution Whenever we have a sequence of Forth words that contains no branch entry or exit points, we collapse this sequence to a single transition. We do this using symbolic execution [11]: we first fill the stacks and heap of a standard Forth abstract machine with symbols representing arbitrary values (e.g. D = d1 . . . dl and R = r1 . . . rl), and then execute the sequence of Forth words on the machine. This results in a new symbolic state, and we use this state, and its difference to the original state, to derive the transition function of the complete sequence. Consider, for example, the sequence R> SWAP >R that swaps the top the data stack with the top of the return stack and yields the symbolic state D = r1d2 . . . dl. and R = d1r2 . . . rl. Compared to the initial state we have only changed the top elements on both stacks, and hence the neural transition will only need to swap the top elements of D and R.\nCollapsing If-Branches When symbolic execution hits a branching point we generally cannot simply continue execution, as the branching behaviour will depend on the current machine state and we cannot symbolically resolve it. However, for branches arising from if-clauses that involve no function calls or loop structures we can still avoid giving control back to the program counter and evaluating all words. We simply execute both branches in parallel, and then let the resulting state be the sum of the output states of both branches, weighted by the score given to the symbol true expected on top of the data stack."
+    }, {
+      "heading" : "3.5 Training",
+      "text" : "When training the program we assume that we have a sequence of input-output pairs of machine states (xi,yi)i. Additionally we may have a mask mi that indicates which components of the machine states should be assessed and which should be ignored. For example, we do not care about values in the stack buffer above the target stack depth. Using ST (xi) to denote the final state of the execution RNN after T steps, when using initial state xi, we can use backpropagation and any variant of SGD to optimise a loss function L(ST (xi),yi,mi). Note that it is trivial to also provide supervision on the trace level, as done by the Neural Program Interpreter [19]."
+    }, {
+      "heading" : "4 Related Work",
+      "text" : "Program Synthesis The idea of program synthesis is as old as Artificial Intelligence, and thus has a long history in computer science [16]. A large body of work has focused on using genetic programming [13] to induce programs from the given input-output specification [18]. Other approaches were taken too. Inductive Programming approaches [12] aimed at inducing programs from incomplete specifications of the code to be implemented. Heuristic search in special graph structures induced recursive programs that satisfy the input-output specifications [1]. Lastly, SAT-based program synthesisers [21] successfully filled in simple underspecified bit-stream programmes.\nProbabilistic and Bayesian Programming Our work is closely related to probabilistic programming languages such as Church [4]. They allow users to inject random choice primitives into programs as a way to define generative distributions over possible execution traces. In a sense, the random choice primitives in such languages correspond to the slots in our sketches. A core difference lies in the way we train the behaviour of slots: instead of calculating their posteriors using probabilistic inference, we estimate their parameters using backpropagation and gradient descent. This makes it easy to seamlessly connect our sketches to further neural input and output modules, such as an LSTM that feeds into the machine heap, or a neural reinforcement learning agent that operates the neural machine. In addition, the underlying programming and probabilistic paradigm in these programming languages is often functional and declarative, whereas our approach focuses on a procedural and discriminative view.\nNeural approaches Recently, there has been a surge of research in program synthesis and execution in deep learning, with increasingly elaborate deep models. Many of these models were based on differentiable versions of abstract data structures, and a few abstract machines. The first notable example of an abstract machine was the Neural Turing Machine (NTM) [5] which is able to learn simple algorithmic problems with its differentiable controller and memory access, trained with backpropagation. Neural GPUs [10], on the other hand, approximated Turing completeness with a comparatively shallow model.\nSubsequent work explored other memory structures, and controller structures to approach general computability. Neural stacks aided in learning binary addition and recognizing context-free languages [9], and were a crucial component in language transduction experiments, together with the neural queues, and deques [6, 14]. In other work, LSTM [8] controllers controlled connections between computational primitives to learn referencing and dereferencing pointers in various array and list access problems.\nThis work in neural approximations to abstract structures and machines naturally leads to more elaborate machinery able to induce and call code or code-like behavior. [17] learned SQLlike behavior—querying tables from natural language with simple arithmetic operations. Neural Programmer-Interpreters [19] learn to represent and execute programs, operating on different modes of environment, and are able to incorporate decisions better captured in a neural network than in many lines of code (e.g. using image as an input). Users inject prior procedural knowledge by training on program traces and hence require full procedural knowledge. In contrast, we enable users to use their partial knowledge in sketches.\nGenerally previous neural approaches have been focusing on learning algorithms completely from scratch, and it is not obvious how to incorporate any structural priors. To the best of our knowledge, ∂4 is the first neural implementation of an abstract machine for an actual programming language, and this enables us to inject such priors in a straightforward manner."
+    }, {
+      "heading" : "5 Experiments",
+      "text" : "We test ∂4 on sorting and addition tasks presented in [19] with varying levels of program structure."
+    }, {
+      "heading" : "5.1 Sorting",
+      "text" : "Sorting sequences of digits is a hard task for RNNs such as LSTMs, as they fail to generalize to sequences that are marginally longer than the ones they have been trained on [19]. We investigate several strong priors based on BubbleSort for this transduction task and present two ∂4 sketches that enable us to learn sorting from only few training examples. This is achieved by defining sufficient structure so that the network’s behavior is invariant to the input sequence length. For instance, we can assume that for sorting a list of numbers we need to repeatedly apply a function to gradually shorter sub-lists. This outer loop can be specified in ∂4 with line 9 of Listing 1 which repeatedly calls a function BUBBLE. Listing 2 shows a sketch for BUBBLE where we only specify that based on the top two elements of the stack, these two elements and the top of the return stack need to be permuted (line 2). The exact behavior needs to be learned end-to-end from input-output examples. In the next line we further specify that the result should be put on the return stack and BUBBLE should be called on the the rest of the stack (line 3). Compare this sketch with the commented out sketch in lines 5 and 6. Here we are providing more structure and leave less behavior open to be learned. Concretely, there the ∂4 model only has to learn to compare the two top elements on the stack from input-output examples.\nFigure 2a shows training and test accuracies for the two sketches discussed above when provided with a different number of training sequences of length 3 and tested on sequences of length 8. As expected, providing less structure (permute sketch) results in a worse fit on the training set when given only few training examples. However, with more training examples the permute sketch with less prior structure generalize as well as the compare sketch. For 256 training examples both sketches learn the correct behavior and generalize to sequences that are over twice as long.\nIt is interesting to analyse the program counter traces, depicted in Figure 3. The trace follows a single example from start, to middle, and the end of the training process. In the beginning of training, the program counter starts to deviate from the the one-hot representation in the first 20 steps (not observed in the figure due to unobservable changes), and after 2 iterations of SORT, ∂4 fails to correctly determine the next command. After a few training epochs ∂4 learns better permutations which enables the algorithm to take crisp decisions and arrive to a halt in the correct state.\nProgram Code Optimizations We measure the runtime of BubbleSort on sequences of varying length with and without the optimizations described in Section 3.4. The results of ten repeated runs are shown in Figure 2b and demonstrate large relative improvements for symbolic execution and collapsing of branches compared to non-optimized ∂4 code.\n0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64 65 66 67 68 69 70 71 72 73 74 75 76 77 78 79 80 81 82 83 84 85 86 87 88 89 90 91 92 93 94 95 96 97 98 99100101102103104105106107108109110111112113114115116117118119\n(a) Program Counter trace in early stages of training.\n0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64 65 66 67 68 69 70 71 72 73 74 75 76 77 78 79 80 81 82 83 84 85 86 87 88 89 90 91 92 93 94 95 96 97 98 99100101102103104105106107108109110111112113114115116117118119\n(b) Program Counter trace in the middle of training.\n0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64 65 66 67 68 69 70 71 72 73 74 75 76 77 78 79 80 81 82 83 84 85 86 87 88 89 90 91 92 93 94 95 96 97 98 99100101102103104105106107108109110111112113114115116117118119"
+    }, {
+      "heading" : "5.2 Addition",
+      "text" : "Addition of numbers with n digits is another problem we apply ∂4 to. The algorithm we rely on is the standard elementary school addition, where the goal is to iterate over the aligned digits and carry, and calculate their resulting sum and carry. The sketch we chose in this case, is shown in Listing 3. As input it requires aligned pairs of digits, a carry for the least significant digit and the length of the respective numbers. The sketch essentially defines the halting condition of the recursion (no remaining digits, line 1-2), and manipulates two digits and a carry into a new digit (pushed to the return stack) and a new carry. It then reduces the problem size by one, and returns the solution by popping it from the return stack. The presented sketch, when trained on single-digit addition examples, successfully learns the single-digit addition, and generalises to a large number of digits.\n0 : ADD-DIGITS ( a1 b1 ... an bn carry n -- r1 r2 ... r_{n+1} ) 1 DUP 0 = IF 2 DROP 3 ELSE 4 >R \\ put n on R 5 { observe D0 D-1 D-2 -> manipulate D-1 D-2 } 6 DROP SWAP R> 1- SWAP >R \\ new_carry n-1 7 ADD-DIGITS \\ call add-digits on ...an-1 bn-1 new_carry n-1 8 R> \\ put remembered results back on the stack 9 THEN\n10 ;\nListing 3: Sketch for Elementary Addition. Input data is used to fill data stack externally."
+    }, {
+      "heading" : "6 Conclusion",
+      "text" : "We have presented ∂4, a differentiable abstract machine for the language Forth, and showed how to use it to fill in missing behaviour in Forth program sketches. The ∂4 successfully learned to sort and add, using only program sketches and input output pairs as input. We believe the ∂4 will be useful for addressing complex problems, such as machine reading and inference in knowledge bases where we could inject the recursive structure of theorem proving but leave unification open to be learned. We also think it can be used as testbed for understanding how much prior structural bias a problem needs. In the future we plan to focus on more user-friendly host languages, scaling up learning and execution further, and the integration of non-differentiable transitions (as those arising when interacting with a real environment)."
+    }, {
+      "heading" : "Acknowledgments",
+      "text" : "We thank Dirk Weissenborn and Guillaume Bouchard for comments on this draft. This work was supported by Microsoft Research through its PhD Scholarship Programme, an Allen Distinguished Investigator Award and a Marie Curie Career Integration Award."
+    }, {
+      "heading" : "A. ∂4 Words",
+      "text" : "We implemented a small subset of available Forth words in ∂4. The table of these words, together with their descriptions is given in Table 1. The commands are roughly divided into 6 groups. These groups, line-separated in the table, are:\nData stack operations 1+, 1-, DUP, SWAP, OVER, DROP Heap operations @, ! Comparators >, <, = Return stack operations >R, R>, @R Control statements IF..THEN..ELSE, BEGIN..WHILE..REPEAT,\nDO..LOOP Subroutine control :, ;"
+    }, {
+      "heading" : "B. Forth Adder",
+      "text" : "0 : DIGIT+ 1 DUP 1 = IF >R 2 DUP 9 = IF 3 DROP 0 R> ELSE 1+ R> 1- 4 THEN 5 THEN 6 >R 7 BEGIN DUP WHILE 8 1- SWAP DUP 9 = IF 9 R> 1+ >R\n10 DROP 0 11 ELSE 12 1+ SWAP 13 THEN 14 REPEAT 15 DROP 16 R> 17 ;\nListing 4: Full code for adding two digits and a carry. The code is long due to the fact that the adding of two numbers in Differentiable Forth is currently realised with multiple executions of 1+."
+    } ],
+    "references" : [ {
+      "title" : "Recursive Program Synthesis",
+      "author" : [ "A. Albarghouthi", "S. Gulwani", "Z. Kincaid" ],
+      "venue" : "In Computer Aided Verification,",
+      "citeRegEx" : "1",
+      "shortCiteRegEx" : "1",
+      "year" : 2013
+    }, {
+      "title" : "Programming Languages - Forth. American National Standard for Information Systems, ANSI X3.215-1994",
+      "author" : [ "A.J.T. Committee" ],
+      "venue" : null,
+      "citeRegEx" : "3",
+      "shortCiteRegEx" : "3",
+      "year" : 1994
+    }, {
+      "title" : "Church: a language for generative models",
+      "author" : [ "N. Goodman", "V. Mansinghka", "D.M. Roy", "K. Bonawitz", "J.B. Tenenbaum" ],
+      "venue" : "In Proc. UAI,",
+      "citeRegEx" : "4",
+      "shortCiteRegEx" : "4",
+      "year" : 2008
+    }, {
+      "title" : "Learning to Transduce with Unbounded Memory",
+      "author" : [ "E. Grefenstette", "K.M. Hermann", "M. Suleyman", "P. Blunsom" ],
+      "venue" : "In Proc. NIPS,",
+      "citeRegEx" : "6",
+      "shortCiteRegEx" : "6",
+      "year" : 2015
+    }, {
+      "title" : "Ontology-Based Meta- Mining of Knowledge Discovery Workflows",
+      "author" : [ "M. Hilario", "P. Nguyen", "H. Do", "A. Woznica", "A. Kalousis" ],
+      "venue" : "In Meta-Learning in Computational Intelligence,",
+      "citeRegEx" : "7",
+      "shortCiteRegEx" : "7",
+      "year" : 2011
+    }, {
+      "title" : "Long short-term memory",
+      "author" : [ "S. Hochreiter", "J. Schmidhuber" ],
+      "venue" : "Neural computation,",
+      "citeRegEx" : "8",
+      "shortCiteRegEx" : "8",
+      "year" : 1997
+    }, {
+      "title" : "Inferring Algorithmic Patterns with Stack-Augmented Recurrent Nets",
+      "author" : [ "A. Joulin", "T. Mikolov" ],
+      "venue" : "In Proc. NIPS,",
+      "citeRegEx" : "9",
+      "shortCiteRegEx" : "9",
+      "year" : 2015
+    }, {
+      "title" : "Neural GPUs Learn Algorithms",
+      "author" : [ "Ł. Kaiser", "I. Sutskever" ],
+      "venue" : "In Proc. ICLR",
+      "citeRegEx" : "10",
+      "shortCiteRegEx" : "10",
+      "year" : 2016
+    }, {
+      "title" : "Symbolic Execution and Program Testing",
+      "author" : [ "J.C. King" ],
+      "venue" : "Commun. ACM,",
+      "citeRegEx" : "11",
+      "shortCiteRegEx" : "11",
+      "year" : 1976
+    }, {
+      "title" : "Inductive Programming: A Survey of Program Synthesis Techniques",
+      "author" : [ "E. Kitzelmann" ],
+      "venue" : "In Approaches and Applications of Inductive Programming,",
+      "citeRegEx" : "12",
+      "shortCiteRegEx" : "12",
+      "year" : 2009
+    }, {
+      "title" : "Genetic Programming: On the Programming of Computers by means of Natural Selection, volume 1",
+      "author" : [ "J.R. Koza" ],
+      "venue" : null,
+      "citeRegEx" : "13",
+      "shortCiteRegEx" : "13",
+      "year" : 1992
+    }, {
+      "title" : "Neural Random-Access Machines",
+      "author" : [ "K. Kurach", "M. Andrychowicz", "I. Sutskever" ],
+      "venue" : "In Proc. ICLR",
+      "citeRegEx" : "14",
+      "shortCiteRegEx" : "14",
+      "year" : 2016
+    }, {
+      "title" : "Learning repetitive text-editing procedures with smartedit",
+      "author" : [ "T. Lau", "S.A. Wolfman", "P. Domingos", "D.S. Weld" ],
+      "venue" : "Your Wish Is My Command: Giving Users the Power to Instruct Their Software,",
+      "citeRegEx" : "15",
+      "shortCiteRegEx" : "15",
+      "year" : 2001
+    }, {
+      "title" : "Toward automatic program synthesis",
+      "author" : [ "Z. Manna", "R.J. Waldinger" ],
+      "venue" : "Communications of the ACM,",
+      "citeRegEx" : "16",
+      "shortCiteRegEx" : "16",
+      "year" : 1971
+    }, {
+      "title" : "Neural Programmer: Inducing latent programs with gradient descent",
+      "author" : [ "A. Neelakantan", "Q.V. Le", "I. Sutskever" ],
+      "venue" : "In Proc. ICLR",
+      "citeRegEx" : "17",
+      "shortCiteRegEx" : "17",
+      "year" : 2016
+    }, {
+      "title" : "Evolutionary Program Induction of Binary Machine Code and Its Applications",
+      "author" : [ "P. Nordin" ],
+      "venue" : null,
+      "citeRegEx" : "18",
+      "shortCiteRegEx" : "18",
+      "year" : 1997
+    }, {
+      "title" : "Programming by Sketching for Bit-streaming Programs",
+      "author" : [ "A. Solar-Lezama", "R. Rabbah", "R. Bodı́k", "K. Ebcioğlu" ],
+      "venue" : "In Proc. PLDI,",
+      "citeRegEx" : "20",
+      "shortCiteRegEx" : "20",
+      "year" : 2005
+    }, {
+      "title" : "Combinatorial Sketching for Finite Programs",
+      "author" : [ "A. Solar-Lezama", "L. Tancau", "R. Bodik", "S. Seshia", "V. Saraswat" ],
+      "venue" : "In Proc. ASPLOS,",
+      "citeRegEx" : "21",
+      "shortCiteRegEx" : "21",
+      "year" : 2006
+    } ],
+    "referenceMentions" : [ {
+      "referenceID" : 6,
+      "context" : "A recent and important step towards this goal are neural architectures that can learn to perform algorithms akin to traditional computers, using primitives such as memory access and stack manipulation [5, 9, 10, 14, 19].",
+      "startOffset" : 201,
+      "endOffset" : 219
+    }, {
+      "referenceID" : 7,
+      "context" : "A recent and important step towards this goal are neural architectures that can learn to perform algorithms akin to traditional computers, using primitives such as memory access and stack manipulation [5, 9, 10, 14, 19].",
+      "startOffset" : 201,
+      "endOffset" : 219
+    }, {
+      "referenceID" : 11,
+      "context" : "A recent and important step towards this goal are neural architectures that can learn to perform algorithms akin to traditional computers, using primitives such as memory access and stack manipulation [5, 9, 10, 14, 19].",
+      "startOffset" : 201,
+      "endOffset" : 219
+    }, {
+      "referenceID" : 4,
+      "context" : "For example, in visual programming [7], a user often knows a rough sketch of what she wants to do, and needs to fit in the specific components.",
+      "startOffset" : 35,
+      "endOffset" : 38
+    }, {
+      "referenceID" : 12,
+      "context" : "In programming by demonstration [15] and programming with query languages [17] a user conforms to a larger set of conditions on the data, and needs to settle details.",
+      "startOffset" : 32,
+      "endOffset" : 36
+    }, {
+      "referenceID" : 14,
+      "context" : "In programming by demonstration [15] and programming with query languages [17] a user conforms to a larger set of conditions on the data, and needs to settle details.",
+      "startOffset" : 74,
+      "endOffset" : 78
+    }, {
+      "referenceID" : 16,
+      "context" : "In this approach the programmer specifies a program sketch [20] in a traditional programming language.",
+      "startOffset" : 59,
+      "endOffset" : 63
+    }, {
+      "referenceID" : 5,
+      "context" : "For example, the input heap of the program could be filled with the output of an LSTM [8], and its output could be connected to the neural network of an reinforcement learning agent.",
+      "startOffset" : 86,
+      "endOffset" : 89
+    }, {
+      "referenceID" : 1,
+      "context" : "Forth is a simple but Turing-complete stack-based programming language [3, 2].",
+      "startOffset" : 71,
+      "endOffset" : 77
+    }, {
+      "referenceID" : 2,
+      "context" : "Line 11 first puts the sequence [2 4 2 7] on the data stack D, followed by the sequence length 4, and then calls the SORT word.",
+      "startOffset" : 32,
+      "endOffset" : 41
+    }, {
+      "referenceID" : 4,
+      "context" : "Line 11 first puts the sequence [2 4 2 7] on the data stack D, followed by the sequence length 4, and then calls the SORT word.",
+      "startOffset" : 32,
+      "endOffset" : 41
+    }, {
+      "referenceID" : 4,
+      "context" : "At this point the stack should contain the ordered sequence [7 4 2 2].",
+      "startOffset" : 60,
+      "endOffset" : 69
+    }, {
+      "referenceID" : 2,
+      "context" : "At this point the stack should contain the ordered sequence [7 4 2 2].",
+      "startOffset" : 60,
+      "endOffset" : 69
+    }, {
+      "referenceID" : 8,
+      "context" : "We do this using symbolic execution [11]: we first fill the stacks and heap of a standard Forth abstract machine with symbols representing arbitrary values (e.",
+      "startOffset" : 36,
+      "endOffset" : 40
+    }, {
+      "referenceID" : 13,
+      "context" : "Program Synthesis The idea of program synthesis is as old as Artificial Intelligence, and thus has a long history in computer science [16].",
+      "startOffset" : 134,
+      "endOffset" : 138
+    }, {
+      "referenceID" : 10,
+      "context" : "A large body of work has focused on using genetic programming [13] to induce programs from the given input-output specification [18].",
+      "startOffset" : 62,
+      "endOffset" : 66
+    }, {
+      "referenceID" : 15,
+      "context" : "A large body of work has focused on using genetic programming [13] to induce programs from the given input-output specification [18].",
+      "startOffset" : 128,
+      "endOffset" : 132
+    }, {
+      "referenceID" : 9,
+      "context" : "Inductive Programming approaches [12] aimed at inducing programs from incomplete specifications of the code to be implemented.",
+      "startOffset" : 33,
+      "endOffset" : 37
+    }, {
+      "referenceID" : 0,
+      "context" : "Heuristic search in special graph structures induced recursive programs that satisfy the input-output specifications [1].",
+      "startOffset" : 117,
+      "endOffset" : 120
+    }, {
+      "referenceID" : 17,
+      "context" : "Lastly, SAT-based program synthesisers [21] successfully filled in simple underspecified bit-stream programmes.",
+      "startOffset" : 39,
+      "endOffset" : 43
+    }, {
+      "referenceID" : 2,
+      "context" : "Probabilistic and Bayesian Programming Our work is closely related to probabilistic programming languages such as Church [4].",
+      "startOffset" : 121,
+      "endOffset" : 124
+    }, {
+      "referenceID" : 7,
+      "context" : "Neural GPUs [10], on the other hand, approximated Turing completeness with a comparatively shallow model.",
+      "startOffset" : 12,
+      "endOffset" : 16
+    }, {
+      "referenceID" : 6,
+      "context" : "Neural stacks aided in learning binary addition and recognizing context-free languages [9], and were a crucial component in language transduction experiments, together with the neural queues, and deques [6, 14].",
+      "startOffset" : 87,
+      "endOffset" : 90
+    }, {
+      "referenceID" : 3,
+      "context" : "Neural stacks aided in learning binary addition and recognizing context-free languages [9], and were a crucial component in language transduction experiments, together with the neural queues, and deques [6, 14].",
+      "startOffset" : 203,
+      "endOffset" : 210
+    }, {
+      "referenceID" : 11,
+      "context" : "Neural stacks aided in learning binary addition and recognizing context-free languages [9], and were a crucial component in language transduction experiments, together with the neural queues, and deques [6, 14].",
+      "startOffset" : 203,
+      "endOffset" : 210
+    }, {
+      "referenceID" : 5,
+      "context" : "In other work, LSTM [8] controllers controlled connections between computational primitives to learn referencing and dereferencing pointers in various array and list access problems.",
+      "startOffset" : 20,
+      "endOffset" : 23
+    }, {
+      "referenceID" : 14,
+      "context" : "[17] learned SQLlike behavior—querying tables from natural language with simple arithmetic operations.",
+      "startOffset" : 0,
+      "endOffset" : 4
+    } ],
+    "year" : 2016,
+    "abstractText" : "There are families of neural networks that can learn to compute any function, provided sufficient training data. However, given that in practice training data is scarce for all but a small set of problems, a core question is how to incorporate prior knowledge into a model. Here we consider the case of prior procedural knowledge such as knowing the overall recursive structure of a sequence transduction program or the fact that a program will likely use arithmetic operations on real numbers to solve a task. To this end we present a differentiable interpreter for the programming language Forth. Through a neural implementation of the dual stack machine that underlies Forth, programmers can write program sketches with slots that can be filled with learnable behaviour. As the program interpreter is end-to-end differentiable, we can optimize this behaviour directly through gradient descent techniques on user specified objectives, and also integrate the program into any larger neural computation graph. We show empirically that our interpreter is able to effectively leverage different levels of prior program structure and learn complex transduction tasks such as sequence sorting or addition with substantially less data and better generalisation over problem sizes. In addition, we introduce neural program optimisations based on symbolic computation and parallel branching that lead to significant speed improvements.",
+    "creator" : "LaTeX with hyperref package"
+  }
+}

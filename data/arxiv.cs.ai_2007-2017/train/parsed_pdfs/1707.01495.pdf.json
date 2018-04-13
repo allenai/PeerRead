@@ -1,0 +1,656 @@
+{
+  "name" : "1707.01495.pdf",
+  "metadata" : {
+    "source" : "CRF",
+    "title" : "Hindsight Experience Replay",
+    "authors" : [ "Marcin Andrychowicz", "Filip Wolski", "Alex Ray", "Jonas Schneider", "Rachel Fong", "Peter Welinder", "Bob McGrew", "Josh Tobin", "Pieter Abbeel", "Wojciech Zaremba" ],
+    "emails" : [ "marcin@openai.com" ],
+    "sections" : [ {
+      "heading" : "1 Introduction",
+      "text" : "Reinforcement learning (RL) combined with neural networks has recently led to a wide range of successes in learning policies for sequential decision-making problems. This includes simulated environments, such as playing Atari games (Mnih et al., 2015), and defeating the best human player at the game of Go (Silver et al., 2016), as well as robotic tasks such as helicopter control (Ng et al., 2006), hitting a baseball (Peters and Schaal, 2008), screwing a cap onto a bottle (Levine et al., 2015), or door opening (Chebotar et al., 2016).\nHowever, a common challenge, especially for robotics, is the need to engineer a reward function that not only reflects the task at hand but is also carefully shaped (Ng et al., 1999) to guide the policy optimization. For example, Popov et al. (2017) use a cost function consisting of five relatively complicated terms which need to be carefully weighted in order to train a policy for stacking a brick on top of another one. The necessity of cost engineering limits the applicability of RL in the real world because it requires both RL expertise and domain-specific knowledge. Moreover, it is not applicable in situations where we do not know what admissible behaviour may look like. It is therefore of great practical relevance to develop algorithms which can learn from unshaped reward signals, e.g. a binary signal indicating successful task completion.\nOne ability humans have, unlike the current generation of model-free RL algorithms, is to learn almost as much from achieving an undesired outcome as from the desired one. Imagine that you are learning how to play hockey and are trying to shoot a puck into a net. You hit the puck but it misses the net on the right side. The conclusion drawn by a standard RL algorithm in such a situation would\n∗ marcin@openai.com † Equal advising.\nar X\niv :1\n70 7.\n01 49\n5v 1\n[ cs\n.L G\n] 5\nJ ul\n2 01\n7\nbe that the performed sequence of actions does not lead to a successful shot, and little (if anything) would be learned. It is however possible to draw another conclusion, namely that this sequence of actions would be successful if the net had been placed further to the right.\nIn this paper we introduce a technique called Hindsight Experience Replay (HER) which allows the algorithm to perform exactly this kind of reasoning and can be combined with any off-policy RL algorithm. It is applicable whenever there are multiple goals which can be achieved, e.g. achieving each state of the system may be treated as a separate goal. Not only does HER improve the sample efficiency in this setting, but more importantly, it makes learning possible even if the reward signal is sparse and binary. Our approach is based on training universal policies (Schaul et al., 2015a) which take as input not only the current state, but also a goal state. The pivotal idea behind HER is to replay each episode with a different goal than the one the agent was trying to achieve, e.g. one of the goals which was achieved in the episode."
+    }, {
+      "heading" : "2 Background",
+      "text" : "In this section we introduce reinforcement learning formalism used in the paper as well as RL algorithms we use in our experiments."
+    }, {
+      "heading" : "2.1 Reinforcement Learning",
+      "text" : "We consider the standard reinforcement learning formalism consisting of an agent interacting with an environment. To simplify the exposition we assume that the environment is fully observable. An environment is described by a set of states S, a set of actions A, a distribution of initial states p(s0), a reward function r : S ×A → R, transition probabilities p(st+1|st, at), and a discount factor γ ∈ [0, 1]. A deterministic policy is a mapping from states to actions: π : S → A. Every episode starts with sampling an initial state s0. At every timestep t the agent produces an action based on the current state: at = π(st). Then it gets the reward rt = r(st, at) and the environment’s new state is sampled from the distribution p(·|st, at). A discounted sum of future rewards is called a return: Rt = ∑∞ i=t γ\ni−tri. The agent’s goal is to maximize its expected return Es0 [R0|s0]. The Q-function or action-value function is defined as Qπ(st, at) = E[Rt|st, at].\nLet π∗ denote an optimal policy i.e. any policy π∗ s.t. Qπ ∗ (s, a) ≥ Qπ(s, a) for every s ∈ S, a ∈ A and any policy π. All optimal policies have the same Q-function which is called optimal Q-function and denoted Q∗. It is easy to show that it satisfies the following equation called the Bellman equation:\nQ∗(s, a) = Es′∼p(·|s,a) [ r(s, a) + γ max\na′∈A Q∗(s′, a′)\n] ."
+    }, {
+      "heading" : "2.2 Deep Q-Networks (DQN)",
+      "text" : "Deep Q-Networks (DQN) (Mnih et al., 2015) is a model-free RL algorithm for discrete action spaces. Here we sketch it only informally, see Mnih et al. (2015) for more details. In DQN we maintain a neural network Q which approximates Q∗. A greedy policy w.r.t. Q is defined as πQ(s) = argmaxa∈AQ(s, a). An -greedy policy w.r.t. Q is a policy which with probability takes a random action (sampled uniformly from A) and takes the action πQ(s) with probability 1− . During training we generate episodes using -greedy policy w.r.t. the current approximation of the action-value function Q. The transition tuples (st, at, rt, st+1) encountered during training are stored in the so-called replay buffer. The generation of new episodes is interleaved with neural network training. The network is trained using mini-batch gradient descent on the loss L which encourages the approximated Q-function to satisfy the Bellman equation: L = E (Q(st, at)− yt)2, where yt = rt + γmaxa′∈AQ(st+1, a′) and the tuples (st, at, rt, st+1) are sampled from the replay buffer1.\nIn order to make this optimization procedure more stable the targets yt are usually computed using a separate target network which changes at a slower pace than the main network. A common practice\n1The targets yt depend on the network parameters but this dependency is ignored during backpropagation.\nis to periodically set the weights of the target network to the current weights of the main network (e.g. Mnih et al. (2015)) or to use a polyak-averaged2 (Polyak and Juditsky, 1992) version of the main network instead (Lillicrap et al., 2015)."
+    }, {
+      "heading" : "2.3 Deep Deterministic Policy Gradients (DDPG)",
+      "text" : "Deep Deterministic Policy Gradients (DDPG) (Lillicrap et al., 2015) is a model-free RL algorithm for continuous action spaces. Here we sketch it only informally, see Lillicrap et al. (2015) for more details. In DDPG we maintain two neural networks: a target policy (also called an actor) π : S → A and an action-value function approximator (called the critic) Q : S ×A → R. The critic’s job is to approximate the actor’s action-value function Qπ .\nEpisodes are generated using a behavioral policy which is a noisy version of the target policy, e.g. πb(s) = π(s) + N (0, 1). The critic is trained in a similar way as the Q-function in DQN but the targets yt are computed using actions outputted by the actor, i.e. yt = rt + γQ(st+1, π(st+1)). The actor is trained with mini-batch gradient descent on the loss La = −EsQ(s, π(s)), where s is sampled from the replay buffer. The gradient of La w.r.t. actor parameters can be computed by backpropagation through the combined critic and actor networks."
+    }, {
+      "heading" : "2.4 Universal Value Function Approximators (UVFA)",
+      "text" : "Universal Value Function Approximators (UVFA) (Schaul et al., 2015a) is an extension of DQN to the setup where there is more than one goal we may try to achieve. Let G be the space of possible goals. Every goal g ∈ G corresponds to some reward function rg : S ×A → R. Every episode starts with sampling a state-goal pair from some distribution p(s0, g). The goal stays fixed for the whole episode. At every timestep the agent gets as input not only the current state but also the current goal π : S × G → A and gets the reward rt = rg(st, at). The Q-function now depends not only on a state-action pair but also on a goal Qπ(st, at, g) = E[Rt|st, at, g]. Schaul et al. (2015a) show that in this setup it is possible to train an approximator to the Q-function using direct bootstrapping from the Bellman equation (just like in case of DQN) and that a greedy policy derived from it can generalize to previously unseen state-action pairs. The extension of this approach to DDPG is straightforward."
+    }, {
+      "heading" : "3 Hindsight Experience Replay",
+      "text" : ""
+    }, {
+      "heading" : "3.1 A motivating example",
+      "text" : "Consider a bit-flipping environment with the state space S = {0, 1}n and the action space A = {0, 1, . . . , n− 1} for some integer n in which executing the i-th action flips the i-th bit of the state. For every episode we sample uniformly an initial state as well as a target state and the policy gets a reward of −1 as long as it is not in the target state, i.e. rg(s, a) = −[s 6= g].\nStandard RL algorithms are bound to fail in this environment for n > 40 because they will never experience any reward other than −1. Notice that using techniques for improving exploration (e.g. VIME (Houthooft et al., 2016), count-based exploration (Ostrovski et al., 2017) or bootstrapped DQN (Osband et al., 2016)) does not help here because the real problem is not in lack of diversity of states being visited, rather it is simply impractical to explore such a large state space. The standard solution to this problem would be to use a shaped reward function which is more informative and guides the agent towards the goal, e.g. rg(s, a) = −||s − g||2. While using a shaped reward solves the problem in our toy environment, it may be difficult to apply to more complicated problems. We investigate the results of reward shaping experimentally in Sec. 4.4.\nInstead of shaping the reward we propose a different solution which does not require any domain knowledge. Consider an episode with\n2 A polyak-averaged version of a parametric model M which is being trained is a model whose parameters are computed as an exponential moving average of the parameters of M over time.\na state sequence s1, . . . , sT and a goal g 6= s1, . . . , sT which implies that the agent received a reward of −1 at every timestep. The pivotal idea behind our approach is to re-examine this trajectory with a different goal — while this trajectory may not help us learn how to achieve the state g, it definitely tells us something about how to achieve the state sT . This information can be harvested by using an off-policy RL algorithm and experience replay where we replace g in the replay buffer by sT . In addition we can still replay with the original goal g left intact in the replay buffer. With this modification at least half of the replayed trajectories contain rewards different from −1 and learning becomes much simpler. Fig. 1 compares the final performance of DQN with and without this additional replay technique which we call Hindsight Experience Replay (HER). DQN without HER can only solve the task for n ≤ 13 while DQN with HER easily solves the task for n up to 50. See Appendix A for the details of the experimental setup. Note that this approach combined with powerful function approximators (e.g., deep neural networks) allows the agent to learn how to achieve the goal g even if it has never observed it during training.\nWe more formally describe our approach in the following sections."
+    }, {
+      "heading" : "3.2 Multi-goal RL",
+      "text" : "We are interested in training agents which learn to achieve multiple different goals. We follow the approach from Universal Value Function Approximators (Schaul et al., 2015a), i.e. we train policies and value functions which take as input not only a state s ∈ S but also a goal g ∈ G. Moreover, we show that training an agent to perform multiple tasks can be easier than training it to perform only one task (see Sec. 4.3 for details) and therefore our approach may be applicable even if there is only one task we would like the agent to perform (a similar situation was recently observed by Pinto and Gupta (2016)).\nWe assume that every goal g ∈ G corresponds to some predicate fg : S → {0, 1} and that the agent’s goal is to achieve any state s that satisfies fg(s) = 1. In the case when we want to exactly specify the desired state of the system we may use S = G and fg(s) = [s = g]. The goals can also specify only some properties of the state, e.g. suppose that S = R2 and we want to be able to achieve an arbitrary state with the given value of x coordinate. In this case G = R and fg((x, y)) = [x = g]. Moreover, we assume that given a state s we can easily find a goal g which is satisfied in this state. More formally, we assume that there is given a mapping m : S → G s.t. ∀s∈Sfm(s)(s) = 1. Notice that this assumption is not very restrictive and can usually be satisfied. In the case where each goal corresponds to a state we want to achieve, i.e. G = S and fg(s) = [s = g], the mapping m is just an identity. For the case of 2-dimensional state and 1-dimensional goals from the previous paragraph this mapping is also very simple m((x, y)) = x.\nA universal policy can be trained using an arbitrary RL algorithm by sampling goals and initial states from some distributions, running the agent for some number of timesteps and giving it a negative reward at every timestep when the goal is not achieved, i.e. rg(s, a) = −[fg(s) = 0]. This does not however work very well in practice because this reward function is sparse and not very informative.\nIn order to solve this problem we introduce the technique of Hindsight Experience Replay which is the crux of our approach."
+    }, {
+      "heading" : "3.3 Algorithm",
+      "text" : "The idea behind Hindsight Experience Replay (HER) is very simple: after experiencing some episode s0, s1, . . . , sT we store in the replay buffer every transition st → st+1 not only with the original goal used for this episode but also with a subset of other goals. Notice that the goal being pursued influences the agent’s actions but not the environment dynamics and therefore we can replay each trajectory with an arbitrary goal assuming that we use an off-policy RL algorithm like DQN (Mnih et al., 2015), DDPG (Lillicrap et al., 2015), NAF (Gu et al., 2016) or SDQN (Metz et al., 2017).\nOne choice which has to be made in order to use HER is the set of additional goals used for replay. In the simplest version of our algorithm we replay each trajectory with the goal m(sT ), i.e. the goal which is achieved in the final state of the episode. We experimentally compare different types and quantities of additional goals for replay in Sec. 4.5. In all cases we also replay each trajectory with the original goal pursued in the episode. See Alg. 1 for a more formal description of the algorithm.\nAlgorithm 1 Hindsight Experience Replay (HER) Given: • an off-policy RL algorithm A, . e.g. DQN, DDPG, NAF, SDQN • a strategy S for sampling goals for replay, . e.g. S(s0, . . . , sT ) = m(sT ) • a reward function r : S ×A× G → R. . e.g. r(s, a, g) = −[fg(s) = 0]\nInitialize A . e.g. initialize neural networks Initialize replay buffer R for episode = 1,M do\nSample a goal g and an initial state s0. for t = 0, T − 1 do\nSample an action at using the behavioral policy from A: at ← πb(st||g) . || denotes concatenation\nExecute the action at and observe a new state st+1 end for for t = 0, T − 1 do\nrt := r(st, at, g) Store the transition (st||g, at, rt, st+1||g) in R . standard experience replay Sample a set of additional goals for replay G := S(current episode) for g′ ∈ G do\nr′ := r(st, at, g ′)\nStore the transition (st||g′, at, r′, st+1||g′) in R . HER end for\nend for for t = 1, N do\nSample a minibatch B from the replay buffer R Perform one step of optimization using A and minibatch B\nend for end for\nHER may be seen as a form of implicit curriculum as the goals used for replay naturally shift from ones which are simple to achieve even by a random agent to more difficult ones. However, in contrast to explicit curriculum, HER does not require having any control over the distribution of initial environment states. Not only does HER learn with extremely sparse rewards, in our experiments it also performs better with sparse rewards than with shaped ones (See Sec. 4.4). These results are indicative of the practical challenges with reward shaping, and that shaped rewards would often constitute a compromise on the metric we truly care about (such as binary success/failure)."
+    }, {
+      "heading" : "4 Experiments",
+      "text" : "The video presenting our experiments is available at https://goo.gl/SMrQnI.\nThis section is organized as follows. In Sec. 4.1 we introduce multi-goal RL environments we use for the experiments as well as our training procedure. In Sec. 4.2 we compare the performance of DDPG with and without HER. In Sec. 4.3 we check if HER improves performance in the single-goal setup. In Sec. 4.4 we analyze the effects of using shaped reward functions. In Sec. 4.5 we compare different strategies for sampling additional goals for HER. In Sec. 4.6 we show the results of the experiments on the physical robot."
+    }, {
+      "heading" : "4.1 Environments",
+      "text" : "The are no standard environments for multi-goal RL and therefore we created our own environments. We decided to use manipulation environments based on an existing hardware robot to ensure that the challenges we face correspond as closely as possible to the real world. In all experiments we use a 7-DOF Fetch Robotics arm which has a two-fingered parallel gripper. The robot is simulated using the MuJoCo (Todorov et al., 2012) physics engine. The whole training procedure is performed in the simulation but we show in Sec. 4.6 that the trained policies perform well on the physical robot without any finetuning.\nPolicies are represented as Multi-Layer Perceptrons (MLPs) with Rectified Linear Unit (ReLU) activation functions. Training is performed using the DDPG algorithm (Lillicrap et al., 2015) with Adam (Kingma and Ba, 2014) as the optimizer. For improved efficiency we use 8 workers which average the parameters after every update. See Appendix A for more details and the values of all hyperparameters.\nWe consider 3 different tasks:\n1. Pushing. In this task a box is placed on a table in front of the robot and the task is to move it to the target location on the table. The robot fingers are locked to prevent grasping. The learned behaviour is a mixture of pushing and rolling.\n2. Sliding. In this task a puck is placed on a long slippery table and the target position is outside of the robot’s reach so that it has to hit the puck with such a force that it slides and then stops in the appropriate place due to friction.\n3. Pick-and-place. This task is similar to pushing but the target position is in the air and the fingers are not locked. To make exploration in this task easier we recorded a single state in which the box is grasped and start half of the training episodes from this state.\nStates: The state of the system is represented in the MuJoCo physics engine and consists of angles and velocities of all robot joints as well as positions, rotations and velocities (linear and angular) of all objects.\nGoals: Goals describe the desired position of the object (a box or a puck depending on the task) with some fixed tolerance of i.e. G = R3 and fg(s) = [|g − sobject| ≤ ], where sobject is the position of the object in the state s. The mapping from states to goals used in HER is simply m(s) = sobject.\nRewards: Unless stated otherwise we use binary and sparse rewards r(s, a, g) = −[fg(s′) = 0] where s′ if the state after the execution of the action a in the state s. We compare sparse and shaped reward functions in Sec. 4.4.\nState-goal distributions: For all tasks the initial position of the gripper is fixed, while the initial position of the object and the target are randomized. See Appendix A for details.\nObservations: In this paragraph relative means relative to the current gripper position. The policy is given as input the absolute position of the gripper, the relative position of the object and the target3, as well as the distance between the fingers. The Q-function is additionally given the linear velocity of\n3The target position is relative to the current object position.\nthe gripper and fingers as well as relative linear and angular velocity of the object. We decided to restrict the input to the policy in order to make deployment on the physical robot easier.\nActions: None of the problems we consider require gripper rotation and therefore we keep it fixed. Action space is 4-dimensional. Three dimensions specify the desired relative gripper position at the next timestep. We use MuJoCo constraints to move the gripper towards the desired position but Jacobian-based control could be used instead4. The last dimension specify the desired distance between the 2 fingers which are position controlled.\nStrategy S for sampling goals for replay: Unless stated otherwise HER uses replay with the goal corresponding to the final state in each episode, i.e. S(s0, . . . , sT ) = m(sT ). We compare different strategies for choosing which goals to replay with in Sec. 4.5."
+    }, {
+      "heading" : "4.2 Does HER improve performance?",
+      "text" : "In order to verify if HER improves performance we evaluate DDPG with and without HER on all 3 tasks. Moreover, we compare against DDPG with count-based exploration5 (Strehl and Littman, 2005; Kolter and Ng, 2009; Tang et al., 2016; Bellemare et al., 2016; Ostrovski et al., 2017). For HER we store each transition in the replay buffer twice: once with the goal used for the generation of the episode and once with the goal corresponding to the final state from the episode (we call this strategy final). In Sec. 4.5 we perform ablation studies of different strategies S for choosing goals for replay, here we include the best version from Sec. 4.5 in the plot for comparison.\nFrom Fig. 3 it is clear that DDPG without HER is unable to solve any of the tasks6 and DDPG with count-based exploration is only able to make some progress on the sliding task. On the other hand, DDPG with HER solves all tasks almost perfectly. It confirms that HER is a crucial element which makes learning from sparse, binary rewards possible.\n4The successful deployment on a physical robot (Sec. 4.6) confirms that our control model produces movements which are reproducible on the physical robot despite not being fully physically plausible.\n5 We discretize the state space and use an intrinsic reward of the form α/ √ N , where α is a hyperparameter and N is the number of times the given state was visited. The discretization works as follows. We take the relative position of the box and the target and then discretize every coordinate using a grid with a stepsize β which is a hyperparameter. We have performed a hyperparameter search over α ∈ {0.032, 0.064, 0.125, 0.25, 0.5, 1, 2, 4, 8, 16, 32}, β ∈ {1cm, 2cm, 4cm, 8cm}. The best results were obtained using α = 1 and β = 1cm and these are the results we report.\n6We also evaluated DQN (without HER) on our tasks and it was not able to solve any of them.\n4.3 Does HER improve performance even if there is only one goal we care about?\nIn this section we evaluate whether HER improves performance in the case where there is only one goal we care about. To this end, we repeat the experiments from the previous section but the goal state is identical in all episodes.\nFrom Fig. 4 it is clear that DDPG+HER performs much better than pure DDPG even if the goal state is identical in all episodes. More importantly, comparing Fig. 3 and Fig. 4 we can also notice that HER learns faster if training episodes contain multiple goals, so in practice it is advisable to train on multiple goals even if we care only about one of them."
+    }, {
+      "heading" : "4.4 How does HER interact with reward shaping?",
+      "text" : "So far we only considered binary rewards of the form r(s, a, g) = −[|g − sobject| > ]. In this section we check how the performance of DDPG with and without HER changes if we replace this reward with one which is shaped. We considered reward functions of the form r(s, a, g) = λ|g − sobject|p − |g − s′object|p, where s′ is the state of the environment after the execution of the action a in the state s and λ ∈ {0, 1}, p ∈ {1, 2} are hyperparameters. Fig. 5 shows the results. Surprisingly neither DDPG, nor DDPG+HER was able to successfully solve any of the tasks with any of these reward functions7.Our results are consistent with the fact that successful applications of RL to difficult manipulation tasks which does not use demonstrations usually have more complicated reward functions than the ones we tried (e.g. Popov et al. (2017)).\nThe following two reasons can cause shaped rewards to perform so poorly: (1) There is a huge discrepancy between what we optimize (i.e. a shaped reward function) and the success condition (i.e.: is the object within some radius from the goal at the end of the episode); (2) Shaped rewards penalize for inappropriate behaviour (e.g. moving the box in a wrong direction) which may hinder exploration. It can cause the agent to learn not to touch the box at all if it can not manipulate it precisely and we noticed such behaviour in some of our experiments.\nOur results suggest that domain-agnostic reward shaping does not work well (at least in the simple forms we have tried). Of course for every problem there exists a reward which makes it easy (Ng et al., 1999) but designing such shaped rewards requires a lot of domain knowledge and may in some cases not be much easier than directly scripting the policy. This strengthens our belief that learning from sparse, binary rewards is an important problem.\n4.5 How many goals should we replay each trajectory with and how to choose them?\nIn this section we experimentally evaluate different strategies (i.e. S in Alg. 1) for choosing goals to use with HER. So far the only additional goals we used for replay were the ones corresponding to\n7We also tried to rescale the distances, so that the range of rewards is similar as in the case of binary rewards, clipping big distances and adding a simple (linear or quadratic) term encouraging the gripper to move towards the object but none of these techniques have lead to successful training.\nthe final state of the environment and we will call this strategy final. Apart from it we consider the following strategies:\n• future — replay with k random states which come from the same episode as the transition being replayed and were observed after it,\n• episode — replay with k random states coming from the same episode as the transition being replayed,\n• random — replay with k random states encountered so far in the whole training procedure.\nAll of these strategies have a hyperparameter k which controls the ratio of HER data to data coming from normal experience replay in the replay buffer.\nThe plots comparing different strategies and different values of k can be found in Fig. 6. We can see from the plots that all strategies apart from random solve pushing and pick-and-place almost perfectly regardless of the values of k. In all cases future with k equal 4 or 8 performs best and it is the only strategy which is able to solve the sliding task almost perfectly. The learning curves for\nfuture with k = 4 can be found in Fig. 3. It confirms that the the most valuable goals for replay are the ones which are going to be achieved in the near future. Notice that increasing the values of k above 8 degrades performance because the fraction of normal replay data in the buffer becomes very low."
+    }, {
+      "heading" : "4.6 Deployment on a physical robot",
+      "text" : "We took a policy for the pick-and-place task trained in the simulator (version with the future strategy and k = 4 from Sec. 4.5) and deployed it on a physical fetch robot without any finetuning. The box position was predicted using a separately trained CNN using raw fetch head camera images. See Appendix B for details.\nInitially the policy succeeded in 2 out of 5 trials. It was not robust to small errors in the box position estimation because it was trained on perfect state coming from the simulation. After retraining the policy with gaussian noise (std=1cm) added to observations8 the success rate increased to 5/5. The video showing some of the trials is available at https://goo.gl/SMrQnI."
+    }, {
+      "heading" : "5 Related work",
+      "text" : "The technique of experience replay has been introduced in Lin (1992) and became very popular after it was used in the DQN agent playing Atari (Mnih et al., 2015). Prioritized experience replay (Schaul et al., 2015b) is an improvement to experience replay which prioritizes transitions in the replay buffer in order to speed up training. It it orthogonal to our work and both approaches can be easily combined.\nLearning simultaneously policies for multiple tasks have been heavily explored in the context of policy search, e.g. Caruana (1998); Da Silva et al. (2012); Kober et al. (2012); Devin et al. (2016); Pinto and Gupta (2016). Learning off-policy value functions for multiple tasks was investigated by Foster and Dayan (2002) and Sutton et al. (2011). Our work is most heavily based on Schaul et al. (2015a) who considers training a single neural network approximating multiple value functions. Learning simultaneously to perform multiple tasks has been also investigated for a long time in the context of Hierarchical Reinforcement Learning, e.g. Bakker and Schmidhuber (2004); Vezhnevets et al. (2017).\nOur approach may be seen as a form of implicit curriculum learning (Elman, 1993; Bengio et al., 2009). While curriculum is now often used for training neural networks (e.g. Zaremba and Sutskever (2014); Graves et al. (2016)), the curriculum is almost always hand-crafted. The problem of automatic curriculum generation has been approached only recently. Graves et al. (2017) consider a setup where there is a fixed discrete set of tasks and empirically evaluate different strategies for automatic curriculum generation in this settings. Another approach investigated by Sukhbaatar et al. (2017) and Held et al. (2017) uses self-play between the policy and a task-setter in order to automatically generate goal states which are on the border of what the current policy can achieve. Our approach is orthogonal to these techniques and can be combined with them.\n8The Q-function approximator was trained using exact observations. It does not have to be robust to noisy observations because it is not used during the deployment on the physical robot."
+    }, {
+      "heading" : "6 Conclusions",
+      "text" : "We introduced a novel technique called Hindsight Experience Replay which makes possible applying RL algorithms to problems with sparse and binary rewards. Our technique can be combined with an arbitrary off-policy RL algorithm and we experimentally demonstrated that with DQN and DDPG.\nWe showed that HER allows training policies which push, slide and pick-and-place objects with a robotic arm to the specified positions while the vanilla RL algorithm fails to solve these tasks. We also showed that the policy for the pick-and-place task performs well on the physical robot without any finetuning. As far as we know, it is the first time so complicated behaviours were learned using only sparse, binary rewards."
+    }, {
+      "heading" : "Acknowledgments",
+      "text" : "We would like to thank Ankur Handa, Jonathan Ho, John Schulman, Matthias Plappert, Tim Salimans, and Vikash Kumar for providing feedback on the previous versions of this manuscript. We would also like to thank Rein Houthooft and the whole OpenAI team for fruitful discussions."
+    }, {
+      "heading" : "A Experiment details",
+      "text" : "In this section we provide more details on our experimental setup and hyperparameters used.\nBit-flipping experiment: We used a network with 1 hidden layer with 256 neurons. The length of each episode was equal to the number of bits and the episode was considered successful if the goal state was achieved at an arbitrary timestep during the episode. All other hyperparameters used were the same as in the case of DDPG experiments.\nState-goal distributions: For all tasks the initial position of the gripper is fixed, for the pushing and sliding tasks it is located just above the table surface and for pushing it is located 20cm above the table. The object is placed randomly on the table in the 30cm x 30cm (20c x 20cm for sliding) square with the center directly under the gripper (both objects are 5cm wide). For pushing, the goal state is sampled uniformly from the same square as the box position. In the pick-and-place task the target is located in the air in order to force the robot to grasp (and not just push). The x and y coordinates of the goal position are sampled uniformly from the mentioned square and the height is sampled uniformly between 10cm and 45cm. For sliding the goal position is sampled from a 60cm x 60cm square centered 40cm away from the initial gripper position. For all tasks we discard initial state-goal pairs in which the goal is already satisfied.\nNetwork architecture: Both actor and critic networks have 3 hidden layers with 64 hidden units in each layer. Hidden layers use ReLu activation function and the actor output layer uses tanh. The output of the tanh is then rescaled so that it lies in the range [−5cm, 5cm]. In order to prevent tanh saturation and vanishing gradients we add the square of the their preactivations to the actor’s cost function.\nTraining procedure: We train for 200 epochs. Each epoch consists of 50 cycles where each cycle consists of running the policy for 16 episodes and then performing 40 optimization steps on minibatches of size 128 sampled uniformly from a replay buffer consisting of 106 transitions. We update the target networks after every cycle using the decay coefficient of 0.95. Apart from using the target network for computing Q-targets for the critic we also use it in testing episodes as it is more stable than the main network. The whole training procedure is distributed over 8 threads. For the Adam optimization algorithm we use the learning rate of 0.001 and the default values from Tensorflow framework (Abadi et al., 2016) for the other hyperparameters. We use the discount factor of γ = 0.98 for all transitions including the ones ending an episode. Moreover, we clip the targets used to train the critic to the range of possible values, i.e. [− 11−γ , 0].\nInput scaling: Neural networks have problems dealing with inputs of different magnitudes and therefore it is crucial to scale them properly. To this end, we rescale inputs to neural networks so that they have mean zero and standard deviation equal to one and then clip them to the range [−5, 5]. Means and standard deviations used for rescaling are computed using all the observations encountered so far in the training.\nExploration: The behavioral policy we use for exploration works as follows. With probability 20% we sample (uniformly) a random action from the hypercube of valid actions. Otherwise, we take the output of the policy network and add independently to every coordinate normal noise with standard deviation equal to 5% of the total range of allowed values on this coordinate.\nSimulation: Every episode consists of 50 environment timesteps, each of which consists of 10 MuJoCo steps with ∆t = 0.002s. MuJoCo uses soft constraints for contacts and therefore object penetration is possible. It can be minimized by using a small timestep and more constraint solver epochs but it would slow down the simulation. We encountered some penetration in the pushing task (the agent learnt to push the box into the table in a way that it is pushed out by contact forces onto the target). In order to void this behaviour we added to the reward a term penalizing the squared depth of penetration for every contact pair.\nTraining time: Training for 200 epochs took us approximately 2.5h for pushing and the pick-andplace tasks and 6h for kicking (because physics simulation was slower for this task) using 8 cpu cores."
+    }, {
+      "heading" : "B Deployment on the physical robot",
+      "text" : "We have trained a convolutional neural network (CNN) which predicts the box position given the raw image from the fetch head camera. The CNN was trained using only images coming from the Mujoco renderer. Despite the fact that training images were not photorealistic, the trained network performs well on real world data thanks to a high degree of randomization of textures, lightning and other visual parameters in training. This approach called domain randomization is described in more detail in Tobin et al. (2017).\nAt the beginning of each episode we initialize a simulated environment using the box position predicted by the CNN and robot state coming from the physical robot. From this point we run the policy in the simulator. After each timestep we send the simulated robot joint angles to the real one which is position-controlled and uses the simulated data as targets."
+    } ],
+    "references" : [ {
+      "title" : "Tensorflow: Large-scale machine learning on heterogeneous distributed systems. arXiv preprint arXiv:1603.04467",
+      "author" : [ "M. Abadi", "A. Agarwal", "P. Barham", "E. Brevdo", "Z. Chen", "C. Citro", "G.S. Corrado", "A. Davis", "J. Dean", "M Devin" ],
+      "venue" : null,
+      "citeRegEx" : "Abadi et al\\.,? \\Q2016\\E",
+      "shortCiteRegEx" : "Abadi et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Hierarchical reinforcement learning based on subgoal discovery and subpolicy specialization",
+      "author" : [ "B. Bakker", "J. Schmidhuber" ],
+      "venue" : "Proc. of the 8-th Conf. on Intelligent Autonomous Systems, pages 438–445.",
+      "citeRegEx" : "Bakker and Schmidhuber,? 2004",
+      "shortCiteRegEx" : "Bakker and Schmidhuber",
+      "year" : 2004
+    }, {
+      "title" : "Unifying countbased exploration and intrinsic motivation",
+      "author" : [ "M. Bellemare", "S. Srinivasan", "G. Ostrovski", "T. Schaul", "D. Saxton", "R. Munos" ],
+      "venue" : "Advances in Neural Information Processing Systems, pages 1471–1479.",
+      "citeRegEx" : "Bellemare et al\\.,? 2016",
+      "shortCiteRegEx" : "Bellemare et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Curriculum learning",
+      "author" : [ "Y. Bengio", "J. Louradour", "R. Collobert", "J. Weston" ],
+      "venue" : "Proceedings of the 26th annual international conference on machine learning, pages 41–48. ACM.",
+      "citeRegEx" : "Bengio et al\\.,? 2009",
+      "shortCiteRegEx" : "Bengio et al\\.",
+      "year" : 2009
+    }, {
+      "title" : "Multitask learning",
+      "author" : [ "R. Caruana" ],
+      "venue" : "Learning to learn, pages 95–133. Springer.",
+      "citeRegEx" : "Caruana,? 1998",
+      "shortCiteRegEx" : "Caruana",
+      "year" : 1998
+    }, {
+      "title" : "Path integral guided policy search",
+      "author" : [ "Y. Chebotar", "M. Kalakrishnan", "A. Yahya", "A. Li", "S. Schaal", "S. Levine" ],
+      "venue" : "arXiv preprint arXiv:1610.00529.",
+      "citeRegEx" : "Chebotar et al\\.,? 2016",
+      "shortCiteRegEx" : "Chebotar et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Learning parameterized skills",
+      "author" : [ "B. Da Silva", "G. Konidaris", "A. Barto" ],
+      "venue" : "arXiv preprint arXiv:1206.6398.",
+      "citeRegEx" : "Silva et al\\.,? 2012",
+      "shortCiteRegEx" : "Silva et al\\.",
+      "year" : 2012
+    }, {
+      "title" : "Learning modular neural network policies for multi-task and multi-robot transfer",
+      "author" : [ "C. Devin", "A. Gupta", "T. Darrell", "P. Abbeel", "S. Levine" ],
+      "venue" : "arXiv preprint arXiv:1609.07088.",
+      "citeRegEx" : "Devin et al\\.,? 2016",
+      "shortCiteRegEx" : "Devin et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Learning and development in neural networks: The importance of starting small",
+      "author" : [ "J.L. Elman" ],
+      "venue" : "Cognition, 48(1):71–99.",
+      "citeRegEx" : "Elman,? 1993",
+      "shortCiteRegEx" : "Elman",
+      "year" : 1993
+    }, {
+      "title" : "Structure in the space of value functions",
+      "author" : [ "D. Foster", "P. Dayan" ],
+      "venue" : "Machine Learning, 49(2):325–346.",
+      "citeRegEx" : "Foster and Dayan,? 2002",
+      "shortCiteRegEx" : "Foster and Dayan",
+      "year" : 2002
+    }, {
+      "title" : "Automated curriculum learning for neural networks",
+      "author" : [ "A. Graves", "M.G. Bellemare", "J. Menick", "R. Munos", "K. Kavukcuoglu" ],
+      "venue" : "arXiv preprint arXiv:1704.03003.",
+      "citeRegEx" : "Graves et al\\.,? 2017",
+      "shortCiteRegEx" : "Graves et al\\.",
+      "year" : 2017
+    }, {
+      "title" : "Hybrid computing using a neural network with dynamic external memory",
+      "author" : [ "A. Graves", "G. Wayne", "M. Reynolds", "T. Harley", "I. Danihelka", "A. Grabska-Barwińska", "S.G. Colmenarejo", "E. Grefenstette", "T. Ramalho", "J Agapiou" ],
+      "venue" : null,
+      "citeRegEx" : "Graves et al\\.,? \\Q2016\\E",
+      "shortCiteRegEx" : "Graves et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Continuous deep q-learning with model-based acceleration",
+      "author" : [ "S. Gu", "T. Lillicrap", "I. Sutskever", "S. Levine" ],
+      "venue" : "arXiv preprint arXiv:1603.00748.",
+      "citeRegEx" : "Gu et al\\.,? 2016",
+      "shortCiteRegEx" : "Gu et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Automatic goal generation for reinforcement learning agents",
+      "author" : [ "D. Held", "X. Geng", "C. Florensa", "P. Abbeel" ],
+      "venue" : "arXiv preprint arXiv:1705.06366.",
+      "citeRegEx" : "Held et al\\.,? 2017",
+      "shortCiteRegEx" : "Held et al\\.",
+      "year" : 2017
+    }, {
+      "title" : "Vime: Variational information maximizing exploration",
+      "author" : [ "R. Houthooft", "X. Chen", "Y. Duan", "J. Schulman", "F. De Turck", "P. Abbeel" ],
+      "venue" : "Advances in Neural Information Processing Systems, pages 1109– 1117.",
+      "citeRegEx" : "Houthooft et al\\.,? 2016",
+      "shortCiteRegEx" : "Houthooft et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Adam: A method for stochastic optimization",
+      "author" : [ "D. Kingma", "J. Ba" ],
+      "venue" : "arXiv preprint arXiv:1412.6980.",
+      "citeRegEx" : "Kingma and Ba,? 2014",
+      "shortCiteRegEx" : "Kingma and Ba",
+      "year" : 2014
+    }, {
+      "title" : "Reinforcement learning to adjust parametrized motor primitives to new situations",
+      "author" : [ "J. Kober", "A. Wilhelm", "E. Oztop", "J. Peters" ],
+      "venue" : "Autonomous Robots, 33(4):361–379.",
+      "citeRegEx" : "Kober et al\\.,? 2012",
+      "shortCiteRegEx" : "Kober et al\\.",
+      "year" : 2012
+    }, {
+      "title" : "Near-bayesian exploration in polynomial time",
+      "author" : [ "J.Z. Kolter", "A.Y. Ng" ],
+      "venue" : "Proceedings of the 26th Annual International Conference on Machine Learning, pages 513–520. ACM.",
+      "citeRegEx" : "Kolter and Ng,? 2009",
+      "shortCiteRegEx" : "Kolter and Ng",
+      "year" : 2009
+    }, {
+      "title" : "End-to-end training of deep visuomotor policies",
+      "author" : [ "S. Levine", "C. Finn", "T. Darrell", "P. Abbeel" ],
+      "venue" : "arXiv preprint arXiv:1504.00702.",
+      "citeRegEx" : "Levine et al\\.,? 2015",
+      "shortCiteRegEx" : "Levine et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "Continuous control with deep reinforcement learning",
+      "author" : [ "T.P. Lillicrap", "J.J. Hunt", "A. Pritzel", "N. Heess", "T. Erez", "Y. Tassa", "D. Silver", "D. Wierstra" ],
+      "venue" : "arXiv preprint arXiv:1509.02971.",
+      "citeRegEx" : "Lillicrap et al\\.,? 2015",
+      "shortCiteRegEx" : "Lillicrap et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "Self-improving reactive agents based on reinforcement learning, planning and teaching",
+      "author" : [ "Lin", "L.-J." ],
+      "venue" : "Machine learning, 8(3-4):293–321.",
+      "citeRegEx" : "Lin and L..J.,? 1992",
+      "shortCiteRegEx" : "Lin and L..J.",
+      "year" : 1992
+    }, {
+      "title" : "Discrete sequential prediction of continuous actions for deep rl",
+      "author" : [ "L. Metz", "J. Ibarz", "N. Jaitly", "J. Davidson" ],
+      "venue" : "arXiv preprint arXiv:1705.05035.",
+      "citeRegEx" : "Metz et al\\.,? 2017",
+      "shortCiteRegEx" : "Metz et al\\.",
+      "year" : 2017
+    }, {
+      "title" : "Human-level control through deep reinforcement learning",
+      "author" : [ "V. Mnih", "K. Kavukcuoglu", "D. Silver", "A.A. Rusu", "J. Veness", "M.G. Bellemare", "A. Graves", "M. Riedmiller", "A.K. Fidjeland", "G Ostrovski" ],
+      "venue" : null,
+      "citeRegEx" : "Mnih et al\\.,? \\Q2015\\E",
+      "shortCiteRegEx" : "Mnih et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "Autonomous inverted helicopter flight via reinforcement learning",
+      "author" : [ "A. Ng", "A. Coates", "M. Diel", "V. Ganapathi", "J. Schulte", "B. Tse", "E. Berger", "E. Liang" ],
+      "venue" : "Experimental Robotics IX, pages 363–372.",
+      "citeRegEx" : "Ng et al\\.,? 2006",
+      "shortCiteRegEx" : "Ng et al\\.",
+      "year" : 2006
+    }, {
+      "title" : "Policy invariance under reward transformations: Theory and application to reward shaping",
+      "author" : [ "A.Y. Ng", "D. Harada", "S. Russell" ],
+      "venue" : "ICML, volume 99, pages 278–287.",
+      "citeRegEx" : "Ng et al\\.,? 1999",
+      "shortCiteRegEx" : "Ng et al\\.",
+      "year" : 1999
+    }, {
+      "title" : "Deep exploration via bootstrapped dqn",
+      "author" : [ "I. Osband", "C. Blundell", "A. Pritzel", "B. Van Roy" ],
+      "venue" : "Advances In Neural Information Processing Systems, pages 4026–4034.",
+      "citeRegEx" : "Osband et al\\.,? 2016",
+      "shortCiteRegEx" : "Osband et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Count-based exploration with neural density models",
+      "author" : [ "G. Ostrovski", "M.G. Bellemare", "Oord", "A. v. d.", "R. Munos" ],
+      "venue" : "arXiv preprint arXiv:1703.01310.",
+      "citeRegEx" : "Ostrovski et al\\.,? 2017",
+      "shortCiteRegEx" : "Ostrovski et al\\.",
+      "year" : 2017
+    }, {
+      "title" : "Reinforcement learning of motor skills with policy gradients",
+      "author" : [ "J. Peters", "S. Schaal" ],
+      "venue" : "Neural networks, 21(4):682–697.",
+      "citeRegEx" : "Peters and Schaal,? 2008",
+      "shortCiteRegEx" : "Peters and Schaal",
+      "year" : 2008
+    }, {
+      "title" : "Learning to push by grasping: Using multiple tasks for effective learning",
+      "author" : [ "L. Pinto", "A. Gupta" ],
+      "venue" : "arXiv preprint arXiv:1609.09025.",
+      "citeRegEx" : "Pinto and Gupta,? 2016",
+      "shortCiteRegEx" : "Pinto and Gupta",
+      "year" : 2016
+    }, {
+      "title" : "Acceleration of stochastic approximation by averaging",
+      "author" : [ "B.T. Polyak", "A.B. Juditsky" ],
+      "venue" : "SIAM Journal on Control and Optimization, 30(4):838–855.",
+      "citeRegEx" : "Polyak and Juditsky,? 1992",
+      "shortCiteRegEx" : "Polyak and Juditsky",
+      "year" : 1992
+    }, {
+      "title" : "Data-efficient deep reinforcement learning for dexterous manipulation",
+      "author" : [ "I. Popov", "N. Heess", "T. Lillicrap", "R. Hafner", "G. Barth-Maron", "M. Vecerik", "T. Lampe", "Y. Tassa", "T. Erez", "M. Riedmiller" ],
+      "venue" : "arXiv preprint arXiv:1704.03073.",
+      "citeRegEx" : "Popov et al\\.,? 2017",
+      "shortCiteRegEx" : "Popov et al\\.",
+      "year" : 2017
+    }, {
+      "title" : "Universal value function approximators",
+      "author" : [ "T. Schaul", "D. Horgan", "K. Gregor", "D. Silver" ],
+      "venue" : "Proceedings of the 32nd International Conference on Machine Learning (ICML-15), pages 1312–1320.",
+      "citeRegEx" : "Schaul et al\\.,? 2015a",
+      "shortCiteRegEx" : "Schaul et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "Prioritized experience replay",
+      "author" : [ "T. Schaul", "J. Quan", "I. Antonoglou", "D. Silver" ],
+      "venue" : "arXiv preprint arXiv:1511.05952.",
+      "citeRegEx" : "Schaul et al\\.,? 2015b",
+      "shortCiteRegEx" : "Schaul et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "Mastering the game of go with deep neural networks and tree search. Nature, 529(7587):484–489",
+      "author" : [ "D. Silver", "A. Huang", "C.J. Maddison", "A. Guez", "L. Sifre", "G. Van Den Driessche", "J. Schrittwieser", "I. Antonoglou", "V. Panneershelvam", "M Lanctot" ],
+      "venue" : null,
+      "citeRegEx" : "Silver et al\\.,? \\Q2016\\E",
+      "shortCiteRegEx" : "Silver et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "A theoretical analysis of model-based interval estimation",
+      "author" : [ "A.L. Strehl", "M.L. Littman" ],
+      "venue" : "Proceedings of the 22nd international conference on Machine learning, pages 856–863. ACM.",
+      "citeRegEx" : "Strehl and Littman,? 2005",
+      "shortCiteRegEx" : "Strehl and Littman",
+      "year" : 2005
+    }, {
+      "title" : "Intrinsic motivation and automatic curricula via asymmetric self-play",
+      "author" : [ "S. Sukhbaatar", "I. Kostrikov", "A. Szlam", "R. Fergus" ],
+      "venue" : "arXiv preprint arXiv:1703.05407.",
+      "citeRegEx" : "Sukhbaatar et al\\.,? 2017",
+      "shortCiteRegEx" : "Sukhbaatar et al\\.",
+      "year" : 2017
+    }, {
+      "title" : "Horde: A scalable real-time architecture for learning knowledge from unsupervised sensorimotor interaction",
+      "author" : [ "R.S. Sutton", "J. Modayil", "M. Delp", "T. Degris", "P.M. Pilarski", "A. White", "D. Precup" ],
+      "venue" : "The 10th International Conference on Autonomous Agents and Multiagent Systems-Volume 2, pages 761–768. International Foundation for Autonomous Agents and Multiagent Systems.",
+      "citeRegEx" : "Sutton et al\\.,? 2011",
+      "shortCiteRegEx" : "Sutton et al\\.",
+      "year" : 2011
+    }, {
+      "title" : " exploration: A study of count-based exploration for deep reinforcement learning",
+      "author" : [ "H. Tang", "R. Houthooft", "D. Foote", "A. Stooke", "X. Chen", "Y. Duan", "J. Schulman", "F. De Turck", "P. Abbeel" ],
+      "venue" : "arXiv preprint arXiv:1611.04717.",
+      "citeRegEx" : "Tang et al\\.,? 2016",
+      "shortCiteRegEx" : "Tang et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Domain randomization for transferring deep neural networks from simulation to the real world",
+      "author" : [ "J. Tobin", "R. Fong", "A. Ray", "J. Schneider", "W. Zaremba", "P. Abbeel" ],
+      "venue" : "arXiv preprint arXiv:1703.06907.",
+      "citeRegEx" : "Tobin et al\\.,? 2017",
+      "shortCiteRegEx" : "Tobin et al\\.",
+      "year" : 2017
+    }, {
+      "title" : "Mujoco: A physics engine for model-based control",
+      "author" : [ "E. Todorov", "T. Erez", "Y. Tassa" ],
+      "venue" : "Intelligent Robots and Systems (IROS), 2012 IEEE/RSJ International Conference on, pages 5026–5033. IEEE.",
+      "citeRegEx" : "Todorov et al\\.,? 2012",
+      "shortCiteRegEx" : "Todorov et al\\.",
+      "year" : 2012
+    }, {
+      "title" : "Feudal networks for hierarchical reinforcement learning",
+      "author" : [ "A.S. Vezhnevets", "S. Osindero", "T. Schaul", "N. Heess", "M. Jaderberg", "D. Silver", "K. Kavukcuoglu" ],
+      "venue" : "arXiv preprint arXiv:1703.01161.",
+      "citeRegEx" : "Vezhnevets et al\\.,? 2017",
+      "shortCiteRegEx" : "Vezhnevets et al\\.",
+      "year" : 2017
+    }, {
+      "title" : "Learning to execute",
+      "author" : [ "W. Zaremba", "I. Sutskever" ],
+      "venue" : "arXiv preprint arXiv:1410.4615.",
+      "citeRegEx" : "Zaremba and Sutskever,? 2014",
+      "shortCiteRegEx" : "Zaremba and Sutskever",
+      "year" : 2014
+    }, {
+      "title" : "raw image from the fetch head camera. The CNN was trained using only images coming from the Mujoco renderer. Despite the fact that training images were not photorealistic, the trained network performs well on real world data thanks to a high degree of randomization of textures, lightning and other visual parameters in training",
+      "author" : [ "Tobin" ],
+      "venue" : null,
+      "citeRegEx" : "Tobin,? \\Q2017\\E",
+      "shortCiteRegEx" : "Tobin",
+      "year" : 2017
+    } ],
+    "referenceMentions" : [ {
+      "referenceID" : 22,
+      "context" : "This includes simulated environments, such as playing Atari games (Mnih et al., 2015), and defeating the best human player at the game of Go (Silver et al.",
+      "startOffset" : 66,
+      "endOffset" : 85
+    }, {
+      "referenceID" : 33,
+      "context" : ", 2015), and defeating the best human player at the game of Go (Silver et al., 2016), as well as robotic tasks such as helicopter control (Ng et al.",
+      "startOffset" : 63,
+      "endOffset" : 84
+    }, {
+      "referenceID" : 23,
+      "context" : ", 2016), as well as robotic tasks such as helicopter control (Ng et al., 2006), hitting a baseball (Peters and Schaal, 2008), screwing a cap onto a bottle (Levine et al.",
+      "startOffset" : 61,
+      "endOffset" : 78
+    }, {
+      "referenceID" : 27,
+      "context" : ", 2006), hitting a baseball (Peters and Schaal, 2008), screwing a cap onto a bottle (Levine et al.",
+      "startOffset" : 28,
+      "endOffset" : 53
+    }, {
+      "referenceID" : 18,
+      "context" : ", 2006), hitting a baseball (Peters and Schaal, 2008), screwing a cap onto a bottle (Levine et al., 2015), or door opening (Chebotar et al.",
+      "startOffset" : 84,
+      "endOffset" : 105
+    }, {
+      "referenceID" : 5,
+      "context" : ", 2015), or door opening (Chebotar et al., 2016).",
+      "startOffset" : 25,
+      "endOffset" : 48
+    }, {
+      "referenceID" : 24,
+      "context" : "However, a common challenge, especially for robotics, is the need to engineer a reward function that not only reflects the task at hand but is also carefully shaped (Ng et al., 1999) to guide the policy optimization.",
+      "startOffset" : 165,
+      "endOffset" : 182
+    }, {
+      "referenceID" : 5,
+      "context" : ", 2015), or door opening (Chebotar et al., 2016). However, a common challenge, especially for robotics, is the need to engineer a reward function that not only reflects the task at hand but is also carefully shaped (Ng et al., 1999) to guide the policy optimization. For example, Popov et al. (2017) use a cost function consisting of five relatively complicated terms which need to be carefully weighted in order to train a policy for stacking a brick on top of another one.",
+      "startOffset" : 26,
+      "endOffset" : 300
+    }, {
+      "referenceID" : 31,
+      "context" : "Our approach is based on training universal policies (Schaul et al., 2015a) which take as input not only the current state, but also a goal state.",
+      "startOffset" : 53,
+      "endOffset" : 75
+    }, {
+      "referenceID" : 22,
+      "context" : "Deep Q-Networks (DQN) (Mnih et al., 2015) is a model-free RL algorithm for discrete action spaces.",
+      "startOffset" : 22,
+      "endOffset" : 41
+    }, {
+      "referenceID" : 22,
+      "context" : "Deep Q-Networks (DQN) (Mnih et al., 2015) is a model-free RL algorithm for discrete action spaces. Here we sketch it only informally, see Mnih et al. (2015) for more details.",
+      "startOffset" : 23,
+      "endOffset" : 157
+    }, {
+      "referenceID" : 29,
+      "context" : "(2015)) or to use a polyak-averaged2 (Polyak and Juditsky, 1992) version of the main network instead (Lillicrap et al.",
+      "startOffset" : 37,
+      "endOffset" : 64
+    }, {
+      "referenceID" : 19,
+      "context" : "(2015)) or to use a polyak-averaged2 (Polyak and Juditsky, 1992) version of the main network instead (Lillicrap et al., 2015).",
+      "startOffset" : 101,
+      "endOffset" : 125
+    }, {
+      "referenceID" : 21,
+      "context" : "Mnih et al. (2015)) or to use a polyak-averaged2 (Polyak and Juditsky, 1992) version of the main network instead (Lillicrap et al.",
+      "startOffset" : 0,
+      "endOffset" : 19
+    }, {
+      "referenceID" : 19,
+      "context" : "Deep Deterministic Policy Gradients (DDPG) (Lillicrap et al., 2015) is a model-free RL algorithm for continuous action spaces.",
+      "startOffset" : 43,
+      "endOffset" : 67
+    }, {
+      "referenceID" : 19,
+      "context" : "Deep Deterministic Policy Gradients (DDPG) (Lillicrap et al., 2015) is a model-free RL algorithm for continuous action spaces. Here we sketch it only informally, see Lillicrap et al. (2015) for more details.",
+      "startOffset" : 44,
+      "endOffset" : 190
+    }, {
+      "referenceID" : 31,
+      "context" : "Universal Value Function Approximators (UVFA) (Schaul et al., 2015a) is an extension of DQN to the setup where there is more than one goal we may try to achieve.",
+      "startOffset" : 46,
+      "endOffset" : 68
+    }, {
+      "referenceID" : 31,
+      "context" : "Universal Value Function Approximators (UVFA) (Schaul et al., 2015a) is an extension of DQN to the setup where there is more than one goal we may try to achieve. Let G be the space of possible goals. Every goal g ∈ G corresponds to some reward function rg : S ×A → R. Every episode starts with sampling a state-goal pair from some distribution p(s0, g). The goal stays fixed for the whole episode. At every timestep the agent gets as input not only the current state but also the current goal π : S × G → A and gets the reward rt = rg(st, at). The Q-function now depends not only on a state-action pair but also on a goal Q(st, at, g) = E[Rt|st, at, g]. Schaul et al. (2015a) show that in this setup it is possible to train an approximator to the Q-function using direct bootstrapping from the Bellman equation (just like in case of DQN) and that a greedy policy derived from it can generalize to previously unseen state-action pairs.",
+      "startOffset" : 47,
+      "endOffset" : 676
+    }, {
+      "referenceID" : 14,
+      "context" : "VIME (Houthooft et al., 2016), count-based exploration (Ostrovski et al.",
+      "startOffset" : 5,
+      "endOffset" : 29
+    }, {
+      "referenceID" : 26,
+      "context" : ", 2016), count-based exploration (Ostrovski et al., 2017) or bootstrapped DQN (Osband et al.",
+      "startOffset" : 33,
+      "endOffset" : 57
+    }, {
+      "referenceID" : 25,
+      "context" : ", 2017) or bootstrapped DQN (Osband et al., 2016)) does not help here because the real problem is not in lack of diversity of states being visited, rather it is simply impractical to explore such a large state space.",
+      "startOffset" : 28,
+      "endOffset" : 49
+    }, {
+      "referenceID" : 31,
+      "context" : "We follow the approach from Universal Value Function Approximators (Schaul et al., 2015a), i.",
+      "startOffset" : 67,
+      "endOffset" : 89
+    }, {
+      "referenceID" : 28,
+      "context" : "3 for details) and therefore our approach may be applicable even if there is only one task we would like the agent to perform (a similar situation was recently observed by Pinto and Gupta (2016)).",
+      "startOffset" : 172,
+      "endOffset" : 195
+    }, {
+      "referenceID" : 22,
+      "context" : "Notice that the goal being pursued influences the agent’s actions but not the environment dynamics and therefore we can replay each trajectory with an arbitrary goal assuming that we use an off-policy RL algorithm like DQN (Mnih et al., 2015), DDPG (Lillicrap et al.",
+      "startOffset" : 223,
+      "endOffset" : 242
+    }, {
+      "referenceID" : 19,
+      "context" : ", 2015), DDPG (Lillicrap et al., 2015), NAF (Gu et al.",
+      "startOffset" : 14,
+      "endOffset" : 38
+    }, {
+      "referenceID" : 12,
+      "context" : ", 2015), NAF (Gu et al., 2016) or SDQN (Metz et al.",
+      "startOffset" : 13,
+      "endOffset" : 30
+    }, {
+      "referenceID" : 21,
+      "context" : ", 2016) or SDQN (Metz et al., 2017).",
+      "startOffset" : 16,
+      "endOffset" : 35
+    }, {
+      "referenceID" : 39,
+      "context" : "The robot is simulated using the MuJoCo (Todorov et al., 2012) physics engine.",
+      "startOffset" : 40,
+      "endOffset" : 62
+    }, {
+      "referenceID" : 19,
+      "context" : "Training is performed using the DDPG algorithm (Lillicrap et al., 2015) with Adam (Kingma and Ba, 2014) as the optimizer.",
+      "startOffset" : 47,
+      "endOffset" : 71
+    }, {
+      "referenceID" : 15,
+      "context" : ", 2015) with Adam (Kingma and Ba, 2014) as the optimizer.",
+      "startOffset" : 18,
+      "endOffset" : 39
+    }, {
+      "referenceID" : 34,
+      "context" : "Moreover, we compare against DDPG with count-based exploration5 (Strehl and Littman, 2005; Kolter and Ng, 2009; Tang et al., 2016; Bellemare et al., 2016; Ostrovski et al., 2017).",
+      "startOffset" : 64,
+      "endOffset" : 178
+    }, {
+      "referenceID" : 17,
+      "context" : "Moreover, we compare against DDPG with count-based exploration5 (Strehl and Littman, 2005; Kolter and Ng, 2009; Tang et al., 2016; Bellemare et al., 2016; Ostrovski et al., 2017).",
+      "startOffset" : 64,
+      "endOffset" : 178
+    }, {
+      "referenceID" : 37,
+      "context" : "Moreover, we compare against DDPG with count-based exploration5 (Strehl and Littman, 2005; Kolter and Ng, 2009; Tang et al., 2016; Bellemare et al., 2016; Ostrovski et al., 2017).",
+      "startOffset" : 64,
+      "endOffset" : 178
+    }, {
+      "referenceID" : 2,
+      "context" : "Moreover, we compare against DDPG with count-based exploration5 (Strehl and Littman, 2005; Kolter and Ng, 2009; Tang et al., 2016; Bellemare et al., 2016; Ostrovski et al., 2017).",
+      "startOffset" : 64,
+      "endOffset" : 178
+    }, {
+      "referenceID" : 26,
+      "context" : "Moreover, we compare against DDPG with count-based exploration5 (Strehl and Littman, 2005; Kolter and Ng, 2009; Tang et al., 2016; Bellemare et al., 2016; Ostrovski et al., 2017).",
+      "startOffset" : 64,
+      "endOffset" : 178
+    }, {
+      "referenceID" : 24,
+      "context" : "Of course for every problem there exists a reward which makes it easy (Ng et al., 1999) but designing such shaped rewards requires a lot of domain knowledge and may in some cases not be much easier than directly scripting the policy.",
+      "startOffset" : 70,
+      "endOffset" : 87
+    }, {
+      "referenceID" : 28,
+      "context" : "Popov et al. (2017)).",
+      "startOffset" : 0,
+      "endOffset" : 20
+    }, {
+      "referenceID" : 22,
+      "context" : "The technique of experience replay has been introduced in Lin (1992) and became very popular after it was used in the DQN agent playing Atari (Mnih et al., 2015).",
+      "startOffset" : 142,
+      "endOffset" : 161
+    }, {
+      "referenceID" : 32,
+      "context" : "Prioritized experience replay (Schaul et al., 2015b) is an improvement to experience replay which prioritizes transitions in the replay buffer in order to speed up training.",
+      "startOffset" : 30,
+      "endOffset" : 52
+    }, {
+      "referenceID" : 8,
+      "context" : "Our approach may be seen as a form of implicit curriculum learning (Elman, 1993; Bengio et al., 2009).",
+      "startOffset" : 67,
+      "endOffset" : 101
+    }, {
+      "referenceID" : 3,
+      "context" : "Our approach may be seen as a form of implicit curriculum learning (Elman, 1993; Bengio et al., 2009).",
+      "startOffset" : 67,
+      "endOffset" : 101
+    }, {
+      "referenceID" : 2,
+      "context" : "Caruana (1998); Da Silva et al.",
+      "startOffset" : 0,
+      "endOffset" : 15
+    }, {
+      "referenceID" : 2,
+      "context" : "Caruana (1998); Da Silva et al. (2012); Kober et al.",
+      "startOffset" : 0,
+      "endOffset" : 39
+    }, {
+      "referenceID" : 2,
+      "context" : "Caruana (1998); Da Silva et al. (2012); Kober et al. (2012); Devin et al.",
+      "startOffset" : 0,
+      "endOffset" : 60
+    }, {
+      "referenceID" : 2,
+      "context" : "Caruana (1998); Da Silva et al. (2012); Kober et al. (2012); Devin et al. (2016); Pinto and Gupta (2016).",
+      "startOffset" : 0,
+      "endOffset" : 81
+    }, {
+      "referenceID" : 2,
+      "context" : "Caruana (1998); Da Silva et al. (2012); Kober et al. (2012); Devin et al. (2016); Pinto and Gupta (2016). Learning off-policy value functions for multiple tasks was investigated by Foster and Dayan (2002) and Sutton et al.",
+      "startOffset" : 0,
+      "endOffset" : 105
+    }, {
+      "referenceID" : 2,
+      "context" : "Caruana (1998); Da Silva et al. (2012); Kober et al. (2012); Devin et al. (2016); Pinto and Gupta (2016). Learning off-policy value functions for multiple tasks was investigated by Foster and Dayan (2002) and Sutton et al.",
+      "startOffset" : 0,
+      "endOffset" : 205
+    }, {
+      "referenceID" : 2,
+      "context" : "Caruana (1998); Da Silva et al. (2012); Kober et al. (2012); Devin et al. (2016); Pinto and Gupta (2016). Learning off-policy value functions for multiple tasks was investigated by Foster and Dayan (2002) and Sutton et al. (2011). Our work is most heavily based on Schaul et al.",
+      "startOffset" : 0,
+      "endOffset" : 230
+    }, {
+      "referenceID" : 2,
+      "context" : "Caruana (1998); Da Silva et al. (2012); Kober et al. (2012); Devin et al. (2016); Pinto and Gupta (2016). Learning off-policy value functions for multiple tasks was investigated by Foster and Dayan (2002) and Sutton et al. (2011). Our work is most heavily based on Schaul et al. (2015a) who considers training a single neural network approximating multiple value functions.",
+      "startOffset" : 0,
+      "endOffset" : 287
+    }, {
+      "referenceID" : 1,
+      "context" : "Bakker and Schmidhuber (2004); Vezhnevets et al.",
+      "startOffset" : 0,
+      "endOffset" : 30
+    }, {
+      "referenceID" : 1,
+      "context" : "Bakker and Schmidhuber (2004); Vezhnevets et al. (2017). Our approach may be seen as a form of implicit curriculum learning (Elman, 1993; Bengio et al.",
+      "startOffset" : 0,
+      "endOffset" : 56
+    }, {
+      "referenceID" : 1,
+      "context" : "Bakker and Schmidhuber (2004); Vezhnevets et al. (2017). Our approach may be seen as a form of implicit curriculum learning (Elman, 1993; Bengio et al., 2009). While curriculum is now often used for training neural networks (e.g. Zaremba and Sutskever (2014); Graves et al.",
+      "startOffset" : 0,
+      "endOffset" : 259
+    }, {
+      "referenceID" : 1,
+      "context" : "Bakker and Schmidhuber (2004); Vezhnevets et al. (2017). Our approach may be seen as a form of implicit curriculum learning (Elman, 1993; Bengio et al., 2009). While curriculum is now often used for training neural networks (e.g. Zaremba and Sutskever (2014); Graves et al. (2016)), the curriculum is almost always hand-crafted.",
+      "startOffset" : 0,
+      "endOffset" : 281
+    }, {
+      "referenceID" : 1,
+      "context" : "Bakker and Schmidhuber (2004); Vezhnevets et al. (2017). Our approach may be seen as a form of implicit curriculum learning (Elman, 1993; Bengio et al., 2009). While curriculum is now often used for training neural networks (e.g. Zaremba and Sutskever (2014); Graves et al. (2016)), the curriculum is almost always hand-crafted. The problem of automatic curriculum generation has been approached only recently. Graves et al. (2017) consider a setup where there is a fixed discrete set of tasks and empirically evaluate different strategies for automatic curriculum generation in this settings.",
+      "startOffset" : 0,
+      "endOffset" : 432
+    }, {
+      "referenceID" : 1,
+      "context" : "Bakker and Schmidhuber (2004); Vezhnevets et al. (2017). Our approach may be seen as a form of implicit curriculum learning (Elman, 1993; Bengio et al., 2009). While curriculum is now often used for training neural networks (e.g. Zaremba and Sutskever (2014); Graves et al. (2016)), the curriculum is almost always hand-crafted. The problem of automatic curriculum generation has been approached only recently. Graves et al. (2017) consider a setup where there is a fixed discrete set of tasks and empirically evaluate different strategies for automatic curriculum generation in this settings. Another approach investigated by Sukhbaatar et al. (2017) and Held et al.",
+      "startOffset" : 0,
+      "endOffset" : 652
+    }, {
+      "referenceID" : 1,
+      "context" : "Bakker and Schmidhuber (2004); Vezhnevets et al. (2017). Our approach may be seen as a form of implicit curriculum learning (Elman, 1993; Bengio et al., 2009). While curriculum is now often used for training neural networks (e.g. Zaremba and Sutskever (2014); Graves et al. (2016)), the curriculum is almost always hand-crafted. The problem of automatic curriculum generation has been approached only recently. Graves et al. (2017) consider a setup where there is a fixed discrete set of tasks and empirically evaluate different strategies for automatic curriculum generation in this settings. Another approach investigated by Sukhbaatar et al. (2017) and Held et al. (2017) uses self-play between the policy and a task-setter in order to automatically generate goal states which are on the border of what the current policy can achieve.",
+      "startOffset" : 0,
+      "endOffset" : 675
+    } ],
+    "year" : 2017,
+    "abstractText" : "Dealing with sparse rewards is one of the biggest challenges in Reinforcement Learning (RL). We present a novel technique called Hindsight Experience Replay which allows sample-efficient learning from rewards which are sparse and binary and therefore avoid the need for complicated reward engineering. It can be combined with an arbitrary off-policy RL algorithm and may be seen as a form of implicit curriculum. We demonstrate our approach on the task of manipulating objects with a robotic arm. In particular, we run experiments on three different tasks: pushing, sliding, and pick-and-place, in each case using only binary rewards indicating whether or not the task is completed. Our ablation studies show that Hindsight Experience Replay is a crucial ingredient which makes training possible in these challenging environments. We show that our policies trained on a physics simulation can be deployed on a physical robot and successfully complete the task. The video presenting our experiments is available at https://goo.gl/SMrQnI.",
+    "creator" : "LaTeX with hyperref package"
+  }
+}

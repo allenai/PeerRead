@@ -1,0 +1,328 @@
+{
+  "name" : "1509.02151.pdf",
+  "metadata" : {
+    "source" : "CRF",
+    "title" : "C3: Lightweight Incrementalized MCMC for Probabilistic Programs using Continuations and Callsite Caching",
+    "authors" : [ "Daniel Ritchie", "Andreas Stuhlmüller", "Noah D. Goodman" ],
+    "emails" : [ ],
+    "sections" : [ {
+      "heading" : "1 Introduction",
+      "text" : "Probabilistic programming languages (PPLs) are a powerful, general-purpose tool for developing probabilistic models. A PPL is a programming language augmented with random sampling statements; programs written in a PPL correspond to generative priors. Performing inference on such programs amounts to reasoning about the space of execution traces which satisfy some condition on the program output. Many different PPL systems have been proposed, such as BLOG [2], Figaro [3], Church [4], Venture [5], Anglican [6], and Stan [7].\nThere are many possible implementations of PPL inference. One popular choice is the ‘Lightweight MH’ framework [1]. Lightweight MH uses a source-to-source transformation to turn a probablistic program into a deterministic one, where random choices are uniquely identified by their structural position in the program execution trace. Random choice values are then stored in a database indexed by these structural ‘addresses.’ To perform a Metropolis-Hastings proposal, Lightweight MH changes the value of a random choice and re-executes the program, looking up the values of other random choices in the database to reuse them when possible. Lightweight MH is simple to implement and allows PPLs to be built atop existing deterministic languages. Users can thus leverage existing libraries and fast compilers/runtimes for these ‘host’ languages. For example, Stochastic Matlab can access Matlab’s rich matrix and image manipulation routines [1], WebPPL runs on Google’s highly-optimized V8 Javascript engine [8], and Quicksand’s host language compiles to fast machine code using LLVM [9].\nUnfortunately, Lightweight MH is also inefficient: when an MH proposal changes a random choice, the entire program re-executes to propagate this change. This is rarely necessary: for many models, most proposals affect only a small subset of the program execution trace. To update the trace, re-execution is needed only where values can change. Under Lightweight MH, random choice val-\nar X\niv :1\n50 9.\n02 15\n1v 2\n[ cs\n.A I]\n8 S\nep 2\nues are preserved and reused when possible, limiting the effect of a proposal to a subset of the changed variable’s Markov blanket (sometimes a much smaller subset, due to context-specific independence [10]). Custom PPL interpreters can leverage this property to incrementalize proposal re-execution [5], but implementing such interpreters is complicated, and using them makes it difficult or impossible to leverage libraries and fast runtimes for existing deterministic languages.\nIn this paper, we present a new implementation technique for MH proposals on probabilistic programs that gives the best of both worlds: incrementalized proposal execution using a lightweight, source-to-source transformation framework. Our method, C3, is based on two core ideas:\n1. Continuations: Converting the program into continuation-passing style to allow program re-execution to begin anywhere.\n2. Callsite caching: Caching function calls to avoid re-execution when function inputs or ouputs have not changed.\nWe first describe how to implement C3 in any functional PPL with first-class functions; our implementation is integrated into the open-source WebPPL probabilistic programming language [8]. We then compare C3 to Lightweight MH, showing that it gives orders of magnitude speedups on common models such as HMMs, topic models, Gaussian mixtures, and hierarchical linear regression. In some cases, C3 reduces runtimes from linear in model size to constant. We also demonstrate that C3 is nearly an order of magnitude faster on a complex inverse procedural modeling example from computer graphics."
+    }, {
+      "heading" : "2 Approach",
+      "text" : "To illustrate our approach, we use a simple example: a binary state Hidden Markov Model program written in WebPPL (Figure 1 Left). This program recursively samples latent states (inside the transition function), conditioning on the observations in the obs list (inside the observation function). When invoked, hmm(N, obs) generates a linear chain of latent and observed random variables (Figure 1 Right).\nConsider how Lightweight MH performs a proposal on this program. It first runs the program once to initialize the database of random choices. It then selects a choice ci uniformly at random from this database (the red circle in Figure 1 Right) and changes its value. This change necessitates a constanttime update to the score of ci+1. However, Lightweight MH re-executes the entire program, invoking a chain of recursive calls to hmm (the orange bar in Figure 1 Right) and then unwinding those calls (the blue bar). This process requires 2N such call visits for an HMM with N states.\nOne strategy for speeding up re-execution is to cache function calls and reuse their results if they are invoked again with unchanged inputs. We call this scheme, which is a generalization of Lightweight MH’s random choice reuse policy, callsite caching. With this strategy, the recursive re-execution of hmm must still traverse all ancestors of choice ci but can stop at hmm(i, obs): it can reuse the result of hmm(i-1, obs), since the inputs have not changed. As shown in Figure 1 Right, using callsite caching can result in less re-execution, but it still requires ∼ 2N hmm call visits on average. Now suppose we instead convert the program into continuation passing style. CPS re-organizes a program to make all data and control flow explicit—instead of returning, functions invoke a ‘continuation’ function which represents the remaining computation to be performed [11]. For our HMM example, by storing the continuation at ci, computation can resume from the point where this random choice is made, which corresponds to unwinding the stack from hmm(i, obs) up to hmm(N, obs). Looking at the ‘Continuations’ row of Figure 1, this is a significant improvement over Lightweight MH and is also better than callsite caching. However, it still requires ∼ N call visits. Our main insight is that we can achieve the desired runtime by combining callsite caching with continuations—we call the resulting system C3. With C3, re-execution can not only jump directly to choice ci by invoking its continuation, but it can actually terminate almost immediately: the cache also contains the return values of all function calls, and since the return value of hmm(i+1, obs) has not changed, all subsequent computation will not change either. C3 unwinds only two recursive hmm calls, giving the desired constant-time update. Thus C3 is more than the sum of its parts: by combining caching with CPS, it enables incrementalization benefits that neither component can deliver independently.\nIn the sections that follow, we describe how to implement C3 in a functional PPL. Specifically, we describe how to transform the program source at compile-time (Section 3) to make requisite data available to the runtime caching mechanism (Section 4)."
+    }, {
+      "heading" : "3 Compile-time Source Transformations",
+      "text" : "Lightweight MH transforms the source code of probabilistic programs to compute random choice addresses; the transformed code can then be executed on existing runtimes for the host deterministic language. C3 fits into this framework by adding three additonal source transformations: caching, function tagging, and a standard continuation passing style transform for functional languages.\nCaching This transform wraps every function callsite with a call to an intrinsic cache function (Figure 2 Middle). This function performs run-time callsite cache lookups, as described in Section 4.\nFunction tagging This transform analyzes the body of each function and tags the function with both a lexically-unique ID as well as the values of its free variables (Figure 2 Right). In Section 4, we describe how C3 uses this information to decide whether a function call must be re-executed.\nThe final source transformation pipeline is: caching→ function tagging→ address computation→ CPS. Standard compiler optimizations such as inlining, constant folding, and common subexpres-\nsion elimination can then be applied. In fact, the host language compiler often already performs such optimizations, which is an additional benefit of the lightweight transformational approach."
+    }, {
+      "heading" : "4 Runtime Caching Implementation",
+      "text" : "When performing an MH proposal, callsite caching aims to avoid re-executing functions and to enable early termination from them as often as possible. In this section, we describe how C3 efficiently implements both of these types of computational ‘short-circuiting’ for probabilistic functional programs. Figure 3 provides high-level code for the main subroutines which govern the caching system."
+    }, {
+      "heading" : "4.1 Cache Representation",
+      "text" : "We first require an efficient cache structure to minimize overhead introduced by performing a cache access on every function call. C3 uses a tree-structured cache: it stores one node for each function call. A node’s children correspond to the function’s callees. Random choices are stored as leaf nodes. C3 also maintains a stack of nodes which tracks the program’s call stack (nodeStack in Figure 3). During cache lookups, the desired node, if it exists, must be a child of the node on the top of this stack. Exploiting this property accelerates lookups, which would otherwise proceed from the cache root. Altogether, this structure provides expected constant time lookups, additions, and deletions. In addition, by storing a node’s children in execution order, C3 can efficiently determine when child nodes have become ‘stale’ (i.e. unreachable) due to control flow changes and should be removed. A child node is marked unreachable when its parent begins or resumes execution (execute line 8; propagate line 6) and marked reachable when it is executed (execute line 2). Any children left marked unreachable when the parent exits are removed from the cache (execute line 16)."
+    }, {
+      "heading" : "4.2 Short-Circuit On Function Entry",
+      "text" : "As described in Section 3, every function call is wrapped in a call to cache, which retrieves (or creates) a cache node for the current address. C3 then evaluates whether the node’s associated function call must be re-evaluated or if its previous return value can be re-used (the execute function). Reuse is possible when the following two criteria are satisfied:\n1. The function’s arguments are equivalent to those from the previous execution.\n2. The function itself is equivalent to that from the previous execution.\nThe first criterion can be verified with conservative equality testing; C3 uses shallow value equality testing, though deeper equality tests could result in more reuse for structured argument types. Deep equality testing is more expensive, though this can be mitigated using data structure techniques such as hash consing [12] or compiler optimizations such as global value numbering [13].\nThe second criterion is necessary because C3 operates on languages with first-class functions, so the identity of the caller at a given callsite is a runtime variable. Checking whether the two functions are exactly equal (i.e. refer to the same closure) is too conservative, however. Instead, C3 leverages the information provided by the function tagging transform from Section 3: two functions are equivalent if they have the same lexical ID (i.e. came from the same source location) and if the values of their free variables are equal. C3 applies this check recursively to any function-valued free variables, and it also memoizes the result, as program execution traces often feature many applications of the same function. This scheme is especially critical to obtain reuse in programs that feature anonymous functions, as those manifest as different closures for each program execution."
+    }, {
+      "heading" : "4.3 Short-Circuit On Function Exit",
+      "text" : "When C3 re-executes the program after changing a random choice (using the propagate function), control may eventually return to a function call whose return value has not changed. In this case, since all subsequent computation will have the same result, C3 can terminate execution early by invoking the exit continuation kexit. During function exit, C3’s execute function detects if control is returning from a proposal by checking if the call is exiting without having first been entered (line 20). This condition signals that the current re-execution originated at some descendant of the exiting call, i.e. a random choice node.\n1 // Using the query table to infer 2 // the sequence of latent states. 3 var hmm = function(n, obs) { 4 if (n === 0) 5 return true; 6 else { 7 var prev = hmm(n-1, obs); 8 var state = transition(prev); 9 query.add(n, state);\n10 observation(state, obs[n]); 11 return state; 12 } 13 }; 14 15 hmm(100, observed_data); 16 return query;\nEarly termination is complicated by inference queries whose size depends on model size: for example, the sequence of latent states in an HMM. In lightweight PPL implementations, inference typically computes the marginal distribution on program return values. Thus, a naı̈ve HMM implementation would construct and return a list of latent states. However, this implementation makes early termination impossible, as the list must be recursively reconstructed after a change to any of its elements.\nFor these scenarios, C3 offers a solution in the form of a global query table to which the program can write values of interest. Critically, query has a write-only interface: since the program cannot read from query, a write to it cannot introduce side-\neffects in subsequent compuation, and thus the semantics of early termination are preserved. Programs that use query can then simply return it to infer the marginal distribution over its contents."
+    }, {
+      "heading" : "4.4 Optimizations",
+      "text" : "C3 takes care to ensure that the amount of work it performs in response to a proposal is only proportional to the amount of the program execution trace affected by that proposal. First, it maintains references to all random choices in a hash table, which provides expected constant time additions, deletions, and random element lookups. This table allows C3 to perform uniform random proposal choice in constant time, rather than the linear time cost of scanning through the entire cache.\nSecond, proposals may be rejected, which necessitates copying the cache in case its prior state must be restored on rejection. C3 avoids copying the entire cache using a copy-on-write scheme with similar principles to transactional memory [14]: modifications to a cache node’s properties are staged and only committed if the proposal is accepted. Thus, C3 only copies as much of the cache as is actually visited during proposal re-execution.\nFinally, it is not always optimal to cache every callsite: caching introduces overhead, and some function calls almost always change on each invocation. C3 detects such callsites and stops caching them in a heuristic process we call adaptive caching. A callsite is un-cached if, after at least N proposals, execution has reached it M times without resulting in either short-circuit-on-entry or short-circuit-on-exit. We use N = 10,M = 50 for the results presented in this paper. A small, constant overhead remains for un-cached callsites, as calling them still triggers a table lookup to determine their caching status. Future work could explore efficiently re-compiling the program to remove cache calls around such callsites."
+    }, {
+      "heading" : "5 Experimental Results",
+      "text" : "We now investigate the runtime performance characteristics of C3. We compare C3 to Lightweight MH, as well as to systems that use only callsite caching and only continuations. This allows us to investigate the incremental benefit provided by each of C3’s components. The source code for all models used in this section is available in the ancillary materials, and our implementation of C3 itself is available as part of the WebPPL probabilistic programming language [8]. All timing data was collected on an Intel Core i7-3840QM machine with 16GB RAM running OSX 10.10.2.\nWe first evaluate these systems on two standard generative models: a discrete-time Hidden Markov Model and a Latent Dirichlet Allocation model. We use synthetic data, since we are interested purely in the computational efficiency of different implementations of the same statistical inference algorithm. The HMM program uses 10 discrete latent states and 10 discrete observable states and returns the sequence of latent states. We condition it on a random sequence of observations, of\nincreasing length from 10 to 100, and run each system for 10000 MH iterations, collecting a sample every 10 iterations. The LDA program uses 10 topics, a vocabulary of 100 words, and 20 words per document. It returns the distribution over words for each topic. We condition it on a set of random documents, increasing in size from 5 to 50, and run each system for 1000 MH iterations.\nFigure 4 shows the results of this experiment; all quantities are averaged over 20 runs. We show wall clock time in seconds (left) and throughput in proposals per second (right). For the HMM, C3’s runtime is constant regardless of model size, whereas Lightweight MH and CPS Only exhibit the expected linear runtime (approximately 2N and N , respectively). As discussed in Section 2, Caching Only has the same complexity as Lightweight MH but is a constant factor slower due to caching overhead. For the LDA model, Lightweight MH and CPS Only all exhibit asymptotic complexity comparable with their performance on the HMM. However, Caching Only performs significantly better. The LDA program is structured with nested loops; caching allows re-execution to skip entire inner loops for many proposals. Caching Only must still re-execute all ancestors of a changed random choice, though, so it is slower than C3, which jumps directly to the change point. C3 does not achieve exactly constant runtime for LDA because a small percentage of its proposals affect hierarchical variables, requiring more re-execution. This is a characteristic of hierarchical models in general; in this specific case, conjugacy could be leveraged to integrate out higher-level variables.\nWe also evaluate these systems on an inverse procedural modeling program. Procedural models are programs that generate random 3D models from the same family. Inverse procedural modeling infers executions of such a program that resemble a target output shape [15]. We use a simple grammarlike program for tree skeletons presented in prior work, conditioning its output to be volumetrically similar to a target shape [16]. We run each system for 2000 MH iterations.\nFigure 5 shows the results of this experiment. C3 achieves the best performance, delivering nearly an order of magnitude speedup over Lightweight MH. Using caching only does not help in this example, since re-executing the program from its beginning reconstructs all of the recursive procedural modeling function’s structured inputs, whose equality is not captured by our cache’s shallow equality tests.\n1 2 3 4 5 6 7 8 9 10 Model Size\n0x\n20x\n40x\n60x\n80x\nS pe\ned up\nModel HMM LDA GMM HLR\nFinally, the figure on the left shows the results of a wider evaluation: for four models, we plot the speedup obtained by C3 over Lightweight MH (in relative throughput) as model size increases. The four models are: the HMM and LDA models from Figure 4, a one-dimensional finite Gaussian mixture model (GMM), and a hierarchical linear regression model (HLR) [17]. The 1-10 normalized Model Size parameter maps to a natural scale parameter for each of the four models; details are available in the ancillary materials. While C3 offers\nonly small benefits over Lightweight MH for small models, it achieves dramatic speedups of 20- 100x for large models."
+    }, {
+      "heading" : "6 Related Work",
+      "text" : "The ideas behind C3 have connections to other areas of active research. First, incrementalizing MCMC proposals for PPLs falls under the umbrella of incremental computation [18]. Much of the active work in this field seeks to build general-purpose languages and compilers to incrementalize any program [19]. However, there are also systems such as ours which seek simpler solutions to domain-specific incrementalization problems. In particular, C3’s callsite caching mechanism was inspired in part by recent work in computer graphics on hierarchical render caches [20].1\nThe Venture PPL features an algorithm to incrementally update a probabilistic execution trace in response to a random choice change [5]. Implemented as part of a custom interpreter, this method walks the trace starting from the changed node, identifying nodes which must be updated or removed, and determining when re-evaluation can stop. C3 performs a similar computation but uses continuations to traverse the execution trace rather than maintaining a complete interpreter state.\nThe Shred system also incrementalizes MH updates for PPLs [17]. Shred traces a program to remove its control flow and then uses data-flow analysis to produce incremental update procedures for each random choice. This process produces very fast proposal code, but it requires significant implementation cost, and its re-compilation overhead grows very large for programs with high control-flow variability, such as PCFGs. C3’s caching scheme is a dynamic analog to Shred’s static slicing which does not have compilation overhead but may not be as fast for models with fixed control flow.\nThe Swift compiler for the BLOG language is another recent system supporting incrementalized MCMC updates [21]. Unlike the above systems, BLOG/Swift uses a possible-world semantics for probabilistic programs, representing program state as a graphical model whose structure changes over time. Swift tracks the Markov Blanket of this model, computing incremental updates to it as model structure changes, allowing it to make efficient MCMC proposals. C3 does not explicitly compute Markov blankets, but its short-circuiting facilities limit re-execution to the subset of a changed variable’s Markov blanket that is affected by the change."
+    }, {
+      "heading" : "7 Discussion and Future Work",
+      "text" : "This paper presented C3, a lightweight, source-to-source compilation system for incrementalizing MCMC updates in probabilistic programs. We have described how C3’s two main components, continuations and callsite caching, allow it both to avoid re-executing function calls and to terminate re-execution early. Our experimental results show that C3 can provide orders-of-magnitude speedups over previous lightweight inference systems on typical generative models. It even enables constant-time updates in some cases where previous systems required linear time. We also demonstrate that C3 improves performance by nearly 10x on a complex, compute-heavy inverse procedural modeling problem. Our implementation of C3 is freely available as part of the open-source WebPPL probabilistic programming language.\nCareful optimization of computational efficiency, such as the work presented in this paper, is necessary for PPLs to move out of the domain of research and into production machine learning and AI systems. Along these lines, there are several directions for future work. First, static analysis might allow C3 to determine at compile time dependencies between random choices and subsequent function calls, obviating the need for some input equality checks and reducing caching overhead. Second, C3’s CPS transform is overcomplete: it transforms the entire program, but C3 only need continuations at random choice points. Detecting and fusing blocks of purely deterministic code before applying the CPS transform could improve performance. Finally, while the results presented in this paper focus on single-site Metropolis Hastings, C3’s core incrementalization scheme also applies to other sampling algorithms, such as Gibbs samplers or particle filter rejuvenation kernels [22].\n1An incomplete, undocumented version of C3’s callsite caching mechanism also appears in the original MIT-Church implementation of the Church probabilistic programming language [4]."
+    } ],
+    "references" : [ {
+      "title" : "Lightweight Implementations of Probabilistic Programming Languages Via Transformational Compilation",
+      "author" : [ "David Wingate", "Andreas Stuhlmüller", "Noah D. Goodman" ],
+      "venue" : "AISTATS",
+      "citeRegEx" : "1",
+      "shortCiteRegEx" : "1",
+      "year" : 2011
+    }, {
+      "title" : "BLOG: Probabilistic Models with Unknown Objects",
+      "author" : [ "Brian Milch", "Bhaskara Marthi", "Stuart J. Russell", "David Sontag", "Daniel L. Ong", "Andrey Kolobov" ],
+      "venue" : null,
+      "citeRegEx" : "2",
+      "shortCiteRegEx" : "2",
+      "year" : 2005
+    }, {
+      "title" : "Figaro: An object-oriented probabilistic programming language",
+      "author" : [ "A. Pfeffer" ],
+      "venue" : "Technical report, Charles River Analytics,",
+      "citeRegEx" : "3",
+      "shortCiteRegEx" : "3",
+      "year" : 2009
+    }, {
+      "title" : "Church: a language for generative models",
+      "author" : [ "Noah D. Goodman", "Vikash K. Mansinghka", "Daniel M. Roy", "Keith Bonawitz", "Joshua B. Tenenbaum" ],
+      "venue" : "UAI",
+      "citeRegEx" : "4",
+      "shortCiteRegEx" : "4",
+      "year" : 2008
+    }, {
+      "title" : "Venture: a higher-order probabilistic programming platform with programmable inference",
+      "author" : [ "Vikash K. Mansinghka", "Daniel Selsam", "Yura N. Perov" ],
+      "venue" : null,
+      "citeRegEx" : "5",
+      "shortCiteRegEx" : "5",
+      "year" : 2014
+    }, {
+      "title" : "A New Approach to Probabilistic Programming Inference",
+      "author" : [ "F. Wood", "J.W. van de Meent", "V. Mansinghka" ],
+      "venue" : "AISTATS",
+      "citeRegEx" : "6",
+      "shortCiteRegEx" : "6",
+      "year" : 2014
+    }, {
+      "title" : "The Design and Implementation of Probabilistic Programming Languages",
+      "author" : [ "Noah D Goodman", "Andreas Stuhlmüller" ],
+      "venue" : "http://dippl.org,",
+      "citeRegEx" : "8",
+      "shortCiteRegEx" : "8",
+      "year" : 2014
+    }, {
+      "title" : "Quicksand: A Lightweight Embedding of Probabilistic Programming for Procedural Modeling and Design",
+      "author" : [ "Daniel Ritchie" ],
+      "venue" : "In The 3rd NIPS Workshop on Probabilistic Programming,",
+      "citeRegEx" : "9",
+      "shortCiteRegEx" : "9",
+      "year" : 2014
+    }, {
+      "title" : "Context-specific Independence in Bayesian Networks",
+      "author" : [ "Craig Boutilier", "Nir Friedman", "Moises Goldszmidt", "Daphne Koller" ],
+      "venue" : "UAI",
+      "citeRegEx" : "10",
+      "shortCiteRegEx" : "10",
+      "year" : 1996
+    }, {
+      "title" : "Compiling with Continuations",
+      "author" : [ "Andrew W. Appel" ],
+      "venue" : null,
+      "citeRegEx" : "11",
+      "shortCiteRegEx" : "11",
+      "year" : 2007
+    }, {
+      "title" : "Monocopy and associative algorithms in an extended lisp",
+      "author" : [ "E. Goto" ],
+      "venue" : "Technical report,",
+      "citeRegEx" : "12",
+      "shortCiteRegEx" : "12",
+      "year" : 1974
+    }, {
+      "title" : "Global Value Numbers and Redundant Computations",
+      "author" : [ "B.K. Rosen", "M.N. Wegman", "F.K. Zadeck" ],
+      "venue" : null,
+      "citeRegEx" : "13",
+      "shortCiteRegEx" : "13",
+      "year" : 1988
+    }, {
+      "title" : "Transactional Memory: Architectural Support for Lockfree Data Structures",
+      "author" : [ "Maurice Herlihy", "J. Eliot B. Moss" ],
+      "venue" : null,
+      "citeRegEx" : "14",
+      "shortCiteRegEx" : "14",
+      "year" : 1993
+    }, {
+      "title" : "Controlling Procedural Modeling Programs with Stochastically-Ordered Sequential Monte Carlo",
+      "author" : [ "Daniel Ritchie", "Ben Mildenhall", "Noah D. Goodman", "Pat Hanrahan" ],
+      "venue" : null,
+      "citeRegEx" : "16",
+      "shortCiteRegEx" : "16",
+      "year" : 2015
+    }, {
+      "title" : "Generating Efficient MCMC Kernels from Probabilistic Programs",
+      "author" : [ "Lingfeng Yang", "Pat Hanrahan", "Noah D. Goodman" ],
+      "venue" : "AISTATS",
+      "citeRegEx" : "17",
+      "shortCiteRegEx" : "17",
+      "year" : 2014
+    }, {
+      "title" : "A Categorized Bibliography on Incremental Computation",
+      "author" : [ "G. Ramalingam", "Thomas Reps" ],
+      "venue" : null,
+      "citeRegEx" : "18",
+      "shortCiteRegEx" : "18",
+      "year" : 1993
+    }, {
+      "title" : "Type-Directed Automatic Incrementalization",
+      "author" : [ "Yan Chen", "Joshua Dunfield", "Umut A. Acar" ],
+      "venue" : "PLDI",
+      "citeRegEx" : "19",
+      "shortCiteRegEx" : "19",
+      "year" : 2012
+    }, {
+      "title" : "Lazy Incremental Computation for Efficient Scene Graph Rendering",
+      "author" : [ "Michael Wörister", "Harald Steinlechner", "Stefan Maierhofer", "Robert F. Tobler" ],
+      "venue" : "HPG",
+      "citeRegEx" : "20",
+      "shortCiteRegEx" : "20",
+      "year" : 2013
+    }, {
+      "title" : "SWIFT: Compiled Inference for Probabilistic Programs",
+      "author" : [ "Lei Li", "Yi Wu", "Stuart J. Russell" ],
+      "venue" : "Technical report,",
+      "citeRegEx" : "21",
+      "shortCiteRegEx" : "21",
+      "year" : 2015
+    }, {
+      "title" : "Following a moving target—Monte Carlo inference for dynamic Bayesian models",
+      "author" : [ "Walter R. Gilks", "Carlo Berzuini" ],
+      "venue" : "Journal of the Royal Statistical Society: Series B (Statistical Methodology),",
+      "citeRegEx" : "22",
+      "shortCiteRegEx" : "22",
+      "year" : 2001
+    } ],
+    "referenceMentions" : [ {
+      "referenceID" : 0,
+      "context" : "Lightweight, source-to-source transformation approaches to implementing MCMC for probabilistic programming languages are popular for their simplicity, support of existing deterministic code, and ability to execute on existing fast runtimes [1].",
+      "startOffset" : 240,
+      "endOffset" : 243
+    }, {
+      "referenceID" : 1,
+      "context" : "Many different PPL systems have been proposed, such as BLOG [2], Figaro [3], Church [4], Venture [5], Anglican [6], and Stan [7].",
+      "startOffset" : 60,
+      "endOffset" : 63
+    }, {
+      "referenceID" : 2,
+      "context" : "Many different PPL systems have been proposed, such as BLOG [2], Figaro [3], Church [4], Venture [5], Anglican [6], and Stan [7].",
+      "startOffset" : 72,
+      "endOffset" : 75
+    }, {
+      "referenceID" : 3,
+      "context" : "Many different PPL systems have been proposed, such as BLOG [2], Figaro [3], Church [4], Venture [5], Anglican [6], and Stan [7].",
+      "startOffset" : 84,
+      "endOffset" : 87
+    }, {
+      "referenceID" : 4,
+      "context" : "Many different PPL systems have been proposed, such as BLOG [2], Figaro [3], Church [4], Venture [5], Anglican [6], and Stan [7].",
+      "startOffset" : 97,
+      "endOffset" : 100
+    }, {
+      "referenceID" : 5,
+      "context" : "Many different PPL systems have been proposed, such as BLOG [2], Figaro [3], Church [4], Venture [5], Anglican [6], and Stan [7].",
+      "startOffset" : 111,
+      "endOffset" : 114
+    }, {
+      "referenceID" : 0,
+      "context" : "One popular choice is the ‘Lightweight MH’ framework [1].",
+      "startOffset" : 53,
+      "endOffset" : 56
+    }, {
+      "referenceID" : 0,
+      "context" : "For example, Stochastic Matlab can access Matlab’s rich matrix and image manipulation routines [1], WebPPL runs on Google’s highly-optimized V8 Javascript engine [8], and Quicksand’s host language compiles to fast machine code using LLVM [9].",
+      "startOffset" : 95,
+      "endOffset" : 98
+    }, {
+      "referenceID" : 6,
+      "context" : "For example, Stochastic Matlab can access Matlab’s rich matrix and image manipulation routines [1], WebPPL runs on Google’s highly-optimized V8 Javascript engine [8], and Quicksand’s host language compiles to fast machine code using LLVM [9].",
+      "startOffset" : 162,
+      "endOffset" : 165
+    }, {
+      "referenceID" : 7,
+      "context" : "For example, Stochastic Matlab can access Matlab’s rich matrix and image manipulation routines [1], WebPPL runs on Google’s highly-optimized V8 Javascript engine [8], and Quicksand’s host language compiles to fast machine code using LLVM [9].",
+      "startOffset" : 238,
+      "endOffset" : 241
+    }, {
+      "referenceID" : 8,
+      "context" : "ues are preserved and reused when possible, limiting the effect of a proposal to a subset of the changed variable’s Markov blanket (sometimes a much smaller subset, due to context-specific independence [10]).",
+      "startOffset" : 202,
+      "endOffset" : 206
+    }, {
+      "referenceID" : 4,
+      "context" : "Custom PPL interpreters can leverage this property to incrementalize proposal re-execution [5], but implementing such interpreters is complicated, and using them makes it difficult or impossible to leverage libraries and fast runtimes for existing deterministic languages.",
+      "startOffset" : 91,
+      "endOffset" : 94
+    }, {
+      "referenceID" : 6,
+      "context" : "We first describe how to implement C3 in any functional PPL with first-class functions; our implementation is integrated into the open-source WebPPL probabilistic programming language [8].",
+      "startOffset" : 184,
+      "endOffset" : 187
+    }, {
+      "referenceID" : 9,
+      "context" : "CPS re-organizes a program to make all data and control flow explicit—instead of returning, functions invoke a ‘continuation’ function which represents the remaining computation to be performed [11].",
+      "startOffset" : 194,
+      "endOffset" : 198
+    }, {
+      "referenceID" : 10,
+      "context" : "Deep equality testing is more expensive, though this can be mitigated using data structure techniques such as hash consing [12] or compiler optimizations such as global value numbering [13].",
+      "startOffset" : 123,
+      "endOffset" : 127
+    }, {
+      "referenceID" : 11,
+      "context" : "Deep equality testing is more expensive, though this can be mitigated using data structure techniques such as hash consing [12] or compiler optimizations such as global value numbering [13].",
+      "startOffset" : 185,
+      "endOffset" : 189
+    }, {
+      "referenceID" : 12,
+      "context" : "C3 avoids copying the entire cache using a copy-on-write scheme with similar principles to transactional memory [14]: modifications to a cache node’s properties are staged and only committed if the proposal is accepted.",
+      "startOffset" : 112,
+      "endOffset" : 116
+    }, {
+      "referenceID" : 6,
+      "context" : "The source code for all models used in this section is available in the ancillary materials, and our implementation of C3 itself is available as part of the WebPPL probabilistic programming language [8].",
+      "startOffset" : 199,
+      "endOffset" : 202
+    }, {
+      "referenceID" : 13,
+      "context" : "We use a simple grammarlike program for tree skeletons presented in prior work, conditioning its output to be volumetrically similar to a target shape [16].",
+      "startOffset" : 151,
+      "endOffset" : 155
+    }, {
+      "referenceID" : 14,
+      "context" : "The four models are: the HMM and LDA models from Figure 4, a one-dimensional finite Gaussian mixture model (GMM), and a hierarchical linear regression model (HLR) [17].",
+      "startOffset" : 163,
+      "endOffset" : 167
+    }, {
+      "referenceID" : 15,
+      "context" : "First, incrementalizing MCMC proposals for PPLs falls under the umbrella of incremental computation [18].",
+      "startOffset" : 100,
+      "endOffset" : 104
+    }, {
+      "referenceID" : 16,
+      "context" : "Much of the active work in this field seeks to build general-purpose languages and compilers to incrementalize any program [19].",
+      "startOffset" : 123,
+      "endOffset" : 127
+    }, {
+      "referenceID" : 17,
+      "context" : "In particular, C3’s callsite caching mechanism was inspired in part by recent work in computer graphics on hierarchical render caches [20].",
+      "startOffset" : 134,
+      "endOffset" : 138
+    }, {
+      "referenceID" : 4,
+      "context" : "The Venture PPL features an algorithm to incrementally update a probabilistic execution trace in response to a random choice change [5].",
+      "startOffset" : 132,
+      "endOffset" : 135
+    }, {
+      "referenceID" : 14,
+      "context" : "The Shred system also incrementalizes MH updates for PPLs [17].",
+      "startOffset" : 58,
+      "endOffset" : 62
+    }, {
+      "referenceID" : 18,
+      "context" : "The Swift compiler for the BLOG language is another recent system supporting incrementalized MCMC updates [21].",
+      "startOffset" : 106,
+      "endOffset" : 110
+    }, {
+      "referenceID" : 19,
+      "context" : "Finally, while the results presented in this paper focus on single-site Metropolis Hastings, C3’s core incrementalization scheme also applies to other sampling algorithms, such as Gibbs samplers or particle filter rejuvenation kernels [22].",
+      "startOffset" : 235,
+      "endOffset" : 239
+    }, {
+      "referenceID" : 3,
+      "context" : "An incomplete, undocumented version of C3’s callsite caching mechanism also appears in the original MIT-Church implementation of the Church probabilistic programming language [4].",
+      "startOffset" : 175,
+      "endOffset" : 178
+    } ],
+    "year" : 2015,
+    "abstractText" : "Lightweight, source-to-source transformation approaches to implementing MCMC for probabilistic programming languages are popular for their simplicity, support of existing deterministic code, and ability to execute on existing fast runtimes [1]. However, they are also slow, requiring a complete re-execution of the program on every Metropolis Hastings proposal. We present a new extension to the lightweight approach, C3, which enables efficient, incrementalized re-execution of MH proposals. C3 is based on two core ideas: transforming probabilistic programs into continuation passing style (CPS), and caching the results of function calls. We show that on several common models, C3 reduces proposal runtime by 20-100x, in some cases reducing runtime complexity from linear in model size to constant. We also demonstrate nearly an order of magnitude speedup on a complex inverse procedural modeling application.",
+    "creator" : "LaTeX with hyperref package"
+  }
+}

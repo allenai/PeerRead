@@ -1,0 +1,415 @@
+{
+  "name" : "1702.05800.pdf",
+  "metadata" : {
+    "source" : "CRF",
+    "title" : "REVISITING DISTRIBUTED SYNCHRONOUS SGD",
+    "authors" : [ "Jianmin Chen", "Xinghao Pan", "Rajat Monga", "Samy Bengio", "Rafal Jozefowicz" ],
+    "emails" : [ "jmchen@google.com", "xinghao@google.com", "rajatmonga@google.com", "bengio@google.com", "rafal@openai.com", "xinghao@eecs.berkeley.edu" ],
+    "sections" : [ {
+      "heading" : "1 INTRODUCTION",
+      "text" : "The recent success of deep learning approaches for domains like speech recognition (Hinton et al., 2012) and computer vision (Ioffe & Szegedy, 2015) stems from many algorithmic improvements but also from the fact that the size of available training data has grown significantly over the years, together with the computing power, in terms of both CPUs and GPUs. While a single GPU often provides algorithmic simplicity and speed up to a given scale of data and model, there exist an operating point where a distributed implementation of training algorithms for deep architectures becomes necessary.\nCurrently, popular distributed training algorithms include mini-batch versions of stochastic gradient descent (SGD) and other stochastic optimization algorithms such as AdaGrad (Duchi et al., 2011), RMSProp (Tieleman & Hinton, 2012), and ADAM (Kingma & Ba, 2014). Unfortunately, bulksynchronous implementations of stochastic optimization are often slow in practice due to the need to wait for the slowest machine in each synchronous batch. To circumvent this problem, practitioners have resorted to asynchronous approaches which emphasize speed by using potentially stale information for computation. While asynchronous training have proven to be faster than their synchronous counterparts, they often result in convergence to poorer results.\nIn this paper1, we revisit synchronous learning, and propose a method for mitigating stragglers in synchronous stochastic optimization. Specifically, we synchronously compute a mini-batch gradient with only a subset of worker machines, thus alleviating the straggler effect while avoiding any staleness in our gradients. The primary contributions of our paper are:\n• Illustration of how gradient staleness in asynchronous training negatively impacts test accuracy and is exacerbated by deep models.\n• Measurement of machine response times for synchronous stochastic optimization in a large deployment of 100 GPUs, showing how stragglers in the tail end affect convergence speed.\n• Proposal of synchronous stochastic optimization with backup workers to mitigate straggler effects without gradient staleness.\n• Establishing the need to measure both speed of convergence and test accuracy of optimum for empirical validation.\n∗Joint first authors †UC Berkeley, Berkeley, CA, USA, xinghao@eecs.berkeley.edu 1This is an extension of our ICLR 2016 workshop extended abstract (Chen et al., 2016).\nar X\niv :1\n70 2.\n05 80\n0v 1\n[ cs\n.D C\n] 1\n9 Fe\nb 20\n17\n• Empirical demonstration that our proposed synchronous training method outperforms asynchronous training by converging faster and to better test accuracies.\nThe remainder of this paper is organized as follows. We briefly present preliminaries and notation in Section 1.1. Section 2 describes asynchronous stochastic optimization and presents experimental evidence of gradient staleness in deep neural network models. We present our approach in Section 3, and exhibit straggler effects that motivate the approach. We then empirically evaluate our approach in Sections 4. Related work is discussed in Section 5, and we conclude in Section 6."
+    }, {
+      "heading" : "1.1 PRELIMINARIES AND NOTATION",
+      "text" : "Given a dataset X = {xi : i = 1, . . . , |X |}, our goal is to learn the parameters θ of a model with respect to an empirical loss function f , defined as f(θ) ∆= 1|X | ∑|X | i=1 F (xi; θ), where F (xi; θ) is the loss with respect to a datapoint xi and the model θ.\nA first-order stochastic optimization algorithm achieves this by iteratively updating θ using a stochastic gradient G ∆= ∇F (xi; θ) computed at a randomly sampled xi, producing a sequence of models θ(0), θ(1), . . . . Stochastic optimization algorithms differ in their update equations. For example, the update of SGD is θ(t+1) = θ(t) − γtG(t) = θ(t) − γt∇F (xi; θ(t)), where γt is the learning rate or step size at iteration t. A mini-batch version of the stochastic optimization algorithm computes the stochastic gradient over mini-batch of size B instead of a single datapoint, i.e., G\n∆ = 1B ∑B i=1∇F (x̃i; θ(t)), where x̃i’s are randomly sampled from X . We will often evaluate performance on an exponential moving average θ̄(t) = αθ̄(t−1) + (1− α)θ(t) with decay rate α. Our interest is in distributed stochastic optimization using N worker machines in charge of computing stochastic gradients that are sent to M parameter servers. Each parameter server j is responsible for storing a subset θ[j] of the model, and performing updates on θ[j]. In the synchronous setting, we will also introduce additional b backup workers for straggler mitigation."
+    }, {
+      "heading" : "2 ASYNCHRONOUS STOCHASTIC OPTIMIZATION",
+      "text" : "An approach for a distributed stochastic gradient descent algorithm was presented in Dean et al. (2012), consisting of two main ingredients. First, the parameters of the model are distributed on multiple servers, depending on the architecture. This set of servers are called the parameter servers. Second, there can be multiple workers processing data in parallel and communicating with the parameter servers. Each worker processes a mini-batch of data independently of the others, as follows:\n• The worker fetches from the parameter servers the most up-to-date parameters of the model needed to process the current mini-batch; • It then computes gradients of the loss with respect to these parameters; • Finally, these gradients are sent back to the parameter servers, which then updates the\nmodel accordingly.\nSince each worker communicates with the parameter servers independently of the others, this is called Asynchronous Stochastic Gradient Descent (Async-SGD), or more generally, Asynchronous Stochastic Optimization (Async-Opt). A similar approach was later proposed by Chilimbi et al. (2014). Async-Opt is presented in Algorithms 1 and 2.\nIn practice, the updates of Async-Opt are different than those of serially running the stochastic optimization algorithm for two reasons. Firstly, the read operation (Algo 1 Line 2) on a worker may be interleaved with updates by other workers to different parameter servers, so the resultant θ̂k may not be consistent with any parameter incarnation θ(t). Secondly, model updates may have occurred while a worker is computing its stochastic gradient; hence, the resultant gradients are typically computed with respect to outdated parameters. We refer to these as stale gradients, and its staleness as the number of updates that have occurred between its corresponding read and update operations.\nUnderstanding the theoretical impact of staleness is difficult work and the topic of many recent papers, e.g. Recht et al. (2011); Duchi et al. (2013); Leblond et al. (2016); Reddi et al. (2015);\nAlgorithm 1: Async-SGD worker k Input: Dataset X Input: B mini-batch size\n1 while True do 2 Read θ̂k = (θ[0], . . . , θ[M ]) from PSs. 3 G\n(t) k := 0.\n4 for i = 1, . . . , B do 5 Sample datapoint x̃i from X . 6 G\n(t) k ← G (t) k + 1 B ∇F (x̃i; θ̂k).\n7 end 8 Send G(t)k to parameter servers. 9 end\nAlgorithm 2: Async-SGD Parameter Server j Input: γ0, γ1, . . . learning rates. Input: α decay rate. Input: θ(0) model initialization.\n1 for t = 0, 1, . . . do 2 Wait for gradient G from any worker. 3 θ(t+1)[j]← θ(t)[j]− γtG[j]. 4 θ̄(t)[j] = αθ̄(t−1)[j] + (1− α)θ(t)[j]. 5 end\nDe Sa et al. (2015); Mania et al. (2015), most of which focus on individual algorithms, under strong assumptions that may not hold up in practice. This is further complicated by deep models with multiple layers, since the times at which model parameters are read and which gradients are computed and sent are dependent on the depth of the layers (Figure 1). To better understand this dependence in real models, we collected staleness statistics on a Async-Opt run with 40 workers on a 18-layer Inception model (Szegedy et al., 2016) trained on the ImageNet Challenge dataset (Russakovsky et al., 2015), as shown in Table 1.\nDespite the abovementioned problems, Async-Opt has been shown to be scale well up to a few dozens of workers for some models. However, at larger scales, increasing the number of machines (and thus staleness of gradients) can result in poorer trained models."
+    }, {
+      "heading" : "2.1 IMPACT OF STALENESS ON TEST ACCURACY",
+      "text" : "We explore how increased staleness contributes to training of poorer models. In order to mimic the setting on a smaller scale, we trained a state-of-the-art MNIST CNN model but simulated staleness by using old gradients for the parameter updates. Details of the model and training are provided in Appendix A.1.\nThe best final classification error on a test set was 0.36%, which increases to 0.47% with average gradient staleness of 20 steps, and up to 0.79% with 50 steps (see Figure 2).\nOnce the average simulated staleness was chosen to be more than 15 steps, the results started to significantly deteriorate and the training itself became much less stable. We had to employ following tricks to prevent the results from blowing up:\n• Slowly increase the staleness over the first 3 epochs of training. This mimics increasing the number of asynchronous workers and is also very important in practice for some of the models we experimented with (e.g. large word-level language models). The trick was not relevant with a simulated staleness less than 15 but became crucial for larger values.\n• Use lower initial learning rates when staleness is at least 20, which reduces a frequency of explosions (train error goes to 90%). This observation is similar to what we found in other experiments - we were able to use much larger learning rates with synchronous training and the results were also more stable.\n• Even with above tricks the divergence occurs occasionally and we found that restarting training from random weights can lead to more successful runs. The best results were then chosen based on validation set performance."
+    }, {
+      "heading" : "3 REVISTING SYNCHRONOUS STOCHASTIC OPTIMIZATION",
+      "text" : "Both Dean et al. (2012) and Chilimbi et al. (2014) use versions of Async-SGD where the main potential problem is that each worker computes gradients over a potentially old version of the model. In order to remove this discrepancy, we propose here to reconsider a synchronous version of distributed stochastic gradient descent (Sync-SGD), or more generally, Synchronous Stochastic Optimization (Sync-Opt), where the parameter servers wait for all workers to send their gradients, aggregate them, and send the updated parameters to all workers afterward. This ensures that the actual algorithm is a true mini-batch stochastic gradient descent, with an effective batch size equal to the sum of all the mini-batch sizes of the workers.\nWhile this approach solves the staleness problem, it also introduces the potential problem that the actual update time now depends on the slowest worker. Although workers have equivalent computation and network communication workload, slow stragglers may result from failing hardware, or contention on shared underlying hardware resources in data centers, or even due to preemption by other jobs.\nTo alleviate the straggler problem, we introduce backup workers (Dean & Barroso, 2013) as follows: instead of having only N workers, we add b extra workers, but as soon as the parameter servers receive gradients from any N workers, they stop waiting and update their parameters using the N gradients. The slowest b workers’ gradients will be dropped when they arrive. Our method is presented in Algorithms 3, 4.\nAlgorithm 3: Sync-SGD worker k, where k = 1, . . . , N + b\nInput: Dataset X Input: B mini-batch size\n1 for t = 0, 1, . . . do 2 Wait to read θ(t) = (θ(t)[0], . . . , θ(t)[M ]) from parameter servers. 3 G\n(t) k := 0\n4 for i = 1, . . . , B do 5 Sample datapoint x̃k,i from X . 6 G\n(t) k ← G (t) k + 1 B ∇F (x̃k,i; θ(t)).\n7 end 8 Send (G(t)k , t) to parameter servers. 9 end\nAlgorithm 4: Sync-SGD Parameter Server j Input: γ0, γ1, . . . learning rates. Input: α decay rate. Input: N number of mini-batches to aggregate. Input: θ(0) model initialization.\n1 for t = 0, 1, . . . do 2 G = {} 3 while |G| < N do 4 Wait for (G, t′) from any worker. 5 if t′ == t then G ← G ∪ {G}. 6 else Drop gradient G. 7 end 8 θ(t+1)[j]← θ(t)[j]− γt\nN ∑ G∈G G[j].\n9 θ̄(t)[j] = αθ̄(t−1)[j] + (1− α)θ(t)[j]. 10 end"
+    }, {
+      "heading" : "3.1 STRAGGLER EFFECTS",
+      "text" : "The use of backup workers is motivated by the need to mitigate slow stragglers while maximizing computation. We investigate the effect of stragglers on Sync-Opt model training here.\nWe ran Sync-Opt with N = 100 workers, b = 0 backups, and 19 parameter servers on the Inception model. Using one variable as a proxy, we collected for each iteration both the start time of the iteration and the time when the kth gradient of that variable arrived at the parameter server. These times are presented in Figure 3 for k = 1, 50, 90, 97, 98, 99, 100. Note that 80% of the 98th gradient arrives in under 2s, whereas only 30% of the final gradient do. Furthermore, the time to collect the final few gradients grows exponentially, resulting in wasted idle resources and time expended to wait for the slowest gradients. This exponential increase is also seen in Figure 4.\nThus, one might choose to drop slow stragglers to decrease the iteration time. However, using fewer machines implies a smaller effective mini-batch size and thus greater gradient variance, which in turn could require more iterations for convergence. We examine this relationship by running Sync-Opt2 with N = 50, 70, 80, 90, 100 and b = 6, and note the number of iterations required for convergence in Figure 5. Additional details of this training are provided in Appendix A.2. As N is doubled from 50 to 100, the number of iterations to converge nearly halves from 137.5e3 to 76.2e3.\n2 Since we are interested in the gradient quality and convergence behavior but not running time in this experiment, the backups serve only to reduce our data collection time but do not affect our analysis.\nHence, there is a trade-off between dropping more stragglers to reduce iteration time, and waiting for more gradients to improve the gradient quality. Consider a hypothetical setting where we have N + b = 100 machines, and we wish to choose the best configuration of N and b to minimize running time to convergence. For each configuration, we can estimate the iterations required from Figure 5 (linearly interpolating for values of N for which we did not collect data). We can multiply this with the mean iteration times (Figure 4) to obtain the running time required to converge for each setting of N and b. These results are shown in Figure 6, indicating that N = 96, b = 4 converges fastest. Therefore, this motivates our choice to use a few backup workers for mitigating stragglers."
+    }, {
+      "heading" : "4 EXPERIMENTS",
+      "text" : "In this section, we present our empirical comparisons of synchronous and asynchronous distributed stochastic optimization algorithms as applied to models such as Inception and PixelCNN. All experiments in this paper are using the TensorFlow system (Abadi et al., 2015)."
+    }, {
+      "heading" : "4.1 METRICS OF COMPARISON: FASTER CONVERGENCE, BETTER OPTIMUM",
+      "text" : "We are interested in two metrics of comparison for our empirical validation: (1) test error or accuracy, and (2) speed of convergence. We point out that for non-convex deep learning models, it is possible to converge faster to a poorer local optimum. Here we show a simple example with Inception using different learning rates.\nWe ran Sync-Opt on Inception with N = 100 and b = 6, but varied the initial learning rate γ0 between 1.125 and 9.0. (Learning rates are exponentially decreased with iterations.) Table 2 shows that smaller γ0 converge faster, but to poorer test precisions. Focusing on speed on an early phase of training could lead to misleading conclusions if we fail to account for eventual convergence. For example, Figure 3b shows that using γ0 = 1.125 reaches = 75% precision 1.5× faster than γ0 = 4.5, but is slower for = 77.75%, and fails to reach higher precisions."
+    }, {
+      "heading" : "4.2 INCEPTION",
+      "text" : "We conducted experiments on the Inception model (Szegedy et al., 2016) trained on ImageNet Challenge dataset (Russakovsky et al., 2015), where the task is to classify images out of 1000 categories. We used several configurations, varying N + b from 53 to 212 workers. Additional details of the training are provided in Appendix A.3. An epoch is a synchronous iteration for Sync-Opt, or a full pass of N updates for Async-Opt, which represent similar amounts of computation. Results of this experiment are presented in Figure 8.\nFigure 8b shows that Sync-Opt outperforms Async-Opt in test precision: Sync-Opt attains ∼0.5% better test precision than Async-Opt for comparable N + b workers. Furthermore, Sync-Opt converges 6h and 18h faster than Async-Opt for 106 and 212 workers respectively, and is 3h slower\nwhen 53 workers are used, as seen in Figure 8d. This difference in speed is largely due to the fewer epochs (Figure 8c) needed by Sync-Opt, but comparable or better epoch time (Figure 8e)."
+    }, {
+      "heading" : "4.3 PIXELCNN EXPERIMENTS",
+      "text" : "The second model we experimented on is PixelCNN (Oord et al., 2016), a conditional image generation deep neural network, which we train on the CIFAR-10 (Krizhevsky & Hinton, 2009) dataset. Configurations of N + b = 1, 8, 16 workers were used; for Sync-Opt, we always used b = 1 backup worker. Additional details are provided in Appendix A.4.\nConvergence of the test negative log likelihood (NLL) on PixelCNN is shown in Figure 9a, where lower is better. Observe that Sync-Opt obtains lower NLL than Async-Opt; in fact, Async-Opt is even outperformed by serial RMSProp with N = 1 worker, with degrading performance as N increases from 8 to 16. Figure 9b further shows the time taken to reach test NLL. Sync-Opt reduces the time to reach = 2.183 from 40h to < 13h; this NLL is not even achieved by Async-Opt."
+    }, {
+      "heading" : "5 RELATED WORK",
+      "text" : "Multicore and distributed optimization algorithms have received much attention in recent years. Asynchronous algorithms include Recht et al. (2011); Duchi et al. (2013); Zhang et al. (2015a); Reddi et al. (2015); Leblond et al. (2016). Implementations of asynchronous optimization include Xing et al. (2015); Li et al. (2014); Chilimbi et al. (2014). Attempts have also been made in Zinkevich et al. (2010) and Zhang & Jordan (2015) to algorithmically improve synchronous SGD.\nAn alternative solution, “softsync”, was presented in Zhang et al. (2015b), which proposed batching gradients from multiple machines before performing an asynchronous SGD update, thereby reducing the effective staleness of gradients. Similar to our proposal, softsync avoids stragglers by not forcing updates to wait for the slowest worker. However, softsync allows the use of stale gradients but we do not. The two solutions provide different explorations of the trade-off between high accuracy (by minimizing staleness) and fast throughput (by avoiding stragglers).\nWatcharapichat et al. (2016) introduces a distributed deep learning system without parameter servers, by having workers interleave gradient computation and communication in a round-robin pattern. Like Async-Opt, this approach suffers from staleness. We also note that in principle, workers in Sync-Opt can double as parameter servers and execute the update operations and avoid the need to partition hardware resources between workers and servers.\nDas et al. (2016) analyzes distributed stochastic optimization and optimizes the system by solving detailed system balance equations. We believe this approach is complimentary to our work, and could potentially be applied to guide the choice of systems configurations for Sync-Opt.\nKeskar et al. (2016) suggests that large batch sizes for synchronous stochastic optimization leads to poorer generalization. Our effective batch size increases linearly with the number of workers N . However, we did not observe this effect in our experiments; we believe we are not yet in the large batch size regime examined by Keskar et al. (2016)."
+    }, {
+      "heading" : "6 CONCLUSION AND FUTURE WORK",
+      "text" : "Distributed training strategies for deep learning architectures will become ever more important as the size of datasets increases. In this work, we have shown how both synchronous and asynchronous distributed stochastic optimization suffer from their respective weaknesses of stragglers and staleness. This has motivated our development of synchronous stochastic optimization with backup workers, which we show to be a viable and scalable strategy.\nWe are currently experimenting with different kinds of datasets, including word-level language models where parts of the model (the embedding layers) are often very sparse, which involves very different communication constraints. We are also working on further improving the performance of synchronous training like combining gradients from multiple workers sharing the same machine before sending them to the parameter servers to reduce the communication overhead. An alternative of using time-outs instead of backup workers is also being explored."
+    }, {
+      "heading" : "A DETAILS OF MODELS AND TRAINING",
+      "text" : "A.1 MNIST CNN, SECTION 2.1\nThe model used in our experiments is a 4-layer CNN that have 3x3 filters with max-pooling and weight normalization in every layer. We trained the model with SGD for 25 epochs and evaluated performance on the exponential moving average θ̄ using a decay rate of α = 0.9999. Initial learning rate was set to be 0.1 and linearly annealed to 0 in the last 10 epochs. We also used small image rotations and zooms as a data augmentation scheme.\nA.2 INCEPTION, SECTION 3.1\nFor our straggler experiments, we trained the Inception (Szegedy et al., 2016) model on the ImageNet Challenge dataset (Russakovsky et al., 2015). 10 parameter servers were used, and each worker was equipped with a k40 GPU.\nThe underlying optimizer was RMSProp with momentum, with decay of 0.9 and momentum of 0.9. Mini-batch size B = 32 was used. Initial learning rates γ0 were set at 0.045N , which we found to provide good test precisions for Inception. Learning rates were also exponentially decreased with decay rate β = 0.94 as γ0βtN/(2T ), where T = |X |/B is the number of mini-batches in the dataset. Test precisions were evaluated on the exponential moving average θ̄ using α = 0.9999.\nA.3 INCEPTION, SECTION 4.2\nFor experiments comparing Async-Opt and Sync-Opt on the Inception model in Section 4.2, each worker is equipped with a k40 GPU. For N + b = 53 workers, 17 parameter servers were used; for N + b = 106 workers, we used 27 parameter servers; and 37 parameter servers were used for N + b = 212.\nIn the asynchronous training mode, gradient clipping is also needed for stabilization, which requires each worker to collect the gradient across all layers of the deep model, compute the global norm ||G|| and then clip all gradient accordingly. However, synchronization turns out to be very stable so gradient clipping is no longer needed, which means that we can pipeline the update of parameters in different layers: the gradient of top layers’ parameters can be sent to parameter servers while concurrently computing gradients for the lower layers.\nThe underlying optimizer is RMSProp with momentum, with decay of 0.9 and momentum of 0.9. Mini-batch size B = 32 was used. Initial learning rates γ0 for Async-Opt were set to 0.045; for Sync-Opt, we found as a rule-of-thumb that a learning rate of 0.045N worked well for this model. Learning rates were then exponentially decayed with decay rate β = 0.94 as γ0βt/(2T ) for AsyncOpt, where T = |X |/B is the number of mini-batches in the dataset. For Sync-Opt, we learning rates were also exponentially decreased at rate of γ0βtN/(2T ), so that the learning rates after computing the same number of datapoints are comparable for Async-Opt and Sync-Opt.\nTest precisions were evaluated on the exponential moving average θ̄ using α = 0.9999.\nA.4 PIXELCNN, SECTION 4.3\nThe PixelCNN (Oord et al., 2016) model was trained on the CIFAR-10 (Krizhevsky & Hinton, 2009) dataset. Configurations of N + b = 1, 8, 16 workers each with a k80 GPU, and 10 parameter servers were used. For Sync-Opt, we always used b = 1 backup worker. The underlying optimizer is RMSProp with momentum, using decay of 0.95 and momentum of 0.9. Initial learning rates γ0 were set to 1e − 4 and slowly decreased to 3e − 6 after 200,000 iterations. Mini-batch size B = 4 was used."
+    } ],
+    "references" : [ {
+      "title" : "Revisiting distributed synchronous sgd",
+      "author" : [ "Jianmin Chen", "Rajat Monga", "Samy Bengio", "Rafal Jozefowicz" ],
+      "venue" : "arXiv preprint arXiv:1604.00981,",
+      "citeRegEx" : "Chen et al\\.,? \\Q2016\\E",
+      "shortCiteRegEx" : "Chen et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Project adam: Building an efficient and scalable deep learning training system",
+      "author" : [ "T. Chilimbi", "Y. Suzue", "J. Apacible", "K. Kalyanaraman" ],
+      "venue" : "In Proceedings of the 11th USENIX Symposium on Operating Systems Design and Implementation,",
+      "citeRegEx" : "Chilimbi et al\\.,? \\Q2014\\E",
+      "shortCiteRegEx" : "Chilimbi et al\\.",
+      "year" : 2014
+    }, {
+      "title" : "Distributed deep learning using synchronous stochastic gradient descent",
+      "author" : [ "Dipankar Das", "Sasikanth Avancha", "Dheevatsa Mudigere", "Karthikeyan Vaidynathan", "Srinivas Sridharan", "Dhiraj Kalamkar", "Bharat Kaul", "Pradeep Dubey" ],
+      "venue" : "arXiv preprint arXiv:1602.06709,",
+      "citeRegEx" : "Das et al\\.,? \\Q2016\\E",
+      "shortCiteRegEx" : "Das et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Taming the wild: A unified analysis of hogwild-style algorithms",
+      "author" : [ "Christopher M De Sa", "Ce Zhang", "Kunle Olukotun", "Christopher Ré" ],
+      "venue" : "In Advances in Neural Information Processing Systems,",
+      "citeRegEx" : "Sa et al\\.,? \\Q2015\\E",
+      "shortCiteRegEx" : "Sa et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "Large scale distributed deep networks",
+      "author" : [ "J. Dean", "G.S. Corrado", "R. Monga", "K. Chen", "M. Devin", "Q.V. Le", "M.Z. Mao", "M.A. Ranzato", "A. Senior", "P. Tucker", "K. Yang", "A.Y. Ng" ],
+      "venue" : "In Advances in Neural Information Processing Systems,",
+      "citeRegEx" : "Dean et al\\.,? \\Q2012\\E",
+      "shortCiteRegEx" : "Dean et al\\.",
+      "year" : 2012
+    }, {
+      "title" : "The tail at scale",
+      "author" : [ "Jeffrey Dean", "Luiz Andr Barroso" ],
+      "venue" : "Communications of the ACM,",
+      "citeRegEx" : "Dean and Barroso.,? \\Q2013\\E",
+      "shortCiteRegEx" : "Dean and Barroso.",
+      "year" : 2013
+    }, {
+      "title" : "Adaptive subgradient methods for online learning and stochastic optimization",
+      "author" : [ "John Duchi", "Elad Hazan", "Yoram Singer" ],
+      "venue" : "Journal of Machine Learning Research,",
+      "citeRegEx" : "Duchi et al\\.,? \\Q2011\\E",
+      "shortCiteRegEx" : "Duchi et al\\.",
+      "year" : 2011
+    }, {
+      "title" : "Estimation, optimization, and parallelism when data is sparse",
+      "author" : [ "John Duchi", "Michael I Jordan", "Brendan McMahan" ],
+      "venue" : "In Advances in Neural Information Processing Systems,",
+      "citeRegEx" : "Duchi et al\\.,? \\Q2013\\E",
+      "shortCiteRegEx" : "Duchi et al\\.",
+      "year" : 2013
+    }, {
+      "title" : "Deep neural networks for acoustic modeling in speech recognition",
+      "author" : [ "G. Hinton", "L. Deng", "D. Yu", "G. Dahl", "A. Mohamed", "N. Jaitly", "A. Senior", "V. Vanhoucke", "P. Nguyen", "T.N. Sainath", "B. Kingsbury" ],
+      "venue" : "IEEE Signal Processing Magazine,",
+      "citeRegEx" : "Hinton et al\\.,? \\Q2012\\E",
+      "shortCiteRegEx" : "Hinton et al\\.",
+      "year" : 2012
+    }, {
+      "title" : "Batch normalization: Accelerating deep network training by reducing internal covariate shift",
+      "author" : [ "S. Ioffe", "C. Szegedy" ],
+      "venue" : "In Proceedings of the 32nd International Conference on Machine Learning,",
+      "citeRegEx" : "Ioffe and Szegedy.,? \\Q2015\\E",
+      "shortCiteRegEx" : "Ioffe and Szegedy.",
+      "year" : 2015
+    }, {
+      "title" : "On large-batch training for deep learning: Generalization gap and sharp minima",
+      "author" : [ "Nitish Shirish Keskar", "Dheevatsa Mudigere", "Jorge Nocedal", "Mikhail Smelyanskiy", "Ping Tak Peter Tang" ],
+      "venue" : "arXiv preprint arXiv:1609.04836,",
+      "citeRegEx" : "Keskar et al\\.,? \\Q2016\\E",
+      "shortCiteRegEx" : "Keskar et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Adam: A method for stochastic optimization",
+      "author" : [ "Diederik Kingma", "Jimmy Ba" ],
+      "venue" : "arXiv preprint arXiv:1412.6980,",
+      "citeRegEx" : "Kingma and Ba.,? \\Q2014\\E",
+      "shortCiteRegEx" : "Kingma and Ba.",
+      "year" : 2014
+    }, {
+      "title" : "Learning multiple layers of features from tiny images",
+      "author" : [ "Alex Krizhevsky", "Geoffrey Hinton" ],
+      "venue" : null,
+      "citeRegEx" : "Krizhevsky and Hinton.,? \\Q2009\\E",
+      "shortCiteRegEx" : "Krizhevsky and Hinton.",
+      "year" : 2009
+    }, {
+      "title" : "Asaga: Asynchronous parallel saga",
+      "author" : [ "Rémi Leblond", "Fabian Pedregosa", "Simon Lacoste-Julien" ],
+      "venue" : "arXiv preprint arXiv:1606.04809,",
+      "citeRegEx" : "Leblond et al\\.,? \\Q2016\\E",
+      "shortCiteRegEx" : "Leblond et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Scaling distributed machine learning with the parameter server",
+      "author" : [ "Mu Li", "David G Andersen", "Jun Woo Park", "Alexander J Smola", "Amr Ahmed", "Vanja Josifovski", "James Long", "Eugene J Shekita", "Bor-Yiing Su" ],
+      "venue" : "In 11th USENIX Symposium on Operating Systems Design and Implementation",
+      "citeRegEx" : "Li et al\\.,? \\Q2014\\E",
+      "shortCiteRegEx" : "Li et al\\.",
+      "year" : 2014
+    }, {
+      "title" : "Perturbed iterate analysis for asynchronous stochastic optimization",
+      "author" : [ "Horia Mania", "Xinghao Pan", "Dimitris Papailiopoulos", "Benjamin Recht", "Kannan Ramchandran", "Michael I Jordan" ],
+      "venue" : "arXiv preprint arXiv:1507.06970,",
+      "citeRegEx" : "Mania et al\\.,? \\Q2015\\E",
+      "shortCiteRegEx" : "Mania et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "Conditional image generation with pixelcnn decoders",
+      "author" : [ "Aaron van den Oord", "Nal Kalchbrenner", "Oriol Vinyals", "Lasse Espeholt", "Alex Graves", "Koray Kavukcuoglu" ],
+      "venue" : "arXiv preprint arXiv:1606.05328,",
+      "citeRegEx" : "Oord et al\\.,? \\Q2016\\E",
+      "shortCiteRegEx" : "Oord et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Hogwild: A lock-free approach to parallelizing stochastic gradient descent",
+      "author" : [ "Benjamin Recht", "Christopher Re", "Stephen Wright", "Feng Niu" ],
+      "venue" : "In Advances in Neural Information Processing Systems,",
+      "citeRegEx" : "Recht et al\\.,? \\Q2011\\E",
+      "shortCiteRegEx" : "Recht et al\\.",
+      "year" : 2011
+    }, {
+      "title" : "On variance reduction in stochastic gradient descent and its asynchronous variants",
+      "author" : [ "Sashank J Reddi", "Ahmed Hefny", "Suvrit Sra", "Barnabas Poczos", "Alex J Smola" ],
+      "venue" : "In Advances in Neural Information Processing Systems,",
+      "citeRegEx" : "Reddi et al\\.,? \\Q2015\\E",
+      "shortCiteRegEx" : "Reddi et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "Imagenet large scale visual recognition challenge",
+      "author" : [ "Olga Russakovsky", "Jia Deng", "Hao Su", "Jonathan Krause", "Sanjeev Satheesh", "Sean Ma", "Zhiheng Huang", "Andrej Karpathy", "Aditya Khosla", "Michael Bernstein", "Alexander C. Berg", "Li Fei-Fei" ],
+      "venue" : "In International Journal of Computer Vision,",
+      "citeRegEx" : "Russakovsky et al\\.,? \\Q2015\\E",
+      "shortCiteRegEx" : "Russakovsky et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "Rethinking the inception architecture for computer vision",
+      "author" : [ "C. Szegedy", "V. Vanhoucke", "S. Ioffe", "J. Shlens", "Z. Wojna" ],
+      "venue" : "In ArXiv",
+      "citeRegEx" : "Szegedy et al\\.,? \\Q2016\\E",
+      "shortCiteRegEx" : "Szegedy et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Lecture 6.5-rmsprop: Divide the gradient by a running average of its recent magnitude",
+      "author" : [ "Tijmen Tieleman", "Geoffrey Hinton" ],
+      "venue" : "COURSERA: Neural Networks for Machine Learning,",
+      "citeRegEx" : "Tieleman and Hinton.,? \\Q2012\\E",
+      "shortCiteRegEx" : "Tieleman and Hinton.",
+      "year" : 2012
+    }, {
+      "title" : "Ako: Decentralised deep learning with partial gradient exchange",
+      "author" : [ "Pijika Watcharapichat", "Victoria Lopez Morales", "Raul Castro Fernandez", "Peter Pietzuch" ],
+      "venue" : "In Proceedings of the Seventh ACM Symposium on Cloud Computing,",
+      "citeRegEx" : "Watcharapichat et al\\.,? \\Q2016\\E",
+      "shortCiteRegEx" : "Watcharapichat et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Petuum: A new platform for distributed machine learning on big data",
+      "author" : [ "Eric P Xing", "Qirong Ho", "Wei Dai", "Jin Kyu Kim", "Jinliang Wei", "Seunghak Lee", "Xun Zheng", "Pengtao Xie", "Abhimanu Kumar", "Yaoliang Yu" ],
+      "venue" : "IEEE Transactions on Big Data,",
+      "citeRegEx" : "Xing et al\\.,? \\Q2015\\E",
+      "shortCiteRegEx" : "Xing et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "Deep learning with elastic averaging sgd",
+      "author" : [ "Sixin Zhang", "Anna E Choromanska", "Yann LeCun" ],
+      "venue" : "In Advances in Neural Information Processing Systems,",
+      "citeRegEx" : "Zhang et al\\.,? \\Q2015\\E",
+      "shortCiteRegEx" : "Zhang et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "Staleness-aware async-sgd for distributed deep learning",
+      "author" : [ "Wei Zhang", "Suyog Gupta", "Xiangru Lian", "Ji Liu" ],
+      "venue" : "arXiv preprint arXiv:1511.05950,",
+      "citeRegEx" : "Zhang et al\\.,? \\Q2015\\E",
+      "shortCiteRegEx" : "Zhang et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "Splash: User-friendly programming interface for parallelizing stochastic algorithms",
+      "author" : [ "Yuchen Zhang", "Michael I Jordan" ],
+      "venue" : "arXiv preprint arXiv:1506.07552,",
+      "citeRegEx" : "Zhang and Jordan.,? \\Q2015\\E",
+      "shortCiteRegEx" : "Zhang and Jordan.",
+      "year" : 2015
+    }, {
+      "title" : "Parallelized stochastic gradient descent",
+      "author" : [ "Martin Zinkevich", "Markus Weimer", "Lihong Li", "Alex J Smola" ],
+      "venue" : "In Advances in neural information processing systems,",
+      "citeRegEx" : "Zinkevich et al\\.,? \\Q2010\\E",
+      "shortCiteRegEx" : "Zinkevich et al\\.",
+      "year" : 2010
+    } ],
+    "referenceMentions" : [ {
+      "referenceID" : 8,
+      "context" : "The recent success of deep learning approaches for domains like speech recognition (Hinton et al., 2012) and computer vision (Ioffe & Szegedy, 2015) stems from many algorithmic improvements but also from the fact that the size of available training data has grown significantly over the years, together with the computing power, in terms of both CPUs and GPUs.",
+      "startOffset" : 83,
+      "endOffset" : 104
+    }, {
+      "referenceID" : 6,
+      "context" : "Currently, popular distributed training algorithms include mini-batch versions of stochastic gradient descent (SGD) and other stochastic optimization algorithms such as AdaGrad (Duchi et al., 2011), RMSProp (Tieleman & Hinton, 2012), and ADAM (Kingma & Ba, 2014).",
+      "startOffset" : 177,
+      "endOffset" : 197
+    }, {
+      "referenceID" : 0,
+      "context" : "edu This is an extension of our ICLR 2016 workshop extended abstract (Chen et al., 2016).",
+      "startOffset" : 69,
+      "endOffset" : 88
+    }, {
+      "referenceID" : 4,
+      "context" : "An approach for a distributed stochastic gradient descent algorithm was presented in Dean et al. (2012), consisting of two main ingredients.",
+      "startOffset" : 85,
+      "endOffset" : 104
+    }, {
+      "referenceID" : 1,
+      "context" : "A similar approach was later proposed by Chilimbi et al. (2014). Async-Opt is presented in Algorithms 1 and 2.",
+      "startOffset" : 41,
+      "endOffset" : 64
+    }, {
+      "referenceID" : 1,
+      "context" : "A similar approach was later proposed by Chilimbi et al. (2014). Async-Opt is presented in Algorithms 1 and 2. In practice, the updates of Async-Opt are different than those of serially running the stochastic optimization algorithm for two reasons. Firstly, the read operation (Algo 1 Line 2) on a worker may be interleaved with updates by other workers to different parameter servers, so the resultant θ̂k may not be consistent with any parameter incarnation θ. Secondly, model updates may have occurred while a worker is computing its stochastic gradient; hence, the resultant gradients are typically computed with respect to outdated parameters. We refer to these as stale gradients, and its staleness as the number of updates that have occurred between its corresponding read and update operations. Understanding the theoretical impact of staleness is difficult work and the topic of many recent papers, e.g. Recht et al. (2011); Duchi et al.",
+      "startOffset" : 41,
+      "endOffset" : 933
+    }, {
+      "referenceID" : 1,
+      "context" : "A similar approach was later proposed by Chilimbi et al. (2014). Async-Opt is presented in Algorithms 1 and 2. In practice, the updates of Async-Opt are different than those of serially running the stochastic optimization algorithm for two reasons. Firstly, the read operation (Algo 1 Line 2) on a worker may be interleaved with updates by other workers to different parameter servers, so the resultant θ̂k may not be consistent with any parameter incarnation θ. Secondly, model updates may have occurred while a worker is computing its stochastic gradient; hence, the resultant gradients are typically computed with respect to outdated parameters. We refer to these as stale gradients, and its staleness as the number of updates that have occurred between its corresponding read and update operations. Understanding the theoretical impact of staleness is difficult work and the topic of many recent papers, e.g. Recht et al. (2011); Duchi et al. (2013); Leblond et al.",
+      "startOffset" : 41,
+      "endOffset" : 954
+    }, {
+      "referenceID" : 1,
+      "context" : "A similar approach was later proposed by Chilimbi et al. (2014). Async-Opt is presented in Algorithms 1 and 2. In practice, the updates of Async-Opt are different than those of serially running the stochastic optimization algorithm for two reasons. Firstly, the read operation (Algo 1 Line 2) on a worker may be interleaved with updates by other workers to different parameter servers, so the resultant θ̂k may not be consistent with any parameter incarnation θ. Secondly, model updates may have occurred while a worker is computing its stochastic gradient; hence, the resultant gradients are typically computed with respect to outdated parameters. We refer to these as stale gradients, and its staleness as the number of updates that have occurred between its corresponding read and update operations. Understanding the theoretical impact of staleness is difficult work and the topic of many recent papers, e.g. Recht et al. (2011); Duchi et al. (2013); Leblond et al. (2016); Reddi et al.",
+      "startOffset" : 41,
+      "endOffset" : 977
+    }, {
+      "referenceID" : 1,
+      "context" : "A similar approach was later proposed by Chilimbi et al. (2014). Async-Opt is presented in Algorithms 1 and 2. In practice, the updates of Async-Opt are different than those of serially running the stochastic optimization algorithm for two reasons. Firstly, the read operation (Algo 1 Line 2) on a worker may be interleaved with updates by other workers to different parameter servers, so the resultant θ̂k may not be consistent with any parameter incarnation θ. Secondly, model updates may have occurred while a worker is computing its stochastic gradient; hence, the resultant gradients are typically computed with respect to outdated parameters. We refer to these as stale gradients, and its staleness as the number of updates that have occurred between its corresponding read and update operations. Understanding the theoretical impact of staleness is difficult work and the topic of many recent papers, e.g. Recht et al. (2011); Duchi et al. (2013); Leblond et al. (2016); Reddi et al. (2015);",
+      "startOffset" : 41,
+      "endOffset" : 998
+    }, {
+      "referenceID" : 20,
+      "context" : "To better understand this dependence in real models, we collected staleness statistics on a Async-Opt run with 40 workers on a 18-layer Inception model (Szegedy et al., 2016) trained on the ImageNet Challenge dataset (Russakovsky et al.",
+      "startOffset" : 152,
+      "endOffset" : 174
+    }, {
+      "referenceID" : 19,
+      "context" : ", 2016) trained on the ImageNet Challenge dataset (Russakovsky et al., 2015), as shown in Table 1.",
+      "startOffset" : 50,
+      "endOffset" : 76
+    }, {
+      "referenceID" : 3,
+      "context" : "De Sa et al. (2015); Mania et al.",
+      "startOffset" : 3,
+      "endOffset" : 20
+    }, {
+      "referenceID" : 3,
+      "context" : "De Sa et al. (2015); Mania et al. (2015), most of which focus on individual algorithms, under strong assumptions that may not hold up in practice.",
+      "startOffset" : 3,
+      "endOffset" : 41
+    }, {
+      "referenceID" : 3,
+      "context" : "Both Dean et al. (2012) and Chilimbi et al.",
+      "startOffset" : 5,
+      "endOffset" : 24
+    }, {
+      "referenceID" : 1,
+      "context" : "(2012) and Chilimbi et al. (2014) use versions of Async-SGD where the main potential problem is that each worker computes gradients over a potentially old version of the model.",
+      "startOffset" : 11,
+      "endOffset" : 34
+    }, {
+      "referenceID" : 20,
+      "context" : "We conducted experiments on the Inception model (Szegedy et al., 2016) trained on ImageNet Challenge dataset (Russakovsky et al.",
+      "startOffset" : 48,
+      "endOffset" : 70
+    }, {
+      "referenceID" : 19,
+      "context" : ", 2016) trained on ImageNet Challenge dataset (Russakovsky et al., 2015), where the task is to classify images out of 1000 categories.",
+      "startOffset" : 46,
+      "endOffset" : 72
+    }, {
+      "referenceID" : 16,
+      "context" : "The second model we experimented on is PixelCNN (Oord et al., 2016), a conditional image generation deep neural network, which we train on the CIFAR-10 (Krizhevsky & Hinton, 2009) dataset.",
+      "startOffset" : 48,
+      "endOffset" : 67
+    }, {
+      "referenceID" : 10,
+      "context" : "Asynchronous algorithms include Recht et al. (2011); Duchi et al.",
+      "startOffset" : 32,
+      "endOffset" : 52
+    }, {
+      "referenceID" : 4,
+      "context" : "(2011); Duchi et al. (2013); Zhang et al.",
+      "startOffset" : 8,
+      "endOffset" : 28
+    }, {
+      "referenceID" : 4,
+      "context" : "(2011); Duchi et al. (2013); Zhang et al. (2015a); Reddi et al.",
+      "startOffset" : 8,
+      "endOffset" : 50
+    }, {
+      "referenceID" : 4,
+      "context" : "(2011); Duchi et al. (2013); Zhang et al. (2015a); Reddi et al. (2015); Leblond et al.",
+      "startOffset" : 8,
+      "endOffset" : 71
+    }, {
+      "referenceID" : 4,
+      "context" : "(2011); Duchi et al. (2013); Zhang et al. (2015a); Reddi et al. (2015); Leblond et al. (2016). Implementations of asynchronous optimization include Xing et al.",
+      "startOffset" : 8,
+      "endOffset" : 94
+    }, {
+      "referenceID" : 4,
+      "context" : "(2011); Duchi et al. (2013); Zhang et al. (2015a); Reddi et al. (2015); Leblond et al. (2016). Implementations of asynchronous optimization include Xing et al. (2015); Li et al.",
+      "startOffset" : 8,
+      "endOffset" : 167
+    }, {
+      "referenceID" : 4,
+      "context" : "(2011); Duchi et al. (2013); Zhang et al. (2015a); Reddi et al. (2015); Leblond et al. (2016). Implementations of asynchronous optimization include Xing et al. (2015); Li et al. (2014); Chilimbi et al.",
+      "startOffset" : 8,
+      "endOffset" : 185
+    }, {
+      "referenceID" : 1,
+      "context" : "(2014); Chilimbi et al. (2014). Attempts have also been made in Zinkevich et al.",
+      "startOffset" : 8,
+      "endOffset" : 31
+    }, {
+      "referenceID" : 1,
+      "context" : "(2014); Chilimbi et al. (2014). Attempts have also been made in Zinkevich et al. (2010) and Zhang & Jordan (2015) to algorithmically improve synchronous SGD.",
+      "startOffset" : 8,
+      "endOffset" : 88
+    }, {
+      "referenceID" : 1,
+      "context" : "(2014); Chilimbi et al. (2014). Attempts have also been made in Zinkevich et al. (2010) and Zhang & Jordan (2015) to algorithmically improve synchronous SGD.",
+      "startOffset" : 8,
+      "endOffset" : 114
+    }, {
+      "referenceID" : 1,
+      "context" : "(2014); Chilimbi et al. (2014). Attempts have also been made in Zinkevich et al. (2010) and Zhang & Jordan (2015) to algorithmically improve synchronous SGD. An alternative solution, “softsync”, was presented in Zhang et al. (2015b), which proposed batching gradients from multiple machines before performing an asynchronous SGD update, thereby reducing the effective staleness of gradients.",
+      "startOffset" : 8,
+      "endOffset" : 233
+    }, {
+      "referenceID" : 1,
+      "context" : "(2014); Chilimbi et al. (2014). Attempts have also been made in Zinkevich et al. (2010) and Zhang & Jordan (2015) to algorithmically improve synchronous SGD. An alternative solution, “softsync”, was presented in Zhang et al. (2015b), which proposed batching gradients from multiple machines before performing an asynchronous SGD update, thereby reducing the effective staleness of gradients. Similar to our proposal, softsync avoids stragglers by not forcing updates to wait for the slowest worker. However, softsync allows the use of stale gradients but we do not. The two solutions provide different explorations of the trade-off between high accuracy (by minimizing staleness) and fast throughput (by avoiding stragglers). Watcharapichat et al. (2016) introduces a distributed deep learning system without parameter servers, by having workers interleave gradient computation and communication in a round-robin pattern.",
+      "startOffset" : 8,
+      "endOffset" : 755
+    }, {
+      "referenceID" : 1,
+      "context" : "(2014); Chilimbi et al. (2014). Attempts have also been made in Zinkevich et al. (2010) and Zhang & Jordan (2015) to algorithmically improve synchronous SGD. An alternative solution, “softsync”, was presented in Zhang et al. (2015b), which proposed batching gradients from multiple machines before performing an asynchronous SGD update, thereby reducing the effective staleness of gradients. Similar to our proposal, softsync avoids stragglers by not forcing updates to wait for the slowest worker. However, softsync allows the use of stale gradients but we do not. The two solutions provide different explorations of the trade-off between high accuracy (by minimizing staleness) and fast throughput (by avoiding stragglers). Watcharapichat et al. (2016) introduces a distributed deep learning system without parameter servers, by having workers interleave gradient computation and communication in a round-robin pattern. Like Async-Opt, this approach suffers from staleness. We also note that in principle, workers in Sync-Opt can double as parameter servers and execute the update operations and avoid the need to partition hardware resources between workers and servers. Das et al. (2016) analyzes distributed stochastic optimization and optimizes the system by solving detailed system balance equations.",
+      "startOffset" : 8,
+      "endOffset" : 1192
+    }, {
+      "referenceID" : 1,
+      "context" : "(2014); Chilimbi et al. (2014). Attempts have also been made in Zinkevich et al. (2010) and Zhang & Jordan (2015) to algorithmically improve synchronous SGD. An alternative solution, “softsync”, was presented in Zhang et al. (2015b), which proposed batching gradients from multiple machines before performing an asynchronous SGD update, thereby reducing the effective staleness of gradients. Similar to our proposal, softsync avoids stragglers by not forcing updates to wait for the slowest worker. However, softsync allows the use of stale gradients but we do not. The two solutions provide different explorations of the trade-off between high accuracy (by minimizing staleness) and fast throughput (by avoiding stragglers). Watcharapichat et al. (2016) introduces a distributed deep learning system without parameter servers, by having workers interleave gradient computation and communication in a round-robin pattern. Like Async-Opt, this approach suffers from staleness. We also note that in principle, workers in Sync-Opt can double as parameter servers and execute the update operations and avoid the need to partition hardware resources between workers and servers. Das et al. (2016) analyzes distributed stochastic optimization and optimizes the system by solving detailed system balance equations. We believe this approach is complimentary to our work, and could potentially be applied to guide the choice of systems configurations for Sync-Opt. Keskar et al. (2016) suggests that large batch sizes for synchronous stochastic optimization leads to poorer generalization.",
+      "startOffset" : 8,
+      "endOffset" : 1477
+    }, {
+      "referenceID" : 1,
+      "context" : "(2014); Chilimbi et al. (2014). Attempts have also been made in Zinkevich et al. (2010) and Zhang & Jordan (2015) to algorithmically improve synchronous SGD. An alternative solution, “softsync”, was presented in Zhang et al. (2015b), which proposed batching gradients from multiple machines before performing an asynchronous SGD update, thereby reducing the effective staleness of gradients. Similar to our proposal, softsync avoids stragglers by not forcing updates to wait for the slowest worker. However, softsync allows the use of stale gradients but we do not. The two solutions provide different explorations of the trade-off between high accuracy (by minimizing staleness) and fast throughput (by avoiding stragglers). Watcharapichat et al. (2016) introduces a distributed deep learning system without parameter servers, by having workers interleave gradient computation and communication in a round-robin pattern. Like Async-Opt, this approach suffers from staleness. We also note that in principle, workers in Sync-Opt can double as parameter servers and execute the update operations and avoid the need to partition hardware resources between workers and servers. Das et al. (2016) analyzes distributed stochastic optimization and optimizes the system by solving detailed system balance equations. We believe this approach is complimentary to our work, and could potentially be applied to guide the choice of systems configurations for Sync-Opt. Keskar et al. (2016) suggests that large batch sizes for synchronous stochastic optimization leads to poorer generalization. Our effective batch size increases linearly with the number of workers N . However, we did not observe this effect in our experiments; we believe we are not yet in the large batch size regime examined by Keskar et al. (2016).",
+      "startOffset" : 8,
+      "endOffset" : 1806
+    } ],
+    "year" : 2017,
+    "abstractText" : "Distributed training of deep learning models on large-scale training data is typically conducted with asynchronous stochastic optimization to maximize the rate of updates, at the cost of additional noise introduced from asynchrony. In contrast, the synchronous approach is often thought to be impractical due to idle time wasted on waiting for straggling workers. We revisit these conventional beliefs in this paper, and examine the weaknesses of both approaches. We demonstrate that a third approach, synchronous optimization with backup workers, can avoid asynchronous noise while mitigating for the worst stragglers. Our approach is empirically validated and shown to converge faster and to better test accuracies.",
+    "creator" : "LaTeX with hyperref package"
+  }
+}

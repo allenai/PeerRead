@@ -1,0 +1,444 @@
+{
+  "name" : "1705.06390.pdf",
+  "metadata" : {
+    "source" : "CRF",
+    "title" : "Scalable Exact Parent Sets Identification in Bayesian Networks Learning with Apache Spark",
+    "authors" : [ "Subhadeep Karan", "Jaroslaw Zola" ],
+    "emails" : [ "skaran@buffalo.edu", "jzola@buffalo.edu" ],
+    "sections" : [ {
+      "heading" : "1. Introduction",
+      "text" : "In Machine Learning, the parent set assignment problem is to find a set of random variables that best explain a selected variable given input data and some predefined scoring criterion [1]. It is a precursor to Bayesian networks structure learning, where it is solved for each variable to produce a list of potential predecessors of that variable in a final network thus drastically limiting the number of structures that have to be considered [2], [3], [4]. It is also closely related to the feature selection problem, since it directly translates into Markov blankets discovery [5]. Because of these connections, the problem has many practical applications spanning clinical decision support systems, risk assessment, strategic planning, fraud detection and many others [6], [7], [8], [9]. In all these applications, random variables model attributes of interest, e.g. describing a patient in a clinical decision support system, their realizations are observed from data, and a model obtained by solving the parent set assignment provides insights into how different attributes depend on each other, including conditional dependencies.\nWhile the parent set identification is critical to building models like Bayesian networks, it is also known to be formally hard for the most commonly used scoring functions. For instance, it is NP-complete for the Normalized Maximum Likelihood (NML) criterion [1]. Consequently, the current approaches, which we briefly review in Section 5, either depend on heuristics or deliver exact solutions but are limited in how large instances they can solve. In fact, the largest problems solved by exact algorithms do not contain more than 40 variables [10]. In contrast, the real-world systems that strongly depend on the high quality Bayesian networks often involve hundreds of variables. The available heuristics that can solve instances of that size, e.g. [3], do not provide any guarantees on the quality of the solutions they find. This significantly impacts their usefulness, since the inherent uncertainty of the model due to the input data and the scoring function, cannot be separated from the deficiencies of the learning algorithm [11]. Consequently, there is a gap between the quality and the size of the models that depend on the exact parent set identification and that can be efficiently learned from the data.\nResponding to the above challenges, in this paper, we propose a new distributed memory algorithm for the exact parent sets identification problem. Our goal is to push the limit on the scale of instances that can be solved in acceptable time limits on a modestly sized parallel cluster. To this end, we make the following specific contributions: 1) we propose a new strategy to constraint and reorganize dynamic programming computations in the parent set assignment problem such that computational grain is improved and finegrained synchronization is avoided, 2) we define a simple mechanism that we use to change the mode of computations from BFS to DFS such that the main memory is preserved. To validate our approach, we provide an efficient implementation on the Apache Spark platform [12], and demonstrate its strong scalability across different ML test sets. We then show that on a 500-core cluster with 25 nodes, our system can process HEPAR II test data [13] in slightly over 20 hours. With 70 variables and small variability, this data set is one of the most challenging benchmarks for Bayesian networks structure learning, and it has no exact results available to date. ar X iv :1\n70 5.\n06 39\n0v 1\n[ cs\n.A I]\n1 8\nM ay\nThe reminder of this paper is organized following the common practice. In Section 2, we provide basic definitions and formally state the problem. In Section 3, we introduce our proposed method, and we describe its experimental validation in Section 4. We summarize related work in Section 5, and conclude the paper in Section 6."
+    }, {
+      "heading" : "2. Preliminaries",
+      "text" : "Consider a set of n random variables X = {X1, . . . , Xn}, and suppose that we are given a complete input data table D = {D1, . . . , Dn}, where Di is a vector of m observations of Xi. Let s(Xi, Pa(Xi)) be a scoring function that quantifies how well Xi is explained by a set of variables Pa(Xi) ⊆ X −{Xi} given the data D. We will call Pa(Xi) a parent set, or simply parents, of Xi. We are assuming that s is given. For example, it could be one of the several available functions, such as information theoretic MDL [14] and AIC [15] or the BD family implementing Bayesian scoring criteria [16], [17]. In this work, we mostly focus on the MDL scoring function, but our results can be generalized to other scoring criteria. Moreover, we do not consider details of how s is computed, except that it has to access the data in D, and the cost of computations is not negligible as it grows with the size of Pa(Xi) and the number of observations m. The parent set assignment problem is to find a subset Pa(Xi) ⊆ X − {Xi} such that s(Xi, Pa(Xi)) is minimized.\nLet d(Xi, U), U ⊆ X − {Xi}, be the score of selecting optimal parent set of Xi from among variables in U , that is d(Xi, U) = min\nPa(Xi)⊆U s(Xi, Pa(Xi)). We can efficiently\nexpress d via the following recursion:\nd(Xi, U) = min\n{ s(Xi, U),\nmin Xj∈U\nd(Xi, U − {Xj}). (1)\nTo find an optimal parent set assignment of Xi we could solve the recursion in Eq. (1) for U = X − {Xi} while recording the choice of parents we made in the process. However, in the majority of practical applications, especially in the context of Bayesian networks structure learning, it is necessary to consider a slightly broader version of the problem.\nWe will say that U ⊆ X −{Xi} is a maximal parent set of Xi if d(Xi, U) = s(Xi, U). From Eq. (1) we have that if U is a maximal parent set then no subset of U has score better than d(Xi, U), i.e. ∀U ′⊂Ud(Xi, U) < d(Xi, U ′). Hence, by identifying all maximal parent sets of Xi and memoizing their corresponding scores s, we can efficiently answer queries about any optimal parent set of Xi. Specifically, to answer query d(Xi, U ′) for any U ′ it is sufficient to check if U ′ is one of the maximal parent sets of Xi. If it is, then all we have to do is to return the memoized score s of that maximal parent set. Otherwise, d(Xi, U ′) must be equal to the smallest s among all maximal parent sets of Xi for which U ′ is a superset.\nThe above property of maximal parent sets has important practical implications. For example, to compute the score\nQ(X ) of an optimal Bayesian network over X , and thus find the network itself, we have to solve recursion of the form Q(U) = min\nXi∈U (d(Xi, U − {Xi}) + Q(U − {Xi})). Even\nwith the efficient algorithms such as [2], [4] this requires large and hard to predict number of queries for optimal parent sets, owing to the component d(Xi, U−{Xi}) in the recursion. Because for a single variable Xi there are 2n−1 optimal parent sets, memoizing them all is impractical and often infeasible. In contrast, the set of all maximal parent sets is usually many orders of magnitude smaller, and hence using it instead, in the way we explained before, is the desired and viable alternative [2], [4], [3].\nFrom the computational point of view, identifying maximal parent sets of Xi is the same as selecting its optimal parent set from X−{Xi}. The only difference are extra steps required to test and store subsets that correspond to maximal parent sets. In practical settings, we wish to enumerate all maximal parent sets for all variables in X , and this is the problem we are considering in this paper."
+    }, {
+      "heading" : "3. Proposed Approach",
+      "text" : "Given a set of variables X , database of observations D, and a scoring function s, our goal is to enumerate all maximal parent sets for all Xi ∈ X . If we consider a single variable Xi, then we can directly apply recursion in Eq. (1) and starting from the empty set we can consider parent sets of growing size. This process can be though of as a top-down traversal of the dynamic programming lattice with n levels formed by the partial order “set inclusion” on the power set of X −{Xi} (see Figure 1a). At the level l = 0 of the lattice we have empty set. Two nodes in the lattice, U ′ and U , are connected only if U ′ ⊂ U and |U | = |U ′|+1. Here we use U to denote both a subset of X −{Xi} and the corresponding node in the lattice. A node U represents a parent set of Xi. When it is discovered, we compute s(Xi, U), compare it with scores d passed by its predecessors to obtain d(Xi, U), and if U is a maximal parent set we store or report a tuple (Xi, U, s(Xi, U)).\nWhile the above strategy is clearly guaranteed to enumerate all maximal parent sets, it is both computationally and memory challenging. The computational complexity is due to the Θ(2n) invocations of s, and memory complexity is driven by how the dynamic programming lattice is traversed. For example, one way is to assume BFS traversal induced by the precedence constraints in the lattice. In such case, maximal parent sets are enumerated layerby-layer with a synchronization point between any two consecutive layers. This strategy requires that both layers are stored in the memory, which implies O (( n n 2 )) space complexity, irrespective of which parallel BFS realization we assume [18]. Another approach is to use some variant of DFS. With DFS we can benefit from techniques like hypercube pipelining, similar to [19], but this strategy requires that we store partial results and update them each time a node is discovered before its all predecessors are processed. As a result, the space complexity is O(2n) and we have\nto maintain potentially irregular memory updates to detect new maximal parent sets. Finally, while all variables in X can be processed independently, the resulting embarrassing parallelism is highly limited. This is because the computational cost for a single variable is exponential in n, which effectively constraints the total number of variables we may hope to process. For example, if we assume n = 48 then the estimated memory requirements to process a single lattice, with O(2n) nodes and 16 B per node, is 4 PB with a modest 48-way parallelism."
+    }, {
+      "heading" : "3.1. Constraining the Search Space",
+      "text" : "To achieve a scalable strategy, we start from constraining the search space. This is necessary since the exponential cost of considering all optimal parent sets is prohibitive for realistic problem instances, irrespective of how efficient is our parallel exploration algorithm.\nFor every variable Xi it is reasonable to expect that its optimal parent set will not contain all other variables. In other words, there is a limit on the depth to which we should be exploring the dynamic programming lattice of Xi. To maintain exactness guarantees, we have to ensure\nthat the bound on the depth of exploration is no smaller than the unknown size of the optimal parent set. Here we provide such a bound for the information-theoretic MDL scoring function. We note that similar bounds can be derived for other functions, and in fact a significant work in this direction has been done, for example in [20].\nThe MDL score is defined as:\ns(Xi, U) = m · H(Xi|U) +NC(Xi, U), (2)\nwhere\nNC(Xi, U) = 1\n2 · log2(m) · qi · (ri − 1) (3)\nis a network complexity term, H(Xi|U) is the estimated conditional entropy of Xi given U , and ri > 1 is the number of states of Xi, and qi = ∏ j,Xj∈U rj is the number of states that variables in U can assume (qi = 1 if U = ∅). The parameters ri and qi as well as the conditional entropy are directly assessed from D. In short, the MDL score of a pair (Xi, U) is the number of bits required to encode information about Xi and its parents U if we were to use Huffmann coding of D.\nTo derive the bound we exploit the following observation. When U is empty, we have the maximal conditional entropy H(Xi|∅) = H(Xi) and the minimal network complexityNC(Xi, ∅) = 0.5·log2(m)·(ri−1). By increasing the size of U we can decrease conditional entropy of Xi, which has the theoretical limit of 0, at the expense of increasing network complexity. This follows from the basic properties of entropy and the definition of the network complexity term. Once the network complexity NC(Xi, U) is greater or equal to s(Xi, ∅) = m ·H(Xi) +NC(Xi, ∅), irrespective of which variables we add to U , the score s(Xi, U) will always increase. This is the point at which network complexity outweighs any gains from the decreasing entropy of Xi. Consequently, if U satisfies\nCondition 1: NC(Xi, U) ≥ s(Xi, ∅),\nthen any superset of U can be excluded from further consideration, since it will not admit new optimal or maximal parent sets for Xi. The efficiency of Condition 1 depends on the input data D. Nevertheless, it works extremely well in practice. For example, in our experiments, reported in Section 4, we found that for real-world data with n = 70 we never considered nodes with more than nine variables.\nWe can further extend our pruning strategy by using the following observation [21]. The lowest entropy we can achieve for Xi is H(Xi,X −{Xi}). Now consider the score d(Xi, U). Here we have that if\nCondition 2: d(Xi, U) ≤ m·H(Xi,X−{Xi})+NC(Xi, U)\nholds, then no superset of U can improve the score d(Xi, U). This is because any superset of U has higher network complexity, and hence ∀U ′⊃Um · H(Xi,X − {Xi}) + NC(Xi, U) ≤ H(Xi,X − {Xi}) + NC(Xi, U ′). As previously, if U satisfies the condition we can exclude it from further considerations, since it will not admit new optimal or maximal parent sets. The example effect of applying our pruning conditions is shown in Figure 1b.\nAlthough both conditions achieve the same goal of pruning the search space, they differ in which information they require. To test Condition 1, we use only network complexity, which can be computed for any pair Xi and U independently of other U ′ ⊂ U , i.e. independently of predecessors of U in the dynamic programming lattice. On the other hand, Condition 2 provides a tighter bound but depends on the score d(Xi, U), which, as we explained earlier, requires access to the maximal parent sets of Xi."
+    }, {
+      "heading" : "3.2. Parallel Exploration",
+      "text" : "Because of the memory and computational complexity, which remains challenging even when our pruning conditions are applied, we focus our parallel strategy on the distributed memory systems, with the Apache Spark platform [12] serving as an execution vehicle.\nRecall that our goal is to traverse in the top-down fashion the dynamic programming lattices for all Xi. A node U in a lattice corresponds to a computational task that evaluates\ns(Xi, U), tests if U is a maximal parent set, and checks if supersets of U can admit new maximal parent sets. These tests are the source of precedence constraints between the tasks. The main idea of our parallel approach is as follows. We onthe-fly generate and “fold” the dynamic programming lattices for different Xi into a single lattice with lower memory requirement and denser computational load. We explore the resulting lattice in parallel, initially in the BFS mode, and switch to DFS when memory becomes a bottleneck. To store and access maximal parent sets discovered in the process, we maintain a global state, which is synchronized via reduction between the layers. Finally, we reorder computations within each layer to eliminate fine-grain synchronization between the tasks, that otherwise would be necessary to effectuate our pruning conditions. Below, we explain each element of our approach.\n3.2.1. Folding Lattices. If we consider the dynamic programming lattice for variable Xi, then until our pruning conditions become effective we have to manage ( n−1 l ) tasks at the level l of the lattice. Consequently, the memory required to represent the entire layer l is bounded by B1 = c1 · n · ( n−1 l ) , assuming cost c1 to store a task. This easily becomes problematic for larger problems as soon as l > 2. The problem persists even when pruning takes place, since initially only some of the tasks are removed from consideration. However, we can “fold” the dynamic programming lattices such that the tasks sharing the same set U across different lattices are represented by a single task (see Figure 1c). Let the memory taken by such combined task be c2. The memory requirement of the new lattice is\nB2 = c2 · ( n l ) . This gives us\nB1 B2 = c1 c2 · (n− l) reduction in\nmemory complexity. To store a task we can use a bitmap, where i-th bit indicates whether element i is in a set. In such case, c2 = 2 · c1, since in the compacted lattice we require one bitmap to represent all Xi for a task, and one bitmap to represent the actual U (v.s. storing only U in the original lattice). By using bitmaps we additionally reduce memory overhead, and we can realize basic operations, like testing set inclusion, with only few hardware instructions. The memory reduction becomes less significant as l increases. However, this is acceptable, since we expect that thanks to the pruning conditions the search process will terminate early, which we confirm via experimental results.\nThe main advantage of our “folding” step is significantly increased computational density. To process a single task in the “folded” lattice, we have to perform multiple evaluations of s with the same parent set U . Without explaining details of how s is computed from D, we note that by having the same parents in the consecutive invocations of s, we can precompute statistics about D induced by U , and reuse them from one invocation to another. Consequently, the cost of processing a task in the “folded” lattice is higher than the cost of processing an individual corresponding task in the original lattice, but it is lower than the total cost of processing all corresponding tasks from the original lattices, i.e. if X is a set of random variables sharing U we have\nthat T (s(X,U)) < ∑\nXi∈X T (s(Xi, U)), where T is the processing cost.\nBy “folding” the lattices, we limit parallelism in the first two stages of the lattice. However, this has a negligible effect on the scalability, since even for large n the cost of processing these layers in minimal compared to the total processing time. Alternatively, we may decide to “fold” the lattices only after the desired level of parallelism is achieved. Finally, the computational cost of individual tasks becomes non-uniform, but this is addressed by the dynamic scheduling at the run-time.\n3.2.2. Limiting Synchronization. Consider the task for node U at the layer l, and suppose that Condition 1 or Condition 2 holds for U . In such case, no task that corresponds to a superset of U should be generated and included in the layer l + 1, as it will not contribute new maximal parent sets. In other words, at given layer we should see only those tasks whose predecessors all did not satisfy the pruning conditions. However, to enforce this requirement we would need either complex synchronization between all tasks within the same layer, or a reduction operation on all possible tasks for the next layer, which effectively would defy the purpose of pruning.\nTo address this problem, we can change the way in which tasks for the next layer are enumerated, such that synchronization is bypassed at the small cost of considering a few unnecessary tasks in the next layer. We first order variables in X by the decreasing number of states they have in D, i.e. for any Xi and Xj , if i < j then ri ≥ rj , and we maintain this ordering for every node U . If two variables have the same number of states, we use H(Xi,X − {Xi}) < H(Xj ,X − {Xj}) as a secondary condition. Then, when deciding whether a task should be considered in the next layer, instead of checking if any of its predecessors satisfied pruning condition, which would require synchronization, we check only one selected predecessor. Specifically, let Xj ∈ U be the maximal element in U . To enumerate descendants of U , we consider only U ′ = U ∪ {Xk} for all k > j. Thus, node U becomes a predecessor to n − j nodes (see Figure 1d). At the same time, from Eq. (3) and Conditions 1 and 2, it follows that smaller the j the higher the probability that U will satisfy pruning conditions. To see why, observe that the network complexity term grows as the product of the number of states that variables in U can assume. Because variables are ordered by the decreasing number of their states and the increasing entropy, we have that if |U | = |U ′′| and j < j′′, where Xj is the maximal element in U and Xj′′ is the maximal element in U ′′, then NC(Xi, U) ≥ NC(Xi, U ′′). Consequently, nodes that are predecessors to the largest number of nodes in the next layer are most likely to meet the pruning conditions. While this approach does not guarantee that all tasks that should be pruned will not be generated, it works very well in practice. In fact, in our experiments we found that we remove no less than 97% of all tasks that should be pruned. The remaining 3% constitute an extra work of processing nodes that do not contribute maximal\nparent sets. Note that these nodes once processed never create successors and thus the extra work overhead does not propagate.\nTo decide whether node U at layer l is a maximal parent set for Xi, we require optimal parent set scores, d(Xi, U\n′), for all subsets U ′ ⊂ U from the layer l − 1. As we explained earlier, instead of maintaining a complete list of all optimal parent sets, to retrieve d(Xi, U) we depend only on the previously enumerated maximal parent sets. For each variable Xi, we store a list L(Xi) of its maximal parent sets represented by tuples (U, s(Xi, U)), and sorted by the score s(Xi, U). Then to extract all optimal parent set scores for Xi and U we require O(|L(Xi)|) scan of L(Xi). This is affordable, since even complete L(Xi) is very small for a typical input data (see Table 1 in Section 4). Each task at layer l may contribute a new maximal parent set that must be available to all tasks for Xi in the subsequent layers. Consequently, we maintain all L(Xi) as a global state that is updated via all-to-all reduction, with list merging as an operator, after given layer is entirely processed. This step can be efficiently executed considering a small size of L(Xi).\n3.2.3. Changing Exploration Mode. While our pruning conditions significantly constrain the search space, for large problems the number of the tasks generated in the later stages of the execution may still exceed the available main memory. This in turn would lead to the undesired out-ofcore execution. After processing all tasks at layer l, we can estimate the number of tasks that layer l + 2 will have in the worst case. If that number exceeds the total available memory, it is reasonable to conclude that we have sufficient parallelism, and instead of creating new tasks we can change the mode of execution into a memory preserving DFS. Specifically, for each node U at layer l + 1, instead of considering all supersets of U independently, we can process them sequentially following the DFS order (see Figure 1d). However, in such case we cannot assume that the global list of all maximal parent sets is consistent between different tasks. As a result, some tasks could end up generating incorrect maximal parent sets or could perform extra work because without the access to the complete list of maximal parent sets Condition 2 could unnecessarily fail. To mitigate this situation, we flag all maximal parent sets generated in the DFS mode that potentially could not be maximal in the global sense, i.e. when maximal parent sets from other tasks are taken into the account. These are maximal parent sets U whose at least one strict subset U ′ ⊂ U has been processed in a different task. Once all tasks are processed, we perform reduction to obtain the final global state for all L(Xi). Then, we proceed with checking if the flagged maximal parent sets remain maximal in the merged L(Xi). Let zf (Xi) be the total number of maximal parent sets flagged when running in the DFS mode. The cost of verifying these maximal parent sets is O(zf (Xi) · |L(xi)|). This is because, in the worst case, for every flagged maximal parent set U , we have to check if none of the remaining elements in L(Xi) is a subset of U with a better score.\nHowever, it turns out that in the practical settings zf (Xi) is a very small number, and in fact frequently we have that zf (Xi) = 0. To understand why, consider the following. The memory requirements due to BFS grow exponentially with the depth of the dynamic programming lattice. At the same time, because the network complexity term, NC, grows exponentially as well, the probability of enumerating new maximal parent sets decreases as we progress to the higher layers of the lattice. In our experiments, for all tested data sets we did not enumerate new maximal parent sets beyond layer l = 6. At the same time, if the available main memory is limited, and we are forced to switch to the DFS mode early, then we can expect that the majority of the maximal parent sets tested by a single task will not be depending on the maximal parent sets discovered in other tasks. This is a direct consequence of the precedence constraints within the lattice.\nWhen switching to the DFS mode, we can expect an increased computational imbalance between the tasks. However, the largest tasks which could be the source of the most significant imbalance are the ones which are the most likely to be pruned. At the same time, the number of the DFS tasks will remain sufficient to provide room for load balancing at the run-time, which we confirm by experiments."
+    }, {
+      "heading" : "3.3. Apache Spark Implementation",
+      "text" : "We implemented our parallel approach using the Apache Spark platform. The reason we use Spark is purely pragmatic: the platform supports locality-aware dynamic task scheduling, which we directly benefit from, since our computational tasks can be heterogeneous owing to the lattice “folding” and the potential use of the DFS mode. Additionally, Spark API makes expressing iterative BSP-style programs extremely productive. While it is clear that using one of the traditional HPC models, e.g. MPI or UPC, we could probably achieve faster implementation, we believe that the scalability would remain comparable.\nThe high level exploration components of our method are implemented in Python, and the computationally intensive parts, specifically evaluations of function s, are offloaded to the efficient, SIMD-parallel C++ kernel derived from our SABNA package [4], [22]. Apache Spark is usually regarded as a platform for the data intensive computing. In our case, the input data is typically very small (i.e. at the order of MB), however, it quickly generates massive new data representing individual tasks of the dynamic programming lattice. Below we provide details of the implementation assuming that reader is familiar with the basics of the Apache Spark interface [23].\nWe follow the standard BSP model realized via iterative transformations on a sequence of Spark Resilient Distributed Datasets (RDDs), where RDDi represents layer i of the compacted dynamic programming lattice. To represent a node in the lattice, RDD stores a tuple (X,U), where both X and U are expressed via bitmaps, and X keeps variables that share U . To obtain RDDi, we initialize and parallelize RDD0 on Spark\ndriver, since this is very inexpensive operation. Then, we iteratively apply the following transformations: RDDi = RDDi−1.repartition(p).mapPartitions(M), where p is a small multiple, usually four, of the total number of cores that Spark executors can use, and M is the mapping function that: 1) evaluates function s for all variables in X , and identifies potential maximal parent sets, 2) checks the conditions to constraint the search space, and 3) accordingly yields nodes for the next layer to explore. The repartitioning transformation is to ensure good load balancing between executors since the number of tasks grows from one RDD to the next. Here we depend on the default Spark scheduler. We use mapPartitions, instead of a more natural map, to enable indexing of the data D when map M is initialized. By indexing D we significantly accelerate computations of s, and by doing so only once per partition we avoid unnecessary overheads. At the end of every iteration we materialize RDD by invoking Spark’s count action. Based on the resulting size of RDD, we assess the memory requirement for the subsequent iterations, and decide whether we should be switching to the DFS mode. Finally, at any point of the execution we make sure that the last two RDDs are cached and remain in the main memory to avoid expensive RDD recomputing or restoring from the secondary storage.\nThe mapping function M makes use of the information about maximal parent sets from previous iterations, i.e. L(Xi) for all Xi. To maintain this global state we use a combination of Spark accumulator and broadcast variables, since the memory cost of representing maximal parent sets is very small. In a given iteration, newly discovered maximal parent sets are added by each executor to a customized Spark accumulator to form an update to the global list of all maximal parent sets. As this could lead to potential duplicate entries in L(Xi) when a task fails or speculative execution is enabled, we make sure that only unique entries are considered. After the count action at the end of the iteration is performed, the accumulator is reduced an the global list managed by the Spark driver is updated and broadcast back to the executors. Together with the count and repartition step, these operations represent communication and synchronization stages in the BSP model.\nIn the DFS mode, instead of generating RDD for the next layer, which would exceed the available main memory, we apply another transformation to the current RDD, where we explore each partition as described in Section 3.2.3. As we explained earlier, this increases the computational cost of every task and makes tasks more heterogeneous. However, at this stage the number of RDD partitions and the distribution of their computational load is such that the Spark run-time can easily maintain load balance."
+    }, {
+      "heading" : "4. Experimental Results",
+      "text" : "To understand performance characteristics of our approach, we performed a set of experiments on a standalone Apache Spark cluster with 25 nodes and GbE interconnect. Each node in the cluster is equipped with 20-core dualsocket Intel Xeon E5v3 2.3 GHz processor, 64 GB of RAM\nand a standard SATA hard drive. The shared file system is run under GPFS, however, this is of minor importance considering that the input data is very small, even for the largest considered problems, and it is accessed only once at the very beginning of the computations.\nWe used several popular benchmark data sets from the UCI Machine Learning Repository [24], including Alarm (AL), Hail Finder (HF), the US Census Data (UCSD) and HEPAR II. These are commonly considered too challenging to be solved exactly using sequential techniques, and are among the most demanding tests for the parent set assignment. The properties of all data sets are provided in Table 1, including: ri – the number of states that the variables in the set can assume, z – the total number of generated maximal parent sets, and the properties of the output collection of the maximal parent sets L(Xi)."
+    }, {
+      "heading" : "4.1. Scalability Tests",
+      "text" : "In the first set of experiments, we analyzed scalability of the platform depending on the number of input variables n and the number of observations m. We executed our Spark software on the varying number of nodes and we recorded wall time, as well as: lmax – the deepest processed layer in the dynamic programming lattice, lz – the last layer at which we found new maximal parent sets, and the amount of extra work we had to perform due to removed synchronization (Section 3.2.2). In each case we ran one Spark executor per node, and Spark driver was collocated together with one of the executors since its resource usage was negligible. The results of this experiment are summarized in Tables 2-3 and Figure 2. Here we report only relative speedup computed with respect to the time obtained on two nodes, since, except of AL-4K, we were not able to process the test data sets using sequential software.\nWe start the analysis by first looking at the execution time and the speedup of our method. From Table 2 and Figure 2 we can see that, with the exception of AL-4K, the software achieves very good scalability on up to 24 nodes (480 cores). In all test cases, the required main memory never exceeds 84 GB, which enables us to run completely in the BFS mode. The slightly weaker scalability for AL4K can be attributed to the overall size of the problem. With small n and relatively small number of observations the problem can be solved in a few minutes on 12 nodes. Beyond that point, the overhead of synchronization between layers becomes significant compared to the optimized compute time on the collapsed dynamic programming lattice. As\nthe number of observations for this data set increases (data set AL-10K), computational time increases and expectedly scalability improves.\nBecause of the relatively small size, we were able to process AL-4K using a sequential code in 2,435 minutes. The sequential code is written entirely in C++, is optimized for memory usage and provides the same lattice constraining techniques as the parallel version. It also uses the same computational kernel to compute s. While this result suggests outstanding super-linear performance of our parallel code, we should keep in mind that the comparison is not completely fair, since the sequential version has significant overheads due to memory management (to avoid enumerating unnecessary tasks). Nevertheless, the result shows that even “small” problems can take more than a day to process sequentially, and this time can be easily reduced to minutes by using a cluster with a few nodes.\nNext we consider the effectiveness of our approach in terms of removing synchronization and constraining the search space. Table 3 shows that in the worst case we have to perform only 3.2% of extra work compared to the completely synchronized version in which no unnecessary tasks are generated. At the same time, the total number of processed nodes is a small fraction of what we would\nhave to process without constraining the search space. For example, for the USCD benchmark the total number of tasks up to layer lmax = 8 is 1,689,096,333 when no pruning is applied, and it is reduced to approximately 12% of that when the pruning is enabled. Even then however, the total number of tasks to process is of the order of 108, which demonstrates complexity of the problem and the need for parallel approach. The same pattern holds true for other tested data sets.\nThe last layer at which we enumerate new maximal parent sets, lz , is always much smaller than lmax. This suggests that there is a room to tighten the pruning conditions. At the same time, it confirms that switching to the DFS at the higher levels of the dynamic programming lattice will not trigger any significant work due to how we manage the global state with all maximal parent sets. Finally, by looking at the results for AL-4 and AL-10 data sets, we can see that both lmax and lz are increasing when the number of observations increases. This is because with the growing m the network complexity term increases logarithmically for any variable Xi, but s(Xi, ∅) grows linearly. Consequently, the effectiveness of the pruning conditions decreases. Nevertheless, the overall performance of the method remains reasonable."
+    }, {
+      "heading" : "4.2. HEPAR II Test",
+      "text" : "In our second experiment, we focused on the HEPAR II test data. This benchmark comes from one of the early clinical decision support systems for multiple-disorder diagnosis of liver that involved a complex Bayesian network [13]. As we already mentioned, the parent set assignment problem plays a critical role in the exact Bayesian networks learning, and hence directly translates into our ability to build high quality models for critical applications. This makes the benchmark interesting from the practical point of view. The benchmark is also challenging as it contains 70 variables, and all variables assume only few states, making it hard to identify variables that should be pruned.\nTo process HEPAR II we used all 25 nodes of our cluster. The experiment took 20 hours and 17 minutes to complete, with lmax = 8 and lz = 4. To the best of our knowledge, this is the first time exact results for HEPAR II are reported. The peak memory consumption was 327 GB, and the execution involved the total of 10,770,519,474 tasks. Because the total memory available in our cluster is 1.6 TB, we again were able to process this benchmark completely in the BFS mode. However, to see how turning into the DFS mode affects the performance, we limited the available memory to 4 GB per node or 100 GB total memory. In this case, at layer l = 7 we had to switch to the DFS mode to process the remaining 9,427,586,763 tasks. This had the minor impact on the performance, and we were able to complete the entire execution in 20 hours and 28 minutes. Here we should keep in mind that because lz = 4 there were no new maximal parent sets discovered when running in the DFS mode. However, we believe that even\nwith new parent sets discovered the performance would not be drastically changed."
+    }, {
+      "heading" : "5. Related Work",
+      "text" : "Because of its importance, the parent assignment problem has been considered as a standalone question [1], [3] and in the relation to the structure learning of Bayesian networks [2], [4]. In [1], Koivisto provides several hardness results that suggest that the parent assignment for a single variable most likely has no polynomial-time solution. This motivates our parallel approach as there is a practical need to push the size of the problems that can be solved exactly in realistic time limits. In [2], [4], multiple authors discuss the application of maximal parent sets in exact Bayesian networks structure learning. However, in each case maximal parent sets are assumed to be given and no details of how that is achieved are provided. In this paper, we provide the actual scalable algorithm for maximal parent sets enumeration, which in fact can be combined with any Bayesian network structure learning strategy. There is a significant body of work on solving maximal parent sets enumeration while discovering Bayesian network structure [25], [26], [27], including parallel algorithms [19], [28]. However, when both problems are coupled many optimizations specific to the parent sets enumeration become infeasible. As a result, these combined approaches do not scale and are limited to the instances with 30 to 40 variables, even when using thousands of cores and provably optimal MPIbased realizations [19], [28]. Finally, recently Scanagatta et al. [3] proposed a greedy heuristic that depends on a fast approximation of the actual scoring function to constraint the number of explored parent sets. While this approach can be used to solve problems larger than what we report, it does not provide any quality guarantees. In contrast, our method is guaranteed to provide the exact solution."
+    }, {
+      "heading" : "6. Conclusion",
+      "text" : "The exact parent set identification is a challenging problem with important applications in the exact structure learning of Bayesian networks. In this paper, we proposed a new scalable distributed memory approach to the problem, and we used it to efficiently process HEPAR II data set. This experiment clearly demonstrated that our method can handle even the most challenging data sets and using only limited hardware resources. This in turn opens new possibilities for exact learning of large Bayesian networks, as with some effort our method can be combined with the already existing solvers, e.g. [4]. Our approach is scalable and we believe can be generalized to other popular scoring functions including AIC and BDeu. Since the efficiency of constraining the search space for these functions is currently unclear, the ability of our solution to adopt to heavy workloads provides a significant advantage."
+    }, {
+      "heading" : "Acknowledgments",
+      "text" : "Authors wish to acknowledge hardware and technical support provided by the Center for Computational Research at the University at Buffalo."
+    } ],
+    "references" : [ {
+      "title" : "Parent assignment is hard for the MDL, AIC, and NML costs",
+      "author" : [ "M. Koivisto" ],
+      "venue" : "International Conference on Computational Learning Theory, 2006, pp. 289–303.",
+      "citeRegEx" : "1",
+      "shortCiteRegEx" : null,
+      "year" : 2006
+    }, {
+      "title" : "Learning optimal Bayesian networks using A* search",
+      "author" : [ "C. Yuan", "B. Malone", "X. Wu" ],
+      "venue" : "International Joint Conference on Artificial Intelligence, 2011, pp. 2186–2191.",
+      "citeRegEx" : "2",
+      "shortCiteRegEx" : null,
+      "year" : 2011
+    }, {
+      "title" : "Learning Bayesian networks with thousands of variables",
+      "author" : [ "M. Scanagatta", "C. de Campos", "G. Corani", "M. Zaffalon" ],
+      "venue" : "Neural Information Processing Systems, 2015, pp. 1864–1872.",
+      "citeRegEx" : "3",
+      "shortCiteRegEx" : null,
+      "year" : 2015
+    }, {
+      "title" : "Exact structure learning of Bayesian networks by optimal path extension",
+      "author" : [ "S. Karan", "J. Zola" ],
+      "venue" : "IEEE International Conference on Big Data, 2016, pp. 48–55.",
+      "citeRegEx" : "4",
+      "shortCiteRegEx" : null,
+      "year" : 2016
+    }, {
+      "title" : "Algorithms for large scale Markov blanket discovery.",
+      "author" : [ "I. Tsamardinos", "C. Aliferis", "A. Statnikov", "E. Statnikov" ],
+      "venue" : "in FLAIRS Conference,",
+      "citeRegEx" : "5",
+      "shortCiteRegEx" : "5",
+      "year" : 2003
+    }, {
+      "title" : "Clinical Decision Support Systems: A review on knowledge representation and inference under uncertainties",
+      "author" : [ "G. Kong", "D.-L. Xu", "J.-B. Yang" ],
+      "venue" : "International Journal of Computational Intelligence Systems, vol. 1, no. 2, pp. 159–167, 2008.",
+      "citeRegEx" : "6",
+      "shortCiteRegEx" : null,
+      "year" : 2008
+    }, {
+      "title" : "Comparing risks of alternative medical diagnosis using Bayesian arguments",
+      "author" : [ "N. Fenton", "M. Neil" ],
+      "venue" : "Journal of Biomedical Informatics, vol. 43, no. 4, pp. 485–495, 2010.",
+      "citeRegEx" : "7",
+      "shortCiteRegEx" : null,
+      "year" : 2010
+    }, {
+      "title" : "Using Bayesian belief networks for credit card fraud detection",
+      "author" : [ "L. Mukhanov" ],
+      "venue" : "International Conference on Artificial Intelligence and Applications, 2008, pp. 221–225.",
+      "citeRegEx" : "8",
+      "shortCiteRegEx" : null,
+      "year" : 2008
+    }, {
+      "title" : "Using Bayesian networks to analyze expression data",
+      "author" : [ "N. Friedman", "M. Linial", "I. Nachman", "D. Pe’er" ],
+      "venue" : "Journal of Computational Biology, vol. 7, no. 3-4, pp. 601–620, 2000.",
+      "citeRegEx" : "9",
+      "shortCiteRegEx" : null,
+      "year" : 2000
+    }, {
+      "title" : "An improved lower bound for Bayesian Network structure learning",
+      "author" : [ "X. Fan", "Y. Changhe" ],
+      "venue" : "Association for the Advancement of Artificial Intelligence, 2015.",
+      "citeRegEx" : "10",
+      "shortCiteRegEx" : null,
+      "year" : 2015
+    }, {
+      "title" : "Probabilistic Graphical Models: Principles and Techniques",
+      "author" : [ "D. Koller", "N. Friedman" ],
+      "venue" : null,
+      "citeRegEx" : "11",
+      "shortCiteRegEx" : "11",
+      "year" : 2009
+    }, {
+      "title" : "Apache Spark: a unified engine for big data processing",
+      "author" : [ "M. Zaharia", "M. Franklin", "A. Ghodsi", "J. Gonzalez", "S. Shenker", "I. Stoica", "R. Xin", "P. Wendell", "T. Das", "M. Armbrust", "A. Dave", "X. Meng", "J. Rosen", "S. Venkataraman" ],
+      "venue" : "Communication of the ACM, vol. 59, no. 11, pp. 56–65, 2016.",
+      "citeRegEx" : "12",
+      "shortCiteRegEx" : null,
+      "year" : 2016
+    }, {
+      "title" : "Estimating the dimension of a model",
+      "author" : [ "G. Schwarz" ],
+      "venue" : "The Annals of Statistics, vol. 6, pp. 461–464, 1978.",
+      "citeRegEx" : "14",
+      "shortCiteRegEx" : null,
+      "year" : 1978
+    }, {
+      "title" : "Information theory and an extension of the maximum likelihood principle",
+      "author" : [ "H. Akaike" ],
+      "venue" : "Second International Symposium on Information Theory, 1973, pp. 267–281.",
+      "citeRegEx" : "15",
+      "shortCiteRegEx" : null,
+      "year" : 1973
+    }, {
+      "title" : "A Bayesian method for the induction of probabilistic networks from data",
+      "author" : [ "G. Cooper", "E. Herskovits" ],
+      "venue" : "Machine Learning, vol. 9, pp. 309–347, 1992.",
+      "citeRegEx" : "16",
+      "shortCiteRegEx" : null,
+      "year" : 1992
+    }, {
+      "title" : "A tutorial on learning with Bayesian networks",
+      "author" : [ "D. Heckerman" ],
+      "venue" : "1995. [Online]. Available: http://tinyurl.com/j939ua3",
+      "citeRegEx" : "17",
+      "shortCiteRegEx" : null,
+      "year" : 1995
+    }, {
+      "title" : "A work-efficient parallel breadthfirst search algorithm (or how to cope with the nondeterminism of reducers)",
+      "author" : [ "C. Leiserson", "T. Schardl" ],
+      "venue" : "ACM Symposium on Parallelism in Algorithms and Architectures, 2010, pp. 303–314.",
+      "citeRegEx" : "18",
+      "shortCiteRegEx" : null,
+      "year" : 2010
+    }, {
+      "title" : "Parallel globally optimal structure learning of Bayesian networks",
+      "author" : [ "O. Nikolova", "J. Zola", "S. Aluru" ],
+      "venue" : "Journal of Parallel and Distributed Computing, vol. 73, pp. 1039–1048, 2013.",
+      "citeRegEx" : "19",
+      "shortCiteRegEx" : null,
+      "year" : 2013
+    }, {
+      "title" : "Efficient structure learning of Bayesian networks using constraints",
+      "author" : [ "C. de Campos", "Q. Ji" ],
+      "venue" : "Journal of Machine Learning Research, pp. 663–689, 2011.",
+      "citeRegEx" : "20",
+      "shortCiteRegEx" : null,
+      "year" : 2011
+    }, {
+      "title" : "A branch-and-bound algorithm for MDL learning Bayesian networks",
+      "author" : [ "J. Tian" ],
+      "venue" : "Conference on Uncertainty in Artificial Intelligence, 2000, pp. 580–588.",
+      "citeRegEx" : "21",
+      "shortCiteRegEx" : null,
+      "year" : 2000
+    }, {
+      "title" : "Finding optimal models for small gene networks",
+      "author" : [ "S. Ott", "S. Imoto", "S. Miyano" ],
+      "venue" : "Pacific Symposium on Biocomputing, 2004, pp. 557–567.",
+      "citeRegEx" : "25",
+      "shortCiteRegEx" : null,
+      "year" : 2004
+    }, {
+      "title" : "Exact Bayesian structure discovery in Bayesian networks",
+      "author" : [ "M. Koivisto", "K. Sood" ],
+      "venue" : "Journal of Machine Learning Research, vol. 5, pp. 549–573, 2004.",
+      "citeRegEx" : "26",
+      "shortCiteRegEx" : null,
+      "year" : 2004
+    }, {
+      "title" : "Finding optimal Bayesian networks by dynamic programming",
+      "author" : [ "A. Singh", "A. Moore" ],
+      "venue" : "Carnegie Mellon University, Tech. Rep., 2005.",
+      "citeRegEx" : "27",
+      "shortCiteRegEx" : null,
+      "year" : 2005
+    }, {
+      "title" : "Parallel algorithm for learning optimal Bayesian network structure",
+      "author" : [ "Y. Tamada", "S. Imoto", "S. Miyano" ],
+      "venue" : "Journal of Machine Learning Research, vol. 12, pp. 2437–2459, 2011.",
+      "citeRegEx" : "28",
+      "shortCiteRegEx" : null,
+      "year" : 2011
+    } ],
+    "referenceMentions" : [ {
+      "referenceID" : 0,
+      "context" : "In Machine Learning, the parent set assignment problem is to find a set of random variables that best explain a selected variable given input data and some predefined scoring criterion [1].",
+      "startOffset" : 185,
+      "endOffset" : 188
+    }, {
+      "referenceID" : 1,
+      "context" : "It is a precursor to Bayesian networks structure learning, where it is solved for each variable to produce a list of potential predecessors of that variable in a final network thus drastically limiting the number of structures that have to be considered [2], [3], [4].",
+      "startOffset" : 254,
+      "endOffset" : 257
+    }, {
+      "referenceID" : 2,
+      "context" : "It is a precursor to Bayesian networks structure learning, where it is solved for each variable to produce a list of potential predecessors of that variable in a final network thus drastically limiting the number of structures that have to be considered [2], [3], [4].",
+      "startOffset" : 259,
+      "endOffset" : 262
+    }, {
+      "referenceID" : 3,
+      "context" : "It is a precursor to Bayesian networks structure learning, where it is solved for each variable to produce a list of potential predecessors of that variable in a final network thus drastically limiting the number of structures that have to be considered [2], [3], [4].",
+      "startOffset" : 264,
+      "endOffset" : 267
+    }, {
+      "referenceID" : 4,
+      "context" : "It is also closely related to the feature selection problem, since it directly translates into Markov blankets discovery [5].",
+      "startOffset" : 121,
+      "endOffset" : 124
+    }, {
+      "referenceID" : 5,
+      "context" : "Because of these connections, the problem has many practical applications spanning clinical decision support systems, risk assessment, strategic planning, fraud detection and many others [6], [7], [8], [9].",
+      "startOffset" : 187,
+      "endOffset" : 190
+    }, {
+      "referenceID" : 6,
+      "context" : "Because of these connections, the problem has many practical applications spanning clinical decision support systems, risk assessment, strategic planning, fraud detection and many others [6], [7], [8], [9].",
+      "startOffset" : 192,
+      "endOffset" : 195
+    }, {
+      "referenceID" : 7,
+      "context" : "Because of these connections, the problem has many practical applications spanning clinical decision support systems, risk assessment, strategic planning, fraud detection and many others [6], [7], [8], [9].",
+      "startOffset" : 197,
+      "endOffset" : 200
+    }, {
+      "referenceID" : 8,
+      "context" : "Because of these connections, the problem has many practical applications spanning clinical decision support systems, risk assessment, strategic planning, fraud detection and many others [6], [7], [8], [9].",
+      "startOffset" : 202,
+      "endOffset" : 205
+    }, {
+      "referenceID" : 0,
+      "context" : "For instance, it is NP-complete for the Normalized Maximum Likelihood (NML) criterion [1].",
+      "startOffset" : 86,
+      "endOffset" : 89
+    }, {
+      "referenceID" : 9,
+      "context" : "In fact, the largest problems solved by exact algorithms do not contain more than 40 variables [10].",
+      "startOffset" : 95,
+      "endOffset" : 99
+    }, {
+      "referenceID" : 2,
+      "context" : "[3], do not provide any guarantees on the quality of the solutions they find.",
+      "startOffset" : 0,
+      "endOffset" : 3
+    }, {
+      "referenceID" : 10,
+      "context" : "This significantly impacts their usefulness, since the inherent uncertainty of the model due to the input data and the scoring function, cannot be separated from the deficiencies of the learning algorithm [11].",
+      "startOffset" : 205,
+      "endOffset" : 209
+    }, {
+      "referenceID" : 11,
+      "context" : "To validate our approach, we provide an efficient implementation on the Apache Spark platform [12], and demonstrate its strong scalability across different ML test sets.",
+      "startOffset" : 94,
+      "endOffset" : 98
+    }, {
+      "referenceID" : 12,
+      "context" : "For example, it could be one of the several available functions, such as information theoretic MDL [14] and AIC [15] or the BD family implementing Bayesian scoring criteria [16], [17].",
+      "startOffset" : 99,
+      "endOffset" : 103
+    }, {
+      "referenceID" : 13,
+      "context" : "For example, it could be one of the several available functions, such as information theoretic MDL [14] and AIC [15] or the BD family implementing Bayesian scoring criteria [16], [17].",
+      "startOffset" : 112,
+      "endOffset" : 116
+    }, {
+      "referenceID" : 14,
+      "context" : "For example, it could be one of the several available functions, such as information theoretic MDL [14] and AIC [15] or the BD family implementing Bayesian scoring criteria [16], [17].",
+      "startOffset" : 173,
+      "endOffset" : 177
+    }, {
+      "referenceID" : 15,
+      "context" : "For example, it could be one of the several available functions, such as information theoretic MDL [14] and AIC [15] or the BD family implementing Bayesian scoring criteria [16], [17].",
+      "startOffset" : 179,
+      "endOffset" : 183
+    }, {
+      "referenceID" : 1,
+      "context" : "with the efficient algorithms such as [2], [4] this requires large and hard to predict number of queries for optimal parent sets, owing to the component d(Xi, U−{Xi}) in the recursion.",
+      "startOffset" : 38,
+      "endOffset" : 41
+    }, {
+      "referenceID" : 3,
+      "context" : "with the efficient algorithms such as [2], [4] this requires large and hard to predict number of queries for optimal parent sets, owing to the component d(Xi, U−{Xi}) in the recursion.",
+      "startOffset" : 43,
+      "endOffset" : 46
+    }, {
+      "referenceID" : 1,
+      "context" : "In contrast, the set of all maximal parent sets is usually many orders of magnitude smaller, and hence using it instead, in the way we explained before, is the desired and viable alternative [2], [4], [3].",
+      "startOffset" : 191,
+      "endOffset" : 194
+    }, {
+      "referenceID" : 3,
+      "context" : "In contrast, the set of all maximal parent sets is usually many orders of magnitude smaller, and hence using it instead, in the way we explained before, is the desired and viable alternative [2], [4], [3].",
+      "startOffset" : 196,
+      "endOffset" : 199
+    }, {
+      "referenceID" : 2,
+      "context" : "In contrast, the set of all maximal parent sets is usually many orders of magnitude smaller, and hence using it instead, in the way we explained before, is the desired and viable alternative [2], [4], [3].",
+      "startOffset" : 201,
+      "endOffset" : 204
+    }, {
+      "referenceID" : 16,
+      "context" : "complexity, irrespective of which parallel BFS realization we assume [18].",
+      "startOffset" : 69,
+      "endOffset" : 73
+    }, {
+      "referenceID" : 17,
+      "context" : "With DFS we can benefit from techniques like hypercube pipelining, similar to [19], but this strategy requires that we store partial results and update them each time a node is discovered before its all predecessors are processed.",
+      "startOffset" : 78,
+      "endOffset" : 82
+    }, {
+      "referenceID" : 18,
+      "context" : "We note that similar bounds can be derived for other functions, and in fact a significant work in this direction has been done, for example in [20].",
+      "startOffset" : 143,
+      "endOffset" : 147
+    }, {
+      "referenceID" : 19,
+      "context" : "We can further extend our pruning strategy by using the following observation [21].",
+      "startOffset" : 78,
+      "endOffset" : 82
+    }, {
+      "referenceID" : 11,
+      "context" : "Because of the memory and computational complexity, which remains challenging even when our pruning conditions are applied, we focus our parallel strategy on the distributed memory systems, with the Apache Spark platform [12] serving as an execution vehicle.",
+      "startOffset" : 221,
+      "endOffset" : 225
+    }, {
+      "referenceID" : 3,
+      "context" : "The high level exploration components of our method are implemented in Python, and the computationally intensive parts, specifically evaluations of function s, are offloaded to the efficient, SIMD-parallel C++ kernel derived from our SABNA package [4], [22].",
+      "startOffset" : 248,
+      "endOffset" : 251
+    }, {
+      "referenceID" : 0,
+      "context" : "Because of its importance, the parent assignment problem has been considered as a standalone question [1], [3] and in the relation to the structure learning of Bayesian networks [2], [4].",
+      "startOffset" : 102,
+      "endOffset" : 105
+    }, {
+      "referenceID" : 2,
+      "context" : "Because of its importance, the parent assignment problem has been considered as a standalone question [1], [3] and in the relation to the structure learning of Bayesian networks [2], [4].",
+      "startOffset" : 107,
+      "endOffset" : 110
+    }, {
+      "referenceID" : 1,
+      "context" : "Because of its importance, the parent assignment problem has been considered as a standalone question [1], [3] and in the relation to the structure learning of Bayesian networks [2], [4].",
+      "startOffset" : 178,
+      "endOffset" : 181
+    }, {
+      "referenceID" : 3,
+      "context" : "Because of its importance, the parent assignment problem has been considered as a standalone question [1], [3] and in the relation to the structure learning of Bayesian networks [2], [4].",
+      "startOffset" : 183,
+      "endOffset" : 186
+    }, {
+      "referenceID" : 0,
+      "context" : "In [1], Koivisto provides several hardness results that suggest that the parent assignment for a single variable most likely has no polynomial-time solution.",
+      "startOffset" : 3,
+      "endOffset" : 6
+    }, {
+      "referenceID" : 1,
+      "context" : "In [2], [4], multiple authors discuss the application of maximal parent sets in exact Bayesian networks structure learning.",
+      "startOffset" : 3,
+      "endOffset" : 6
+    }, {
+      "referenceID" : 3,
+      "context" : "In [2], [4], multiple authors discuss the application of maximal parent sets in exact Bayesian networks structure learning.",
+      "startOffset" : 8,
+      "endOffset" : 11
+    }, {
+      "referenceID" : 20,
+      "context" : "There is a significant body of work on solving maximal parent sets enumeration while discovering Bayesian network structure [25], [26], [27], including parallel algorithms [19], [28].",
+      "startOffset" : 124,
+      "endOffset" : 128
+    }, {
+      "referenceID" : 21,
+      "context" : "There is a significant body of work on solving maximal parent sets enumeration while discovering Bayesian network structure [25], [26], [27], including parallel algorithms [19], [28].",
+      "startOffset" : 130,
+      "endOffset" : 134
+    }, {
+      "referenceID" : 22,
+      "context" : "There is a significant body of work on solving maximal parent sets enumeration while discovering Bayesian network structure [25], [26], [27], including parallel algorithms [19], [28].",
+      "startOffset" : 136,
+      "endOffset" : 140
+    }, {
+      "referenceID" : 17,
+      "context" : "There is a significant body of work on solving maximal parent sets enumeration while discovering Bayesian network structure [25], [26], [27], including parallel algorithms [19], [28].",
+      "startOffset" : 172,
+      "endOffset" : 176
+    }, {
+      "referenceID" : 23,
+      "context" : "There is a significant body of work on solving maximal parent sets enumeration while discovering Bayesian network structure [25], [26], [27], including parallel algorithms [19], [28].",
+      "startOffset" : 178,
+      "endOffset" : 182
+    }, {
+      "referenceID" : 17,
+      "context" : "As a result, these combined approaches do not scale and are limited to the instances with 30 to 40 variables, even when using thousands of cores and provably optimal MPIbased realizations [19], [28].",
+      "startOffset" : 188,
+      "endOffset" : 192
+    }, {
+      "referenceID" : 23,
+      "context" : "As a result, these combined approaches do not scale and are limited to the instances with 30 to 40 variables, even when using thousands of cores and provably optimal MPIbased realizations [19], [28].",
+      "startOffset" : 194,
+      "endOffset" : 198
+    }, {
+      "referenceID" : 2,
+      "context" : "[3] proposed a greedy heuristic that depends on a fast approximation of the actual scoring function to constraint the number of explored parent sets.",
+      "startOffset" : 0,
+      "endOffset" : 3
+    }, {
+      "referenceID" : 3,
+      "context" : "[4].",
+      "startOffset" : 0,
+      "endOffset" : 3
+    } ],
+    "year" : 2017,
+    "abstractText" : "In Machine Learning, the parent set identification problem is to find a set of random variables that best explain selected variable given the data and some predefined scoring function. This problem is a critical component to structure learning of Bayesian networks and Markov blankets discovery, and thus has many practical applications ranging from fraud detection to clinical decision support. In this paper, we introduce a new distributed memory approach to the exact parent sets assignment problem. To achieve scalability, we derive theoretical bounds to constraint the search space when MDL scoring function is used, and we reorganize the underlying dynamic programming such that the computational density is increased and fine-grain synchronization is eliminated. We then design efficient realization of our approach in the Apache Spark platform. Through experimental results, we demonstrate that the method maintains strong scalability on a 500-core standalone Spark cluster, and it can be used to efficiently process data sets with 70 variables, far beyond the reach of the currently available solutions.",
+    "creator" : "LaTeX with hyperref package"
+  }
+}

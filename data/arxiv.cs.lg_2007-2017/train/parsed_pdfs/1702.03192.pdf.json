@@ -1,0 +1,158 @@
+{
+  "name" : "1702.03192.pdf",
+  "metadata" : {
+    "source" : "CRF",
+    "title" : "Improving the Performance of Fully Connected Neural Networks by Out-of-Place Matrix Transpose",
+    "authors" : [ "Shaohuai Shi", "Pengfei Xu", "Xiaowen Chu" ],
+    "emails" : [ "chxw}@comp.hkbu.edu.hk" ],
+    "sections" : [ {
+      "heading" : null,
+      "text" : "Index Terms—Deep Neural Networks; Linear Algebra; Matrix Multiplication; Transpose; GPU;"
+    }, {
+      "heading" : "1. Introduction",
+      "text" : "It is common to see fully connected network has been widely applied in deep learning [1][2]. And the matrix multiplication operation plays an important role of a key mathematic tool in solving deep learning computations. The general form of matrix multiplication for two matrices A and B, which are both row-major matrices, can be represented as follows:\nC = A× B (1)\nwhere A ∈ Rm×k, B ∈ Rk×n and C ∈ Rm×n. Assume that the element in row i and column j of a matrix M is Mij , we have:\nCij = k∑\nk=1\nAik × Bkj (2)\nThere is another form of matrix multiplication, which is A times the transpose of B, i.e.,\nC = A× BT (3)\nwhere BT is the transpose of B, BTji = Bij and B ∈ Rn×k.\nFrom Equation 2, we can find that the complexity of matrix multiplication is O(m×k×n), which is a very timeconsuming computation on a serial algorithm. To do the computation of Equation 3, there are two general methods. The first one is that not to change the positions of elements of B, when it needs to access the column elements, it changes to access the corresponding row elements instead. The second is to transpose B to BT , and then do the matrixmatrix multiplication. In this paper, we focus on accelerating Equation 3.\nNowadays, there exists optimized algorithms to speedup the computation, including ATLAS, LAPACK, OpenBLAS, GotoBLAS, Intel MKL, Eigen, cuBLAS, clBLAS, etc., which focus on different types of hardware platforms. It is well known that GPUs play an important role in parallel computing. The cuBLAS running on NVIDIA GPU cards, achieves about 3000GFLOPS, which is up to 17x faster than that of MKL on Intel IvyBridge single socket 12 -core E52697 v2 @ 2.70GHz, with single float matrix multiplication on NVIDIA K40M card [3].\nHowever, there are some drawbacks of cuBLAS when do computation of Equation 3, which we call NT operation, compared to Equation 2, named NN operation.\nIn this paper, we test the performance GEMM of cuBLAS on both NN and NT operations, and then we figure out the drawbacks on some cases of cuBLAS. After that, we propose a solution to avoid these poor cases and achieve a better performance to work out Equation 3. Lastly, we exploit our solution to a real-world application Caffe [4] which is a popular deep learning framework and uses cuBLAS to accelerate its operations of matrix-matrix multiplication1. Our experiments show that our solution achieves up to 70% faster than original Caffe in some cases on the GPU of GTX1080.\nThe rest of the paper is organized as follows. We introduce the motivation in Section 2, and followed our methodology in Section 3. Experimental results are presented in Section 4. We conclude the paper and discuss our future work in Section 5.\n1Our source codes can be found here: http://github.com/ caffe-optimized\nar X\niv :1\n70 2.\n03 19\n2v 1\n[ cs\n.D C\n] 1\n0 Fe\nb 20\n17"
+    }, {
+      "heading" : "2. Motivation",
+      "text" : "On deep neural networks, especially the fully connected networks [5], matrix-matrix multiplication is one of the main operations to do the training of networks. According to findings on fully connected networks in [6], we benchmark the performance of GEMM in NN and NT operations with a set of matrix configurations on the newest generation of NVIDIA GPU card (i.e., GTX 1080 with Pascal architecture) with CUDA-8.0. Table 1 shows our hardware setup for the experiments.\nThe benchmark result is shown in Fig. 1. It can be noted that, in most cases, the performance of NN operation is much better than NT operation. For example, in the case of C = A×BT , where A ∈ R4096×53504 and B ∈ R2048×53504, the performance of NN operation is up to four times better than the NT operation on both GTX1080 card. Therefore, there exists some optimization space to speedup the calculation of Equation 3. Since the performance of NN operation is much better than NT operation, we first propose a naive method (TNN) which does the transpose of matrix B first and then exploits NN operation to finish the calculation of Equation 3. However, the time used on transpose operation may be larger than the difference between NT and NN, which results in the performance of TNN operation could be worse than NT operation. To solve this problem, we propose an SVM-based model to decide to choose the faster operation in calculating Equation 3."
+    }, {
+      "heading" : "3. Methods",
+      "text" : ""
+    }, {
+      "heading" : "3.1. Naive Method",
+      "text" : "To calculate Equation 3, we replace the one-step NT operation by two-step TNN operation (i.e., transpose B and do NN operation). This method requires extra GPU memory to store BT to perform out-of-place matrix transpose, and the size of memory required is the same with matrix B. The pseudo-code of TNN method is shown in Algorithm 1. Since TNN operation requires the additional transpose on GPU, the time used by transpose operation (Ttranspose(n, k)) should not be larger than differential between NT (TNT (m,n, k)) and NN (TNN (m,n, k)). In other words, to guarantee TTNN (m,n, k) is smaller than TNT (m,n, k)), we have:\nTtranspose(n, k) < TNT (m,n, k)− TNN (m,n, k) (4)\nHowever, the performance of transpose operation is decided by the hardware platform and the size of matrix. It is difficult to guarantee Equation 4 in practical if the difference between TNT (m,n, k)) and TNN (m,n, k) is small enough.\nTherefore, to perform faster calculation of Equation 3, we don not always use TNN instead of NT, which inspires the next method with SVM model.\nAlgorithm 1 TNN 1: procedure TNN(A, B, C, m, n, k) 2: // 1. Allocate GPU memory for transpose of B 3: BT = cudaMemAlloc(n*k*sizeof(float)) 4: // 2. Tranpose B on GPU and store to BT 5: transposeOnGPU(B, n, k, BT) 6: // 3. Call gemm of cuBLAS with NN parameters 7: cublasSgemm(\ncublasHandler, CUBLAS OP N, CUBLAS OP N, A, lda, BT, ldb, C, ldc, ...)\n8: // 4. Free GPU memory of BT 9: cudaFree(BT)"
+    }, {
+      "heading" : "3.2. Model-based Method",
+      "text" : "According to the performance difference analysis between NT and TNN, we design a model-based optimized method (MTNN) to calculate Equation 3. From Fig. 1, there exist some cases that the performance of NT is extremely close to or even better than that of NN operation, the TNN method could not achieve better performance than NT, so we should not simply replace NT operation to TNN operation in real application. We propose a model to decide which one to choose to achieve better performance between NT and TNN by the size of matrices. Our method is straight forward, and it consists of two steps. First, we collect history data by testing the results of NT and TNN. Second, machine learning method is applied to train a decision model."
+    }, {
+      "heading" : "3.2.1. Data Collection",
+      "text" : "NT operation of cuBLAS is the API: “cublasSgemm” with the second and third parameters set to be “CUBLAS OP T” and “CUBLAS OP N” respectively, while TNN operation is doing the out-of-place transpose first by using “cublasSgeam”, and then calling “cublasSgemm” with both the second and third parameters set to be “CUBLAS OP N”.\nWe choose a range of matrices with sizes in S = {2i|i = 7, 8, ..., 16}. In other words, for all m, n and k (m ∈ S, n ∈ S, k ∈ S), which has 1000 combinations, we test the performances of NT and TNN in calculating Equation 3. Let PNT (m,n, k) and PTNN (m,n, k) denote the performance of NT and TNN respectively with two matrices A and B, where A ∈ Rm×k and B ∈ Rn×k. The difference value between PNT (m,n, k) and PTNN (m,n, k) is denoted by D(m,n, k).\nThe collected data have 1000 records, and each record is with the following format:\nm,n,k,PNT (m,n, k),PTNN (m,n, k),D(m,n, k) The cases that run out of memory are excluded, so the number of total samples is 891, and there are 655 samples with D < 0, and 236 samples with D > 0."
+    }, {
+      "heading" : "3.2.2. Decision Model",
+      "text" : "Given two matrix sizes (i.e., m,n, k) and two methods (i.e., NT and TNN) to calculate Equation 3, we should choose the one with higher performance operation. In formal, given input varibles: 〈m,n, k〉, there is a decision function: f , where\nf(m,n, k) = { −1, PNT (m,n, k) < PTNN (m,n, k) +1, PNT (m,n, k) ≥ PTNN (m,n, k)\nIf f(m,n, k) = −1, then we choose TNN, otherwise we choose NT. Our target is to learn the decision function: f with the collected data, which is generalized as a classification problem. The training samples are denoted by X = {〈log2(m), log2(n), log2(k)〉|m,n, k ∈ S}, and the corresponding labels are Y = {f(m,n, k)|m,n, k ∈ S}. The SVM algorithm [7] is applied to solve this decision model. We use libsvm [8] with the kernel of radial basis function. Since the number of positive samples (236) is much smaller than that of negative one (655), the −wi parameter of libsvm is set to be 1.4 to solve the unbalanceddata problem. A 10-fold cross validation is used to test the performance of the model. 90 percentages of samples are used to be the training set, and the others are the testing set."
+    }, {
+      "heading" : "3.3. Integration with Caffe",
+      "text" : "To accelerate the training of deep learning by using MTNN method, the decision model is integrated into Caffe, and fully connected networks, the main operations of which are NT and NN, are tested on the integrated Caffe. When there is an operation of Equation 3 needs to be computed, the predictor can decide a faster version to perform the operation instead of calling NT of cuBLAS directly."
+    }, {
+      "heading" : "4. Results",
+      "text" : "We first present the results of matrix multiplication which compares the performances between original NT method by cuBLAS and TNN method, and then results of model-based method are also included for comparison. After that, the performance of our method in Caffe is shown."
+    }, {
+      "heading" : "4.1. Results of TNN Method",
+      "text" : "Results of the original NT method and TNN method are shown in Fig. 2. It can be noticed that there are some cases that NT method still outperforms TNN method, especially when the value of K is small (e.g., there are up to half of the cases that NT method is better than TNN method when K is 128). Among the tested cases, the maximum speedup of TNN method is up to 4.7 times compared to NT method. In the cases with better results of NT, the performance of NT is 1.67 times better than TNN at maximum. On average, TNN is 1.6 times better than NT."
+    }, {
+      "heading" : "4.2. Results of MTNN",
+      "text" : "The data collected is splitted into ten parts on average, and 10-fold cross validation method is used to check the model. So among the 10 parts, each part is used to be a test set and the others to be a training set. The average precision of 10-fold cross validation is 95.1%, which means that the decision model can make the calculation of Equation 3 fast enough in 95.1% cases. After 10-fold cross validation, we put all the samples as the training set to generate the final decision model. The result compared to the original method is shown in Fig. 3. Compared to Fig. 2, most of red rectangles have been replaced by blue dashes. The statistic result is shown in Table. 2 and Table. 3. From Table. 2, it is noted that the ratio of the cases that NT is better TNN decreases from 0.262 to 0.02 by MTNN method. In other words, out method can improve the performance in 98% of the cases.\nTable 2. Compare performance of NT to TNN and MTNN.\nLarger than Smaller than Equal to TNN MTNN TNN MTNN TNN MTNN\n# of Cases 233 18 655 622 3 251 Ratio 0.262 0.02 0.735 0.698 0.003 0.282\nNote: the ratio is equal to the number of cases devided by the total number of valid samples.\nTable 3. Performance speedup of TNN and MTNN compared to NT.\nMaximum speedup Mimimum speedup Average speedup TNN 4.7 -1.66 1.59\nMTNN 4.7 -1.14 1.66 Note: the negative speedup means that the performance of NT is better than\nTNN or MTNN."
+    }, {
+      "heading" : "4.3. FCN Results in Caffe",
+      "text" : "To test the performance of integrated Caffe, we choose two fully connected layers, which has 4096 neurons each layer, in AlexNet [2]. In addition, a smaller FCN network is tested to do the comparison. The mini-batch size varies from 128 to 2048. The performance comparison of FCN model running between three versions of Caffe, say original Caffe (CaffeNT), Caffe with TNN method (CaffeTNN) and Caffe with MTNN method (CaffeMTNN), is displayed in Fig. 4.\nBy integrating our method to Caffe, the performance of optimized Caffe can accomplish up to 70% speedup compared to the original Caffe on GTX1080 card. Compared to CaffeTNN, CaffeMTNN has slightly better performance, which is contributed by the decision model."
+    }, {
+      "heading" : "5. Conclusion and Future Work",
+      "text" : "Our method to multiply matrix A and the transpose of matrix B is much better than that of cuBLAS API. The original results achieve about 4.7x speedup compared to\nusing cuBLAS directly on GTX1080 card. Furthermore, the method is applied to Caffe, and the optimized Caffe performs about 70% speedup on GTX1080 card.\nThe transposition algorithm we used is out-of-place method, which results in double memory of a matrix and it cannot run normally if there is no enough memory. Therefore, we plan to exploit in-place matrix transposition algorithm and to find a good trade-off between memory overhead and throughput."
+    } ],
+    "references" : [ {
+      "title" : "Lenet-5, convolutional neural networks",
+      "author" : [ "Y. LeCun" ],
+      "venue" : "URL: http://yann. lecun. com/exdb/lenet, 2015.",
+      "citeRegEx" : "1",
+      "shortCiteRegEx" : null,
+      "year" : 2015
+    }, {
+      "title" : "Imagenet classification with deep convolutional neural networks",
+      "author" : [ "A. Krizhevsky", "I. Sutskever", "G.E. Hinton" ],
+      "venue" : "Advances in neural information processing systems, 2012, pp. 1097–1105.",
+      "citeRegEx" : "2",
+      "shortCiteRegEx" : null,
+      "year" : 2012
+    }, {
+      "title" : "cublas — nvidia",
+      "author" : [ "NVIDIA" ],
+      "venue" : "https: / /developer.nvidia.com/cublas, 2016, accessed: 2016-09-6.",
+      "citeRegEx" : "3",
+      "shortCiteRegEx" : null,
+      "year" : 2016
+    }, {
+      "title" : "Caffe: Convolutional architecture for fast feature embedding",
+      "author" : [ "Y. Jia", "E. Shelhamer", "J. Donahue", "S. Karayev", "J. Long", "R. Girshick", "S. Guadarrama", "T. Darrell" ],
+      "venue" : "Proceedings of the 22nd ACM international conference on Multimedia, 2014, pp. 675–678.",
+      "citeRegEx" : "4",
+      "shortCiteRegEx" : null,
+      "year" : 2014
+    }, {
+      "title" : "Theory of the backpropagation neural network",
+      "author" : [ "R. Hecht-Nielsen" ],
+      "venue" : "Neural Networks, 1989. IJCNN., International Joint Conference on. IEEE, 1989, pp. 593–605.",
+      "citeRegEx" : "5",
+      "shortCiteRegEx" : null,
+      "year" : 1989
+    }, {
+      "title" : "Benchmarking state-of-the-art deep learning software tools",
+      "author" : [ "S. Shi", "Q. Wang", "P. Xu", "X. Chu" ],
+      "venue" : "arXiv preprint arXiv:1608.07249, 2016.",
+      "citeRegEx" : "6",
+      "shortCiteRegEx" : null,
+      "year" : 2016
+    }, {
+      "title" : "Least squares support vector machine classifiers",
+      "author" : [ "J.A. Suykens", "J. Vandewalle" ],
+      "venue" : "Neural processing letters, vol. 9, no. 3, pp. 293–300, 1999.",
+      "citeRegEx" : "7",
+      "shortCiteRegEx" : null,
+      "year" : 1999
+    }, {
+      "title" : "LIBSVM: A library for support vector machines",
+      "author" : [ "C.-C. Chang", "C.-J. Lin" ],
+      "venue" : "ACM Transactions on Intelligent Systems and Technology, vol. 2, pp. 27:1–27:27, 2011, software available at http://www.csie. ntu.edu.tw/∼cjlin/libsvm.",
+      "citeRegEx" : "8",
+      "shortCiteRegEx" : null,
+      "year" : 2011
+    } ],
+    "referenceMentions" : [ {
+      "referenceID" : 0,
+      "context" : "It is common to see fully connected network has been widely applied in deep learning [1][2].",
+      "startOffset" : 85,
+      "endOffset" : 88
+    }, {
+      "referenceID" : 1,
+      "context" : "It is common to see fully connected network has been widely applied in deep learning [1][2].",
+      "startOffset" : 88,
+      "endOffset" : 91
+    }, {
+      "referenceID" : 2,
+      "context" : "70GHz, with single float matrix multiplication on NVIDIA K40M card [3].",
+      "startOffset" : 67,
+      "endOffset" : 70
+    }, {
+      "referenceID" : 3,
+      "context" : "Lastly, we exploit our solution to a real-world application Caffe [4] which is a popular deep learning framework and uses cuBLAS to accelerate its operations of matrix-matrix multiplication1.",
+      "startOffset" : 66,
+      "endOffset" : 69
+    }, {
+      "referenceID" : 4,
+      "context" : "On deep neural networks, especially the fully connected networks [5], matrix-matrix multiplication is one of the main operations to do the training of networks.",
+      "startOffset" : 65,
+      "endOffset" : 68
+    }, {
+      "referenceID" : 5,
+      "context" : "According to findings on fully connected networks in [6], we benchmark the performance of GEMM in NN and NT operations with a set of matrix configurations on the newest generation of NVIDIA GPU card (i.",
+      "startOffset" : 53,
+      "endOffset" : 56
+    }, {
+      "referenceID" : 6,
+      "context" : "The SVM algorithm [7] is applied to solve this decision model.",
+      "startOffset" : 18,
+      "endOffset" : 21
+    }, {
+      "referenceID" : 7,
+      "context" : "We use libsvm [8] with the kernel of radial basis function.",
+      "startOffset" : 14,
+      "endOffset" : 17
+    }, {
+      "referenceID" : 1,
+      "context" : "To test the performance of integrated Caffe, we choose two fully connected layers, which has 4096 neurons each layer, in AlexNet [2].",
+      "startOffset" : 129,
+      "endOffset" : 132
+    } ],
+    "year" : 2017,
+    "abstractText" : "Fully connected network has been widely used in deep learning, and its computation efficiency is highly benefited from the matrix multiplication algorithm with cuBLAS on GPU. However, We found that, there exist some drawbacks of cuBLAS in calculating matrix A multiplies the transpose of matrix B (i.e., NT operation). To reduce the impact of NT operation by cuBLAS, we exploit the out-of-place transpose of matrix B to avoid using NT operation, and then we apply our method to Caffe, which is a popular deep learning tool. Our contribution is two-fold. First, we propose a naive method (TNN) and model-based method (MTNN) to increase the performance in calculating A × B , and it achieves about 4.7 times performance enhancement in our tested cases on GTX1080 card. Second, we integrate MTNN method into Caffe to enhance the efficiency in training fully connected networks, which achieves about 70% speedup compared to the original Caffe in our configured fully connected networks on GTX1080 card.",
+    "creator" : "LaTeX with hyperref package"
+  }
+}

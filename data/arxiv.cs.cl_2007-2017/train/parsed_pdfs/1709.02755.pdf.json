@@ -1,0 +1,746 @@
+{
+  "name" : "1709.02755.pdf",
+  "metadata" : {
+    "source" : "CRF",
+    "title" : "Training RNNs as Fast as CNNs",
+    "authors" : [ "Tao Lei", "Yu Zhang" ],
+    "emails" : [ "tao@asapp.com", "yzhang87@csail.mit.edu" ],
+    "sections" : [ {
+      "heading" : "1 Introduction",
+      "text" : "Many recent advances in deep learning have come from increased model capacity and associated computation. This often involves using larger and deeper networks that are tuned with extensive hyper-parameter settings. The growing model sizes and hyper-parameters, however, have greatly increased the training time. For instance, training a state-of-the-art translation or speech recognition system would take several days to complete (Vaswani et al., 2017; Wu et al., 2016b; Sak et al., 2014). Apparently, computation has become a major bottleneck for deep learning research.\nTo counter the dramatically increased computation, parallelization such as GPU-accelerated training has been predominately adopted to scale deep learning (Diamos et al., 2016; Goyal et al., 2017). While operations such as convolution and attention are well-suited for multi-threaded / GPU computation, recurrent neural nets, however, remain less amenable to parallelization. In a typical implementation, the computation of output state ht is suspended until the entire computation of ht−1 completes. This constraint impedes independent computation and largely slows down sequence processing. Figure 1 illustrates the processing time of cuDNN-optimized LSTMs (Appleyard et al., 2016) and word-level convolutions using conv2d. The difference is quite significant – even the very optimized LSTM implementation performs over 10x slower.\nIn this work, we introduce the Simple Recurrent Unit (SRU) which operates significantly faster than existing recurrent implementations. The recurrent unit simplifies state computation and hence exposes the same parallelism as CNNs, attention and feed-forward nets. Specifically, while the update of internal state ct still makes use of the previous state ct−1, the dependence on ht−1 in a recurrence step has been dropped. As a result, all matrix multiplications (i.e. gemm) and element-wise operations in the recurrent unit can be easily parallelized across different dimensions and steps. Similar to the implementation of cuDNN LSTM and conv2d, we perform CUDA-level optimizations for SRU by compiling all element-wise operations into a single kernel function call. As shown in Figure 1, our implementation achieves the same speed of its conv2d counterpart.\nOf course, an alternative implementation that fails to deliver comparable or better accuracy would have no applicability. To this end, we evaluate SRU on a wide range of applications including classifi-\n1https://github.com/taolei87/sru\nar X\niv :1\n70 9.\n02 75\n5v 1\n[ cs\n.C L\n] 8\nS ep\n2 01\n7\ncation, question answering, language modeling, translation and speech recognition. Experimental results confirm the effectiveness of SRU – it achieves better performance compared to recurrent (or convolutional) baseline models across these tasks, while being able to train much faster."
+    }, {
+      "heading" : "2 Method",
+      "text" : "We present Simple Recurrent Unit (SRU) in this section. We start with a basic gated recurrent neural network implementation, and then present necessary modifications for the speed-up. The modifications can be adopted to other gated recurrent neural nets, being not restricted to this particular instance."
+    }, {
+      "heading" : "2.1 SRU implementation",
+      "text" : "Most top-performing recurrent neural networks such as long short-term memory (LSTMs) (Hochreiter and Schmidhuber, 1997) and gated recurrent unit (GRUs) (Cho et al., 2014) make use of neural gates to control the information flow and alleviate the gradient vanishing (or explosion) problem. Consider a typical implementation,\nct = ft ct−1 + it x̃t = ft ct−1 + (1− ft) x̃t\nwhere ft and it are sigmoid gates referred as the forget gate and input gate. x̃t is the transformed input at step t. We choose the coupled version it = 1 − ft here for simplicity. The computation of x̃t also varies in different RNN instances. We use the simplest version that performs a linear transformation over the input vector x̃t = Wxt (Lei et al., 2017; Lee et al., 2017). Finally, the internal state ct is passed to an activation function g(·) to produce the output state ht = g(ct). We include two additional features in our implementation. First, we add skip connections between recurrent layers since they are shown quite effective for training deep networks (He et al., 2016; Srivastava et al., 2015; Wu et al., 2016a). Specifically, we use highway connections (Srivastava et al., 2015) and the output state h′t is computed as,\nh′t = rt ht + (1− rt) xt (1) = rt g(ct) + (1− rt) xt (2)\nwhere rt is the output of a reset gate. Second, we implement variational dropout (Gal and Ghahramani, 2016) in addition to the standard dropout for RNN regularization. Variational dropout uses a shared dropout mask across different time steps t. The mask is applied over input xt during every matrix multiplication in RNN (i.e., W · drop(xt)). Standard dropout is performed on ht before it is given to the highway connection."
+    }, {
+      "heading" : "2.2 Speeding-up the recurrence",
+      "text" : "Existing RNN implementations use the previous output state ht−1 in the recurrence computation. For instance, the forget vector would be computed by ft = σ(Wfxt +Rfht−1 + bf ). The inclusion of\nRht−1 breaks independence and parallelization: each dimension of the hidden state depends on the other, hence the computation of ht has to wait until the entire ht−1 is available.\nWe propose to completely drop the connection (between ht−1 and the neural gates of step t). The associated equations of SRU are given below,\nx̃t = Wxt (3) ft = σ(Wfxt + bf ) (4) rt = σ(Wrxt + br) (5) ct = ft ct−1 + (1− ft) x̃t (6) ht = rt g(ct) + (1− rt) xt (7)\nGiven a sequence of input vectors {x1, · · · ,xn}, {x̃t, ft, rt} for different t = 1 · · ·n are independent and hence all these vectors can be computed in parallel. Our formulation is similar to the recently proposed Quasi-RNN (Bradbury et al., 2017). While we drop ht−1 in the linear transformation terms of Eq (3) to (5), Quasi-RNN uses k-gram conv2d operations to substitute the linear terms. The computation bottleneck of our network is simply the three matrix multiplications in (3)∼(5). After computing x̃t, ft and rt, Eq (6) and (7) can be computed quite easily and fast since all operations are element-wise.\nOne open question is whether the simplification reduces the representational capability of the recurrent model. A theoretical analysis regarding the representational characteristics of (a broader class of) such recurrent architectures is presented in (Lei et al., 2017). In our experimental section, we empirically demonstrate that SRU can achieve the same or better performance by stacking the same number of or more layers. In fact, training a deeper network with SRU is much easier since each layer enjoys less computation and higher processing speed."
+    }, {
+      "heading" : "2.3 CUDA level optimization",
+      "text" : "A naive implementation of SRU in existing deep learning libraries can already achieve over 5x speed-up over the naive LSTM implementation. This is still sub-optimal since implementation on top of DL libraries introduces a lot of computation overhead such as data copy and kernel launching latencies. In contrast, convolution conv2d and cuDNN LSTM (Appleyard et al., 2016) have been optimized as CUDA kernel functions to accelerate their computation. To demonstrate the potential and compare with these implementations, we implement a version with CUDA-level optimizations in PyTorch.\nOptimizing SRU is similar to but much easier than the cuDNN LSTM (Appleyard et al., 2016). Our RNN formulation permits two optimizations that become possible for the first time in RNNs. First, the matrix multiplications across all time steps can be batched, which can significantly improve the computation intensity and hence GPU utilization. Second, all element-wise operations of the sequence can be fused (compiled) into one kernel function and be parallelized across hidden dimensions. Without the fusion, operations such as addition + and sigmoid activation σ() would invoke a separate function call. This brings additional kernel launching latency and also adds data moving cost.\nSpecifically, the matrix multiplications in Eq (3)∼(5) are grouped into one single multiplication, which can be formulated as,\nU> = ( W Wf Wr ) [x1,x2, · · · ,xn] (8)\nwhere U ∈ Rn×3d is the resulting matrix. When the input is a mini-batch of k sequences, U would be a tensor of size (n, k, 3d). We choose a length-major representation instead of a batch-major version here. The pseudocode of the fused kernel function is presented in Algorithm 1."
+    }, {
+      "heading" : "3 Experiments",
+      "text" : "We evaluate SRU on a diverse set of benchmarks. These benchmarks are chosen to have a broad coverage of application scenarios and computation difficulties. Specifically, we train models on text\nAlgorithm 1 Mini-batch version of the forward pass defined in Eq (3) to (7). Input: x[l, i, j], U[l, i, j′], bf [j] and br[j]; initial state c0[i, j].\nl = 1, · · · , n, i = 1, · · · , k, j = 1, · · · , d and j′ = 1, · · · , 3d Initialize h[·, ·, ·] and c[·, ·, ·] as two n× k × d tensors. for i = 1, · · · , k; j = 1, · · · , d do // parallelize over i and j c = c0[i, j] for l = 1, · · · , n do f = σ (U[l, i, j + d] + bf [j] ) r = σ (U[l, i, j + d× 2] + br[j] ) c = f × c+ (1− f)×U[l, i, j] h = r × g(c) + (1− r)× x[l, i, j] c[l, i, j] = c h[l, i, j] = h\nend for end for return h[·, ·, ·] and c[·, ·, ·]\nclassification, question answering, language modeling, machine translation and speech recognition tasks. Training time on these benchmarks ranges from a couple of minutes (for classification) to several days (for speech).\nWe are primarily interested in whether SRU achieves better results and better performance-speed trade-off compared to other (recurrent) alternatives. To this end, we stack multiple layers of SRU as a direct substitute of other recurrent (or convolutional) modules in a model. We minimize hyperparameter tuning and architecture engineering for a fair comparison with prior work, since such effort has a non-trivial impact on the results. The model configurations are made (mostly) consistent with prior work."
+    }, {
+      "heading" : "3.1 Classification",
+      "text" : "Dataset We use 6 classification datasets from (Kim, 2014)2: movie reviews (MR) (Pang and Lee, 2005), subjectivity data (SUBJ) (Pang and Lee, 2004), customer reviews (CR) (Hu and Liu, 2004), TREC questions (Li and Roth, 2002), opinion polarity from MPQA data (Wiebe et al., 2005) and Stanford sentiment treebank (SST) (Socher et al., 2013)3. All these datasets contain several thousand annotated sentences. We use the word2vec embeddings trained on 100 billion tokens from Google News, following (Kim, 2014). The word vectors are normalized to unit vectors and are fixed during training.\nSetup We train RNN encoders and use the last hidden state to predict the class label for a given input sentence. For most datasets, a 2-layer RNN encoder with 128 hidden dimensions suffices to produce good results. We experiment with 4-layer RNNs for SST dataset since the amount of annotation is an order of magnitude larger than other datasets. In addition, we train the same CNN model of (Kim, 2014) under our setting as a reference. We use the same filter widths and number of filters as (Kim, 2014). All models are trained using default Adam optimizer with a maximum of 100 epochs. We tune dropout probability among {0.1, 0.3, 0.5, 0.7} and report the best results.\nResults Table 1 presents the test accuracy on the six benchmarks. Our model achieves better accuracy consistently across the datasets. More importantly, our implementation processes data significantly faster than cuDNN LSTM. Figure 2 plots the validation curves of our model, cuDNN LSTM and the wide CNNs of (Kim, 2014). On the movie review dataset for instance, our model completes 100 training epochs within 40 seconds, while cuDNN LSTM takes more than 450 seconds.\n2https://github.com/harvardnlp/sent-conv-torch 3We use the binary version of Stanford sentiment treebank."
+    }, {
+      "heading" : "3.2 Question answering",
+      "text" : "Dataset We use Stanford Question Answering Dataset (SQuAD) (Rajpurkar et al., 2016) as our benchmark. It is one of the largest machine comprehension dataset, consisting over 100,000 questionanswer pairs extracted from Wikipedia articles. We use the standard train and dev sets provided on the official website.\nSetup We train the Document Reader model as described in (Chen et al., 2017) and compare the model variants which use LSTM (original setup) and SRU (our setup). We use the open source PyTorch re-implementation4 of the Document Reader model. Due to minor implementation differences, this version obtains 1% worse performance compared to the results reported in (Chen et al., 2017) when using the same training options. Following the suggestions of the authors, we use a smaller learning rate (0.001 instead of 0.002 for Adamax optimizer) and re-tune the dropout rates of word embeddings and RNNs. This gives us results comparable to the original paper.\nAll models are trained for a maximum of 50 epochs, batch size 32, a fixed learning rate of 0.001 and hidden dimension 128. We use a dropout of 0.5 for input word embeddings, 0.2 for SRU layers and 0.3 for LSTM layers.\nResults Table 2 summarizes our results on SQuAD. LSTM models achieve 69.6% exact match and 78.9% F1 score, being on par with the results in the original work (Chen et al., 2017). SRU obtains better results than LSTM, getting 70.3% exact match and 79.5 F1 score. Moreover, SRU exhibits 6x to 10x speed-up and hence more than 69% reduction in total training time."
+    }, {
+      "heading" : "3.3 Language modeling",
+      "text" : "Dataset We use the Penn Treebank corpus (PTB) as the benchmark for language modeling. The processed data along with train, dev and test splits are taken from (Mikolov et al., 2010), which contains about 1 million tokens with a truncated vocabulary of 10k. Following standard practice, the training data is treated as a long sequence (split into a few chunks for mini-batch training), and hence the models are trained using truncated back-propagation-through-time (BPTT).\nSetup Our training configuration largely follows prior work (Zaremba et al., 2014; Gal and Ghahramani, 2016; Zoph and Le, 2016). We use a batch size of 32 and truncated back-propagation with 35 steps. The dropout probability is 0.75 for the input embedding and output softmax layer. The standard dropout and variational dropout probability is 0.2 for stacked RNN layers. SGD with an initial learning rate of 1 and gradient clipping are used for optimization. We train a maximum of 300 epochs and start to decrease the learning rate by a factor of 0.98 after 175 epochs. We use the same configuration for models with different layers and hidden dimensions.\n4https://github.com/hitvoice/DrQA\nResults Table 3 shows the results of our model and prior work. We use a parameter budget of 24 million for a fair comparison. cuDNN LSTM implementation obtains a perplexity of 71.4 at the speed of 73∼79 seconds per epoch. The perplexity is worse than most of those numbers reported in prior work and we attribute this difference to the lack of variational dropout support in cuDNN implementation. In contrast, SRU obtains better perplexity compared to cuDNN LSTM and prior work, reaching 64.7 with 3 recurrent layers and 60.3 with 6 layers5. SRU also achieves better speed-perplexity trade-off, being able to run 47 seconds per epoch given 6 RNN layers."
+    }, {
+      "heading" : "3.4 Machine translation",
+      "text" : "Dataset We select WMT’14 English→German translation task as our evaluation benchmark. Following standard practice (Peitz et al., 2014; Li et al., 2014; Jean et al., 2015), the training corpus was pre-processed and about 4 million translation pairs are left after processing. The news-test-2014 data is used as the test set and the concatenation of news-test-2012 and news-test-2013 data is used as the development set.\nSetup We use OpenNMT (Klein et al., 2017), an open-source machine translation system for our experiments. We take the Pytorch version of this system6 and extend it with our SRU implementation. The system trains a seq2seq model using a recurrent encoder-decoder architecture with attention (Luong et al., 2015). By default, the model feeds ht−1 (i.e. the hidden state of decoder at step t− 1) as an additional input to the RNN decoder at step t. Although this can potentially improve translation quality, it also impedes parallelization and hence slows down the training procedure. We choose to disable this option unless otherwise specified. All models are trained with hidden and word embedding size 500, 15 epochs, SGD with initial learning rate 1.0 and batch size 64. Unlike OpenNMT’s default setting, we use a smaller standard dropout rate of 0.1 and a weight decay of 10−5. This leads to better results for both RNN implementations.\nResults Table 4 presents the translation results. We obtain better BLEU scores compared to the results presented in the report of OpenNMT system (Klein et al., 2017). SRU with 10 stacking layers\n5These results may be improved. As recently demonstrated by (Melis et al., 2017), the LSTM can achieve a perplexity of 58 via better regularization and hyper-parameter tuning. We leave this for future work.\n6https://github.com/OpenNMT/OpenNMT-py\nachieves a BLEU score of 20.7 while cuDNN LSTM achieves 20.45 using more parameters and more training time. Our implementation is also more scalable: a SRU layer in encoder and decoder adds only 4 min per training epoch. In comparison, the rest of the operations (e.g. attention and softmax output) costs about 95 min and a LSTM layer costs 23 min per epoch. As a result, we can easily stack many layers of SRU without increasing much of the training time. During our experiments, we do not observe an over-fitting on the dev set even using 10 layers."
+    }, {
+      "heading" : "3.5 Speech recognition",
+      "text" : "Dataset We use Switchboard-1 corpus (Godfrey et al., 1992) for our experiments. 4,870 sides of conversations (about 300 hours speech) from 520 speakers are used as training data, and 40 sides of Switchboard-1 conversations (about 2 hours speech) from the 2000 Hub5 evaluation are used as testing data.\nSetup We use Kaldi (Povey et al., 2011) for feature extraction, decoding, and training of initial HMM-GMM models. Maximum likelihood-criterion context-dependent speaker adapted acoustic models with Mel-Frequency Cepstral Coefficient (MFCC) features are trained with standard Kaldi recipes. Forced alignment is performed to generate labels for neural network acoustic model training.\nFor speech recognition task, we use Computational Network Toolkit (CNTK) (Yu et al., 2014) instead of PyTorch for neural network training. Following (Sainath et al., 2015), all weights are randomly initialized from the uniform distribution with range [−0.05, 0.05], and all biases are initialized to 0 without generative or discriminative pretraining (Seide et al., 2011). All neural network models, unless explicitly stated otherwise, are trained with a cross-entropy (CE) criterion using truncated back-propagation-through-time (BPTT) (Williams and Peng, 1990) for optimization. No momentum is used for the first epoch, and a momentum of 0.9 is used for subsequent epochs (Zhang et al., 2015). L2 constraint regularization (Hinton et al., 2012) with weight 10−5 is applied.\nTo train the uni-directional model, we unroll 20 frames and use 80 utterances in each mini-batch. We also delayed the output of LSTM by 10 frames as suggested in (Sak et al., 2014) to add more context for LSTM. The ASR performance can be further improved by using bidirectional model and state-level Minimum Bayes Risk (sMBR) training (Kingsbury et al., 2012). To train the bidirectional model, the latency-controlled method described in (Zhang et al., 2015) was applied. We set Nc = 80 and Nr = 20 and processed 40 utterances simultaneously. To train the recurrent model with sMBR criterion (Kingsbury et al., 2012), we adopted the two-forward-pass method described in (Zhang et al., 2015), and processed 40 utterances simultaneously.\nThe input features for all models are 80-dimensional log Mel filterbank features computed every 10 ms, with an additional 3-dimensional pitch features unless explicitly stated. The output targets are 8802-context-dependent triphone states, of which the numbers are determined by the last HMM-GMM training stage.\nResults Table 5 summaries the results using SRU and other published results on SWBD corpus. We achieve state of the art results on this dataset. Note that LF-MMI for sequence training, i-vectors for speaker adaptation, and speaker perturbation for data augmentation have been applied in (Povey et al., 2016). All of these techniques can also been used for SRU. Moreover, we believe different highway variants such as grid LSTM (Hsu et al., 2016) can also further boost our model. If we also apply the same highway connection to LSTM, the performance is slightly worse than the baseline. Removing the dependency of h in LSTM can improve the speed but no gain for WER. Here we didn’t use our customized kernel for SRU because CNTK has a special batching algorithm for RNNs. We can see without any kernel optimization, the SRU is already faster than LSTM using the same amount of parameters. More detailed experimental results about different highway structure and number of layers are refer to Appendix A.1."
+    }, {
+      "heading" : "4 Conclusion",
+      "text" : "This work presents Simple Recurrent Unit (SRU), a recurrent module that runs as fast as CNNs and scales easily to over 10 layers. We perform an extensive evaluation on NLP and speech recognition tasks, demonstrating the effectiveness of this recurrent unit. We open source our implementation to facilitate future NLP and deep learning research."
+    }, {
+      "heading" : "5 Acknowledgement",
+      "text" : "We thank Alexander Rush and Yoon Kim for their help on the machine translation experiments, and Danqi Chen for her help on SQuAD experiments. We also thank Adam Yala and Yoav Artzi for useful discussions and comments. A special thanks to Hugh Perkins for his support on the experimental environment setup, Runqi Yang for answering questions about his code, and the PyTorch community for enabling flexible neural module implementation."
+    }, {
+      "heading" : "A Additional results and analyses",
+      "text" : "A.1 Speech recognition\nBaseline Table 6 compared different LSTM baseline model. For all the models, we follow the configurations reported in the paper Sak et al. (2014)7. We found that more than 5-layer will significantly increase the word error rate (WER). We can observed that our best LSTM model (with least parameters) has 5-layer and each layer contains 1024 memory cells. We will use it as a baseline model in Section 3.5.\nEffect of Highway Transform for SRU The dimensions of xt and ht must be equal in Eq. 2. If this is not the case (e.g., the first layer of the SRU), we can perform a linear projection Wlh by the highway connections to match the dimensions at layer l:\nh′t = rt g(ct) + (1− rt) Wlhxt.\nWe can also use a square matrix Wlh for every layer. As illustrated in Table 7, adding this transformation significantly improved the WER from 12.6% to 11.8% when we use the same amount of parameters. Note that all the highway transform are outside the recurrent loop, therefore the computation can be very efficient.\nEffect of Depth for SRU Table 8 shows a comparison of the layers to different RNN models. It can be seen that the 10-layer SRU already outperform our best LSTM model using the same amount of parameters. The speed is also 1.4x faster even using a straight forward implementation in CNTK. 8 We can see without any kernel optimization, the SRU is already faster than LSTM because it require less “small” matrix multiplication. 12-layer SRU seems works best in this corpus which is also faster than the LSTM model.\n7We removed the projection layer because we found the vanilla LSTM model give us better performance as illustrated in Table 6.\n8Here we didn’t use our customized SRU kernel because CNTK has some constraints to incorporate with it."
+    } ],
+    "references" : [ {
+      "title" : "Quasi-recurrent neural networks",
+      "author" : [ "James Bradbury", "Stephen Merity", "Caiming Xiong", "Richard Socher" ],
+      "venue" : "In ICLR,",
+      "citeRegEx" : "Bradbury et al\\.,? \\Q2017\\E",
+      "shortCiteRegEx" : "Bradbury et al\\.",
+      "year" : 2017
+    }, {
+      "title" : "Reading Wikipedia to answer open-domain questions",
+      "author" : [ "Danqi Chen", "Adam Fisch", "Jason Weston", "Antoine Bordes" ],
+      "venue" : "In Association for Computational Linguistics (ACL),",
+      "citeRegEx" : "Chen et al\\.,? \\Q2017\\E",
+      "shortCiteRegEx" : "Chen et al\\.",
+      "year" : 2017
+    }, {
+      "title" : "Learning phrase representations using rnn encoder–decoder for statistical machine translation",
+      "author" : [ "Kyunghyun Cho", "Bart van Merriënboer", "Çağlar Gülçehre", "Dzmitry Bahdanau", "Fethi Bougares", "Holger Schwenk", "Yoshua Bengio" ],
+      "venue" : "In Proceedings of the 2014 Conference on Empirical Methods in Natural Language Processing (EMNLP),",
+      "citeRegEx" : "Cho et al\\.,? \\Q2014\\E",
+      "shortCiteRegEx" : "Cho et al\\.",
+      "year" : 2014
+    }, {
+      "title" : "Persistent rnns: Stashing recurrent weights on-chip",
+      "author" : [ "Greg Diamos", "Shubho Sengupta", "Bryan Catanzaro", "Mike Chrzanowski", "Adam Coates", "Erich Elsen", "Jesse Engel", "Awni Hannun", "Sanjeev Satheesh" ],
+      "venue" : "In International Conference on Machine Learning,",
+      "citeRegEx" : "Diamos et al\\.,? \\Q2016\\E",
+      "shortCiteRegEx" : "Diamos et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "A theoretically grounded application of dropout in recurrent neural networks",
+      "author" : [ "Yarin Gal", "Zoubin Ghahramani" ],
+      "venue" : "In Advances in Neural Information Processing Systems",
+      "citeRegEx" : "Gal and Ghahramani.,? \\Q2016\\E",
+      "shortCiteRegEx" : "Gal and Ghahramani.",
+      "year" : 2016
+    }, {
+      "title" : "Switchboard: Telephone speech corpus for research and development",
+      "author" : [ "J.J. Godfrey", "E.C. Holliman", "J. McDaniel" ],
+      "venue" : "In Proc. International Conference on Acoustics, Speech and Signal Processing (ICASSP),",
+      "citeRegEx" : "Godfrey et al\\.,? \\Q1992\\E",
+      "shortCiteRegEx" : "Godfrey et al\\.",
+      "year" : 1992
+    }, {
+      "title" : "Accurate, large minibatch sgd: Training imagenet in 1 hour",
+      "author" : [ "Priya Goyal", "Piotr Dollár", "Ross Girshick", "Pieter Noordhuis", "Lukasz Wesolowski", "Aapo Kyrola", "Andrew Tulloch", "Yangqing Jia", "Kaiming He" ],
+      "venue" : "arXiv preprint arXiv:1706.02677,",
+      "citeRegEx" : "Goyal et al\\.,? \\Q2017\\E",
+      "shortCiteRegEx" : "Goyal et al\\.",
+      "year" : 2017
+    }, {
+      "title" : "Deep residual learning for image recognition",
+      "author" : [ "Kaiming He", "Xiangyu Zhang", "Shaoqing Ren", "Jian Sun" ],
+      "venue" : "In Proceedings of the IEEE conference on computer vision and pattern recognition,",
+      "citeRegEx" : "He et al\\.,? \\Q2016\\E",
+      "shortCiteRegEx" : "He et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Improving neural networks by preventing co-adaptation of feature detectors",
+      "author" : [ "Geoffrey Hinton", "Nitish Srivastava", "Alex Krizhevsky", "Ilya Sutskever", "Ruslan Salakhutdinov" ],
+      "venue" : "In arXiv,",
+      "citeRegEx" : "Hinton et al\\.,? \\Q2012\\E",
+      "shortCiteRegEx" : "Hinton et al\\.",
+      "year" : 2012
+    }, {
+      "title" : "Long short-term memory",
+      "author" : [ "Sepp Hochreiter", "Jürgen Schmidhuber" ],
+      "venue" : "Neural computation,",
+      "citeRegEx" : "Hochreiter and Schmidhuber.,? \\Q1997\\E",
+      "shortCiteRegEx" : "Hochreiter and Schmidhuber.",
+      "year" : 1997
+    }, {
+      "title" : "A prioritized grid long short-term memory rnn for speech recognition",
+      "author" : [ "W. Hsu", "Y. Zhang", "J. Glass" ],
+      "venue" : "In Proc. SLT,",
+      "citeRegEx" : "Hsu et al\\.,? \\Q2016\\E",
+      "shortCiteRegEx" : "Hsu et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Mining and summarizing customer reviews",
+      "author" : [ "Minqing Hu", "Bing Liu" ],
+      "venue" : "In Proceedings of the tenth ACM SIGKDD international conference on Knowledge discovery and data mining,",
+      "citeRegEx" : "Hu and Liu.,? \\Q2004\\E",
+      "shortCiteRegEx" : "Hu and Liu.",
+      "year" : 2004
+    }, {
+      "title" : "Tying word vectors and word classifiers: A loss framework for language modeling",
+      "author" : [ "Hakan Inan", "Khashayar Khosravi", "Richard Socher" ],
+      "venue" : "arXiv preprint arXiv:1611.01462,",
+      "citeRegEx" : "Inan et al\\.,? \\Q2016\\E",
+      "shortCiteRegEx" : "Inan et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "On using very large target vocabulary for neural machine translation",
+      "author" : [ "Sébastien Jean", "Kyunghyun Cho", "Roland Memisevic", "Yoshua Bengio" ],
+      "venue" : "In Proceedings of the 53rd Annual Meeting of the Association for Computational Linguistics and the 7th International Joint Conference on Natural Language Processing (Volume 1: Long Papers),",
+      "citeRegEx" : "Jean et al\\.,? \\Q2015\\E",
+      "shortCiteRegEx" : "Jean et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "Convolutional neural networks for sentence classification",
+      "author" : [ "Yoon Kim" ],
+      "venue" : "In Proceedings of the Empiricial Methods in Natural Language Processing (EMNLP",
+      "citeRegEx" : "Kim.,? \\Q2014\\E",
+      "shortCiteRegEx" : "Kim.",
+      "year" : 2014
+    }, {
+      "title" : "Scalable Minimum Bayes Risk Training of Deep Neural Network Acoustic Models Using Distributed Hessian-free Optimization",
+      "author" : [ "Brian Kingsbury", "Tara Sainath", "Hagen Soltau" ],
+      "venue" : "In INTERSPEECH,",
+      "citeRegEx" : "Kingsbury et al\\.,? \\Q2012\\E",
+      "shortCiteRegEx" : "Kingsbury et al\\.",
+      "year" : 2012
+    }, {
+      "title" : "Opennmt: Opensource toolkit for neural machine translation",
+      "author" : [ "Guillaume Klein", "Yoon Kim", "Yuntian Deng", "Jean Senellart", "Alexander Rush" ],
+      "venue" : "In Proceedings of ACL 2017, System Demonstrations,",
+      "citeRegEx" : "Klein et al\\.,? \\Q2017\\E",
+      "shortCiteRegEx" : "Klein et al\\.",
+      "year" : 2017
+    }, {
+      "title" : "Recurrent additive networks",
+      "author" : [ "Kenton Lee", "Omer Levy", "Luke Zettlemoyer" ],
+      "venue" : "arXiv preprint arXiv:1705.07393,",
+      "citeRegEx" : "Lee et al\\.,? \\Q2017\\E",
+      "shortCiteRegEx" : "Lee et al\\.",
+      "year" : 2017
+    }, {
+      "title" : "Deriving neural architectures from sequence and graph kernels",
+      "author" : [ "Tao Lei", "Wengong Jin", "Regina Barzilay", "Tommi Jaakkola" ],
+      "venue" : null,
+      "citeRegEx" : "Lei et al\\.,? \\Q2017\\E",
+      "shortCiteRegEx" : "Lei et al\\.",
+      "year" : 2017
+    }, {
+      "title" : "The dcu-ictcas mt system at wmt 2014 on german-english translation task",
+      "author" : [ "Liangyou Li", "Xiaofeng Wu", "Santiago Cortes Vaillo", "Jun Xie", "Andy Way", "Qun Liu" ],
+      "venue" : "In Proceedings of the Ninth Workshop on Statistical Machine Translation,",
+      "citeRegEx" : "Li et al\\.,? \\Q2014\\E",
+      "shortCiteRegEx" : "Li et al\\.",
+      "year" : 2014
+    }, {
+      "title" : "Learning question classifiers",
+      "author" : [ "Xin Li", "Dan Roth" ],
+      "venue" : "In Proceedings of the 19th international conference on Computational linguistics-Volume 1. Association for Computational Linguistics,",
+      "citeRegEx" : "Li and Roth.,? \\Q2002\\E",
+      "shortCiteRegEx" : "Li and Roth.",
+      "year" : 2002
+    }, {
+      "title" : "Effective approaches to attentionbased neural machine translation",
+      "author" : [ "Minh-Thang Luong", "Hieu Pham", "Christopher D. Manning" ],
+      "venue" : "In Empirical Methods in Natural Language Processing (EMNLP). Association for Computational Linguistics,",
+      "citeRegEx" : "Luong et al\\.,? \\Q2015\\E",
+      "shortCiteRegEx" : "Luong et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "On the state of the art of evaluation in neural language models",
+      "author" : [ "Gábor Melis", "Chris Dyer", "Phil Blunsom" ],
+      "venue" : "arXiv preprint arXiv:1707.05589,",
+      "citeRegEx" : "Melis et al\\.,? \\Q2017\\E",
+      "shortCiteRegEx" : "Melis et al\\.",
+      "year" : 2017
+    }, {
+      "title" : "Recurrent neural network based language model",
+      "author" : [ "Tomas Mikolov", "Martin Karafiát", "Lukas Burget", "Jan Cernockỳ", "Sanjeev Khudanpur" ],
+      "venue" : "In INTERSPEECH 2010, 11th Annual Conference of the International Speech Communication Association,",
+      "citeRegEx" : "Mikolov et al\\.,? \\Q2010\\E",
+      "shortCiteRegEx" : "Mikolov et al\\.",
+      "year" : 2010
+    }, {
+      "title" : "A sentimental education: Sentiment analysis using subjectivity summarization based on minimum cuts",
+      "author" : [ "Bo Pang", "Lillian Lee" ],
+      "venue" : "In Proceedings of the 42nd annual meeting on Association for Computational Linguistics,",
+      "citeRegEx" : "Pang and Lee.,? \\Q2004\\E",
+      "shortCiteRegEx" : "Pang and Lee.",
+      "year" : 2004
+    }, {
+      "title" : "Seeing stars: Exploiting class relationships for sentiment categorization with respect to rating scales. In Proceedings of the 43rd annual meeting on association for computational linguistics, pages 115–124",
+      "author" : [ "Bo Pang", "Lillian Lee" ],
+      "venue" : "Association for Computational Linguistics,",
+      "citeRegEx" : "Pang and Lee.,? \\Q2005\\E",
+      "shortCiteRegEx" : "Pang and Lee.",
+      "year" : 2005
+    }, {
+      "title" : "The rwth aachen german-english machine translation system for wmt 2014",
+      "author" : [ "Stephan Peitz", "Joern Wuebker", "Markus Freitag", "Hermann Ney" ],
+      "venue" : "In Proceedings of the Ninth Workshop on Statistical Machine Translation,",
+      "citeRegEx" : "Peitz et al\\.,? \\Q2014\\E",
+      "shortCiteRegEx" : "Peitz et al\\.",
+      "year" : 2014
+    }, {
+      "title" : "The Kaldi Speech Recognition Toolkit",
+      "author" : [ "Daniel Povey", "Arnab Ghoshal", "Gilles Boulianne", "Lukas Burget", "Ondrej Glembek", "Nagendra Goel", "Mirko Hannenmann", "Petr Motlicek", "Yanmin Qian", "Petr Schwarz", "Jan Silovsky", "Georg Stemmer", "Karel Vesely" ],
+      "venue" : "In Automatic Speech Recognition and Understanding Workshop,",
+      "citeRegEx" : "Povey et al\\.,? \\Q2011\\E",
+      "shortCiteRegEx" : "Povey et al\\.",
+      "year" : 2011
+    }, {
+      "title" : "Purely sequence-trained neural networks for asr based on lattice-free mmi",
+      "author" : [ "Daniel Povey", "Vijayaditya Peddinti", "Daniel Galvez", "Pegah Ghahremani", "Vimal Manohar", "Xingyu Na", "Yiming Wang", "Sanjeev Khudanpur" ],
+      "venue" : "In INTERSPEECH,",
+      "citeRegEx" : "Povey et al\\.,? \\Q2016\\E",
+      "shortCiteRegEx" : "Povey et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Using the output embedding to improve language models",
+      "author" : [ "Ofir Press", "Lior Wolf" ],
+      "venue" : "In Proceedings of the 15th Conference of the European Chapter of the Association for Computational Linguistics (EACL),",
+      "citeRegEx" : "Press and Wolf.,? \\Q2017\\E",
+      "shortCiteRegEx" : "Press and Wolf.",
+      "year" : 2017
+    }, {
+      "title" : "Squad: 100,000+ questions for machine comprehension of text",
+      "author" : [ "P. Rajpurkar", "J. Zhang", "K. Lopyrev", "P. Liang" ],
+      "venue" : "In Empirical Methods in Natural Language Processing (EMNLP),",
+      "citeRegEx" : "Rajpurkar et al\\.,? \\Q2016\\E",
+      "shortCiteRegEx" : "Rajpurkar et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Convolutional, Long Short-Term Memory, Fully Connected Deep Neural Networks",
+      "author" : [ "Tara N. Sainath", "Oriol Vinyals", "Andrew Senior", "Hasim Sak" ],
+      "venue" : "In IEEE International Conference on Acoustics, Speech and Signal Processing,",
+      "citeRegEx" : "Sainath et al\\.,? \\Q2015\\E",
+      "shortCiteRegEx" : "Sainath et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "Long Short-Term Memory Recurrent Neural Network Architectures for Large Scale Acoustic Modeling",
+      "author" : [ "Hasim Sak", "Andrew Senior", "Francoise Françoise" ],
+      "venue" : "In INTERSPEECH,",
+      "citeRegEx" : "Sak et al\\.,? \\Q2014\\E",
+      "shortCiteRegEx" : "Sak et al\\.",
+      "year" : 2014
+    }, {
+      "title" : "The ibm 2016 english conversational telephone speech recognition system",
+      "author" : [ "George Saon", "Tom Sercu", "Steven Rennie", "Hong-Kwang J. Kuo" ],
+      "venue" : "In https://arxiv.org/abs/1604.08242,",
+      "citeRegEx" : "Saon et al\\.,? \\Q2016\\E",
+      "shortCiteRegEx" : "Saon et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Feature engineering in context-dependent deep neural networks for conversational speech transcription",
+      "author" : [ "Frank Seide", "Gang Li", "Xie Chen", "Dong Yu" ],
+      "venue" : "In Automatic Speech Recognition and Understanding (ASRU),",
+      "citeRegEx" : "Seide et al\\.,? \\Q2011\\E",
+      "shortCiteRegEx" : "Seide et al\\.",
+      "year" : 2011
+    }, {
+      "title" : "Recursive deep models for semantic compositionality over a sentiment treebank",
+      "author" : [ "Richard Socher", "Alex Perelygin", "Jean Wu", "Jason Chuang", "Christopher D. Manning", "Andrew Y. Ng", "Christopher Potts" ],
+      "venue" : "In Proceedings of the 2013 Conference on Empirical Methods in Natural Language Processing,",
+      "citeRegEx" : "Socher et al\\.,? \\Q2013\\E",
+      "shortCiteRegEx" : "Socher et al\\.",
+      "year" : 2013
+    }, {
+      "title" : "Training very deep networks",
+      "author" : [ "Rupesh K Srivastava", "Klaus Greff", "Jürgen Schmidhuber" ],
+      "venue" : "In Advances in neural information processing systems,",
+      "citeRegEx" : "Srivastava et al\\.,? \\Q2015\\E",
+      "shortCiteRegEx" : "Srivastava et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "Attention is all you need",
+      "author" : [ "Ashish Vaswani", "Noam Shazeer", "Niki Parmar", "Jakob Uszkoreit", "Llion Jones", "Aidan N Gomez", "Lukasz Kaiser", "Illia Polosukhin" ],
+      "venue" : "arXiv preprint arXiv:1706.03762,",
+      "citeRegEx" : "Vaswani et al\\.,? \\Q2017\\E",
+      "shortCiteRegEx" : "Vaswani et al\\.",
+      "year" : 2017
+    }, {
+      "title" : "Annotating expressions of opinions and emotions in language",
+      "author" : [ "Janyce Wiebe", "Theresa Wilson", "Claire Cardie" ],
+      "venue" : "Language resources and evaluation,",
+      "citeRegEx" : "Wiebe et al\\.,? \\Q2005\\E",
+      "shortCiteRegEx" : "Wiebe et al\\.",
+      "year" : 2005
+    }, {
+      "title" : "An efficient gradient-based algorithm for on-line training of recurrent network trajectories",
+      "author" : [ "Ronald J Williams", "Jing Peng" ],
+      "venue" : "Neural computation,",
+      "citeRegEx" : "Williams and Peng.,? \\Q1990\\E",
+      "shortCiteRegEx" : "Williams and Peng.",
+      "year" : 1990
+    }, {
+      "title" : "An empirical exploration of skip connections for sequential tagging",
+      "author" : [ "Huijia Wu", "Jiajun Zhang", "Chengqing Zong" ],
+      "venue" : "In Proceedings of COLING 2016,",
+      "citeRegEx" : "Wu et al\\.,? \\Q2016\\E",
+      "shortCiteRegEx" : "Wu et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Google’s neural machine translation system: Bridging the gap between human and machine translation",
+      "author" : [ "Yonghui Wu", "Mike Schuster", "Zhifeng Chen", "Quoc V Le", "Mohammad Norouzi", "Wolfgang Macherey", "Maxim Krikun", "Yuan Cao", "Qin Gao", "Klaus Macherey" ],
+      "venue" : "arXiv preprint arXiv:1609.08144,",
+      "citeRegEx" : "Wu et al\\.,? \\Q2016\\E",
+      "shortCiteRegEx" : "Wu et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "An introduction to computational networks and the computational network toolkit",
+      "author" : [ "D. Yu", "A. Eversole", "M. Seltzer", "K. Yao", "B. Guenter", "O. Kuchaiev", "F. Seide", "H. Wang", "J. Droppo", "Z. Huang", "Y. Zhang", "G. Zweig", "C. Rossbach", "J. Currey", "J. Gao", "A. May", "A. Stolcke", "M. Slaney" ],
+      "venue" : "Technical Report MSR, Microsoft Research,",
+      "citeRegEx" : "Yu et al\\.,? \\Q2014\\E",
+      "shortCiteRegEx" : "Yu et al\\.",
+      "year" : 2014
+    }, {
+      "title" : "Recurrent neural network regularization",
+      "author" : [ "Wojciech Zaremba", "Ilya Sutskever", "Oriol Vinyals" ],
+      "venue" : "arXiv preprint arXiv:1409.2329,",
+      "citeRegEx" : "Zaremba et al\\.,? \\Q2014\\E",
+      "shortCiteRegEx" : "Zaremba et al\\.",
+      "year" : 2014
+    }, {
+      "title" : "Speech recognition with predictionadaptation-correction recurrent neural networks",
+      "author" : [ "Yu Zhang", "Dong Yu", "Michael L Seltzer", "Jasha Droppo" ],
+      "venue" : "In Acoustics, Speech and Signal Processing (ICASSP),",
+      "citeRegEx" : "Zhang et al\\.,? \\Q2015\\E",
+      "shortCiteRegEx" : "Zhang et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "Recurrent highway networks",
+      "author" : [ "Julian Georg Zilly", "Rupesh Kumar Srivastava", "Jan Koutník", "Jürgen Schmidhuber" ],
+      "venue" : "In Proceedings of the 34th International Conference on Machine Learning (ICML),",
+      "citeRegEx" : "Zilly et al\\.,? \\Q2017\\E",
+      "shortCiteRegEx" : "Zilly et al\\.",
+      "year" : 2017
+    }, {
+      "title" : "Neural architecture search with reinforcement learning",
+      "author" : [ "Barret Zoph", "Quoc V Le" ],
+      "venue" : "arXiv preprint arXiv:1611.01578,",
+      "citeRegEx" : "Zoph and Le.,? \\Q2016\\E",
+      "shortCiteRegEx" : "Zoph and Le.",
+      "year" : 2016
+    } ],
+    "referenceMentions" : [ {
+      "referenceID" : 37,
+      "context" : "For instance, training a state-of-the-art translation or speech recognition system would take several days to complete (Vaswani et al., 2017; Wu et al., 2016b; Sak et al., 2014).",
+      "startOffset" : 119,
+      "endOffset" : 177
+    }, {
+      "referenceID" : 32,
+      "context" : "For instance, training a state-of-the-art translation or speech recognition system would take several days to complete (Vaswani et al., 2017; Wu et al., 2016b; Sak et al., 2014).",
+      "startOffset" : 119,
+      "endOffset" : 177
+    }, {
+      "referenceID" : 3,
+      "context" : "To counter the dramatically increased computation, parallelization such as GPU-accelerated training has been predominately adopted to scale deep learning (Diamos et al., 2016; Goyal et al., 2017).",
+      "startOffset" : 154,
+      "endOffset" : 195
+    }, {
+      "referenceID" : 6,
+      "context" : "To counter the dramatically increased computation, parallelization such as GPU-accelerated training has been predominately adopted to scale deep learning (Diamos et al., 2016; Goyal et al., 2017).",
+      "startOffset" : 154,
+      "endOffset" : 195
+    }, {
+      "referenceID" : 9,
+      "context" : "Most top-performing recurrent neural networks such as long short-term memory (LSTMs) (Hochreiter and Schmidhuber, 1997) and gated recurrent unit (GRUs) (Cho et al.",
+      "startOffset" : 85,
+      "endOffset" : 119
+    }, {
+      "referenceID" : 2,
+      "context" : "Most top-performing recurrent neural networks such as long short-term memory (LSTMs) (Hochreiter and Schmidhuber, 1997) and gated recurrent unit (GRUs) (Cho et al., 2014) make use of neural gates to control the information flow and alleviate the gradient vanishing (or explosion) problem.",
+      "startOffset" : 152,
+      "endOffset" : 170
+    }, {
+      "referenceID" : 18,
+      "context" : "We use the simplest version that performs a linear transformation over the input vector x̃t = Wxt (Lei et al., 2017; Lee et al., 2017).",
+      "startOffset" : 98,
+      "endOffset" : 134
+    }, {
+      "referenceID" : 17,
+      "context" : "We use the simplest version that performs a linear transformation over the input vector x̃t = Wxt (Lei et al., 2017; Lee et al., 2017).",
+      "startOffset" : 98,
+      "endOffset" : 134
+    }, {
+      "referenceID" : 7,
+      "context" : "First, we add skip connections between recurrent layers since they are shown quite effective for training deep networks (He et al., 2016; Srivastava et al., 2015; Wu et al., 2016a).",
+      "startOffset" : 120,
+      "endOffset" : 180
+    }, {
+      "referenceID" : 36,
+      "context" : "First, we add skip connections between recurrent layers since they are shown quite effective for training deep networks (He et al., 2016; Srivastava et al., 2015; Wu et al., 2016a).",
+      "startOffset" : 120,
+      "endOffset" : 180
+    }, {
+      "referenceID" : 36,
+      "context" : "Specifically, we use highway connections (Srivastava et al., 2015) and the output state ht is computed as, ht = rt ht + (1− rt) xt (1) = rt g(ct) + (1− rt) xt (2) where rt is the output of a reset gate.",
+      "startOffset" : 41,
+      "endOffset" : 66
+    }, {
+      "referenceID" : 4,
+      "context" : "Second, we implement variational dropout (Gal and Ghahramani, 2016) in addition to the standard dropout for RNN regularization.",
+      "startOffset" : 41,
+      "endOffset" : 67
+    }, {
+      "referenceID" : 0,
+      "context" : "Our formulation is similar to the recently proposed Quasi-RNN (Bradbury et al., 2017).",
+      "startOffset" : 62,
+      "endOffset" : 85
+    }, {
+      "referenceID" : 18,
+      "context" : "A theoretical analysis regarding the representational characteristics of (a broader class of) such recurrent architectures is presented in (Lei et al., 2017).",
+      "startOffset" : 139,
+      "endOffset" : 157
+    }, {
+      "referenceID" : 14,
+      "context" : "Dataset We use 6 classification datasets from (Kim, 2014)2: movie reviews (MR) (Pang and Lee, 2005), subjectivity data (SUBJ) (Pang and Lee, 2004), customer reviews (CR) (Hu and Liu, 2004), TREC questions (Li and Roth, 2002), opinion polarity from MPQA data (Wiebe et al.",
+      "startOffset" : 46,
+      "endOffset" : 57
+    }, {
+      "referenceID" : 25,
+      "context" : "Dataset We use 6 classification datasets from (Kim, 2014)2: movie reviews (MR) (Pang and Lee, 2005), subjectivity data (SUBJ) (Pang and Lee, 2004), customer reviews (CR) (Hu and Liu, 2004), TREC questions (Li and Roth, 2002), opinion polarity from MPQA data (Wiebe et al.",
+      "startOffset" : 79,
+      "endOffset" : 99
+    }, {
+      "referenceID" : 24,
+      "context" : "Dataset We use 6 classification datasets from (Kim, 2014)2: movie reviews (MR) (Pang and Lee, 2005), subjectivity data (SUBJ) (Pang and Lee, 2004), customer reviews (CR) (Hu and Liu, 2004), TREC questions (Li and Roth, 2002), opinion polarity from MPQA data (Wiebe et al.",
+      "startOffset" : 126,
+      "endOffset" : 146
+    }, {
+      "referenceID" : 11,
+      "context" : "Dataset We use 6 classification datasets from (Kim, 2014)2: movie reviews (MR) (Pang and Lee, 2005), subjectivity data (SUBJ) (Pang and Lee, 2004), customer reviews (CR) (Hu and Liu, 2004), TREC questions (Li and Roth, 2002), opinion polarity from MPQA data (Wiebe et al.",
+      "startOffset" : 170,
+      "endOffset" : 188
+    }, {
+      "referenceID" : 20,
+      "context" : "Dataset We use 6 classification datasets from (Kim, 2014)2: movie reviews (MR) (Pang and Lee, 2005), subjectivity data (SUBJ) (Pang and Lee, 2004), customer reviews (CR) (Hu and Liu, 2004), TREC questions (Li and Roth, 2002), opinion polarity from MPQA data (Wiebe et al.",
+      "startOffset" : 205,
+      "endOffset" : 224
+    }, {
+      "referenceID" : 38,
+      "context" : "Dataset We use 6 classification datasets from (Kim, 2014)2: movie reviews (MR) (Pang and Lee, 2005), subjectivity data (SUBJ) (Pang and Lee, 2004), customer reviews (CR) (Hu and Liu, 2004), TREC questions (Li and Roth, 2002), opinion polarity from MPQA data (Wiebe et al., 2005) and Stanford sentiment treebank (SST) (Socher et al.",
+      "startOffset" : 258,
+      "endOffset" : 278
+    }, {
+      "referenceID" : 35,
+      "context" : ", 2005) and Stanford sentiment treebank (SST) (Socher et al., 2013)3.",
+      "startOffset" : 46,
+      "endOffset" : 67
+    }, {
+      "referenceID" : 14,
+      "context" : "We use the word2vec embeddings trained on 100 billion tokens from Google News, following (Kim, 2014).",
+      "startOffset" : 89,
+      "endOffset" : 100
+    }, {
+      "referenceID" : 14,
+      "context" : "In addition, we train the same CNN model of (Kim, 2014) under our setting as a reference.",
+      "startOffset" : 44,
+      "endOffset" : 55
+    }, {
+      "referenceID" : 14,
+      "context" : "We use the same filter widths and number of filters as (Kim, 2014).",
+      "startOffset" : 55,
+      "endOffset" : 66
+    }, {
+      "referenceID" : 14,
+      "context" : "Figure 2 plots the validation curves of our model, cuDNN LSTM and the wide CNNs of (Kim, 2014).",
+      "startOffset" : 83,
+      "endOffset" : 94
+    }, {
+      "referenceID" : 14,
+      "context" : "Wide CNNs refer to the sentence convolutional model (Kim, 2014) using 3, 4, 5-gram features (i.",
+      "startOffset" : 52,
+      "endOffset" : 63
+    }, {
+      "referenceID" : 1,
+      "context" : "Model # layers d Size Dev EM Dev F1 Time / epoch RNN Total (Chen et al., 2017) 3 128 4.",
+      "startOffset" : 59,
+      "endOffset" : 78
+    }, {
+      "referenceID" : 30,
+      "context" : "Dataset We use Stanford Question Answering Dataset (SQuAD) (Rajpurkar et al., 2016) as our benchmark.",
+      "startOffset" : 59,
+      "endOffset" : 83
+    }, {
+      "referenceID" : 1,
+      "context" : "Setup We train the Document Reader model as described in (Chen et al., 2017) and compare the model variants which use LSTM (original setup) and SRU (our setup).",
+      "startOffset" : 57,
+      "endOffset" : 76
+    }, {
+      "referenceID" : 1,
+      "context" : "Due to minor implementation differences, this version obtains 1% worse performance compared to the results reported in (Chen et al., 2017) when using the same training options.",
+      "startOffset" : 119,
+      "endOffset" : 138
+    }, {
+      "referenceID" : 1,
+      "context" : "9% F1 score, being on par with the results in the original work (Chen et al., 2017).",
+      "startOffset" : 64,
+      "endOffset" : 83
+    }, {
+      "referenceID" : 23,
+      "context" : "The processed data along with train, dev and test splits are taken from (Mikolov et al., 2010), which contains about 1 million tokens with a truncated vocabulary of 10k.",
+      "startOffset" : 72,
+      "endOffset" : 94
+    }, {
+      "referenceID" : 43,
+      "context" : "Setup Our training configuration largely follows prior work (Zaremba et al., 2014; Gal and Ghahramani, 2016; Zoph and Le, 2016).",
+      "startOffset" : 60,
+      "endOffset" : 127
+    }, {
+      "referenceID" : 4,
+      "context" : "Setup Our training configuration largely follows prior work (Zaremba et al., 2014; Gal and Ghahramani, 2016; Zoph and Le, 2016).",
+      "startOffset" : 60,
+      "endOffset" : 127
+    }, {
+      "referenceID" : 46,
+      "context" : "Setup Our training configuration largely follows prior work (Zaremba et al., 2014; Gal and Ghahramani, 2016; Zoph and Le, 2016).",
+      "startOffset" : 60,
+      "endOffset" : 127
+    }, {
+      "referenceID" : 43,
+      "context" : "Model # layers Size Dev Test Time / epoch RNN Total LSTM (Zaremba et al., 2014) 2 66m 82.",
+      "startOffset" : 57,
+      "endOffset" : 79
+    }, {
+      "referenceID" : 29,
+      "context" : "4 LSTM (Press and Wolf, 2017) 2 51m 75.",
+      "startOffset" : 7,
+      "endOffset" : 29
+    }, {
+      "referenceID" : 12,
+      "context" : "2 LSTM (Inan et al., 2016) 2 28m 72.",
+      "startOffset" : 7,
+      "endOffset" : 26
+    }, {
+      "referenceID" : 45,
+      "context" : "0 RHN (Zilly et al., 2017) 10 23m 67.",
+      "startOffset" : 6,
+      "endOffset" : 26
+    }, {
+      "referenceID" : 18,
+      "context" : "4 KNN (Lei et al., 2017) 4 20m - 63.",
+      "startOffset" : 6,
+      "endOffset" : 24
+    }, {
+      "referenceID" : 46,
+      "context" : "8 NAS (Zoph and Le, 2016) - 25m - 64.",
+      "startOffset" : 6,
+      "endOffset" : 25
+    }, {
+      "referenceID" : 46,
+      "context" : "0 NAS (Zoph and Le, 2016) - 54m - 62.",
+      "startOffset" : 6,
+      "endOffset" : 25
+    }, {
+      "referenceID" : 43,
+      "context" : "Models in comparison are trained using similar regularization and learning strategy: variational dropout is used except for (Zaremba et al., 2014), (Press and Wolf, 2017) and cuDNN LSTM; input and output word embeddings are tied except for (Zaremba et al.",
+      "startOffset" : 124,
+      "endOffset" : 146
+    }, {
+      "referenceID" : 29,
+      "context" : ", 2014), (Press and Wolf, 2017) and cuDNN LSTM; input and output word embeddings are tied except for (Zaremba et al.",
+      "startOffset" : 9,
+      "endOffset" : 31
+    }, {
+      "referenceID" : 43,
+      "context" : ", 2014), (Press and Wolf, 2017) and cuDNN LSTM; input and output word embeddings are tied except for (Zaremba et al., 2014); SGD with learning rate decaying is used for all models.",
+      "startOffset" : 101,
+      "endOffset" : 123
+    }, {
+      "referenceID" : 26,
+      "context" : "Following standard practice (Peitz et al., 2014; Li et al., 2014; Jean et al., 2015), the training corpus was pre-processed and about 4 million translation pairs are left after processing.",
+      "startOffset" : 28,
+      "endOffset" : 84
+    }, {
+      "referenceID" : 19,
+      "context" : "Following standard practice (Peitz et al., 2014; Li et al., 2014; Jean et al., 2015), the training corpus was pre-processed and about 4 million translation pairs are left after processing.",
+      "startOffset" : 28,
+      "endOffset" : 84
+    }, {
+      "referenceID" : 13,
+      "context" : "Following standard practice (Peitz et al., 2014; Li et al., 2014; Jean et al., 2015), the training corpus was pre-processed and about 4 million translation pairs are left after processing.",
+      "startOffset" : 28,
+      "endOffset" : 84
+    }, {
+      "referenceID" : 16,
+      "context" : "Setup We use OpenNMT (Klein et al., 2017), an open-source machine translation system for our experiments.",
+      "startOffset" : 21,
+      "endOffset" : 41
+    }, {
+      "referenceID" : 21,
+      "context" : "The system trains a seq2seq model using a recurrent encoder-decoder architecture with attention (Luong et al., 2015).",
+      "startOffset" : 96,
+      "endOffset" : 116
+    }, {
+      "referenceID" : 16,
+      "context" : "We obtain better BLEU scores compared to the results presented in the report of OpenNMT system (Klein et al., 2017).",
+      "startOffset" : 95,
+      "endOffset" : 115
+    }, {
+      "referenceID" : 22,
+      "context" : "As recently demonstrated by (Melis et al., 2017), the LSTM can achieve a perplexity of 58 via better regularization and hyper-parameter tuning.",
+      "startOffset" : 28,
+      "endOffset" : 48
+    }, {
+      "referenceID" : 16,
+      "context" : "OpenNMT default setup # layers Size Test BLEU Time in RNNs (Klein et al., 2017) 2 - - 17.",
+      "startOffset" : 59,
+      "endOffset" : 79
+    }, {
+      "referenceID" : 16,
+      "context" : "60 (Klein et al., 2017) + BPE 2 - - 19.",
+      "startOffset" : 3,
+      "endOffset" : 23
+    }, {
+      "referenceID" : 5,
+      "context" : "5 Speech recognition Dataset We use Switchboard-1 corpus (Godfrey et al., 1992) for our experiments.",
+      "startOffset" : 57,
+      "endOffset" : 79
+    }, {
+      "referenceID" : 27,
+      "context" : "Setup We use Kaldi (Povey et al., 2011) for feature extraction, decoding, and training of initial HMM-GMM models.",
+      "startOffset" : 19,
+      "endOffset" : 39
+    }, {
+      "referenceID" : 42,
+      "context" : "For speech recognition task, we use Computational Network Toolkit (CNTK) (Yu et al., 2014) instead of PyTorch for neural network training.",
+      "startOffset" : 73,
+      "endOffset" : 90
+    }, {
+      "referenceID" : 31,
+      "context" : "Following (Sainath et al., 2015), all weights are randomly initialized from the uniform distribution with range [−0.",
+      "startOffset" : 10,
+      "endOffset" : 32
+    }, {
+      "referenceID" : 34,
+      "context" : "05], and all biases are initialized to 0 without generative or discriminative pretraining (Seide et al., 2011).",
+      "startOffset" : 90,
+      "endOffset" : 110
+    }, {
+      "referenceID" : 39,
+      "context" : "All neural network models, unless explicitly stated otherwise, are trained with a cross-entropy (CE) criterion using truncated back-propagation-through-time (BPTT) (Williams and Peng, 1990) for optimization.",
+      "startOffset" : 164,
+      "endOffset" : 189
+    }, {
+      "referenceID" : 44,
+      "context" : "9 is used for subsequent epochs (Zhang et al., 2015).",
+      "startOffset" : 32,
+      "endOffset" : 52
+    }, {
+      "referenceID" : 8,
+      "context" : "L2 constraint regularization (Hinton et al., 2012) with weight 10−5 is applied.",
+      "startOffset" : 29,
+      "endOffset" : 50
+    }, {
+      "referenceID" : 32,
+      "context" : "We also delayed the output of LSTM by 10 frames as suggested in (Sak et al., 2014) to add more context for LSTM.",
+      "startOffset" : 64,
+      "endOffset" : 82
+    }, {
+      "referenceID" : 15,
+      "context" : "The ASR performance can be further improved by using bidirectional model and state-level Minimum Bayes Risk (sMBR) training (Kingsbury et al., 2012).",
+      "startOffset" : 124,
+      "endOffset" : 148
+    }, {
+      "referenceID" : 44,
+      "context" : "To train the bidirectional model, the latency-controlled method described in (Zhang et al., 2015) was applied.",
+      "startOffset" : 77,
+      "endOffset" : 97
+    }, {
+      "referenceID" : 15,
+      "context" : "To train the recurrent model with sMBR criterion (Kingsbury et al., 2012), we adopted the two-forward-pass method described in (Zhang et al.",
+      "startOffset" : 49,
+      "endOffset" : 73
+    }, {
+      "referenceID" : 44,
+      "context" : ", 2012), we adopted the two-forward-pass method described in (Zhang et al., 2015), and processed 40 utterances simultaneously.",
+      "startOffset" : 61,
+      "endOffset" : 81
+    }, {
+      "referenceID" : 33,
+      "context" : "5 Very Deep CNN + sMBR (Saon et al., 2016) 10 10.",
+      "startOffset" : 23,
+      "endOffset" : 42
+    }, {
+      "referenceID" : 28,
+      "context" : "5 LSTM + LF-MMI (Povey et al., 2016) 3 10.",
+      "startOffset" : 16,
+      "endOffset" : 36
+    }, {
+      "referenceID" : 28,
+      "context" : "3 Bi-LSTM + LF-MMI (Povey et al., 2016) 3 9.",
+      "startOffset" : 19,
+      "endOffset" : 39
+    }, {
+      "referenceID" : 28,
+      "context" : "Note that LF-MMI for sequence training, i-vectors for speaker adaptation, and speaker perturbation for data augmentation have been applied in (Povey et al., 2016).",
+      "startOffset" : 142,
+      "endOffset" : 162
+    }, {
+      "referenceID" : 10,
+      "context" : "Moreover, we believe different highway variants such as grid LSTM (Hsu et al., 2016) can also further boost our model.",
+      "startOffset" : 66,
+      "endOffset" : 84
+    } ],
+    "year" : 2017,
+    "abstractText" : "Recurrent neural networks scale poorly due to the intrinsic difficulty in parallelizing their state computations. For instance, the forward pass computation of ht is blocked until the entire computation of ht−1 finishes, which is a major bottleneck for parallel computing. In this work, we propose an alternative RNN implementation by deliberately simplifying the state computation and exposing more parallelism. The proposed recurrent unit operates as fast as a convolutional layer and 5-10x faster than cuDNN-optimized LSTM. We demonstrate the unit’s effectiveness across a wide range of applications including classification, question answering, language modeling, translation and speech recognition. We open source our implementation in PyTorch and CNTK1.",
+    "creator" : "LaTeX with hyperref package"
+  }
+}

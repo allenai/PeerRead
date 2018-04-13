@@ -1,0 +1,480 @@
+{
+  "name" : "1611.04581.pdf",
+  "metadata" : {
+    "source" : "CRF",
+    "title" : "How to scale distributed deep learning?",
+    "authors" : [ "Peter H. Jin", "Qiaochu Yuan", "Forrest Iandola" ],
+    "emails" : [ "phj@berkeley.edu", "qyuan@berkeley.edu", "forresti@berkeley.edu", "keutzer@berkeley.edu" ],
+    "sections" : [ {
+      "heading" : "1 Introduction",
+      "text" : "Estimates of the data gathered by a self-driving car start from at least 750 MB/s.1 With proper annotation or through an unsupervised learning scheme, all of this data can become useful for training the object detection system or grid-occupancy system of a self-driving car. The resulting training set can lead to weeks or more of training time on a single CPU/GPU system. Therefore, for such applications training time defines the most time consuming element of the workflow, and reduced training time is highly desirable.\nTo achieve significant reductions in training time, the training must be distributed across multiple CPUs/GPUs with the goal of strong scaling: as more nodes are thrown at the problem, the training time should ideally decrease proportionally. There are two primary approaches to distributed stochastic gradient descent (SGD) for training deep neural networks: (i) synchronous all-reduce SGD based on a fast all-reduce collective communication operation [1, 2, 3, 4], and (ii) asynchronous SGD using a parameter server [5, 6].\nBoth approaches (i) and (ii) have weaknesses at scale. Synchronous SGD is penalized by straggling processors, underutilizes compute resources, and is not robust in the face of failing processors or nodes. On the other hand, asynchronous approaches using parameter servers create a communication bottleneck and underutilize the available network resources, slowing convergence.\n1 http://www.kurzweilai.net/googles-self-driving-car-gathers-nearly-1-gbsec\nar X\niv :1\n61 1.\n04 58\n1v 1\n[ cs\n.L G\n] 1\n4 N\nov 2\n01 6\nIndividual researchers also have different numbers of nodes at their disposal, including compute and network resources. So determining the best approach for a given number of nodes, as well as the approach that scales to the most number of nodes, is of interest to practitioners with finite resources.\nWe are concerned with the following questions:\na. How fast do asynchronous and synchronous SGD algorithms converge at both the beginning of training (large step sizes) and at the end of training (large step sizes)?\nb. How does the convergence of async. and sync. SGD vary with the number of nodes?\nTo compare the strengths and weaknesses of asynchronous and synchronous SGD algorithms, we train a modern ResNet convolutional network [7] on the ImageNet dataset [8] using various distributed SGD methods. We primarily compare synchronous all-reduce SGD, the recently proposed asynchronous elastic averaging SGD [9], as well as our own method, asynchronous gossiping SGD, based on an algorithm originally developed in a different problem setting [10]. Gossiping SGD is an asynchronous method that does not use a centralized parameter server, and in a sense, gossiping is a decentralized version of elastic averaging. We find that asynchronous SGD, including both elastic averaging and gossiping, exhibits the best scaling at larger step sizes and, perhaps counterintuitively, at smaller scales (up to around 32 distributed nodes). For smaller step sizes and at larger scales, all-reduce consistently converges to the most accurate solution faster than the asynchronous methods."
+    }, {
+      "heading" : "2 Background",
+      "text" : "In this section, we will describe the baseline synchronous and asynchronous SGD methods, as well as a recently proposed asynchronous method that is more scalable than its predecessor. We will use the following naming convention for SGD: θ are the parameters over which the objective is minimized, θ̃ is the center parameter (if applicable), α is the step size, µ is the momentum, subscript i refers to the i-th node out of p total nodes, and subscript t refers to the t-th (minibatch) iteration. Additionally, b will refer to the per-node minibatch size, whereas m will refer to the aggregate minibatch size summed across all nodes."
+    }, {
+      "heading" : "2.1 Synchronous All-Reduce SGD",
+      "text" : "In traditional synchronous all-reduce SGD, there are two alternating phases proceeding in lock-step: (1) each node computes its local parameter gradients, and (2) all nodes collectively communicate all-to-all to compute an aggregate gradient, as if they all formed a large distributed minibatch. The second phase of exchanging gradients forms a barrier and is the communication-intensive phase, usually implemented by an eponymous all-reduce operation. The time complexity of an all-reduction can be decomposed into latency-bound and bandwidth-bound terms. Although the latency term scales with O(log(p)), there are fast ring algorithms which have bandwidth term independent of p [11]. With modern networks capable of handling bandwidth on the order of 1–10 GB/s combined with neural network parameter sizes on the order of 10–100 MB, the communication of gradients or parameters between nodes across a network can be very fast. Instead, the communication overhead of all-reduce results from its use of a synchronization barrier, where all nodes must wait for all other nodes until the all-reduce is complete before proceeding to the next stochastic gradient iteration. This directly leads to a straggler effect where the slowest nodes will prevent the rest of the nodes from making progress. Examples of large-scale synchronous data parallel SGD for distributed deep learning are given in [1], [2], [3], and [4]. We provide pseudocode for synchronous data-parallel SGD in Algorithm 1.\nAlgorithm 1 Synchronous all-reduce SGD. initialize θ0,i ← θ0 for t ∈ {0, . . . , T} do\n∆θt,i ← −αt∇fi(θt,i;Xt,i) + µ∆θt−1 ∆θt ← all-reduce-average(∆θt,i) θt+1,i ← θt,i + ∆θt\nend for"
+    }, {
+      "heading" : "2.2 Asynchronous Parameter-Server SGD",
+      "text" : "A different approach to SGD consists of each node asynchronously performing its own gradient updates and occasionally synchronizing its parameters with a central parameter store. This form of asynchronous SGD was popularized by “Hogwild” SGD [12], which considered solving sparse problems on single machine shared memory systems. “Downpour” SGD [5] then generalized the approach to distributed SGD where nodes communicate their gradients with a central parameter server. The main weakness of the asynchronous parameter-server approach to SGD is that the workers communicate all-to-one with a central server, and the communication throughput is limited by the finite link reception bandwidth at the server. One approach for alleviating the communication bottleneck is introducing a delay between rounds of communication, but increasing the delay greatly decreases the rate of convergence [9]. Large scale asynchronous SGD for deep learning was first implemented in Google DistBelief [5] and has also been implemented in [6]; large scale parameter server systems in the non-deep learning setting have also been demonstrated in [13] and [14]."
+    }, {
+      "heading" : "2.3 Elastic Averaging SGD",
+      "text" : "Elastic averaging SGD [9] is a new algorithm belonging to the family of asynchronous parameterserver methods which introduces a modification to the usual stochastic gradient objective to achieve faster convergence. Elastic averaging seeks to maximize the consensus between the center parameter θ̃ and the local parameters θi in addition to the loss:\nFconsensus(θ1, . . . , θp, θ̃) = p∑ i=1 [ f(θi;Xi) + ρ 2 ‖θi − θ̃‖2 ] . (1)\nThe elastic averaging algorithm is given in Algorithm 2. The consensus objective of elastic averaging is closely related to the augmented Lagrangian of ADMM, and the gradient update derived from the consensus objective was shown by [9] to converge significantly faster than vanilla async SGD. However, as elastic averaging is a member of the family of asynchronous parameter-server approaches, it is still subject to a communication bottleneck between the central server and the client workers.\nBecause recent published results indicate that elastic averaging dominates previous asynchronous parameter-server methods [9], we will only consider elastic averaging from this point on.\nAlgorithm 2 Elastic averaging SGD. The hyperparameter β is the moving rate. # client code initialize θ0,i ← θ0 for t ∈ {0, . . . , T} do\nif t > 0 and t ≡ 0 mod τ then θ̃ ← receive-server-param() send-param-update(+β(θt,i − θ̃)) θt,i ← θt,i − β(θt,i − θ̃) end if ∆θt,i ← −αt∇fi(θt,i;Xt,i) + µ∆θt−1,i θt+1,i ← θt,i + ∆θt,i\nend for\n# server code initialize θ̃0 ← θ0 for t ∈ {0, . . . , T} do\nsend-server-param(θ̃t) ∆θ ← receive-param-update() θ̃t+1 ← θ̃t + ∆θ\nend for"
+    }, {
+      "heading" : "3 Gossiping SGD",
+      "text" : ""
+    }, {
+      "heading" : "3.1 Algorithm",
+      "text" : "In a nutshell, the synchronous all-reduce algorithm consists of two repeating phases: (1) calculation of the local gradients at each node, and (2) exact aggregation of the local gradients via all-reduce. To derive gossiping SGD, we would like to replace the synchronous all-reduce operation with a more asynchronous-friendly communication pattern. The fundamental building block we use is a gossip aggregation algorithm [15, 16], which combined with SGD leads to the gossiping SGD algorithm. Asynchronous gossiping SGD was introduced in [10] for the general case of a sparse communication\ngraph between nodes (e.g. wireless sensor networks). The original problem setting of gossiping also typically involved synchronous rounds of communication, whereas we are most interested in asynchronous gossip.\nThe mathematical formulation of the gossiping SGD update can also be derived by conceptually linking gossiping to elastic averaging. Introduce a distributed version of the global consensus objective, in which the center parameter is replaced with the average of the local parameters:\nFdist-consensus(θ1, . . . , θp) = p∑ i=1 f(θi;Xi) + ρ 2 ∥∥∥∥∥∥θi − 1p p∑ j=1 θj ∥∥∥∥∥∥ 2  . (2)\nThe corresponding gradient steps look like the following: θ′t,i = θt,i − α∇f(θt,i;Xi) (3)\nθt+1,i = θ ′ t,i − β θ′t,i − 1p p∑ j=1 θ′t,j  . (4) If we replace the distributed mean 1p ∑p j=1 θt,j with the unbiased one-node estimator θt,jt,i , such that\njt,i ∼ Uniform({1, . . . , p}) and E[θt,jt,i ] = 1p ∑p j=1 θt,j , then we derive the gossiping SGD update:\nθ′t,i = θt,i − α∇f(θt,i;Xi) (5) θt+1,i = θ ′ t,i − β(θ′t,i − θ′jt,i,t) (6)\n= (1− β)θ′t,i + βθ′jt,i,t. (7) To make this more intuitive, we describe a quantity related to the distributed consensus, the diffusion potential. Fix θ(0)i = θt,i, and consider the synchronous gossip setting of purely calculating an average of the parameters and where there are no gradient steps. Then the updated parameter after k repeated gossip rounds, θ(k)i , can be represented as a weighted average of the initial parameter values θ (0) j . Denoting the weighted contribution of θ (0) j toward θ (k) i by v (k) i,j , the diffusion potential is:\nΦdiffusion(θ (k) 1 , . . . , θ (k) p ) = p∑ i=1 p∑ j=1 ∥∥∥∥∥∥v(k)i,j θ(0)j − 1p p∑ j′=1 v (k) i,j′θ (0) j′ ∥∥∥∥∥∥ 2 . (8)\nIt can be shown that repeated rounds of a form of gossiping reduces the diffusion potential by a fixed rate per round [15].\nIf jt,i is chosen uniformly as above, then the algorithm is equivalent to “pull-gossip,” i.e. each node pulls or receives θj from one and only one other random node per iteration. On the other hand, if we replace the “one-node estimator” with querying θj from multiple nodes, with the constraint that each j is represented only once per iteration, then the algorithm becomes “push-gossip,” i.e. each node pushes or sends its own θi to one and only one other random node, while receiving from between zero and multiple other nodes. Push-gossiping SGD can be interpreted as an interleaving of a gradient step and a simplified push-sum gossip step [15]. Algorithms 3 and 4 describe pull-gossiping and push-gossiping SGD respectively.\nAlgorithm 3 Pull-gossiping SGD. initialize θ0,i ← θ0 for t ∈ {0, . . . , T} do\nif t > 0 and t ≡ 0 mod τ then set xi ← θt,i choose a target j θt,i ← average of xi, xj end if ∆θt,i ← −αt∇fi(θt,i;Xt,i) + µ∆θt−1,i θt+1,i ← θt,i + ∆θt,i\nend for\nAlgorithm 4 Push-gossiping SGD. initialize θ0,i ← θ0 for t ∈ {0, . . . , T} do\nif t > 0 and t ≡ 0 mod τ then set xi ← θt,i choose a target j send xi to i (ourselves) and to j θt,i ← average of received x’s end if ∆θt,i ← −αt∇fi(θt,i;Xt,i) + µ∆θt−1,i θt+1,i ← θt,i + ∆θt,i\nend for"
+    }, {
+      "heading" : "3.2 Analysis",
+      "text" : "Our analysis of gossiping SGD is based on the analyses in [17, 16, 10, 18, 9]. We assume that all processors are able to communicate with all other processors at each step. The main convergence result is the following: Theorem 1. Let f be a m-strongly convex function with L-Lipschitz gradients. Assume that we can sample gradients g = ∇f(θ;Xi) + ξi with additive noise with zero mean E[ξi] = 0 and bounded variance E[ξTi ξi] ≤ σ2. Then, running the asynchronous pull-gossip algorithm, with constant step size 0 < α ≤ 2m+L , the expected sum of squares convergence of the local parameters to the optimal θ∗ is bounded by\nE[‖θt − θ∗1‖2] ≤ (\n1− 2α p mL m+ L\n)t ‖θ0 − θ∗1‖2 + pασ2 m+ L\n2mL (9)\nFurthermore, with the additional assumption that the gradients are uniformly bounded as sup |∇f(θ)| ≤ C, the expected sum of squares convergence of the local parameters to the mean θ̄t is bounded by\nE[‖θt − θ̄t1‖2] ≤ ( λ ( 1− αm\np\n))t ‖θ0 − θ̄01‖2 + λα2(C2 + σ2)\n1− λ ( 1− αmp ) (10)\nwhere λ = 1− 2β(1− β) p − 2β 2 p (11)\nFor the proofs, please see subsection (6.1) in the supplementary material."
+    }, {
+      "heading" : "4 Experiments",
+      "text" : ""
+    }, {
+      "heading" : "4.1 Implementation",
+      "text" : "We implement the communication systems of gossiping SGD and other algorithms using Message Passing Interface (MPI) [19]. Because we wanted to run our code in cluster computing environments with Infiniband or more specialized interconnects, then targeting MPI was the easiest solution. We targeted our code to run on GPUs, using the Nvidia CUDA 7.0 driver and using the cuBLAS and cuDNNv4 [20] libraries for the core computational kernels.\nFor our experiments up to p = 16 nodes, we use a local cluster of 16 machines, each one consisting of an Nvidia Kepler K80 dual GPU, an 8-core Intel Haswell E5-1680v2 CPU, and a Mellanox ConnectX-3 FDR 4× Infiniband (56 Gb/s) NIC. We utilize only one GPU per K80. For our larger scale experiments up to p = 128 nodes, we used a GPU supercomputer with over 10,000 total nodes. Nodes consist of an Nvidia Kepler K20X GPU and an 8-core AMD Bulldozer Opteron 6274 CPU, and are connected by a Cray Gemini interconnect in a 3D torus configuration."
+    }, {
+      "heading" : "4.2 Methodology",
+      "text" : "We chose ResNets [7] for our neural network architecture; specifically, we trained ResNet-18, which is small enough to train rapidly for experimentation, but also possesses features relevant to modern networks, including depth, residual layers, and batch normalization [21]. We ran on the image classification problem of ImageNet consisting of 1.28 million training images and 50,000 validation images divided into 1000 classes [8]. Our data augmentation is as follows: we performed multi-scale training by scaling the shortest dimension of images to between 256 and 480 pixels [22], we took random 224× 224 crops and horizontal flips, and we added pixelwise color noise [23]. We evaluate validation loss and top-1 error on center crops of the validation set images with the shortest dimension scaled to 256 pixels.\nUnless otherwise noted, we initialized the learning rate to α = 0.1, then we annealed it twice by a factor of 0.1. For our experiments with aggregate minibatch size m = pb = 256, we annealed at exactly 150k and 300k iterations into training. For our experiments with larger aggregate minibatch sizes, we decreased the number of iterations at which the step size was annealed. We used Nesterov momentum of µ = 0.9 and weight decay of λ = 10−4. For elastic averaging, we set β = 0.8/p. For all-reduce and gossiping, we used a communication interval of τ = 1, i.e. communication occurred every iteration. For gossiping, we used both τ = 1 and τ = 10 (the latter is recommended in [9])."
+    }, {
+      "heading" : "4.3 Results",
+      "text" : "Our first set of experiments compare all-reduce, elastic averaging, and push-gossiping at p = 8 and p = 16 with an aggregate minibatch size m = pb = 256. The results are in Figure 1.\nFor p = 8, elastic averaging with a communication delay τ = 10 performs ahead of the other methods, Interestingly, all-reduce has practically no synchronization overhead on the system at p = 8 and is as fast as gossiping. All methods converge to roughly the same minimum loss value.\nFor p = 16, gossiping converges faster than elastic averaging with τ = 10, and both come ahead of all-reduce. Additionally, elastic averaging with both τ = 1 and τ = 10 has trouble converging to the same validation loss as the other methods once the step size has been annealed to a small value (α = 0.001 in this case).\nWe also perform larger scale experiments at p = 32 nodes, p = 64 nodes, and p = 128 nodes in the GPGPU supercomputing environment. In this environment, elastic averaging did not perform well so we do not show those results here; pull-gossiping also performed better than push-gossiping, so we only show results for pull-gossiping. The results are in Figure 2. At this scale, we begin to see the scaling advantage of synchronous all-reduce SGD. One iteration of gossiping SGD is still faster than one iteration of all-reduce SGD, and gossiping works quickly at the initial step size. But gossiping SGD begins to converge much slower after the step size has annealed.\nWe note that the training time of SGD can be thought of as the product (wall-clock time per iteration) × (number of iterations). One observation we made consistent with [4] was the following: letting synchronous all-reduce SGD run for many epochs, it will typically converge to a lower optimal validation loss (or higher validation accuracy) than either elastic averaging or gossiping SGD. We found that letting all-reduce SGD run for over 1 million iterations with a minibatch size of 256 led to a peak top-1 validation accuracy of 68.7%. However, elastic averaging often had trouble breaking 67%, as did gossiping when the number of nodes was greater than p = 32. In other words, at larger scales the asynchronous methods require more iterations to convergence despite lower wall-clock time per iteration."
+    }, {
+      "heading" : "5 Discussion",
+      "text" : "Revisiting the questions we asked in the beginning:\na. How fast do asynchronous and synchronous SGD algorithms converge at both the beginning of training (large step sizes) and at the end of training (large step sizes)? Up to around 32 nodes, asynchronous SGD can converge faster than all-reduce SGD when the step size is large. When the step size is small (roughly 0.001 or less), gossiping can converge faster than elastic averaging, but all-reduce SGD converges most consistently.\nb. How does the convergence behavior of asynchronous and synchronous distributed SGD vary with the number of nodes? Both elastic averaging and gossiping seem to converge faster than synchronous all-reduce SGD with fewer nodes (up to 16–32 nodes). With more nodes (up to a scale of 100 nodes), all-reduce SGD can consistently converge to a high-accuracy solution, whereas asynchronous methods seem to plateau at lower accuracy. In particular, the fact that gossiping SGD does not scale as well as does synchronous SGD with more nodes suggests that the asynchrony and the pattern of communication, rather than the amount of communication (both methods have low amounts of communication), are responsible for the difference in convergence.\nIn this work, we focused on comparing the scaling of synchronous and asynchronous SGD methods on a supervised learning problem on two platforms: a local GPU cluster and a GPU supercomputer. However, there are other platforms that are relevant for researchers, depending on what resources they have available. These other platforms include multicore CPUs, multi-GPU single servers, local CPU clusters, and cloud CPU/GPU instances, and we would expect to observe somewhat different results compared to the platforms tested in this work.\nWhile our experiments were all in the setting of supervised learning (ImageNet image classification), the comparison between synchronous and asynchronous parallelization of learning may differ in other settings; c.f. recent results on asynchronous methods in deep reinforcement learning [24]. Additionally, we specifically used convolutional neural networks in our supervised learning experiments, which because of their high arithmetic intensity (high ratio of floating point operations to memory footprint) have a different profile from networks with many fully connected operations, including most recurrent networks.\nFinally, we exclusively looked at SGD with Nesterov momentum as the underlying algorithm to be parallelized/distributed. Adaptive versions of SGD such as RMSProp [25] and Adam [26] are also widely used in deep learning, and their corresponding distributed versions may have additional considerations (e.g. sharing the squared gradients in [24])."
+    }, {
+      "heading" : "Acknowledgments",
+      "text" : "We thank Kostadin Ilov, Ed F. D’Azevedo, and Chris Fuson for helping make this work possible, as well as Josh Tobin for insightful discussions. We would also like to thank the anonymous reviewers for their constructive feedback. This research is partially funded by DARPA Award Number HR001112-2-0016 and by ASPIRE Lab industrial sponsors and affiliates Intel, Google, Hewlett-Packard, Huawei, LGE, NVIDIA, Oracle, and Samsung. This research used resources of the Oak Ridge Leadership Computing Facility at the Oak Ridge National Laboratory, which is supported by the Office of Science of the U.S. Department of Energy under Contract No. DE-AC05-00OR22725."
+    }, {
+      "heading" : "6 Appendix",
+      "text" : ""
+    }, {
+      "heading" : "6.1 Analysis",
+      "text" : "The analysis below loosely follow the arguments presented in, and use a combination of techniques appearing from [17,16,10,18,9].\nFor ease of exposition and notation, we focus our attention on the case of univariate strongly convex function f with Lipschitz gradients. (Since the sum of squares errors are additive in vector components, the arguments below generalize to the case of multivariate functions.) We assume that the gradients of the function f can be sampled by all processors independently up to additive noise with zero mean and bounded variance. (Gaussian noise satisfy these assumptions, for example.) We also assume a fully connected network where all processors are able to communicate with all other processors. Additional assumptions are introduced below as needed.\nWe denote by θt = [θt,1, · · · , θt,p] T the vector containing all local parameter values at time step t, we denote by θ∗ the optimal value of the objective function f , and we denote by θ̄t ≡ 1p ∑p i=1 θt,i the spatial average of the local parameters taken at time step t.\nWe derive bounds for the following two quantities:\n• E[‖θt − θ∗1‖2], the squared sum of the local parameters’ deviation from the optimum θ∗\n• E[‖θt − θ̄t1‖2], the squared sum of the local parameters’ deviation from the mean θ̄t = 1 p ∑p i=1 θt,i\nwhere the expectation is taken with respect to both the “pull” parameter choice and the gradient noise term. In the literature [18], the latter is usually referred to as “agent agreement” or “agent consensus”."
+    }, {
+      "heading" : "6.1.1 Synchronous pull-gossip algorithm",
+      "text" : "We begin by analyzing the synchronous version of the pull-gossip algorithm described in Algorithm 3. For each processor i, let ji denote the processor, chosen uniformly randomly from {1, · · · , p} from which processor i “pulls” parameter values. The update for each θt,i is given by\nθt+1,i = 1\n2 (θt,i + θt,ji)− αt\n( ∇f ( 1\n2 (θt,i + θt,ji) ;Xt,i\n) + ξt,i ) (12)\nWe prove the following rate of convergence for the synchronous pull-gossip algorithm.\nTheorem 2. Let f be a m-strongly convex function with L-Lipschitz gradients. Assume that we can sample gradients g = ∇f(θ;Xi) + ξi with additive noise with zero mean E[ξi] = 0 and bounded variance E[ξTi ξi] ≤ σ2. Then, running the synchronous pull-gossip algorithm as outlined above with step size 0 < α ≤ 2m+L , the expected sum of squares convergence of the local parameters to the optimal θ∗ is bounded by\nE[‖θt − θ∗1‖2] ≤ (\n1− 2α mL m+ L\n)t ‖θ0 − θ∗1‖2 + pασ2 m+ L\n2mL (13)\nRemark. Note that this bound is characteristic of SGD bounds, where the iterates converge to within some ball around the optimal solution. It can be shown by induction that a decreasing step size schedule of αt ∼ O(1/pt) can be used to achieve a convergence rate of O(1/t).\nProof. For notational simplicity, we denote θt,i,ji ≡ 12 (θt,i + θt,ji), and drop the Xt,i in the gradient term. We tackle the first quantity by conditioning on the previous parameter values and expanding as\nE[‖θt+1 − θ∗1‖2 | θt] = E [ p∑ i=1 (θt,i,ji − θ∗) T (θt,i,ji − θ∗) ∣∣∣ θt] (14)\n− 2αtE [ p∑ i=1 ∇f(θt,i,ji)T (θt,i,ji − θ∗) ∣∣∣ θt] (15)\n− 2αtE [ p∑ i=1 ξTt,i (θt,i,ji − θ∗) ∣∣∣ θt] (16)\n+ α2t [ p∑ i=1 (∇f(θt,i,ji) + ξt,i) T (∇f(θt,i,ji) + ξt,i) ∣∣∣ θt] (17)\nRecalling that strongly convex functions satisfy [17], ∀x, z,\n(∇f(x)−∇f(z))T (x− z) (18)\n≥ mL m+ L (x− z)T (x− z) + 1 m+ L (∇f(x)−∇f(z))T (∇f(x)−∇f(z))\nwe can use this inequality, with x = θt,i,ji and z = θ∗ to bound the term in (15):\n− 2αtE [ p∑ i=1 ∇f(θt,i,ji)T (θt,i,ji − θ∗) ∣∣∣ θt] (19)\n≤ −2αtmL m+ L E [ p∑ i=1 (θt,i,ji − θ∗)T (θt,i,ji − θ∗) ∣∣∣ θt]− 2αt m+ L E [ p∑ i=1 ∇f(θt,i,ji)T∇f(θt,i,ji) ∣∣∣ θt]\nUsing (20), and regrouping terms in (14)-(17), we obtain E[‖θt+1 − θ∗1‖2 | θt] ≤ ( 1− 2αt mL\nm+ L\n) E [ p∑ i=1 (θt,i,ji − θ∗) T (θt,i,ji − θ∗) ∣∣∣ θt] (20)\n+ ( α2t − 2αt 1\nm+ L\n) E [ p∑ i=1 ∇f(θt,i,ji)T∇f(θt,i,ji) ∣∣∣ θt] (21)\n+ α2tE [ p∑ i=1 ξTt,iξt,i ∣∣∣ θt] (22) In the above expression, we have dropped the terms linear in ξt,i, using the assumption that these noise terms vanish in expectation. In addition, if the step size parameter α is chosen sufficiently small, 0 < αt ≤ 2m+L , then the second term in (21) can also be dropped. The expression we must contend with is\nE[‖θt+1 − θ∗1‖2 | θt] ≤ ( 1− 2αt mL\nm+ L\n) E [ p∑ i=1 (θt,i,ji − θ∗) T (θt,i,ji − θ∗) ∣∣∣ θt]+ α2tpσ2\n(23)\nUsing the definition of θt,i,ji , we can verify that the following matrix relation holds. θt,1,j1 − θ∗ ... θt,i,ji − θ∗\n... θt,p,jp − θ∗\n =  1 2\n1 2\n. . . 1 2 1 2\n. . . 1 2 1 2\n  θt,1 − θ∗ ... θt,i − θ∗\n... θt,p − θ∗\n ≡MI(θt − θ∗1) (24)\nwhere the random matrix MI depends on the random index set I = {ji}pi=1 of uniformly randomly drawn indices. MI has two entries in each row, one on the diagonal, and one appearing in the jith column, and is a right stochastic matrix but need not be doubly stochastic.\nWe can express this matrix as\nMI = 1\n2 p∑ i=1 ei(ei + eji) T\nand compute its second moment\nE[MTI MI ] = 1\n4 E (I + p∑ i=1 eie T ji )T ( I + p∑ i=1 eie T ji ) (25) = 1\n2\n( I + 1\np 11T\n) (26)\n= Q  1 1 2\n. . . 1 2 QT (27) where in the last line, the orthogonal diagonalization reveals that the eigenvalues of this matrix are bounded by 12 ≤ λi ≤ 1.\nUsing (27), we can further simply (23) to E[‖θt+1 − θ∗1‖2 | θt] ≤ ( 1− 2αt mL\nm+ L\n) (θt − θ∗1)TE [ MTI MI ] (θt − θ∗1) + α2tpσ2 (28)\n≤ ( 1− 2αt mL\nm+ L\n) ‖θt − θ∗1‖2 + α2tpσ2 (29)\nAssuming a constant step size αt ≡ α, the above recursion can be unrolled to derive the bound E[‖θt − θ∗1‖2] ≤ (\n1− 2α mL m+ L\n)t ‖θ0 − θ∗1‖2 + pασ2 m+ L\n2mL (30)\nWe note that the above bound is characteristic of SGD bounds, where the iterates converge to a ball around the optimal solution, whose radius now depends on the number of processors p, in addition to the step size α and the variance of the gradient noise σ2."
+    }, {
+      "heading" : "6.1.2 Asynchronous pull-gossip algorithm",
+      "text" : "We provide similar analysis for the asynchronous version of the pull-gossip algorithm. As is frequently done in the literature, we model the time steps as the ticking of local clocks governed by Poisson processes. More precisely, we assume that each processor has a clock which ticks with a rate 1 Poisson process. A master clock which ticks whenever a local processor clock ticks is then governed by a rate p Poisson process, and a time step in the algorithm is defined as whenever the master clock ticks. Since each master clock tick corresponds to the tick of some local clock on processor i, this in turn marks the time step at which processor i “pulls” the parameter values from the uniformly randomly chosen processor ji. Modeling the time steps by Poisson processes provide nice theoretical properties, i.e. the inter-tick time intervals are i.i.d. exponential variables of rate p, and the local clock i which causes each master clock tick is i.i.d. drawn from {1, · · · , p}, to name a few. For an in depth analysis of this model, and results that relate the master clock ticks to absolute time, please see [16].\nThe main variant implemented is the pull-gossip with fresh parameters in subsection 6.2.2. The update at each time step is given by{\nθt+1,i = (1− β) (θt,i − αt (∇f(θt,i) + ξt,i)) + βθt,ji θt+1,k = θt,k , for k 6= i\nwhere ξt,i is the gradient noise Note in the implementation we use β = 1/2, however in the analysis we retain the β parameter for generality.\nWe have the following convergence result. Theorem 3. Let f be a m-strongly convex function with L-Lipschitz gradients. Assume that we can sample gradients g = ∇f(θ;Xi) + ξi with additive noise with zero mean E[ξi] = 0 and bounded variance E[ξTi ξi] ≤ σ2. Then, running the asynchronous pull-gossip algorithm with the time model as described, with constant step size 0 < α ≤ 2m+L , the expected sum of squares convergence of the local parameters to the optimal θ∗ is bounded by\nE[‖θt − θ∗1‖2] ≤ (\n1− 2α p mL m+ L\n)t ‖θ0 − θ∗1‖2 + pασ2 m+ L\n2mL (31)\nFurthermore, with the additional assumption that the gradients are uniformly bounded as sup |∇f(θ)| ≤ C, the expected sum of squares convergence of the local parameters to the mean θ̄t is bounded by\nE[‖θt − θ̄t1‖2] ≤ ( λ ( 1− αm\np\n))t ‖θ0 − θ̄01‖2 + λα2(C2 + σ2)\n1− λ ( 1− αmp ) (32)\nwhere λ = 1− 2β(1− β) p − 2β 2 p (33)\nRemark. Note again that this bound is characteristic of SGD bounds, with the additional dependence on p, the number of processors.\nProof. For simplicity of notation, we denote gt,i ≡ ∇f(θt,i) + ξt,i. We can write the asynchronous iteration step in matrix form as θt+1,1 − θ∗ ... θt+1,i − θ∗ ... θt+1,ji − θ∗ ...\nθt+1,p − θ∗\n =  1 . . . 1− β β . . . 1 . . .\n1\n   θt,1 − θ∗ ... θt,i − θ∗ ... θt,ji − θ∗ ...\nθt,p − θ∗\n − αt  0 ... gt,i\n... 0 ... 0\n  (34)\n≡ Di,ji ((θt − θ∗)− αtgt) (35) The random matrix Di,ji depends on the indices i and ji, both of which are uniformly randomly drawn from {1, · · · , p}. For notational convenience we will drop the subscripts, but we keep in mind that the expectation below is taken with respect to the randomly chosen indices. We can express the matrix as\nD = I + βei(eji − ei)T (36) and compute its second moment as\nE[DTD] = (\n1− 2β(1− β) p\n) I +\n2β(1− β) p2 11T (37)\n= Q  1 1− 2β(1−β)p . . .\n1− 2β(1−β)p\nQT (38)\nThe orthogonal diagonalization reveals that the eigenvalues of this matrix are bounded by 1− 2β(1−β)p ≤ λi ≤ 1.\nUsing (38), we can expand and bound the expected sum of squares deviation by\nE[‖θt+1 − θ∗1‖2|θt] = E [ ((θt − θ∗1)− αtgt)TDTD((θt − θ∗1)− αtgt) ] (39)\n≤ E [ ‖(θt − θ∗1)− αtgt‖2 ] (40)\n= ‖θt − θ∗1‖2 − 2αt p p∑ i=1 ∇f(θt,i)T (θt,i − θ∗) + α2t p p∑ i=1 ∇f(θt,i)T∇f(θt,i) + α2t p p∑ i=1 ξTt,iξt,i\n(41)\nwhere in the last line, we have dropped terms that are linear in ξt,i by using the zero mean assumption. Making use of the strong convexity inequality (19), we can bound the second term in the above sum by\n−∇f(θt,i)T (θt,i − θ∗) ≤ − mL\nm+ L (θt,i − θ∗)T (θt,i − θ∗)−\n1\nm+ L ∇f(θt,i)T∇f(θt,i)\nand rearrange the terms in (41) to derive E[‖θt+1 − θ∗1‖2|θt] ≤ (\n1− 2αt p mL m+ L\n) ‖θt − θ∗1‖2 (42)\n+ ( α2t p − 2αt p 1 m+ L ) p∑ i=1 ∇f(θt,i)T∇f(θt,i) (43)\n+ α2tσ 2 (44)\nThe term in (43) can be dropped if αt is chosen sufficiently small, with the now familiar requirement that 0 < αt < 2m+L . Assuming this is the case, we have\nE[‖θt+1 − θ∗1‖2|θt] ≤ (\n1− 2αt p mL m+ L\n) ‖θt − θ∗1‖2 + α2tσ2 (45)\nAssuming a constant step size αt ≡ α, we can use the law of iterated expectations to unroll the recursion, giving\nE[‖θt − θ∗1‖2] ≤ (\n1− 2α p mL m+ L\n)t ‖θ0 − θ∗1‖2 + pασ2 m+ L\n2mL (46)\nNote this is the same convergence rate guarantee as stochastic gradient descent with an extra factor of p, albeit the coordination amongst processors required to adjust the step size is unrealistic in practice.\nNext, we prove the bound on the processors’ local parameters’ convergence to each other / to the mean, E[‖θt − θ̄t1‖2].\nFirst, we write the spatial parameter average in vector form as\nθ̄t = 1\np 1T θt (47)\nWith D as previously defined in (35), we can write\nθ̄t+11 = 1\np 1T θt+11 =\n1 p 1TD(θt − αgt)1 (48)\nand so the term we wish to bound can be expanded as ‖θt+1 − θ̄t+11‖2 = (θt − αtgt)T ( DTD − 1\np DT11TD\n) (θt − αtgt) (49)\nIn addition to the diagonalization we previous calculated in (38) (reproduced below for convenience), we calculate some other useful diagonalizations.\nE[DTD] = (\n1− 2β(1− β) p\n) I +\n2β(1− β) p2 11T (50)\n= Q  1 1− 2β(1−β)p . . .\n1− 2β(1−β)p QT (51) E[DT11TD] = 2β2\np I +\n( 1− 2β 2\np2\n) 11T (52)\n= Q  p 2β2 p\n. . . 2β2\np QT (53) E [ DTD − 1\np DT11TD\n] = ( 1− 2β(1− β)\np − 2β\n2\np2\n) I + ( 2β(1− β)\np2 − 1 p\n( 1− 2β 2\np2\n)) 11T\n(54)\n= Q  0 1− 2β(1−β)p − 2β2 p2\n. . . 1− 2β(1−β)p − 2β2 p2 QT (55) We note that all three matrices are diagonalized by the same orthogonal matrix Q. Furthermore, the first eigenvector, corresponding to the eigenvalues 1, p, 0 respectively, is q1 = 1√p1.\nContinuing from (49), we take the expectation and use (55) to further bound the expression. In the computation below we use λ ≡ 1− 2β(1−β)p − 2β2 p as a notational shorthand.\nE[‖θt+1 − θ̄t+11‖2|θt] = E [ (θt − αtgt)T ( DTD − 1\np DT11TD\n) (θt − αtgt) ] (56)\n≤ E [ λ‖(θt − θ̄t1)− αtgt‖2 ] (57)\n= λ ( ‖θt − θ̄t1‖2 −\n2αt p p∑ i=1 ∇f(θt,i)T (θt,i − θ̄t) + α2t p p∑ i=1 ∇f(θt,i)T∇f(θt,i) + α2t p p∑ i=1 ξTt,iξt,i ) (58)\n≤ λ ( ‖θt − θ̄t1‖2 +\n2αt p p∑ i=1 ( f(θ̄t)− f(θt,i) ) − αtm p p∑ i=1 (θi,t − θ̄t)2 + α2t p p∑ i=1 (C2 + σ2) ) (59)\n≤ λ (\n1− αtm p\n) ‖θt − θ̄t1‖2 + λα2t (C2 + σ2) (60)\nIn (58) and (59), we have used the definition of strong convexity and convexity respectively.\nFinally, taking constant step size αt ≡ α, and using the law of iterated expectations to unroll the recursion, we have\nE[‖θt − θ̄t1‖2] ≤ ( λ ( 1− αm\np\n))t ‖θ0 − θ̄01‖2 + λα2(C2 + σ2)\n1− λ ( 1− αmp ) (61)\nWhen the step size α is small and the number of processors p is large, the quantity λ ( 1− αmp )\n=( 1− 2β(1−β)p − 2β2 p )( 1− αmp ) is well approximated by 1− 2β(1−β)p − 2β2 p − αm p , which makes clear the dependence of the rate on the parameter p."
+    }, {
+      "heading" : "6.2 Gossip variants",
+      "text" : ""
+    }, {
+      "heading" : "6.2.1 Gossip with stale parameters (gradient step and gossip at the same time)",
+      "text" : "Consider a one-step distributed consensus gradient update:\nθi,t+1 = θi,t − α∇f(θi,t;Xi)− β θi,t − 1 p p∑ j=1 θj,t  . (62) If we replace the distributed mean 1p ∑p j=1 θj,t with an unbiased one-sample estimator θji,t,t, such\nthat ji,t ∼ Uniform({1, . . . , p}) and E[θji,t,t] = 1p ∑p j=1 θj,t, then we derive the gossiping SGD update: θi,t+1 = θi,t − α∇f(θi,t;Xi)− β(θi,t − θji,t,t) (63)\n= (1− β)θi,t + βθji,t,t − α∇f(θi,t;Xi). (64)"
+    }, {
+      "heading" : "6.2.2 Gossip with fresh parameters (gradient step before gossip)",
+      "text" : "Consider a two-step distributed consensus gradient update: θ′i,t = θi,t − α∇f(θi,t;Xi) (65)\nθi,t+1 = θ ′ i,t − β θ′i,t − 1p p∑ j=1 θ′j,t  . (66) If we replace the distributed mean 1p ∑p j=1 θ ′ j,t with an unbiased one-sample estimator θ ′ ji,t,t\n, such that ji,t ∼ Uniform({1, . . . , p}) and E[θ′ji,t,t] = 1 p ∑p j=1 θ ′ j,t, then we derive the gossiping SGD update: θ′i,t = θi,t − α∇f(θi,t;Xi) (67)\nθi,t+1 = θ ′ i,t − β(θ′i,t − θ′ji,t,t) (68)\n= (1− β)θ′i,t + βθ′ji,t,t. (69)"
+    }, {
+      "heading" : "6.3 Implementation details",
+      "text" : "We provide some more details on our implementation of deep convolutional neural network training in general."
+    }, {
+      "heading" : "6.3.1 ImageNet data augmentation",
+      "text" : "We found that multi-scale training could be a significant performance bottleneck due to the computational overhead of resizing images, even when using multiple threads and asynchronous data loading. To remedy this, we used fast CUDA implementations of linear and cubic interpolation filters to perform image scaling during training on the GPU. We also preprocessed ImageNet images such that their largest dimension was no larger than the maximum scale (in our case, 480 pixels)."
+    }, {
+      "heading" : "6.3.2 ResNet implementation",
+      "text" : "We implemented ResNet-18 using stacked residual convolutional layers with 1×1 projection shortcuts. We used the convolution and batch normalization kernels from cuDNNv4. The highest ImageNet validation set accuracy (center crop, top-1) our implementation of ResNets achieved was about 68.7% with the aforementioned multi-scale data augmentation; we note that researchers at Facebook independently reproduced ResNet with a more sophisticated data augmentation scheme and achieved 69.6% accuracy using the same evaluation methodology on their version of ResNet-18.2\n2 https://github.com/facebook/fb.resnet.torch"
+    } ],
+    "references" : [ {
+      "title" : "Deep Image: Scaling up Image Recognition",
+      "author" : [ "Ren Wu", "Shengen Yan", "Yi Shan", "Qingqing Dang", "Gang Sun" ],
+      "venue" : "arXiv preprint arXiv:1501.02876,",
+      "citeRegEx" : "1",
+      "shortCiteRegEx" : "1",
+      "year" : 2015
+    }, {
+      "title" : "FireCaffe: near-linear acceleration of deep neural network training on compute clusters",
+      "author" : [ "Forrest N. Iandola", "Khalid Ashraf", "Matthew W. Moskewicz", "Kurt Keutzer" ],
+      "venue" : "arXiv preprint arXiv:1511.00175,",
+      "citeRegEx" : "2",
+      "shortCiteRegEx" : "2",
+      "year" : 2015
+    }, {
+      "title" : "Distributed Deep Learning Using Synchronous Stochastic Gradient Descent",
+      "author" : [ "Dipankar Das", "Sasikanth Avancha", "Dheevatsa Mudigere", "Karthikeyan Vaidynathan", "Srinivas Sridharan", "Dhiraj Kalamkar", "Bharat Kaul", "Pradeep Dubey" ],
+      "venue" : "arXiv preprint arXiv:1602.06709,",
+      "citeRegEx" : "3",
+      "shortCiteRegEx" : "3",
+      "year" : 2016
+    }, {
+      "title" : "Revisiting Distributed Synchronous SGD",
+      "author" : [ "Jianmin Chen", "Rajat Monga", "Samy Bengio", "Rafal Jozefowicz" ],
+      "venue" : "arXiv preprint arXiv:1604.00981,",
+      "citeRegEx" : "4",
+      "shortCiteRegEx" : "4",
+      "year" : 2016
+    }, {
+      "title" : "Large Scale Distributed Deep Networks",
+      "author" : [ "Jeffrey Dean", "Greg Corrado", "Rajat Monga", "Kai Chen", "Matthieu Devin", "Mark Mao", "Andrew Senior", "Paul Tucker", "Ke Yang", "Quoc V. Le", "Andrew Y. Ng" ],
+      "venue" : "In Advances in Neural Information Processing Systems",
+      "citeRegEx" : "5",
+      "shortCiteRegEx" : "5",
+      "year" : 2012
+    }, {
+      "title" : "Project Adam: Building an Efficient and Scalable Deep Learning Training System",
+      "author" : [ "Trishul Chilimbi", "Yutaka Suzue", "Johnson Apacible", "Karthik Kalyanaraman" ],
+      "venue" : "In 11th USENIX Symposium on Operating Systems Design and Implementation,",
+      "citeRegEx" : "6",
+      "shortCiteRegEx" : "6",
+      "year" : 2014
+    }, {
+      "title" : "Deep Residual Learning for Image Recognition",
+      "author" : [ "Kaiming He", "Xiangyu Zhang", "Shaoqing Ren", "Jian Sun" ],
+      "venue" : "arXiv preprint arXiv:1512.03385,",
+      "citeRegEx" : "7",
+      "shortCiteRegEx" : "7",
+      "year" : 2015
+    }, {
+      "title" : "Deep learning with Elastic Averaging SGD",
+      "author" : [ "Sixin Zhang", "Anna E. Choromanska", "Yann LeCun" ],
+      "venue" : "In Advances in Neural Information Processing Systems",
+      "citeRegEx" : "9",
+      "shortCiteRegEx" : "9",
+      "year" : 2015
+    }, {
+      "title" : "Asynchronous Gossip Algorithms for Stochastic Optimization",
+      "author" : [ "S. Sundhar Ram", "A. Nedić", "V.V. Veeravalli" ],
+      "venue" : "In Proceedings of the 48th IEEE Conference on Decision and Control,",
+      "citeRegEx" : "10",
+      "shortCiteRegEx" : "10",
+      "year" : 2009
+    }, {
+      "title" : "Optimization of Collective Communication Operations in MPICH",
+      "author" : [ "Rajeev Thakur", "Rolf Rabenseifner", "William Gropp" ],
+      "venue" : "International Journal of High Performance Computing Applications,",
+      "citeRegEx" : "11",
+      "shortCiteRegEx" : "11",
+      "year" : 2005
+    }, {
+      "title" : "Hogwild: A Lock-Free Approach to Parallelizing Stochastic Gradient Descent",
+      "author" : [ "Benjamin Recht", "Christopher Re", "Stephen Wright", "Feng Niu" ],
+      "venue" : "In Advances in Neural Information Processing Systems",
+      "citeRegEx" : "12",
+      "shortCiteRegEx" : "12",
+      "year" : 2011
+    }, {
+      "title" : "More Effective Distributed ML via a Stale Synchronous Parallel Parameter Server",
+      "author" : [ "Qirong Ho", "James Cipar", "Henggang Cui", "Seunghak Lee", "Jin Kyu Kim", "Phillip B. Gibbons", "Garth A. Gibson", "Greg Ganger", "Eric P. Xing" ],
+      "venue" : "In Advances in Neural Information Processing Systems",
+      "citeRegEx" : "13",
+      "shortCiteRegEx" : "13",
+      "year" : 2013
+    }, {
+      "title" : "Communication Efficient Distributed Machine Learning with the Parameter Server",
+      "author" : [ "Mu Li", "David G. Andersen", "Alex J. Smola", "Kai Yu" ],
+      "venue" : "In Advances in Neural Information Processing Systems",
+      "citeRegEx" : "14",
+      "shortCiteRegEx" : "14",
+      "year" : 2014
+    }, {
+      "title" : "Gossip-Based Computation of Aggregate Information",
+      "author" : [ "David Kempe", "Alin Dobra", "Johannes Gehrke" ],
+      "venue" : "In Proceedings of the 44th Annual IEEE Conference on Foundations of Computer Science,",
+      "citeRegEx" : "15",
+      "shortCiteRegEx" : "15",
+      "year" : 2003
+    }, {
+      "title" : "Randomized Gossip Algorithms",
+      "author" : [ "Stephen Boyd", "Arpita Ghosh", "Balaji Prabhakar", "Devavrat Shah" ],
+      "venue" : "IEEE/ACM Transactions on Networking,",
+      "citeRegEx" : "16",
+      "shortCiteRegEx" : "16",
+      "year" : 2006
+    }, {
+      "title" : "Introductory Lectures on Convex Optimization: A Basic Course, volume",
+      "author" : [ "Yurii Nesterov" ],
+      "venue" : null,
+      "citeRegEx" : "17",
+      "shortCiteRegEx" : "17",
+      "year" : 2013
+    }, {
+      "title" : "Asynchronous Stochastic Convex Optimization for Random Networks: Error Bounds",
+      "author" : [ "Behrouz Touri", "A. Nedić", "S. Sundhar Ram" ],
+      "venue" : "In Information Theory and Applications Workshop (ITA)",
+      "citeRegEx" : "18",
+      "shortCiteRegEx" : "18",
+      "year" : 2010
+    }, {
+      "title" : "Shelhammer. cuDNN: Efficient Primitives for Deep Learning",
+      "author" : [ "Sharan Chetlur", "Cliff Woolley", "Philippe Vandermersch", "Jonathan Cohen", "John Tran", "Bryan Catanzaro", "Evan" ],
+      "venue" : "arXiv preprint arXiv:1410.0759,",
+      "citeRegEx" : "20",
+      "shortCiteRegEx" : "20",
+      "year" : 2014
+    }, {
+      "title" : "Batch Normalization: Accelerating Deep Network Training by Reducing Internal Covariate Shift",
+      "author" : [ "Sergey Ioffe", "Christian Szegedy" ],
+      "venue" : "In Proceedings of the 32nd International Conference on Machine Learning,",
+      "citeRegEx" : "21",
+      "shortCiteRegEx" : "21",
+      "year" : 2015
+    }, {
+      "title" : "Very Deep Convolutional Networks for Large-Scale Image Recognition",
+      "author" : [ "Karen Simonyan", "Andrew Zisserman" ],
+      "venue" : "arXiv preprint arXiv:1409.1556,",
+      "citeRegEx" : "22",
+      "shortCiteRegEx" : "22",
+      "year" : 2014
+    }, {
+      "title" : "ImageNet Classification with Deep Convolutional Neural Networks",
+      "author" : [ "Alex Krizhevsky", "Ilya Sutskever", "Geoffrey E. Hinton" ],
+      "venue" : "In Advances in Neural Information Processing Systems",
+      "citeRegEx" : "23",
+      "shortCiteRegEx" : "23",
+      "year" : 2012
+    }, {
+      "title" : "Asynchronous Methods for Deep Reinforcement Learning",
+      "author" : [ "Volodymyr Mnih", "Adria Puigdomenech Badia", "Mehdi Mirza", "Alex Graves", "Timothy P Lillicrap", "Tim Harley", "David Silver", "Koray Kavukcuoglu" ],
+      "venue" : "arXiv preprint arXiv:1602.01783,",
+      "citeRegEx" : "24",
+      "shortCiteRegEx" : "24",
+      "year" : 2016
+    }, {
+      "title" : "Lecture 6.5-RMSProp: Divide the gradient by a running average of its recent magnitude",
+      "author" : [ "Tijmen Tieleman", "Geoffrey Hinton" ],
+      "venue" : "Coursera: Neural Networks for Machine Learning,",
+      "citeRegEx" : "25",
+      "shortCiteRegEx" : "25",
+      "year" : 2012
+    }, {
+      "title" : "Adam: A Method for Stochastic Optimization",
+      "author" : [ "Diederik Kingma", "Jimmy Ba" ],
+      "venue" : "In 3rd International Conference for Learning Representations,",
+      "citeRegEx" : "26",
+      "shortCiteRegEx" : "26",
+      "year" : 2015
+    } ],
+    "referenceMentions" : [ {
+      "referenceID" : 0,
+      "context" : "There are two primary approaches to distributed stochastic gradient descent (SGD) for training deep neural networks: (i) synchronous all-reduce SGD based on a fast all-reduce collective communication operation [1, 2, 3, 4], and (ii) asynchronous SGD using a parameter server [5, 6].",
+      "startOffset" : 210,
+      "endOffset" : 222
+    }, {
+      "referenceID" : 1,
+      "context" : "There are two primary approaches to distributed stochastic gradient descent (SGD) for training deep neural networks: (i) synchronous all-reduce SGD based on a fast all-reduce collective communication operation [1, 2, 3, 4], and (ii) asynchronous SGD using a parameter server [5, 6].",
+      "startOffset" : 210,
+      "endOffset" : 222
+    }, {
+      "referenceID" : 2,
+      "context" : "There are two primary approaches to distributed stochastic gradient descent (SGD) for training deep neural networks: (i) synchronous all-reduce SGD based on a fast all-reduce collective communication operation [1, 2, 3, 4], and (ii) asynchronous SGD using a parameter server [5, 6].",
+      "startOffset" : 210,
+      "endOffset" : 222
+    }, {
+      "referenceID" : 3,
+      "context" : "There are two primary approaches to distributed stochastic gradient descent (SGD) for training deep neural networks: (i) synchronous all-reduce SGD based on a fast all-reduce collective communication operation [1, 2, 3, 4], and (ii) asynchronous SGD using a parameter server [5, 6].",
+      "startOffset" : 210,
+      "endOffset" : 222
+    }, {
+      "referenceID" : 4,
+      "context" : "There are two primary approaches to distributed stochastic gradient descent (SGD) for training deep neural networks: (i) synchronous all-reduce SGD based on a fast all-reduce collective communication operation [1, 2, 3, 4], and (ii) asynchronous SGD using a parameter server [5, 6].",
+      "startOffset" : 275,
+      "endOffset" : 281
+    }, {
+      "referenceID" : 5,
+      "context" : "There are two primary approaches to distributed stochastic gradient descent (SGD) for training deep neural networks: (i) synchronous all-reduce SGD based on a fast all-reduce collective communication operation [1, 2, 3, 4], and (ii) asynchronous SGD using a parameter server [5, 6].",
+      "startOffset" : 275,
+      "endOffset" : 281
+    }, {
+      "referenceID" : 6,
+      "context" : "SGD vary with the number of nodes? To compare the strengths and weaknesses of asynchronous and synchronous SGD algorithms, we train a modern ResNet convolutional network [7] on the ImageNet dataset [8] using various distributed SGD methods.",
+      "startOffset" : 170,
+      "endOffset" : 173
+    }, {
+      "referenceID" : 7,
+      "context" : "We primarily compare synchronous all-reduce SGD, the recently proposed asynchronous elastic averaging SGD [9], as well as our own method, asynchronous gossiping SGD, based on an algorithm originally developed in a different problem setting [10].",
+      "startOffset" : 106,
+      "endOffset" : 109
+    }, {
+      "referenceID" : 8,
+      "context" : "We primarily compare synchronous all-reduce SGD, the recently proposed asynchronous elastic averaging SGD [9], as well as our own method, asynchronous gossiping SGD, based on an algorithm originally developed in a different problem setting [10].",
+      "startOffset" : 240,
+      "endOffset" : 244
+    }, {
+      "referenceID" : 9,
+      "context" : "Although the latency term scales with O(log(p)), there are fast ring algorithms which have bandwidth term independent of p [11].",
+      "startOffset" : 123,
+      "endOffset" : 127
+    }, {
+      "referenceID" : 0,
+      "context" : "Examples of large-scale synchronous data parallel SGD for distributed deep learning are given in [1], [2], [3], and [4].",
+      "startOffset" : 97,
+      "endOffset" : 100
+    }, {
+      "referenceID" : 1,
+      "context" : "Examples of large-scale synchronous data parallel SGD for distributed deep learning are given in [1], [2], [3], and [4].",
+      "startOffset" : 102,
+      "endOffset" : 105
+    }, {
+      "referenceID" : 2,
+      "context" : "Examples of large-scale synchronous data parallel SGD for distributed deep learning are given in [1], [2], [3], and [4].",
+      "startOffset" : 107,
+      "endOffset" : 110
+    }, {
+      "referenceID" : 3,
+      "context" : "Examples of large-scale synchronous data parallel SGD for distributed deep learning are given in [1], [2], [3], and [4].",
+      "startOffset" : 116,
+      "endOffset" : 119
+    }, {
+      "referenceID" : 10,
+      "context" : "This form of asynchronous SGD was popularized by “Hogwild” SGD [12], which considered solving sparse problems on single machine shared memory systems.",
+      "startOffset" : 63,
+      "endOffset" : 67
+    }, {
+      "referenceID" : 4,
+      "context" : "“Downpour” SGD [5] then generalized the approach to distributed SGD where nodes communicate their gradients with a central parameter server.",
+      "startOffset" : 15,
+      "endOffset" : 18
+    }, {
+      "referenceID" : 7,
+      "context" : "One approach for alleviating the communication bottleneck is introducing a delay between rounds of communication, but increasing the delay greatly decreases the rate of convergence [9].",
+      "startOffset" : 181,
+      "endOffset" : 184
+    }, {
+      "referenceID" : 4,
+      "context" : "Large scale asynchronous SGD for deep learning was first implemented in Google DistBelief [5] and has also been implemented in [6]; large scale parameter server systems in the non-deep learning setting have also been demonstrated in [13] and [14].",
+      "startOffset" : 90,
+      "endOffset" : 93
+    }, {
+      "referenceID" : 5,
+      "context" : "Large scale asynchronous SGD for deep learning was first implemented in Google DistBelief [5] and has also been implemented in [6]; large scale parameter server systems in the non-deep learning setting have also been demonstrated in [13] and [14].",
+      "startOffset" : 127,
+      "endOffset" : 130
+    }, {
+      "referenceID" : 11,
+      "context" : "Large scale asynchronous SGD for deep learning was first implemented in Google DistBelief [5] and has also been implemented in [6]; large scale parameter server systems in the non-deep learning setting have also been demonstrated in [13] and [14].",
+      "startOffset" : 233,
+      "endOffset" : 237
+    }, {
+      "referenceID" : 12,
+      "context" : "Large scale asynchronous SGD for deep learning was first implemented in Google DistBelief [5] and has also been implemented in [6]; large scale parameter server systems in the non-deep learning setting have also been demonstrated in [13] and [14].",
+      "startOffset" : 242,
+      "endOffset" : 246
+    }, {
+      "referenceID" : 7,
+      "context" : "Elastic averaging SGD [9] is a new algorithm belonging to the family of asynchronous parameterserver methods which introduces a modification to the usual stochastic gradient objective to achieve faster convergence.",
+      "startOffset" : 22,
+      "endOffset" : 25
+    }, {
+      "referenceID" : 7,
+      "context" : "The consensus objective of elastic averaging is closely related to the augmented Lagrangian of ADMM, and the gradient update derived from the consensus objective was shown by [9] to converge significantly faster than vanilla async SGD.",
+      "startOffset" : 175,
+      "endOffset" : 178
+    }, {
+      "referenceID" : 7,
+      "context" : "Because recent published results indicate that elastic averaging dominates previous asynchronous parameter-server methods [9], we will only consider elastic averaging from this point on.",
+      "startOffset" : 122,
+      "endOffset" : 125
+    }, {
+      "referenceID" : 13,
+      "context" : "The fundamental building block we use is a gossip aggregation algorithm [15, 16], which combined with SGD leads to the gossiping SGD algorithm.",
+      "startOffset" : 72,
+      "endOffset" : 80
+    }, {
+      "referenceID" : 14,
+      "context" : "The fundamental building block we use is a gossip aggregation algorithm [15, 16], which combined with SGD leads to the gossiping SGD algorithm.",
+      "startOffset" : 72,
+      "endOffset" : 80
+    }, {
+      "referenceID" : 8,
+      "context" : "Asynchronous gossiping SGD was introduced in [10] for the general case of a sparse communication",
+      "startOffset" : 45,
+      "endOffset" : 49
+    }, {
+      "referenceID" : 13,
+      "context" : "It can be shown that repeated rounds of a form of gossiping reduces the diffusion potential by a fixed rate per round [15].",
+      "startOffset" : 118,
+      "endOffset" : 122
+    }, {
+      "referenceID" : 13,
+      "context" : "Push-gossiping SGD can be interpreted as an interleaving of a gradient step and a simplified push-sum gossip step [15].",
+      "startOffset" : 114,
+      "endOffset" : 118
+    }, {
+      "referenceID" : 15,
+      "context" : "2 Analysis Our analysis of gossiping SGD is based on the analyses in [17, 16, 10, 18, 9].",
+      "startOffset" : 69,
+      "endOffset" : 88
+    }, {
+      "referenceID" : 14,
+      "context" : "2 Analysis Our analysis of gossiping SGD is based on the analyses in [17, 16, 10, 18, 9].",
+      "startOffset" : 69,
+      "endOffset" : 88
+    }, {
+      "referenceID" : 8,
+      "context" : "2 Analysis Our analysis of gossiping SGD is based on the analyses in [17, 16, 10, 18, 9].",
+      "startOffset" : 69,
+      "endOffset" : 88
+    }, {
+      "referenceID" : 16,
+      "context" : "2 Analysis Our analysis of gossiping SGD is based on the analyses in [17, 16, 10, 18, 9].",
+      "startOffset" : 69,
+      "endOffset" : 88
+    }, {
+      "referenceID" : 7,
+      "context" : "2 Analysis Our analysis of gossiping SGD is based on the analyses in [17, 16, 10, 18, 9].",
+      "startOffset" : 69,
+      "endOffset" : 88
+    }, {
+      "referenceID" : 17,
+      "context" : "0 driver and using the cuBLAS and cuDNNv4 [20] libraries for the core computational kernels.",
+      "startOffset" : 42,
+      "endOffset" : 46
+    }, {
+      "referenceID" : 6,
+      "context" : "We chose ResNets [7] for our neural network architecture; specifically, we trained ResNet-18, which is small enough to train rapidly for experimentation, but also possesses features relevant to modern networks, including depth, residual layers, and batch normalization [21].",
+      "startOffset" : 17,
+      "endOffset" : 20
+    }, {
+      "referenceID" : 18,
+      "context" : "We chose ResNets [7] for our neural network architecture; specifically, we trained ResNet-18, which is small enough to train rapidly for experimentation, but also possesses features relevant to modern networks, including depth, residual layers, and batch normalization [21].",
+      "startOffset" : 269,
+      "endOffset" : 273
+    }, {
+      "referenceID" : 19,
+      "context" : "Our data augmentation is as follows: we performed multi-scale training by scaling the shortest dimension of images to between 256 and 480 pixels [22], we took random 224× 224 crops and horizontal flips, and we added pixelwise color noise [23].",
+      "startOffset" : 145,
+      "endOffset" : 149
+    }, {
+      "referenceID" : 20,
+      "context" : "Our data augmentation is as follows: we performed multi-scale training by scaling the shortest dimension of images to between 256 and 480 pixels [22], we took random 224× 224 crops and horizontal flips, and we added pixelwise color noise [23].",
+      "startOffset" : 238,
+      "endOffset" : 242
+    }, {
+      "referenceID" : 7,
+      "context" : "For gossiping, we used both τ = 1 and τ = 10 (the latter is recommended in [9]).",
+      "startOffset" : 75,
+      "endOffset" : 78
+    }, {
+      "referenceID" : 3,
+      "context" : "One observation we made consistent with [4] was the following: letting synchronous all-reduce SGD run for many epochs, it will typically converge to a lower optimal validation loss (or higher validation accuracy) than either elastic averaging or gossiping SGD.",
+      "startOffset" : 40,
+      "endOffset" : 43
+    }, {
+      "referenceID" : 21,
+      "context" : "recent results on asynchronous methods in deep reinforcement learning [24].",
+      "startOffset" : 70,
+      "endOffset" : 74
+    }, {
+      "referenceID" : 22,
+      "context" : "Adaptive versions of SGD such as RMSProp [25] and Adam [26] are also widely used in deep learning, and their corresponding distributed versions may have additional considerations (e.",
+      "startOffset" : 41,
+      "endOffset" : 45
+    }, {
+      "referenceID" : 23,
+      "context" : "Adaptive versions of SGD such as RMSProp [25] and Adam [26] are also widely used in deep learning, and their corresponding distributed versions may have additional considerations (e.",
+      "startOffset" : 55,
+      "endOffset" : 59
+    }, {
+      "referenceID" : 21,
+      "context" : "sharing the squared gradients in [24]).",
+      "startOffset" : 33,
+      "endOffset" : 37
+    } ],
+    "year" : 2016,
+    "abstractText" : "Training time on large datasets for deep neural networks is the principal workflow bottleneck in a number of important applications of deep learning, such as object classification and detection in automatic driver assistance systems (ADAS). To minimize training time, the training of a deep neural network must be scaled beyond a single machine to as many machines as possible by distributing the optimization method used for training. While a number of approaches have been proposed for distributed stochastic gradient descent (SGD), at the current time synchronous approaches to distributed SGD appear to be showing the greatest performance at large scale. Synchronous scaling of SGD suffers from the need to synchronize all processors on each gradient step and is not resilient in the face of failing or lagging processors. In asynchronous approaches using parameter servers, training is slowed by contention to the parameter server. In this paper we compare the convergence of synchronous and asynchronous SGD for training a modern ResNet network architecture on the ImageNet classification problem. We also propose an asynchronous method, gossiping SGD, that aims to retain the positive features of both systems by replacing the all-reduce collective operation of synchronous training with a gossip aggregation algorithm. We find, perhaps counterintuitively, that asynchronous SGD, including both elastic averaging and gossiping, converges faster at fewer nodes (up to about 32 nodes), whereas synchronous SGD scales better to more nodes (up to about 100 nodes).",
+    "creator" : "LaTeX with hyperref package"
+  }
+}

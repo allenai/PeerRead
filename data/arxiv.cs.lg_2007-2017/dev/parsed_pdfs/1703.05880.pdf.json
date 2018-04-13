@@ -1,0 +1,579 @@
+{
+  "name" : "1703.05880.pdf",
+  "metadata" : {
+    "source" : "CRF",
+    "title" : "Empirical Evaluation of Parallel Training Algorithms on Acoustic Modeling",
+    "authors" : [ "Wenpeng Li", "Binbin Zhang", "Lei Xie", "Dong Yu" ],
+    "emails" : [ "lxie}@nwpu-aslp.org,", "dongyu@ieee.org" ],
+    "sections" : [ {
+      "heading" : "1. Introduction",
+      "text" : "Since 2010, the year in which deep neural networks (DNNs) were successfully applied to the large vocabulary continuous speech recognition (LCVSR) tasks [1, 2, 3] and led to significant recognition accuracy improvement over the then state of the art, various deep learning models, such as convolutional neural networks (CNNs) [4, 5, 6, 7, 8, 9], long short-term memory (LSTM) recurrent neural networks (RNNs) [10, 11, 12, 13, 14, 15, 16, 17] and their variants [18, 19, 20, 21, 22, 23], have been developed to further improve the performance of automatic speech recognition (ASR) systems. Albeit achieving the state-of-the-art performance, these deep learning models are time consuming to train well, especially when trained on singleGPU. Trade-offs often need to be made between the scale of model size and training corpora (and thus recognition accuracy) and the training time because even with today’s massively parallel GPU it usually takes days or weeks to train large models to desired accuracy on a single GPU.\nMany parallel training algorithms have been proposed to speed up training. These algorithms can be categorized into two classes: model parallelism (e.g., [24, 25]), which exploits and splits the structure of neural networks to distribute computation across GPUs, and data parallelism (e.g., [24, 26, 27]), which splits and distributes data across GPUs to achieve speedup. Model parallelism focuses on computing more parameters at the same time. It allows and is more suitable for training models that are too big to fit in the memory on a single device. On the\n* Corresponding author\nother hand, data parallelism concentrates on processing more training samples at the same time and is thus best used when there are enormous training samples. In speech recognition, data parallelism is more important since ASR models usually fit well on a single GPU while the training set is often large.\nThe core problem data parallelism algorithms try to solve is the difficulty in achieving parallelization of mini-batch based stochastic gradient descent (SGD) algorithm [28], which is the most popular technique to train deep learning models (DLMs). Several successful techniques, such as asynchronous stochastic gradient descent (ASGD) [29, 30, 31], blockwise modelupdate filtering (BMUF) [32], bulk synchronous parallel (BSP) [33, 34, 35, 36], 1-bit SGD [26] and elastic averaging stochastic gradient descent (EASGD) [37], have been proposed recently. Unfortunately, these techniques solve the problem with different assumptions and strategies, have been evaluated only on vastly different data sets and tasks, and there is no theoretical guarantee on their behavior when used to train DLMs. This causes the difficulty in selecting the right parallel algorithm for training models on industrial-size corpora.\nIn this paper, we evaluate and systematically compare four parallel training algorithms, namely BSP, ASGD, BMUF and EASGD with regard to training speed, convergence behavior, final model’s performance, reproducibility, and robustness across models, number of GPUs, and learning control parameters. For all we know, this is the first time these algorithms are compared relatively thoroughly on ASR tasks. It is also the first time EASGD is evaluated for acoustic model training. All the four algorithms were implemented in Kaldi toolkit [38] using message passing interface (MPI) for parameter exchange across GPUs. Using the same communication protocol guarantees that the comparison is fair and reliable. To evaluate these algorithms, we train DNNs and CLDNNs [23] (an architecture that stacks CNNs, LSTMs and DNNs) on 1000hr LibriSpeech [39] corpus.\nThe rest of the paper is organized as follows. In Section 2, we introduce BSP, ASGD, BMUF and EASGD, and discuss relationships between them. In Section 3 we describe series of experimental setups and report related results. We conclude the paper in Section 4."
+    }, {
+      "heading" : "2. Parallel training algorithms",
+      "text" : ""
+    }, {
+      "heading" : "2.1. BSP",
+      "text" : "The bulk synchronous parallel (BSP) [33] algorithm is often referred to as model averaging. In this model, data are distributed across multiple workers. Each worker updates its local model replica independently using its own portion of data with SGD. Periodically the local models are averaged and the generated global model is synchronized across workers. We denote wit as the i-th worker’s local model at time t. The global model w̃t is\nar X\niv :1\n70 3.\n05 88\n0v 2\n[ cs\n.C L\n] 2\n6 Ju\nl 2 01\n7\ncomputed as\nw̃t = w̄t = 1\nN N∑ i=1 wit, (1)\nwhere N is the number of local workers and w̄t is the average model of the local models. This algorithm is easy to implement and can achieve linear speedup when communication cost can be ignored (e.g., with large synchronous time) at the cost of recognition accuracy degradation, esp. when the number of workers becomes large."
+    }, {
+      "heading" : "2.2. ASGD",
+      "text" : "The asynchronous stochastic gradient descent (ASGD) algorithm is the distributed version of SGD. It is proved [40] that ASGD converges for convex problems. As shown in Figure 1, ASGD uses a parameter sever and several local workers. Each worker independently and asynchronously pulls the latest global model w̃t from the parameter server, computes the gradient ∇wit with a new minibatch, and sends it to the parameter server. The parameter server always keeps the current model. When it receives the gradient ∇wit from worker i it generates the new model\nw̃t+k+1 = w̃t+k − η∇wit (2) where η is the learning rate.\nBefore worker i sends gradient ∇wit back to parameter server, some other workers may have already added their local gradients to the model and updated the model k times to become w̃t+k. Therefore ASGD essentially adds a “delayed” gradient ∇wit computed based on the model w̃t to the model w̃t+k [41]. This may be the reason that ASGD can be unstable: sometimes the model can converge to the same accuracy as that trained with SGD but with more iterations, and sometimes it can never achieve the same performance as SGD, esp. when there are many workers."
+    }, {
+      "heading" : "2.3. BMUF",
+      "text" : "The blockwise model-update filtering (BMUF) algorithm [32] can be considered as an improved model averaging technique in which the global model update is implemented as a filter.\nIn BMUF, the full training set D is partitioned into M nonoverlapping blocks and each block is further partitioned into N non-overlapping splits, where N is the number of workers. Each worker updates its local model with its portion of data. The N optimized local models are then averaged using Eq. (1). Unlike BSP, which treats the average model w̄t as the global model, BMUF generates the global model w̃t as\nw̃t = w̃t−1 + ∆t, (3)\nwhere ∆t = ζ∆t−1 + ηGt, 0 ≤ ζ < 1, η > 0, (4)\nis the global-model update,\nGt = w̄t − w̃t−1 (5)\nis the model-update resulted from a block, ζ is called block momentum (BM) and η is called block learning rate (BLR). We use the formula\nη\nN(1− ζ) = C (6)\nto set the values of ζ and η empirically, where C is a constant slightly large than 1 and N is the number of workers. Usually, the value of η and C both are set to 1.0 and the value of ζ is calculated based on Eq. (6). We implemented CBM-BMUF [32] in this work."
+    }, {
+      "heading" : "2.4. EASGD",
+      "text" : "In elastic averaging stochastic gradient descent (EASGD) [37], the loss function is defined as\nmin w1t ,...,w N t ,w̃t N∑ i=1 f(D|wit)+ λ 2 ||wit − w̃t||2 (7)\nwhere D is the training set, f(.) is the loss function for local sequential training, λ is a hyper-parameter for the quadratic penalty term, wit represents model for the i-th worker, and w̃t represents the global model.\nFrom Eq. (7) we observe that EASGD minimizes the loss summed over all workers, as well as the quadratic difference between the global model and local models. λ\n2 ||wit − w̃t||2 is\na quadratic regularization term, which forces local workers to stay close to the global model.\nBy taking the derivative of wit and w̃t in Eq. (7), we get the update rules for wit and w̃t in synchronous EASGD as\nwit+1 = w i t − η∇wit − ηλ(wit − w̃t) w̃t+1 = w̃t − ηλ N∑ i=1 (w̃t − wit) (8)\nwhere∇wit is the stochastic gradient of f(.) with respect to wit. In asynchronous EASGD,∇wit is only used in local updating, and the update rules for local and global models become\nwit+1 = w i t − α(wit − w̃t) w̃t+1 = w̃t − α(w̃t − wit) (9)\nwhere α = ηλ, which controls the update step for the variable. Small α allows for more exploration as it allows wi to fluctuate further from w̃ while large α makes local model perform more exploitation. We only implemented asynchronous EASGD in this work."
+    }, {
+      "heading" : "2.5. Relationships between algorithms",
+      "text" : "These four algorithms, although are different, have relations. First, ASGD and EASGD are asynchronous algorithms based on the client/server framework, in which the global model is stored on and updated by a parameter server, and each worker computes gradients and updates its local model independently. Workers only exchange parameters with the server and do not communicate with each other. BSP and BMUF, on the other hand, are synchronous algorithms that do not use a server. All workers exchange parameters synchronously with each other.\nSecond, in ASGD the global model is updated based on the local gradients computed by and sent from workers. In BSP, EASGD and BMUF, however, the global model is a weighted sum of local models instead of gradients.\nThird, EASGD and BMUF both introduce extra hyperparameters whose values may affect the training behavior, while ASGD and BSP have no extra hyper-parameter and thus require less tuning in practice.\nForth, we argue that BMUF actually minimizes the difference\nmin w̃t\nF (w̃t) = 1\n2 N∑ i=1 ||wit − w̃t||2 (10)\nbetween the global and local models. By taking the derivative of w̃, we get\n∇w̃t = N∑ i=1 (w̃t − wit). (11)\nLet∇w̃t = 0. By directly solving w̃t, we get\nw̃t = 1\nN N∑ i=1 wit. (12)\nThis is the same as BSP in Eq. (1). If we optimize w̃t using SGD, then\nw̃t = w̃t−1 − η N∑ i=1 (w̃t−1 − wit) (13)\nwhich is the same as Eq. (8) in EASGD. Further, if we optimize w̃t using momentum SGD, then\nw̃t = w̃t−1 − η N∑ i=1 (w̃t−1 − wit)− ζ∇w̃t−1\n= w̃t−1 + η ′Gt + ζ ′∆t−1\n= w̃t−1 + ∆t\n(14)\nwhere η′ = Nη, ζ′ = Nζ. This is exactly the BMUF update rule in Eq. (3).\nTherefore we conclude that the global model updates of BSP, EASGD and BMUF are derived from the same objective function with different optimization strategies."
+    }, {
+      "heading" : "3. Experiments",
+      "text" : ""
+    }, {
+      "heading" : "3.1. Experimental setup",
+      "text" : "In this work, all the models are trained on the 1000hr LibriSpeech [39] dataset. The 40-dim FBANK features computed on a 25ms window shifted by 10ms are used. The lexicon and language model (LM) are provided by the dataset. Specifically, the results reported here are all achieved with a full 3-gram LM. We used test-clean and test-other sets for evaluation.\nTo evaluate the parallel training algorithms, we trained two types of DLMs: DNNs and CLDNNs [23]. The input to DNNs is the 40-dim FBANK feature with first and second order time derivatives and 11 frame context. The input to CLDNNs is the same as that to DNNs but without the 2nd order time derivatives. The DNN has 6 hidden layers, each containing 1024 neurons. With 5723 HMM tied-states as output classes, it has about 13.5 million parameters. The CLDNN consists of 1 CNN layer (128 feature maps), 2 DNN layers (1024 neurons) and 2 LSTM layers (1024 memory blocks and 512 projections). With the same output classes as that in DNNs, CLDNNs have about 13.8 million parameters. Both models use the ReLU activation function.\nIn order to ensure the fairness of the comparison and the credibility of the experimental results, we take the following measures: First, all experiments in this work were carried out on the same computing node with 8 GTX1080 GPUs. Second, the four parallel training algorithms were implemented in the KALDI toolkit. The parameter exchange among GPUs is based on OpenMPI. Third, in all parallel training we used the same initial model which was obtained by one-epoch minibatchSGD on a single-GPU. Finally, we used the identical learning rate schedule and the same initial learning rate. The learning rate keeps fixed as long as the cross entropy loss on a crossvalidation (CV) set decreases by at least 1%. Then, the learning rate is halved each epoch until the optimization terminates when the cross entropy loss on the CV set decreases by less than 0.1%."
+    }, {
+      "heading" : "3.2. Experimental results",
+      "text" : ""
+    }, {
+      "heading" : "3.2.1. DNN results",
+      "text" : "In DNN training, the minibatch size was set to 4096. Table 1 compares training speedups and word error rate (WER) on testing sets with four parallel training algorithms on 4 GPUs and 8 GPUs. When using same synchronization period, EASGD achieved the best training speedup, followed by ASGD, BMUF and BSP. However, BMUF achieved the best WER in both 4 and 8 GPU cases, and even outperformed the single-GPU SGD. As Figure 2 shows, the convergence trend of BMUF is similar to minibatch-SGD with single-GPU in the CV set. To further verify our conclusions, we chose the most appropriate synchronization period for each algorithm based on the literature. The results in Table 2 show that BMUF still performed the best."
+    }, {
+      "heading" : "3.2.2. CLDNN results",
+      "text" : "In CLDNN training, we computed gradients on 100 subsequences from different utterances in the same time. The truncated BPTT with truncation step of 20 was used to train the models. The appropriate synchronization period was chosen for each algorithm based on the literature. Specifically, the synchronization periods for BSP, ASGD, BMUF, and EASGD are 5, 5, 80, and 64 minbatches, respectively. Table 3 shows that BMUF achieved the best WER and training speedup with 4 GPUs and ASGD achieved the best WER with 8 GPUs."
+    }, {
+      "heading" : "3.2.3. Synchronization period",
+      "text" : "The choice of synchronization period τ affects the behavior of BMUF and ASGD. As Table 4 shows, the WER of ASGD gradually increased and the training even diverged when increasing τ . This is because ASGD suffers from the problem of de-\nlayed gradient update and larger synchronization period results in greater latency. In contrast, we observed no performance degradation on BMUF when varying the synchronization period. As for training speedup, when synchronization period τ is small, the parameter exchange among multi-GPUs is quite frequent and the communication overhead is the main bottleneck of training speed. So as τ increases (from 5 to 20 minibatches in Table 4), the communication overhead decreases and training speedup increases. When the value of τ continues to increase, the communication overhead is reduced so that the computation speed becomes the main bottleneck. Therefore the training speedup almost keeps unchanged as the synchronization period increases (from 20 to 80 minibatches in Table 4)."
+    }, {
+      "heading" : "3.2.4. Minibatch size",
+      "text" : "Table 5 compares three different minibatch sizes in BMUF. With single-GPU training, the training speed is lower when smaller minibatch size is used. This is because with small minibatch size the GPU power is not fully utilized and the model is updated more frequently.\nThe training speedup s of multi-GPU training is calculated as\ns = ts\nf(ts, N) + tc (15)\nwhere ts is the computation time through one epoch of dataset on single-GPU, N is the number of GPUs, tc is the communication overhead, and\nf(ts, N) = α ts N\n(16)\nis a decreasing function over N . When the minibatch can fill the GPU α is 1, otherwise α is greater than 1. According to Eqs. (15) and (16), we get\ns = 1\nα N + tc ts\n. (17)\nThis means the training speedup s of multi-GPU parallel training depends on tc\nts . When synchronization period τ is small,\nthe communication overhead tc is large due to frequent parameter exchange among GPUs. Although tc and ts decrease\nwith the increase of minibatch size, tc decreases more quickly. Therefore the larger minibatch size leads to the greater training speedup. When τ is large, however, tc is small. ts decreases more quickly with the increase of minibatch size and causes decreasing in training speedup. However, from the perspective of absolute training speed, it benefits from the growth of minibatch size. Eq. (17) also explains why the speedup of CLDNN (Table 3) is much larger than DNN (Table 1). In the same GPU number and synchronization period, tc of DNN and CLDNN is similar, but ts of CLDNN is larger than DNN ."
+    }, {
+      "heading" : "4. Conclusions",
+      "text" : "We implemented four parallel training algorithms, discussed the relationship among them, and evaluated them on speech recognition tasks. The experimental results show that BMUF and ASGD consistently outperform BSP and EASGD. BMUF, in particular, achieved the best performance without frequent synchronization, and even outperformed the single-GPU SGD in some cases. We conjecture that the momentum used in BMUF global model update makes the global model not only related to each local model but also the previous global model. ASGD also achieved pretty good performance and the lager training speedup with the same synchronization period. Profit fully from the asynchronous properties, ASGD is insensitive to the difference of computing capacity of workers, but sensitive to the synchronization period and suffers from the poor reproducibility."
+    }, {
+      "heading" : "5. Acknowledgements",
+      "text" : "This work is supported by the National Natural Science Foundation of China (Grant No. 61571363)."
+    }, {
+      "heading" : "6. References",
+      "text" : "[1] G. E. Dahl, D. Yu, L. Deng, and A. Acero, “Context-dependent\npre-trained deep neural networks for large-vocabulary speech recognition,” IEEE Transactions on Audio Speech & Language Processing, vol. 20, no. 1, pp. 30–42, 2012.\n[2] F. Seide, G. Li, and D. Yu, “Conversational speech transcription using context-dependent deep neural networks.” in INTERSPEECH, 2011, pp. 437–440.\n[3] G. Hinton, L. Deng, D. Yu, G. E. Dahl, A. Mohamed, N. Jaitly, A. Senior, V. Vanhoucke, P. Nguyen, and T. N. Sainath, “Deep neural networks for acoustic modeling in speech recognition: The shared views of four research groups,” IEEE Signal Processing Magazine, vol. 29, no. 6, pp. 82–97, 2012.\n[4] O. Abdel-Hamid, A.-r. Mohamed, H. Jiang, and G. Penn, “Applying convolutional neural networks concepts to hybrid NN-HMM model for speech recognition,” in ICASSP, 2012, pp. 4277–4280.\n[5] O. Abdel-Hamid, L. Deng, and D. Yu, “Exploring convolutional neural network structures and optimization techniques for speech recognition.” in INTERSPEECH, 2013, pp. 3366–3370.\n[6] T. N. Sainath, B. Kingsbury, A.-r. Mohamed, G. E. Dahl, G. Saon, H. Soltau, T. Beran, A. Y. Aravkin, and B. Ramabhadran, “Improvements to deep convolutional neural networks for LVCSR,” in ASRU, 2013 IEEE Workshop on, 2013, pp. 315–320.\n[7] T. N. Sainath, A.-r. Mohamed, B. Kingsbury, and B. Ramabhadran, “Deep convolutional neural networks for LVCSR,” in ICASSP, 2013, pp. 8614–8618.\n[8] O. Abdel-Hamid, A. R. Mohamed, H. Jiang, L. Deng, G. Penn, and D. Yu, “Convolutional neural networks for speech recognition,” IEEE/ACM Transactions on Audio Speech & Language Processing, vol. 22, no. 10, pp. 1533–1545, 2014.\n[9] A.-r. Mohamed, “Deep neural network acoustic models for ASR,” Ph.D. dissertation, University of Toronto, 2014.\n[10] H. Sak, A. Senior, and F. Beaufays, “Long short-term memory based recurrent neural network architectures for large vocabulary speech recognition,” arXiv preprint arXiv:1402.1128, 2014.\n[11] ——, “Long short-term memory recurrent neural network architectures for large scale acoustic modeling.” in INTERSPEECH, 2014, pp. 338–342.\n[12] Y. Miao, J. Li, Y. Wang, S. X. Zhang, and Y. Gong, “Simplifying long short-term memory acoustic models for fast training and decoding,” in ICASSP, 2016, pp. 2284–2288.\n[13] H. Sak, A. Senior, K. Rao, and F. Beaufays, “Fast and accurate recurrent neural network acoustic models for speech recognition,” arXiv preprint arXiv:1507.06947, 2015.\n[14] H. Sak, A. Senior, K. Rao, O. Irsoy, A. Graves, F. Beaufays, and J. Schalkwyk, “Learning acoustic frame labeling for speech recognition with recurrent neural networks,” in ICASSP, 2015, pp. 4280–4284.\n[15] A. Senior, H. Sak, and I. Shafran, “Context dependent phone models for LSTM RNN acoustic modelling,” in ICASSP, 2015, pp. 4585–4589.\n[16] K. Chen and Q. Huo, “Training deep bidirectional LSTM acoustic model for LVCSR by a context-sensitive-chunk BPTT approach,” IEEE/ACM Transactions on Audio, Speech & Language Processing, vol. 24, no. 7, pp. 1185–1193, 2016.\n[17] Y. Zhang, G. Chen, D. Yu, K. Yao, S. Khudanpur, and J. Glass, “Highway long short-term memory RNNs for distant speech recognition,” in ICASSP, 2016, pp. 5755–5759.\n[18] D. Yu, W. Xiong, J. Droppo, A. Stolcke, G. Ye, J. Li, and G. Zweig, “Deep convolutional neural networks with layer-wise context expansion and attention,” in INTERSPEECH, 2016, pp. 17–21.\n[19] S. Sun, B. Zhang, L. Xie, and Y. Zhang, “An unsupervised deep domain adaptation approach for robust speech recognition,” Neurocomputing, 2017.\n[20] T. Sercu and V. Goel, “Advances in very deep convolutional neural networks for LVCSR,” in INTERSPEECH, 2016, pp. 3429–3433.\n[21] S. Zhang, C. Liu, H. Jiang, S. Wei, L. Dai, and Y. Hu, “Feedforward sequential memory networks: A new structure to learn long-term dependency,” arXiv preprint arXiv:1512.08301, 2015.\n[22] S. Zhang, H. Jiang, S. Xiong, S. Wei, and L. R. Dai, “Compact feedforward sequential memory networks for large vocabulary continuous speech recognition,” in INTERSPEECH, 2016, pp. 3389–3393.\n[23] T. N. Sainath, O. Vinyals, A. Senior, and H. Sak, “Convolutional, long short-term memory, fully connected deep neural networks,” in ICASSP, 2015, pp. 4580–4584.\n[24] J. Dean, G. Corrado, R. Monga, K. Chen, M. Devin, M. Mao, A. Senior, P. Tucker, K. Yang, Q. V. Le et al., “Large scale distributed deep networks,” in NIPS, 2012, pp. 1223–1231.\n[25] A. Coates, B. Huval, T. Wang, D. J. Wu, A. Y. Ng, and B. Catanzaro, “Deep learning with COTS HPC systems,” in ICML, 2013.\n[26] F. Seide, H. Fu, J. Droppo, G. Li, and D. Yu, “1-bit stochastic gradient descent and its application to data-parallel distributed training of speech DNNs,” in INTERSPEECH, 2014, pp. 1058–1062.\n[27] A. Agarwal and J. C. Duchi, “Distributed delayed stochastic optimization,” in NIPS, 2011, pp. 873–881.\n[28] D. E. Rumelhart, G. E. Hinton, and R. J. Williams, Learning representations by back-propagating errors. MIT Press, 1986.\n[29] G. Heigold, E. Mcdermott, V. Vanhoucke, and A. Senior, “Asynchronous stochastic optimization for sequence training of deep neural networks,” in ICASSP, 2014, pp. 5587–5591.\n[30] S. Zhang, C. Zhang, Z. You, and R. Zheng, “Asynchronous stochastic gradient descent for DNN training,” in ICASSP, 2013, pp. 6660–6663.\n[31] T. Paine, H. Jin, J. Yang, Z. Lin, and T. Huang, “GPU asynchronous stochastic gradient descent to speed up neural network training,” arXiv preprint arXiv:1312.6186, 2013.\n[32] K. Chen and Q. Huo, “Scalable training of deep learning machines by incremental block training with intra-block parallel optimization and blockwise model-update filtering,” in ICASSP, 2016, pp. 5880–5884.\n[33] L. G. Valiant, “A bridging model for parallel computation,” Communications of the ACM, vol. 33, no. 8, pp. 103–111, 1990.\n[34] H. Ma, F. Mao, and G. W. Taylor, “Theano-mpi: a theano-based distributed training framework,” arXiv preprint arXiv:1605.08325, 2016.\n[35] D. Povey, X. Zhang, and S. Khudanpur, “Parallel training of DNNs with natural gradient and parameter averaging,” arXiv preprint arXiv:1410.7455, 2014.\n[36] H. Su and H. Chen, “Experiments on parallel training of deep neural network using model averaging,” arXiv preprint arXiv:1507.01239, 2015.\n[37] S. Zhang, A. E. Choromanska, and Y. LeCun, “Deep learning with elastic averaging SGD,” in NIPS, 2015, pp. 685–693.\n[38] D. Povey, A. Ghoshal, G. Boulianne, L. Burget, O. Glembek, N. Goel, M. Hannemann, P. Motlicek, Y. Qian, P. Schwarz et al., “The Kaldi speech recognition toolkit,” in ASRU, 2011 IEEE workshop on, no. EPFL-CONF-192584, 2011.\n[39] V. Panayotov, G. Chen, D. Povey, and S. Khudanpur, “Librispeech: an ASR corpus based on public domain audio books,” in ICASSP, 2015, pp. 5206–5210.\n[40] J. Duchi, E. Hazan, and Y. Singer, “Adaptive subgradient methods for online learning and stochastic optimization,” Journal of Machine Learning Research, vol. 12, no. 7, pp. 2121–2159, 2011.\n[41] S. Zheng, Q. Meng, T. Wang, W. Chen, N. Yu, Z.-M. Ma, and T.-Y. Liu, “Asynchronous stochastic gradient descent with delay compensation for distributed deep learning,” arXiv preprint arXiv:1609.08326, 2016."
+    } ],
+    "references" : [ {
+      "title" : "Context-dependent pre-trained deep neural networks for large-vocabulary speech recognition",
+      "author" : [ "G.E. Dahl", "D. Yu", "L. Deng", "A. Acero" ],
+      "venue" : "IEEE Transactions on Audio Speech & Language Processing, vol. 20, no. 1, pp. 30–42, 2012.",
+      "citeRegEx" : "1",
+      "shortCiteRegEx" : null,
+      "year" : 2012
+    }, {
+      "title" : "Conversational speech transcription using context-dependent deep neural networks.",
+      "author" : [ "F. Seide", "G. Li", "D. Yu" ],
+      "venue" : "in INTER- SPEECH,",
+      "citeRegEx" : "2",
+      "shortCiteRegEx" : "2",
+      "year" : 2011
+    }, {
+      "title" : "Deep neural networks for acoustic modeling in speech recognition: The shared views of four research groups",
+      "author" : [ "G. Hinton", "L. Deng", "D. Yu", "G.E. Dahl", "A. Mohamed", "N. Jaitly", "A. Senior", "V. Vanhoucke", "P. Nguyen", "T.N. Sainath" ],
+      "venue" : "IEEE Signal Processing Magazine, vol. 29, no. 6, pp. 82–97, 2012.",
+      "citeRegEx" : "3",
+      "shortCiteRegEx" : null,
+      "year" : 2012
+    }, {
+      "title" : "Applying convolutional neural networks concepts to hybrid NN-HMM model for speech recognition",
+      "author" : [ "O. Abdel-Hamid", "A.-r. Mohamed", "H. Jiang", "G. Penn" ],
+      "venue" : "ICASSP, 2012, pp. 4277–4280.",
+      "citeRegEx" : "4",
+      "shortCiteRegEx" : null,
+      "year" : 2012
+    }, {
+      "title" : "Exploring convolutional neural network structures and optimization techniques for speech recognition.",
+      "author" : [ "O. Abdel-Hamid", "L. Deng", "D. Yu" ],
+      "venue" : "INTERSPEECH,",
+      "citeRegEx" : "5",
+      "shortCiteRegEx" : "5",
+      "year" : 2013
+    }, {
+      "title" : "Improvements to deep convolutional neural networks for LVCSR",
+      "author" : [ "T.N. Sainath", "B. Kingsbury", "A.-r. Mohamed", "G.E. Dahl", "G. Saon", "H. Soltau", "T. Beran", "A.Y. Aravkin", "B. Ramabhadran" ],
+      "venue" : "ASRU, 2013 IEEE Workshop on, 2013, pp. 315–320.",
+      "citeRegEx" : "6",
+      "shortCiteRegEx" : null,
+      "year" : 2013
+    }, {
+      "title" : "Deep convolutional neural networks for LVCSR",
+      "author" : [ "T.N. Sainath", "A.-r. Mohamed", "B. Kingsbury", "B. Ramabhadran" ],
+      "venue" : "ICASSP, 2013, pp. 8614–8618.",
+      "citeRegEx" : "7",
+      "shortCiteRegEx" : null,
+      "year" : 2013
+    }, {
+      "title" : "Convolutional neural networks for speech recognition",
+      "author" : [ "O. Abdel-Hamid", "A.R. Mohamed", "H. Jiang", "L. Deng", "G. Penn", "D. Yu" ],
+      "venue" : "IEEE/ACM Transactions on Audio Speech & Language Processing, vol. 22, no. 10, pp. 1533–1545, 2014.",
+      "citeRegEx" : "8",
+      "shortCiteRegEx" : null,
+      "year" : 2014
+    }, {
+      "title" : "Deep neural network acoustic models for ASR",
+      "author" : [ "A.-r. Mohamed" ],
+      "venue" : "Ph.D. dissertation, University of Toronto, 2014.",
+      "citeRegEx" : "9",
+      "shortCiteRegEx" : null,
+      "year" : 2014
+    }, {
+      "title" : "Long short-term memory based recurrent neural network architectures for large vocabulary speech recognition",
+      "author" : [ "H. Sak", "A. Senior", "F. Beaufays" ],
+      "venue" : "arXiv preprint arXiv:1402.1128, 2014.",
+      "citeRegEx" : "10",
+      "shortCiteRegEx" : null,
+      "year" : 2014
+    }, {
+      "title" : "Simplifying long short-term memory acoustic models for fast training and decoding",
+      "author" : [ "Y. Miao", "J. Li", "Y. Wang", "S.X. Zhang", "Y. Gong" ],
+      "venue" : "ICASSP, 2016, pp. 2284–2288.",
+      "citeRegEx" : "12",
+      "shortCiteRegEx" : null,
+      "year" : 2016
+    }, {
+      "title" : "Fast and accurate recurrent neural network acoustic models for speech recognition",
+      "author" : [ "H. Sak", "A. Senior", "K. Rao", "F. Beaufays" ],
+      "venue" : "arXiv preprint arXiv:1507.06947, 2015.",
+      "citeRegEx" : "13",
+      "shortCiteRegEx" : null,
+      "year" : 2015
+    }, {
+      "title" : "Learning acoustic frame labeling for speech recognition with recurrent neural networks",
+      "author" : [ "H. Sak", "A. Senior", "K. Rao", "O. Irsoy", "A. Graves", "F. Beaufays", "J. Schalkwyk" ],
+      "venue" : "ICASSP, 2015, pp. 4280–4284.",
+      "citeRegEx" : "14",
+      "shortCiteRegEx" : null,
+      "year" : 2015
+    }, {
+      "title" : "Context dependent phone models for LSTM RNN acoustic modelling",
+      "author" : [ "A. Senior", "H. Sak", "I. Shafran" ],
+      "venue" : "ICASSP, 2015, pp. 4585–4589.",
+      "citeRegEx" : "15",
+      "shortCiteRegEx" : null,
+      "year" : 2015
+    }, {
+      "title" : "Training deep bidirectional LSTM acoustic model for LVCSR by a context-sensitive-chunk BPTT approach",
+      "author" : [ "K. Chen", "Q. Huo" ],
+      "venue" : "IEEE/ACM Transactions on Audio, Speech & Language Processing, vol. 24, no. 7, pp. 1185–1193, 2016.",
+      "citeRegEx" : "16",
+      "shortCiteRegEx" : null,
+      "year" : 2016
+    }, {
+      "title" : "Highway long short-term memory RNNs for distant speech recognition",
+      "author" : [ "Y. Zhang", "G. Chen", "D. Yu", "K. Yao", "S. Khudanpur", "J. Glass" ],
+      "venue" : "ICASSP, 2016, pp. 5755–5759.",
+      "citeRegEx" : "17",
+      "shortCiteRegEx" : null,
+      "year" : 2016
+    }, {
+      "title" : "Deep convolutional neural networks with layer-wise context expansion and attention",
+      "author" : [ "D. Yu", "W. Xiong", "J. Droppo", "A. Stolcke", "G. Ye", "J. Li", "G. Zweig" ],
+      "venue" : "INTERSPEECH, 2016, pp. 17–21.",
+      "citeRegEx" : "18",
+      "shortCiteRegEx" : null,
+      "year" : 2016
+    }, {
+      "title" : "An unsupervised deep domain adaptation approach for robust speech recognition",
+      "author" : [ "S. Sun", "B. Zhang", "L. Xie", "Y. Zhang" ],
+      "venue" : "Neurocomputing, 2017.",
+      "citeRegEx" : "19",
+      "shortCiteRegEx" : null,
+      "year" : 2017
+    }, {
+      "title" : "Advances in very deep convolutional neural networks for LVCSR",
+      "author" : [ "T. Sercu", "V. Goel" ],
+      "venue" : "INTERSPEECH, 2016, pp. 3429–3433.",
+      "citeRegEx" : "20",
+      "shortCiteRegEx" : null,
+      "year" : 2016
+    }, {
+      "title" : "Feedforward sequential memory networks: A new structure to learn long-term dependency",
+      "author" : [ "S. Zhang", "C. Liu", "H. Jiang", "S. Wei", "L. Dai", "Y. Hu" ],
+      "venue" : "arXiv preprint arXiv:1512.08301, 2015.",
+      "citeRegEx" : "21",
+      "shortCiteRegEx" : null,
+      "year" : 2015
+    }, {
+      "title" : "Compact feedforward sequential memory networks for large vocabulary continuous speech recognition",
+      "author" : [ "S. Zhang", "H. Jiang", "S. Xiong", "S. Wei", "L.R. Dai" ],
+      "venue" : "INTERSPEECH, 2016, pp. 3389–3393.",
+      "citeRegEx" : "22",
+      "shortCiteRegEx" : null,
+      "year" : 2016
+    }, {
+      "title" : "Convolutional, long short-term memory, fully connected deep neural networks",
+      "author" : [ "T.N. Sainath", "O. Vinyals", "A. Senior", "H. Sak" ],
+      "venue" : "ICASSP, 2015, pp. 4580–4584.",
+      "citeRegEx" : "23",
+      "shortCiteRegEx" : null,
+      "year" : 2015
+    }, {
+      "title" : "Large scale distributed deep networks",
+      "author" : [ "J. Dean", "G. Corrado", "R. Monga", "K. Chen", "M. Devin", "M. Mao", "A. Senior", "P. Tucker", "K. Yang", "Q.V. Le" ],
+      "venue" : "NIPS, 2012, pp. 1223–1231.",
+      "citeRegEx" : "24",
+      "shortCiteRegEx" : null,
+      "year" : 2012
+    }, {
+      "title" : "Deep learning with COTS HPC systems",
+      "author" : [ "A. Coates", "B. Huval", "T. Wang", "D.J. Wu", "A.Y. Ng", "B. Catanzaro" ],
+      "venue" : "ICML, 2013.",
+      "citeRegEx" : "25",
+      "shortCiteRegEx" : null,
+      "year" : 2013
+    }, {
+      "title" : "1-bit stochastic gradient descent and its application to data-parallel distributed training of speech DNNs",
+      "author" : [ "F. Seide", "H. Fu", "J. Droppo", "G. Li", "D. Yu" ],
+      "venue" : "INTERSPEECH, 2014, pp. 1058–1062.",
+      "citeRegEx" : "26",
+      "shortCiteRegEx" : null,
+      "year" : 2014
+    }, {
+      "title" : "Distributed delayed stochastic optimization",
+      "author" : [ "A. Agarwal", "J.C. Duchi" ],
+      "venue" : "NIPS, 2011, pp. 873–881.",
+      "citeRegEx" : "27",
+      "shortCiteRegEx" : null,
+      "year" : 2011
+    }, {
+      "title" : "Asynchronous stochastic optimization for sequence training of deep neural networks",
+      "author" : [ "G. Heigold", "E. Mcdermott", "V. Vanhoucke", "A. Senior" ],
+      "venue" : "ICASSP, 2014, pp. 5587–5591.",
+      "citeRegEx" : "29",
+      "shortCiteRegEx" : null,
+      "year" : 2014
+    }, {
+      "title" : "Asynchronous stochastic gradient descent for DNN training",
+      "author" : [ "S. Zhang", "C. Zhang", "Z. You", "R. Zheng" ],
+      "venue" : "ICASSP, 2013, pp. 6660–6663.",
+      "citeRegEx" : "30",
+      "shortCiteRegEx" : null,
+      "year" : 2013
+    }, {
+      "title" : "GPU asynchronous stochastic gradient descent to speed up neural network training",
+      "author" : [ "T. Paine", "H. Jin", "J. Yang", "Z. Lin", "T. Huang" ],
+      "venue" : "arXiv preprint arXiv:1312.6186, 2013.",
+      "citeRegEx" : "31",
+      "shortCiteRegEx" : null,
+      "year" : 2013
+    }, {
+      "title" : "Scalable training of deep learning machines by incremental block training with intra-block parallel optimization and blockwise model-update filtering",
+      "author" : [ "K. Chen", "Q. Huo" ],
+      "venue" : "ICASSP, 2016, pp. 5880–5884.",
+      "citeRegEx" : "32",
+      "shortCiteRegEx" : null,
+      "year" : 2016
+    }, {
+      "title" : "A bridging model for parallel computation",
+      "author" : [ "L.G. Valiant" ],
+      "venue" : "Communications of the ACM, vol. 33, no. 8, pp. 103–111, 1990.",
+      "citeRegEx" : "33",
+      "shortCiteRegEx" : null,
+      "year" : 1990
+    }, {
+      "title" : "Theano-mpi: a theano-based distributed training framework",
+      "author" : [ "H. Ma", "F. Mao", "G.W. Taylor" ],
+      "venue" : "arXiv preprint arXiv:1605.08325, 2016.",
+      "citeRegEx" : "34",
+      "shortCiteRegEx" : null,
+      "year" : 2016
+    }, {
+      "title" : "Parallel training of DNNs with natural gradient and parameter averaging",
+      "author" : [ "D. Povey", "X. Zhang", "S. Khudanpur" ],
+      "venue" : "arXiv preprint arXiv:1410.7455, 2014.",
+      "citeRegEx" : "35",
+      "shortCiteRegEx" : null,
+      "year" : 2014
+    }, {
+      "title" : "Experiments on parallel training of deep neural network using model averaging",
+      "author" : [ "H. Su", "H. Chen" ],
+      "venue" : "arXiv preprint arXiv:1507.01239, 2015.",
+      "citeRegEx" : "36",
+      "shortCiteRegEx" : null,
+      "year" : 2015
+    }, {
+      "title" : "Deep learning with elastic averaging SGD",
+      "author" : [ "S. Zhang", "A.E. Choromanska", "Y. LeCun" ],
+      "venue" : "NIPS, 2015, pp. 685–693.",
+      "citeRegEx" : "37",
+      "shortCiteRegEx" : null,
+      "year" : 2015
+    }, {
+      "title" : "The Kaldi speech recognition toolkit",
+      "author" : [ "D. Povey", "A. Ghoshal", "G. Boulianne", "L. Burget", "O. Glembek", "N. Goel", "M. Hannemann", "P. Motlicek", "Y. Qian", "P. Schwarz" ],
+      "venue" : "ASRU, 2011 IEEE workshop on, no. EPFL-CONF-192584, 2011.",
+      "citeRegEx" : "38",
+      "shortCiteRegEx" : null,
+      "year" : 2011
+    }, {
+      "title" : "Librispeech: an ASR corpus based on public domain audio books",
+      "author" : [ "V. Panayotov", "G. Chen", "D. Povey", "S. Khudanpur" ],
+      "venue" : "ICASSP, 2015, pp. 5206–5210.",
+      "citeRegEx" : "39",
+      "shortCiteRegEx" : null,
+      "year" : 2015
+    }, {
+      "title" : "Adaptive subgradient methods for online learning and stochastic optimization",
+      "author" : [ "J. Duchi", "E. Hazan", "Y. Singer" ],
+      "venue" : "Journal of Machine Learning Research, vol. 12, no. 7, pp. 2121–2159, 2011.",
+      "citeRegEx" : "40",
+      "shortCiteRegEx" : null,
+      "year" : 2011
+    }, {
+      "title" : "Asynchronous stochastic gradient descent with delay compensation for distributed deep learning",
+      "author" : [ "S. Zheng", "Q. Meng", "T. Wang", "W. Chen", "N. Yu", "Z.-M. Ma", "T.-Y. Liu" ],
+      "venue" : "arXiv preprint arXiv:1609.08326, 2016.",
+      "citeRegEx" : "41",
+      "shortCiteRegEx" : null,
+      "year" : 2016
+    } ],
+    "referenceMentions" : [ {
+      "referenceID" : 0,
+      "context" : "Since 2010, the year in which deep neural networks (DNNs) were successfully applied to the large vocabulary continuous speech recognition (LCVSR) tasks [1, 2, 3] and led to significant recognition accuracy improvement over the then state of the art, various deep learning models, such as convolutional neural networks (CNNs) [4, 5, 6, 7, 8, 9], long short-term memory (LSTM) recurrent neural networks (RNNs) [10, 11, 12, 13, 14, 15, 16, 17] and their variants [18, 19, 20, 21, 22, 23], have been developed to further improve the performance of automatic speech recognition (ASR) systems.",
+      "startOffset" : 152,
+      "endOffset" : 161
+    }, {
+      "referenceID" : 1,
+      "context" : "Since 2010, the year in which deep neural networks (DNNs) were successfully applied to the large vocabulary continuous speech recognition (LCVSR) tasks [1, 2, 3] and led to significant recognition accuracy improvement over the then state of the art, various deep learning models, such as convolutional neural networks (CNNs) [4, 5, 6, 7, 8, 9], long short-term memory (LSTM) recurrent neural networks (RNNs) [10, 11, 12, 13, 14, 15, 16, 17] and their variants [18, 19, 20, 21, 22, 23], have been developed to further improve the performance of automatic speech recognition (ASR) systems.",
+      "startOffset" : 152,
+      "endOffset" : 161
+    }, {
+      "referenceID" : 2,
+      "context" : "Since 2010, the year in which deep neural networks (DNNs) were successfully applied to the large vocabulary continuous speech recognition (LCVSR) tasks [1, 2, 3] and led to significant recognition accuracy improvement over the then state of the art, various deep learning models, such as convolutional neural networks (CNNs) [4, 5, 6, 7, 8, 9], long short-term memory (LSTM) recurrent neural networks (RNNs) [10, 11, 12, 13, 14, 15, 16, 17] and their variants [18, 19, 20, 21, 22, 23], have been developed to further improve the performance of automatic speech recognition (ASR) systems.",
+      "startOffset" : 152,
+      "endOffset" : 161
+    }, {
+      "referenceID" : 3,
+      "context" : "Since 2010, the year in which deep neural networks (DNNs) were successfully applied to the large vocabulary continuous speech recognition (LCVSR) tasks [1, 2, 3] and led to significant recognition accuracy improvement over the then state of the art, various deep learning models, such as convolutional neural networks (CNNs) [4, 5, 6, 7, 8, 9], long short-term memory (LSTM) recurrent neural networks (RNNs) [10, 11, 12, 13, 14, 15, 16, 17] and their variants [18, 19, 20, 21, 22, 23], have been developed to further improve the performance of automatic speech recognition (ASR) systems.",
+      "startOffset" : 325,
+      "endOffset" : 343
+    }, {
+      "referenceID" : 4,
+      "context" : "Since 2010, the year in which deep neural networks (DNNs) were successfully applied to the large vocabulary continuous speech recognition (LCVSR) tasks [1, 2, 3] and led to significant recognition accuracy improvement over the then state of the art, various deep learning models, such as convolutional neural networks (CNNs) [4, 5, 6, 7, 8, 9], long short-term memory (LSTM) recurrent neural networks (RNNs) [10, 11, 12, 13, 14, 15, 16, 17] and their variants [18, 19, 20, 21, 22, 23], have been developed to further improve the performance of automatic speech recognition (ASR) systems.",
+      "startOffset" : 325,
+      "endOffset" : 343
+    }, {
+      "referenceID" : 5,
+      "context" : "Since 2010, the year in which deep neural networks (DNNs) were successfully applied to the large vocabulary continuous speech recognition (LCVSR) tasks [1, 2, 3] and led to significant recognition accuracy improvement over the then state of the art, various deep learning models, such as convolutional neural networks (CNNs) [4, 5, 6, 7, 8, 9], long short-term memory (LSTM) recurrent neural networks (RNNs) [10, 11, 12, 13, 14, 15, 16, 17] and their variants [18, 19, 20, 21, 22, 23], have been developed to further improve the performance of automatic speech recognition (ASR) systems.",
+      "startOffset" : 325,
+      "endOffset" : 343
+    }, {
+      "referenceID" : 6,
+      "context" : "Since 2010, the year in which deep neural networks (DNNs) were successfully applied to the large vocabulary continuous speech recognition (LCVSR) tasks [1, 2, 3] and led to significant recognition accuracy improvement over the then state of the art, various deep learning models, such as convolutional neural networks (CNNs) [4, 5, 6, 7, 8, 9], long short-term memory (LSTM) recurrent neural networks (RNNs) [10, 11, 12, 13, 14, 15, 16, 17] and their variants [18, 19, 20, 21, 22, 23], have been developed to further improve the performance of automatic speech recognition (ASR) systems.",
+      "startOffset" : 325,
+      "endOffset" : 343
+    }, {
+      "referenceID" : 7,
+      "context" : "Since 2010, the year in which deep neural networks (DNNs) were successfully applied to the large vocabulary continuous speech recognition (LCVSR) tasks [1, 2, 3] and led to significant recognition accuracy improvement over the then state of the art, various deep learning models, such as convolutional neural networks (CNNs) [4, 5, 6, 7, 8, 9], long short-term memory (LSTM) recurrent neural networks (RNNs) [10, 11, 12, 13, 14, 15, 16, 17] and their variants [18, 19, 20, 21, 22, 23], have been developed to further improve the performance of automatic speech recognition (ASR) systems.",
+      "startOffset" : 325,
+      "endOffset" : 343
+    }, {
+      "referenceID" : 8,
+      "context" : "Since 2010, the year in which deep neural networks (DNNs) were successfully applied to the large vocabulary continuous speech recognition (LCVSR) tasks [1, 2, 3] and led to significant recognition accuracy improvement over the then state of the art, various deep learning models, such as convolutional neural networks (CNNs) [4, 5, 6, 7, 8, 9], long short-term memory (LSTM) recurrent neural networks (RNNs) [10, 11, 12, 13, 14, 15, 16, 17] and their variants [18, 19, 20, 21, 22, 23], have been developed to further improve the performance of automatic speech recognition (ASR) systems.",
+      "startOffset" : 325,
+      "endOffset" : 343
+    }, {
+      "referenceID" : 9,
+      "context" : "Since 2010, the year in which deep neural networks (DNNs) were successfully applied to the large vocabulary continuous speech recognition (LCVSR) tasks [1, 2, 3] and led to significant recognition accuracy improvement over the then state of the art, various deep learning models, such as convolutional neural networks (CNNs) [4, 5, 6, 7, 8, 9], long short-term memory (LSTM) recurrent neural networks (RNNs) [10, 11, 12, 13, 14, 15, 16, 17] and their variants [18, 19, 20, 21, 22, 23], have been developed to further improve the performance of automatic speech recognition (ASR) systems.",
+      "startOffset" : 408,
+      "endOffset" : 440
+    }, {
+      "referenceID" : 10,
+      "context" : "Since 2010, the year in which deep neural networks (DNNs) were successfully applied to the large vocabulary continuous speech recognition (LCVSR) tasks [1, 2, 3] and led to significant recognition accuracy improvement over the then state of the art, various deep learning models, such as convolutional neural networks (CNNs) [4, 5, 6, 7, 8, 9], long short-term memory (LSTM) recurrent neural networks (RNNs) [10, 11, 12, 13, 14, 15, 16, 17] and their variants [18, 19, 20, 21, 22, 23], have been developed to further improve the performance of automatic speech recognition (ASR) systems.",
+      "startOffset" : 408,
+      "endOffset" : 440
+    }, {
+      "referenceID" : 11,
+      "context" : "Since 2010, the year in which deep neural networks (DNNs) were successfully applied to the large vocabulary continuous speech recognition (LCVSR) tasks [1, 2, 3] and led to significant recognition accuracy improvement over the then state of the art, various deep learning models, such as convolutional neural networks (CNNs) [4, 5, 6, 7, 8, 9], long short-term memory (LSTM) recurrent neural networks (RNNs) [10, 11, 12, 13, 14, 15, 16, 17] and their variants [18, 19, 20, 21, 22, 23], have been developed to further improve the performance of automatic speech recognition (ASR) systems.",
+      "startOffset" : 408,
+      "endOffset" : 440
+    }, {
+      "referenceID" : 12,
+      "context" : "Since 2010, the year in which deep neural networks (DNNs) were successfully applied to the large vocabulary continuous speech recognition (LCVSR) tasks [1, 2, 3] and led to significant recognition accuracy improvement over the then state of the art, various deep learning models, such as convolutional neural networks (CNNs) [4, 5, 6, 7, 8, 9], long short-term memory (LSTM) recurrent neural networks (RNNs) [10, 11, 12, 13, 14, 15, 16, 17] and their variants [18, 19, 20, 21, 22, 23], have been developed to further improve the performance of automatic speech recognition (ASR) systems.",
+      "startOffset" : 408,
+      "endOffset" : 440
+    }, {
+      "referenceID" : 13,
+      "context" : "Since 2010, the year in which deep neural networks (DNNs) were successfully applied to the large vocabulary continuous speech recognition (LCVSR) tasks [1, 2, 3] and led to significant recognition accuracy improvement over the then state of the art, various deep learning models, such as convolutional neural networks (CNNs) [4, 5, 6, 7, 8, 9], long short-term memory (LSTM) recurrent neural networks (RNNs) [10, 11, 12, 13, 14, 15, 16, 17] and their variants [18, 19, 20, 21, 22, 23], have been developed to further improve the performance of automatic speech recognition (ASR) systems.",
+      "startOffset" : 408,
+      "endOffset" : 440
+    }, {
+      "referenceID" : 14,
+      "context" : "Since 2010, the year in which deep neural networks (DNNs) were successfully applied to the large vocabulary continuous speech recognition (LCVSR) tasks [1, 2, 3] and led to significant recognition accuracy improvement over the then state of the art, various deep learning models, such as convolutional neural networks (CNNs) [4, 5, 6, 7, 8, 9], long short-term memory (LSTM) recurrent neural networks (RNNs) [10, 11, 12, 13, 14, 15, 16, 17] and their variants [18, 19, 20, 21, 22, 23], have been developed to further improve the performance of automatic speech recognition (ASR) systems.",
+      "startOffset" : 408,
+      "endOffset" : 440
+    }, {
+      "referenceID" : 15,
+      "context" : "Since 2010, the year in which deep neural networks (DNNs) were successfully applied to the large vocabulary continuous speech recognition (LCVSR) tasks [1, 2, 3] and led to significant recognition accuracy improvement over the then state of the art, various deep learning models, such as convolutional neural networks (CNNs) [4, 5, 6, 7, 8, 9], long short-term memory (LSTM) recurrent neural networks (RNNs) [10, 11, 12, 13, 14, 15, 16, 17] and their variants [18, 19, 20, 21, 22, 23], have been developed to further improve the performance of automatic speech recognition (ASR) systems.",
+      "startOffset" : 408,
+      "endOffset" : 440
+    }, {
+      "referenceID" : 16,
+      "context" : "Since 2010, the year in which deep neural networks (DNNs) were successfully applied to the large vocabulary continuous speech recognition (LCVSR) tasks [1, 2, 3] and led to significant recognition accuracy improvement over the then state of the art, various deep learning models, such as convolutional neural networks (CNNs) [4, 5, 6, 7, 8, 9], long short-term memory (LSTM) recurrent neural networks (RNNs) [10, 11, 12, 13, 14, 15, 16, 17] and their variants [18, 19, 20, 21, 22, 23], have been developed to further improve the performance of automatic speech recognition (ASR) systems.",
+      "startOffset" : 460,
+      "endOffset" : 484
+    }, {
+      "referenceID" : 17,
+      "context" : "Since 2010, the year in which deep neural networks (DNNs) were successfully applied to the large vocabulary continuous speech recognition (LCVSR) tasks [1, 2, 3] and led to significant recognition accuracy improvement over the then state of the art, various deep learning models, such as convolutional neural networks (CNNs) [4, 5, 6, 7, 8, 9], long short-term memory (LSTM) recurrent neural networks (RNNs) [10, 11, 12, 13, 14, 15, 16, 17] and their variants [18, 19, 20, 21, 22, 23], have been developed to further improve the performance of automatic speech recognition (ASR) systems.",
+      "startOffset" : 460,
+      "endOffset" : 484
+    }, {
+      "referenceID" : 18,
+      "context" : "Since 2010, the year in which deep neural networks (DNNs) were successfully applied to the large vocabulary continuous speech recognition (LCVSR) tasks [1, 2, 3] and led to significant recognition accuracy improvement over the then state of the art, various deep learning models, such as convolutional neural networks (CNNs) [4, 5, 6, 7, 8, 9], long short-term memory (LSTM) recurrent neural networks (RNNs) [10, 11, 12, 13, 14, 15, 16, 17] and their variants [18, 19, 20, 21, 22, 23], have been developed to further improve the performance of automatic speech recognition (ASR) systems.",
+      "startOffset" : 460,
+      "endOffset" : 484
+    }, {
+      "referenceID" : 19,
+      "context" : "Since 2010, the year in which deep neural networks (DNNs) were successfully applied to the large vocabulary continuous speech recognition (LCVSR) tasks [1, 2, 3] and led to significant recognition accuracy improvement over the then state of the art, various deep learning models, such as convolutional neural networks (CNNs) [4, 5, 6, 7, 8, 9], long short-term memory (LSTM) recurrent neural networks (RNNs) [10, 11, 12, 13, 14, 15, 16, 17] and their variants [18, 19, 20, 21, 22, 23], have been developed to further improve the performance of automatic speech recognition (ASR) systems.",
+      "startOffset" : 460,
+      "endOffset" : 484
+    }, {
+      "referenceID" : 20,
+      "context" : "Since 2010, the year in which deep neural networks (DNNs) were successfully applied to the large vocabulary continuous speech recognition (LCVSR) tasks [1, 2, 3] and led to significant recognition accuracy improvement over the then state of the art, various deep learning models, such as convolutional neural networks (CNNs) [4, 5, 6, 7, 8, 9], long short-term memory (LSTM) recurrent neural networks (RNNs) [10, 11, 12, 13, 14, 15, 16, 17] and their variants [18, 19, 20, 21, 22, 23], have been developed to further improve the performance of automatic speech recognition (ASR) systems.",
+      "startOffset" : 460,
+      "endOffset" : 484
+    }, {
+      "referenceID" : 21,
+      "context" : "Since 2010, the year in which deep neural networks (DNNs) were successfully applied to the large vocabulary continuous speech recognition (LCVSR) tasks [1, 2, 3] and led to significant recognition accuracy improvement over the then state of the art, various deep learning models, such as convolutional neural networks (CNNs) [4, 5, 6, 7, 8, 9], long short-term memory (LSTM) recurrent neural networks (RNNs) [10, 11, 12, 13, 14, 15, 16, 17] and their variants [18, 19, 20, 21, 22, 23], have been developed to further improve the performance of automatic speech recognition (ASR) systems.",
+      "startOffset" : 460,
+      "endOffset" : 484
+    }, {
+      "referenceID" : 22,
+      "context" : ", [24, 25]), which exploits and splits the structure of neural networks to distribute computation across GPUs, and data parallelism (e.",
+      "startOffset" : 2,
+      "endOffset" : 10
+    }, {
+      "referenceID" : 23,
+      "context" : ", [24, 25]), which exploits and splits the structure of neural networks to distribute computation across GPUs, and data parallelism (e.",
+      "startOffset" : 2,
+      "endOffset" : 10
+    }, {
+      "referenceID" : 22,
+      "context" : ", [24, 26, 27]), which splits and distributes data across GPUs to achieve speedup.",
+      "startOffset" : 2,
+      "endOffset" : 14
+    }, {
+      "referenceID" : 24,
+      "context" : ", [24, 26, 27]), which splits and distributes data across GPUs to achieve speedup.",
+      "startOffset" : 2,
+      "endOffset" : 14
+    }, {
+      "referenceID" : 25,
+      "context" : ", [24, 26, 27]), which splits and distributes data across GPUs to achieve speedup.",
+      "startOffset" : 2,
+      "endOffset" : 14
+    }, {
+      "referenceID" : 26,
+      "context" : "Several successful techniques, such as asynchronous stochastic gradient descent (ASGD) [29, 30, 31], blockwise modelupdate filtering (BMUF) [32], bulk synchronous parallel (BSP) [33, 34, 35, 36], 1-bit SGD [26] and elastic averaging stochastic gradient descent (EASGD) [37], have been proposed recently.",
+      "startOffset" : 87,
+      "endOffset" : 99
+    }, {
+      "referenceID" : 27,
+      "context" : "Several successful techniques, such as asynchronous stochastic gradient descent (ASGD) [29, 30, 31], blockwise modelupdate filtering (BMUF) [32], bulk synchronous parallel (BSP) [33, 34, 35, 36], 1-bit SGD [26] and elastic averaging stochastic gradient descent (EASGD) [37], have been proposed recently.",
+      "startOffset" : 87,
+      "endOffset" : 99
+    }, {
+      "referenceID" : 28,
+      "context" : "Several successful techniques, such as asynchronous stochastic gradient descent (ASGD) [29, 30, 31], blockwise modelupdate filtering (BMUF) [32], bulk synchronous parallel (BSP) [33, 34, 35, 36], 1-bit SGD [26] and elastic averaging stochastic gradient descent (EASGD) [37], have been proposed recently.",
+      "startOffset" : 87,
+      "endOffset" : 99
+    }, {
+      "referenceID" : 29,
+      "context" : "Several successful techniques, such as asynchronous stochastic gradient descent (ASGD) [29, 30, 31], blockwise modelupdate filtering (BMUF) [32], bulk synchronous parallel (BSP) [33, 34, 35, 36], 1-bit SGD [26] and elastic averaging stochastic gradient descent (EASGD) [37], have been proposed recently.",
+      "startOffset" : 140,
+      "endOffset" : 144
+    }, {
+      "referenceID" : 30,
+      "context" : "Several successful techniques, such as asynchronous stochastic gradient descent (ASGD) [29, 30, 31], blockwise modelupdate filtering (BMUF) [32], bulk synchronous parallel (BSP) [33, 34, 35, 36], 1-bit SGD [26] and elastic averaging stochastic gradient descent (EASGD) [37], have been proposed recently.",
+      "startOffset" : 178,
+      "endOffset" : 194
+    }, {
+      "referenceID" : 31,
+      "context" : "Several successful techniques, such as asynchronous stochastic gradient descent (ASGD) [29, 30, 31], blockwise modelupdate filtering (BMUF) [32], bulk synchronous parallel (BSP) [33, 34, 35, 36], 1-bit SGD [26] and elastic averaging stochastic gradient descent (EASGD) [37], have been proposed recently.",
+      "startOffset" : 178,
+      "endOffset" : 194
+    }, {
+      "referenceID" : 32,
+      "context" : "Several successful techniques, such as asynchronous stochastic gradient descent (ASGD) [29, 30, 31], blockwise modelupdate filtering (BMUF) [32], bulk synchronous parallel (BSP) [33, 34, 35, 36], 1-bit SGD [26] and elastic averaging stochastic gradient descent (EASGD) [37], have been proposed recently.",
+      "startOffset" : 178,
+      "endOffset" : 194
+    }, {
+      "referenceID" : 33,
+      "context" : "Several successful techniques, such as asynchronous stochastic gradient descent (ASGD) [29, 30, 31], blockwise modelupdate filtering (BMUF) [32], bulk synchronous parallel (BSP) [33, 34, 35, 36], 1-bit SGD [26] and elastic averaging stochastic gradient descent (EASGD) [37], have been proposed recently.",
+      "startOffset" : 178,
+      "endOffset" : 194
+    }, {
+      "referenceID" : 24,
+      "context" : "Several successful techniques, such as asynchronous stochastic gradient descent (ASGD) [29, 30, 31], blockwise modelupdate filtering (BMUF) [32], bulk synchronous parallel (BSP) [33, 34, 35, 36], 1-bit SGD [26] and elastic averaging stochastic gradient descent (EASGD) [37], have been proposed recently.",
+      "startOffset" : 206,
+      "endOffset" : 210
+    }, {
+      "referenceID" : 34,
+      "context" : "Several successful techniques, such as asynchronous stochastic gradient descent (ASGD) [29, 30, 31], blockwise modelupdate filtering (BMUF) [32], bulk synchronous parallel (BSP) [33, 34, 35, 36], 1-bit SGD [26] and elastic averaging stochastic gradient descent (EASGD) [37], have been proposed recently.",
+      "startOffset" : 269,
+      "endOffset" : 273
+    }, {
+      "referenceID" : 35,
+      "context" : "All the four algorithms were implemented in Kaldi toolkit [38] using message passing interface (MPI) for parameter exchange across GPUs.",
+      "startOffset" : 58,
+      "endOffset" : 62
+    }, {
+      "referenceID" : 21,
+      "context" : "To evaluate these algorithms, we train DNNs and CLDNNs [23] (an architecture that stacks CNNs, LSTMs and DNNs) on 1000hr LibriSpeech [39] corpus.",
+      "startOffset" : 55,
+      "endOffset" : 59
+    }, {
+      "referenceID" : 36,
+      "context" : "To evaluate these algorithms, we train DNNs and CLDNNs [23] (an architecture that stacks CNNs, LSTMs and DNNs) on 1000hr LibriSpeech [39] corpus.",
+      "startOffset" : 133,
+      "endOffset" : 137
+    }, {
+      "referenceID" : 30,
+      "context" : "The bulk synchronous parallel (BSP) [33] algorithm is often referred to as model averaging.",
+      "startOffset" : 36,
+      "endOffset" : 40
+    }, {
+      "referenceID" : 37,
+      "context" : "It is proved [40] that ASGD converges for convex problems.",
+      "startOffset" : 13,
+      "endOffset" : 17
+    }, {
+      "referenceID" : 38,
+      "context" : "Therefore ASGD essentially adds a “delayed” gradient ∇w t computed based on the model w̃t to the model w̃t+k [41].",
+      "startOffset" : 109,
+      "endOffset" : 113
+    }, {
+      "referenceID" : 29,
+      "context" : "The blockwise model-update filtering (BMUF) algorithm [32] can be considered as an improved model averaging technique in which the global model update is implemented as a filter.",
+      "startOffset" : 54,
+      "endOffset" : 58
+    }, {
+      "referenceID" : 29,
+      "context" : "We implemented CBM-BMUF [32] in this work.",
+      "startOffset" : 24,
+      "endOffset" : 28
+    }, {
+      "referenceID" : 34,
+      "context" : "In elastic averaging stochastic gradient descent (EASGD) [37], the loss function is defined as",
+      "startOffset" : 57,
+      "endOffset" : 61
+    }, {
+      "referenceID" : 36,
+      "context" : "Experimental setup In this work, all the models are trained on the 1000hr LibriSpeech [39] dataset.",
+      "startOffset" : 86,
+      "endOffset" : 90
+    }, {
+      "referenceID" : 21,
+      "context" : "To evaluate the parallel training algorithms, we trained two types of DLMs: DNNs and CLDNNs [23].",
+      "startOffset" : 92,
+      "endOffset" : 96
+    } ],
+    "year" : 2017,
+    "abstractText" : "Deep learning models (DLMs) are state-of-the-art techniques in speech recognition. However, training good DLMs can be time consuming especially for production-size models and corpora. Although several parallel training algorithms have been proposed to improve training efficiency, there is no clear guidance on which one to choose for the task in hand due to lack of systematic and fair comparison among them. In this paper we aim at filling this gap by comparing four popular parallel training algorithms in speech recognition, namely asynchronous stochastic gradient descent (ASGD), blockwise model-update filtering (BMUF), bulk synchronous parallel (BSP) and elastic averaging stochastic gradient descent (EASGD), on 1000-hour LibriSpeech corpora using feed-forward deep neural networks (DNNs) and convolutional, long short-term memory, DNNs (CLDNNs). Based on our experiments, we recommend using BMUF as the top choice to train acoustic models since it is most stable, scales well with number of GPUs, can achieve reproducible results, and in many cases even outperforms singleGPU SGD. ASGD can be used as a substitute in some cases.",
+    "creator" : "LaTeX with hyperref package"
+  }
+}

@@ -1,0 +1,540 @@
+{
+  "name" : "1701.07403.pdf",
+  "metadata" : {
+    "source" : "CRF",
+    "title" : "Learning Light Transport the Reinforced Way",
+    "authors" : [ "Ken Dahm" ],
+    "emails" : [ "ken.dahm@gmail.com,", "alexander@gmail.com" ],
+    "sections" : [ {
+      "heading" : "1 Introduction",
+      "text" : "One application of light transport simulation is the computational synthesis of images that cannot be distinguished from real photographs. In such simulation algorithms [21], light transport is modeled by a Fredholm integral equation of the second kind and pixel colors are determined by estimating functionals of the solution of the Fredholm integral equation. The estimators are averages of sampled light transport paths that connect light sources and camera sensors.\nCompared to reality, where photons and their trajectories are abundant, a computer may only consider a tiny fraction of path space, which is one of the dominant reasons for noisy images. It is therefore crucial to efficiently select light transport paths that have an important contribution to the image. While a lot of research in computer graphics has been focussing on importance sampling [16, 4, 3, 1, 20], for long there has not been a simple and efficient online method that can substantially reduce the number of light transport paths with zero contribution [28].\nKen Dahm · Alexander Keller NVIDIA, Fasanenstr. 81, 10623 Berlin, Germany e-mail: ken.dahm@gmail.com, e-mail: keller. alexander@gmail.com\n1\nar X\niv :1\n70 1.\n07 40\n3v 1\n[ cs\n.L G\n] 2\n5 Ja\nThe majority of zero contributions are caused by unsuitable local importance sampling using only a factor instead of the complete integrand (see Fig. 1) or by trying to connect vertices of light transport path segments that are occluded, for example shooting shadow rays to light sources or connecting path segments starting both from the light sources and the camera sensors. An example for this inefficiency has been investigated early on in computer graphics [26, 27]: The visible part of the synthetic scene shown in Fig. 7 is lit through a door. By closing the door more and more the problem can be made arbitrarily more difficult to solve.\nWe therefore propose a method that is based on reinforcement learning [24] and allows one to sample light transport paths that are much more likely to connect lights and sensors. Complementary to first approaches of applying machine learning to image synthesis [28], in Sec. 2 we show that light transport and reinforcement learning can be modeled by the same integral equation. As a consequence, importance in light transport can be learned using any light transport algorithm.\nDeriving a relationship between reinforcement learning and light transport simulation, we succeed to remove all hyper-parameters, yielding an automatic importance sampling scheme as introduced in Sec. 3. Our approach allows for controlling the memory footprint, for suitable representations of importance does not require preprocessing, and can be applied during image synthesis and/or across frames, because it is able to track distributions over time. A second parallel between temporal difference learning and next event estimation is pointed out in Sec. 4.\nAs demonstrated in Sec. 5 and shown in Fig. 8, already a simple implementation can dramatically improve light transport simulation. The efficiency of the scheme is based on two facts: Instead of shooting towards the light sources, we are guiding light transport paths to where the light comes from, which effectively shortens path length, and we learn importance from a smoothed approximation instead from high variance path space samples.\n2 Identifying Q-Learning and Light Transport\nThe setting of reinforcement learning [24] is depicted in Fig. 2: An agent takes an action thereby transitioning to the resulting next state and receiving a reward. In order to maximize the reward, the agent has to learn which action to choose in what state. This process very much resembles how humans learn.\nQ-learning [34] is a model free reinforcement learning technique. Given a set of states S and a set of actions A, it determines a function Q(s,a) that for any s ∈ S values taking the action a ∈ A. Thus given a state s, the action a with the highest value may be selected next and\nQ(s,a) = (1−α) ·Q(s,a)+α · (\nr(s,a)+ γ ·max a′∈A\nQ(s′,a′) )\n(1)\nmay be updated by a fraction of α ∈ [0,1], where r(s,a) is the reward for taking the action resulting in a transition to a state s′. In addition, the maximum Q-value of possible actions in s′ is considered and discounted by a factor of γ ∈ [0,1).\nInstead of taking into account only the best valued action,\nQ(s,a) = (1−α) ·Q(s,a)+α · ( r(s,a)+ γ · ∑\na′∈A π(s′,a′)Q(s′,a′)\n)\naverages all possible actions in s′ and weighs their values Q(s′,a′) by a transition kernel π(s′,a′). This is especially interesting, as later it will turn out that always selecting the ”best” action does not perform as well as considering all options (see Fig. 7). For a continuous space A of actions, we then have\nQ(s,a) = (1−α) ·Q(s,a)+α · ( r(s,a)+ γ · ∫\nA π(s′,a′)Q(s′,a′)da′\n) . (2)\nOn the other hand, the radiance\nL(x,ω) = Le(x,ω)+ ∫\nS +(x) L(h(x,ωi),−ωi) fs(ωi,x,ω)cosθidωi (3)\nin a point x on a surface into direction ω is modeled by a Fredholm integral equation of the second kind. Le is the source radiance and the integral accounts for all radiance that is incident over the hemisphere S +(x) aligned by the surface normal in x and transported into direction ω . The hitpoint function h(x,ωi) traces a ray from x into direction ωi and returns the first surface point intersected. The radiance from this point is attenuated by the bidirectional scattering distribution function fs, where the cosine term of the angle θi between surface normal and ωi accounts for only the fraction that is perpendicular to the surface.\nA comparison of Eqn. 2 for α = 0 and Eqn. 3 reveals structural similarities of the formulation of reinforcement learning and the light transport integral equation, respectively, which lend themselves to matching terms: Interpreting the state s as a location x ∈ R3 and an action a as tracing a ray from location x into direction ω resulting in the point y := h(x,ω) corresponding to the state s′, the reward term r(s,a) can be linked to the emitted radiance Le(y,−ω) = Le(h(x,ω),−ω) as observed from x. Similarly, the integral operator can be applied to the value Q, yielding\nQ(x,ω) = Le(y,−ω)+ ∫\nS +(y) Q(y,ωi) fs(ωi,y,−ω)cosθidωi. (4)\nTaking a look at the geometry and the physical meaning of the terms, it becomes obvious that Q in fact must be the radiance Li(x,ω) incident in x from direction ω and in fact is described by a Fredholm integral equation of the second kind - like the light transport equation 3.\n3 Q-Learning while Path Tracing\nIn order to synthesize images, we need to compute functionals of the radiance equation 3, i.e. project the radiance onto the image plane. For the purpose of this article, we start with a simple forward path tracer [21, 12]: From a virtual camera, rays are traced through the pixels of the screen. Upon their first intersection with the scene geometry, the light transport path is continued into a scattering direction determined according to the optical surface properties. Scattering and ray tracing are repeated until a light source is hit. The contribution of this complete light transport path is added to the pixel pierced by the initial ray of this light transport path when started at the camera.\nIn this simple form, the algorithm exposes quite some variance as can be seen in the images on the left in Fig. 3. This noise may be reduced by importance sampling. We therefore progressively approximate Eqn. 4 using reinforcement learning: Once a direction has been selected and a ray has been traced by the path tracer,\nQ(x,ω) = (1−α) ·Q(x,ω) (5) +α · ( Le(y,−ω)+ ∫\nS +(y) Q(y,ωi) fs(ωi,y,−ω)cosθidωi ) is updated using a learning rate α . The probability density function resulting from normalizing Q in turn is used for importance sampling a direction to continue the path. As consequence more and more light transport paths are sampled that contribute to the image. Computing a global solution to Q in a preprocess would not allow for focussing computations on light transport paths that contribute to the image."
+    }, {
+      "heading" : "3.1 Implementation",
+      "text" : "Often, approximations to Q are tabulated for each pair of state and action. In computer graphics, there are multiple choices to represent radiance and for the purpose of this article, we chose the data structure as used for irradiance volumes [5] to approximate Q. Fig. 4 shows an exemplary visualization of such a discretization during rendering: For selected points y in space, the hemisphere is stratified and one value Qi(y) is stored per sector, i.e. stratum i. Fig. 7f illustrates the placement of probe centers y, which results from mapping a two-dimensional low discrepancy sequence onto the scene surface.\nNow the integral\n∫ S +(y) Q(y,ωi) fs(ωi,y,−ω)cosθidωi ≈ 2π n n−1 ∑ i=0 Qi(y) fs(ωi(ξi),y,−ω)cosθi(ξi)\nin Eqn. 5 can be estimated by using each one uniform random direction ωi(ξ ) in each stratum i.\nThe method has been implemented in an importance driven forward path tracer as shown in Alg. 1: Only two routines for updating Q and selecting a scattering direction proportional to Q need to be added. Normalizing the Qi in a point y then results in a probability density that is used for importance sampling during scattering by inverting the cumulative distribution function. In order to guarantee ergodicity, meaning that every light transport path remains possible, all Qi(y) are initialized with a positive value, for example a uniform probability density or proportional to a factor of the integrand (see Fig. 1).\nThe parameters exposed by our implementation are the discretization, i.e. number of voxels, and the learning rate α . The cumulative distribution functions are built in parallel every accumulated frame."
+    }, {
+      "heading" : "3.2 Consistency",
+      "text" : "It is desirable to craft consistent rendering algorithms [12], because then all renderer introduced artifacts, like for example noise, are guaranteed to vanish over time. This\nAlgorithm 1: Augmenting a path tracer by reinforcement learning for importance sampling requires only two additional routines (highlighted in green): The importance Q needs to be updated along the path and scattering directions are selected proportional to Q as learned so far.\nFunction updateQtable(ray, h,n) idxPrev← findCell(ray.o) idxCurr← findCell(h,n) update← 0 if isAreaLight(h) or isEnvironment(h) then\nupdate← max(getRadiance(ray)) else\nupdate← max(getLastAttenuation(ray) * qmax[idxCurr]) idxQ← findIndex(idxPrev, ray) qtable[idxQ]← (1−α)∗ qtable[idxQ] +α∗ update\nFunction sampleScatteringDirFromQtable(h,n) idx← findCell(h,n) (idxPatch, ps)← sampleCdf(idx) ω ← uniformSamplePatch(idxPatch) return ( fs,ω, ps∗ numpatches/(2∗π))\nFunction pathTrace(camera, scene) throughput← 1 color← 0 ray← setupPrimaryRay(camera) for i← 0 to ∞ do\n(h,n)← intersect(scene, ray) if i > 0 then\nupdateQtable(ray.o, h, n)\nif isEnvironment(h) then color← throughput * getRadianceFromEnvironment(ray) break\nif isAreaLight(h) then color← throughput * getRadianceFromAreaLight(ray) break\n( fs,ω, pω )← sampleScatteringDirFromQtable(h,n) throughput← throughput ∗ fs ∗ cos(n,ω)/pω ray← (h,ω)\nwritePixel(color)\nrequires the Qi(y) to converge, which may be accomplished by a vanishing learning rate α .\nIn reinforcement learning, a typical approach is to count the number of visits to each pair of state s and action a and using\nα(s,a) = 1\n1+visits(s,a) .\nThe method resembles the one used to make progressive photon mapping consistent [6], where consistency has been achieved by decreasing the search radius around a query point every time a photon hits sufficiently close. Similarly, the learning rate may also depend on the total number of visits to a state s alone, or even may be chosen to vanish independently of state and action. Again, such approaches have been explored in consistent photon mapping [13].\nWhile the Qi(y) converge, they do not necessarily converge to the incident radiance in Eqn. 4. First, as they are projections onto a basis, the Qi(y) at best only are an approximation of Q in realistic settings. Second, as the coefficients Qi(y) are learned during path tracing, i.e. image synthesis, and used for importance sampling, it may well happen that they are not updated everywhere at the same rate. Nevertheless, since all operators are linear, the number of visits will be proportional to the number of light transport paths [13] and consequently as long as Qi(y)> 0 whenever Li(y,ωi)> 0 all Qi(y) will be updated eventually."
+    }, {
+      "heading" : "3.3 Environment Lighting",
+      "text" : "Rendering sun and sky is usually done by distributing samples proportional to the brightness of pixels in the environment texture. More samples should end up in brighter regions, which is achieved by constructing and sampling from a cumulative distribution function, for example using the alias method [30]. Furthermore, the sun may be separated from the sky and simulated separately. The efficiency of such importance sampling is highly dependent on occlusion, i.e. what part of the environment can be seen from the point to be shaded (see Fig. 1).\nSimilar to Sec. 3.1 and in order to consider the actual contribution including occlusion, an action space is defined by partitioning the environment map into tiles and learning the importance per tile. Fig. 5 shows the improvement for an example setting."
+    }, {
+      "heading" : "3.4 Light Tracing",
+      "text" : "For guiding light transport paths starting from the light sources, the transported measurement contribution function W has to be learned instead of the incident radiance Q. Storing W uses the same data structures as used for Q. Learning both Q and W allows one to implement bidirectional path tracing [25] with reinforcement learning for importance sampling to guide both light and camera path segments including visibility information for the first time. Note that guiding light transport paths this way may reach efficiency levels that even can make bidirectional path tracing and multiple importance sampling oblivious [28]1.\n1 In addition, personal communication with the authors."
+    }, {
+      "heading" : "4 Temporal Difference Learning and Next Event Estimation",
+      "text" : "Besides the known shortcomings of (bidirectional) path tracing [15, Sec.2.4 Problem of insufficient techniques], the efficiency may be restricted by the approximation quality of Q: For example, the smaller the light sources, the finer the required resolution of Q to reliably guide rays to hit a light source. This is where next event estimation may help.\nAlready in [33] the contribution of light sources has been “learned”: A probability per light source has been determined by the number of successful shadow rays divided by the total number of shadow rays shot. This idea has been refined subsequently [14, 32, 2, 31].\nFor reinforcement learning, the state space may be chosen as a regular grid over the scene, where in each grid cell c for each light source l a value Vc,l is stored that is initialized with zero. Whenever a sample on a light source l is visible to a point x to be illuminated in the cell c upon next event estimation, its value\nV ′c,l = (1−α)Vc,l +α · ‖Cl(x)‖∞ (6)\nis updated using the norm of the contribution Cl(x). Building a cumulative distribution function from all values Vc,l within a cell c, light may be selected by importance sampling. Fig. 6 shows the efficiency gain of this reinforcement learning method over uniform light source selection for 16 paths per pixel.\nIt is interesting to see that this is another relation to reinforcement learning: While the Q-learning equation 5 takes into account the values of the next, non-terminal state, the next state in event estimation is always a terminal state and Q-learning coincides with plain temporal difference learning [23] as in equation 6."
+    }, {
+      "heading" : "4.1 Learning Virtual Point Light Sources",
+      "text" : "The vertices generated by tracing photon trajectories (see Sec. 3.4) can be considered a photon map [9] and may be used in the same way. Furthermore, they may be used as a set of virtual point light sources for for example the instant radiosity [11] algorithm.\nContinuously updating and learning the measurement contribution function W [25] across frames and using the same seed for the pseudo- or quasi-random sequences allows for generating virtual point light sources that expose a certain coherency over time, which reduces temporal artifacts when rendering animations with global illumination."
+    }, {
+      "heading" : "5 Results and Discussion",
+      "text" : "Fig. 7 compares the new reinforcement learning algorithm to common algorithms: For the same budget of light transport paths, the superiority over path tracing with importance sampling according to the reflection properties is obvious. A comparison with the Metropolis algorithm for importance sampling [27, 10] reveals much more uniform noise lacking the typical splotchy structure inherent with the local space exploration of Metropolis samplers. Note, however, that the new reinforcement learning importance sampling scheme could as well be combined with Metropolis sampling. Finally, updating Q by Eqn. 1, i.e. the ”best possible action” strategy is inferior to using the weighted average of all possible next actions according to Eqn. 5. In light transport simulation this is not surprising, as the deviation of the integrand from its estimated maximum very often is much larger than from a piecewise constant approximation.\nShooting towards where the radiance comes from naturally shortens the average path length as can be seen in Fig. 7e. As a consequence the new algorithm for the same budget of light transport paths is around 20% faster than without reinforce-\nment learning. The big gain in quality is due to the dramatic increase of non-zero contribution light transport paths (see Fig. 8), even under complex lighting.\nThe idea of guiding light transport paths has been explored before [16, 8, 4, 20, 1, 28]. However, key to our approach is that by using a representation of Q in Eqn. 5 instead of solving the equation by recursion, i.e. a Neumann series, Q can be learned much faster and in fact during sampling light transport paths without any preprocess.\nBased on the approach to guide light paths using a pre-trained Gaussian mixture model [28] to represent probabilities, in [29] in addition the density of light transport paths is controlled across the scene using splitting and Russian roulette. These ideas have the potential to further improve the efficiency of our approach.\nWhile the memory requirements for storing our data structure for Q are small, the data structure is not adaptive. An alternative is the adaptive hierarchical approximation to Q as used in [16]. Yet, another variant would be learning parameters for lobes to guide light transport paths [1]. In principle any data structure that has been used in graphics to approximate irradiance or radiance is a candidate. Which data structure and what parameters are best, may be depending on the scene to be rendered. For example, using discretized hemispheres limits the resolution with respect to solid angle. If the resolution is chosen too fine, learning is slow, if the resolution is to coarse, convergence is slow.\nGiven that Q asymptotically approximates the incident radiance Li, it is worthwhile to investigate how it can be used for the separation of the main part as explored in [16, 20] to further speed up light transport simulation or even as an alternative to importance sampling."
+    }, {
+      "heading" : "6 Conclusion",
+      "text" : "We presented a new algorithm to increase the efficiency of path tracing by approximating importance using reinforcement learning during image synthesis. Identifying Q-learning and light transport, heuristics have been replaced by physically based functions, and the only parameters that the user may control are the learning rate and the discretization of Q.\nThe combination of reinforcement learning and deep neural networks [19, 7, 17, 18] is an obvious avenue of future research: Representing the radiance on hemispheres already has been successfully explored [22] and the interesting question is how well Q can be represented by neural networks.\nAcknowledgements The authors would like to thank Jaroslav Křivánek and Tero Karras for profound discussions."
+    } ],
+    "references" : [ {
+      "title" : "A significance cache for accelerating global illumination",
+      "author" : [ "T. Bashford-Rogers", "K. Debattista", "A. Chalmers" ],
+      "venue" : "Computer Graphics Forum 31(6), 1837–1851",
+      "citeRegEx" : "1",
+      "shortCiteRegEx" : null,
+      "year" : 2012
+    }, {
+      "title" : "A scalable approach to interactive global illumination",
+      "author" : [ "C. Benthin", "I. Wald", "P. Slusallek" ],
+      "venue" : "Computer Graphics Forum (Proc. Eurographics 2003) 22(3), 621–629",
+      "citeRegEx" : "2",
+      "shortCiteRegEx" : null,
+      "year" : 2003
+    }, {
+      "title" : "Table-driven adaptive importance sampling",
+      "author" : [ "D. Cline", "D. Adams", "P. Egbert" ],
+      "venue" : "Computer Graphics Forum 27(4), 1115–1123",
+      "citeRegEx" : "3",
+      "shortCiteRegEx" : null,
+      "year" : 2008
+    }, {
+      "title" : "Potential-driven Monte Carlo particle tracing for diffuse environments with adaptive probability functions",
+      "author" : [ "P. Dutré", "Y. Willems" ],
+      "venue" : "Rendering Techniques 1995 (Proc. 6th Eurographics Workshop on Rendering), pp. 306–315. Springer",
+      "citeRegEx" : "4",
+      "shortCiteRegEx" : null,
+      "year" : 1995
+    }, {
+      "title" : "The irradiance volume",
+      "author" : [ "G. Greger", "P. Shirley", "P. Hubbard", "D. Greenberg" ],
+      "venue" : "IEEE Computer Graphics and Applications 18(2), 32–43",
+      "citeRegEx" : "5",
+      "shortCiteRegEx" : null,
+      "year" : 1998
+    }, {
+      "title" : "Progressive photon mapping",
+      "author" : [ "T. Hachisuka", "S. Ogaki", "H. Jensen" ],
+      "venue" : "ACM Transactions on Graphics 27(5), 130:1–130:8",
+      "citeRegEx" : "6",
+      "shortCiteRegEx" : null,
+      "year" : 2008
+    }, {
+      "title" : "Deep reinforcement learning with double Q-learning",
+      "author" : [ "H. van Hasselt", "A. Guez", "D. Silver" ],
+      "venue" : "CoRR abs/1509.06461",
+      "citeRegEx" : "7",
+      "shortCiteRegEx" : null,
+      "year" : 2015
+    }, {
+      "title" : "Importance driven path tracing using the photon map",
+      "author" : [ "H. Jensen" ],
+      "venue" : "P. Hanrahan, W. Purgathofer (eds.) Rendering Techniques 1995 (Proc. 6th Eurographics Workshop on Rendering), pp. 326–335. Springer",
+      "citeRegEx" : "8",
+      "shortCiteRegEx" : null,
+      "year" : 1995
+    }, {
+      "title" : "Realistic Image Synthesis Using Photon Mapping",
+      "author" : [ "H. Jensen" ],
+      "venue" : "AK Peters",
+      "citeRegEx" : "9",
+      "shortCiteRegEx" : null,
+      "year" : 2001
+    }, {
+      "title" : "A simple and robust mutation strategy for the Metropolis light transport algorithm",
+      "author" : [ "C. Kelemen", "L. Szirmay-Kalos", "G. Antal", "F. Csonka" ],
+      "venue" : "Computer Graphics Forum 21(3), 531–540",
+      "citeRegEx" : "10",
+      "shortCiteRegEx" : null,
+      "year" : 2002
+    }, {
+      "title" : "Instant radiosity",
+      "author" : [ "A. Keller" ],
+      "venue" : "SIGGRAPH ’97: Proceedings of the 24th annual conference on Computer graphics and interactive techniques, pp. 49–56",
+      "citeRegEx" : "11",
+      "shortCiteRegEx" : null,
+      "year" : 1997
+    }, {
+      "title" : "Quasi-Monte Carlo image synthesis in a nutshell",
+      "author" : [ "A. Keller" ],
+      "venue" : "J. Dick, F. Kuo, G. Peters, I. Sloan (eds.) Monte Carlo and Quasi-Monte Carlo Methods 2012, pp. 203–238. Springer",
+      "citeRegEx" : "12",
+      "shortCiteRegEx" : null,
+      "year" : 2013
+    }, {
+      "title" : "Deterministic consistent density estimation for light transport simulation",
+      "author" : [ "A. Keller", "N. Binder" ],
+      "venue" : "J. Dick, F. Kuo, G. Peters, I. Sloan (eds.) Monte Carlo and Quasi-Monte Carlo Methods 2012, pp. 467–480. Springer",
+      "citeRegEx" : "13",
+      "shortCiteRegEx" : null,
+      "year" : 2013
+    }, {
+      "title" : "Efficient importance sampling techniques for the photon map",
+      "author" : [ "A. Keller", "I. Wald" ],
+      "venue" : "Proc. VISION, MODELING, AND VISUALIZATION, pp. 271–279. IOS Press",
+      "citeRegEx" : "14",
+      "shortCiteRegEx" : null,
+      "year" : 2000
+    }, {
+      "title" : "Efficient bidirectional path tracing by randomized quasi-Monte Carlo integration",
+      "author" : [ "T. Kollig", "A. Keller" ],
+      "venue" : "H. Niederreiter, K. Fang, F. Hickernell (eds.) Monte Carlo and Quasi-Monte Carlo Methods 2000, pp. 290–305. Springer",
+      "citeRegEx" : "15",
+      "shortCiteRegEx" : null,
+      "year" : 2002
+    }, {
+      "title" : "A 5D tree to reduce the variance of Monte Carlo ray tracing",
+      "author" : [ "E. Lafortune", "Y. Willems" ],
+      "venue" : "P. Hanrahan, W. Purgathofer (eds.) Rendering Techniques 1995 (Proc. 6th Eurographics Workshop on Rendering), pp. 11–20. Springer",
+      "citeRegEx" : "16",
+      "shortCiteRegEx" : null,
+      "year" : 1995
+    }, {
+      "title" : "Continuous control with deep reinforcement learning",
+      "author" : [ "T. Lillicrap", "J. Hunt", "A. Pritzel", "N. Heess", "T. Erez", "Y. Tassa", "D. Silver", "D. Wierstra" ],
+      "venue" : "CoRR abs/1509.02971",
+      "citeRegEx" : "17",
+      "shortCiteRegEx" : null,
+      "year" : 2015
+    }, {
+      "title" : "Asynchronous methods for deep reinforcement learning",
+      "author" : [ "V. Mnih", "A. Badia", "M. Mirza", "A. Graves", "T. Lillicrap", "T. Harley", "D. Silver", "K. Kavukcuoglu" ],
+      "venue" : "CoRR abs/1602.01783",
+      "citeRegEx" : "18",
+      "shortCiteRegEx" : null,
+      "year" : 2016
+    }, {
+      "title" : "Playing Atari with deep reinforcement learning",
+      "author" : [ "V. Mnih", "K. Kavukcuoglu", "D. Silver", "A. Graves", "I. Antonoglou", "D. Wierstra", "M. Riedmiller" ],
+      "venue" : "CoRR abs/1312.5602",
+      "citeRegEx" : "19",
+      "shortCiteRegEx" : null,
+      "year" : 2013
+    }, {
+      "title" : "Towards interactive global illumination effects via sequential Monte Carlo adaptation",
+      "author" : [ "V. Pegoraro", "C. Brownlee", "P. Shirley", "S. Parker" ],
+      "venue" : "Proceedings of the 3rd IEEE Symposium on Interactive Ray Tracing, pp. 107–114",
+      "citeRegEx" : "20",
+      "shortCiteRegEx" : null,
+      "year" : 2008
+    }, {
+      "title" : "Physically Based Rendering - From Theory to Implementation",
+      "author" : [ "M. Pharr", "W. Jacob", "G. Humphreys" ],
+      "venue" : "Morgan Kaufmann, Third Edition",
+      "citeRegEx" : "21",
+      "shortCiteRegEx" : null,
+      "year" : 2016
+    }, {
+      "title" : "A machine learning driven sky model",
+      "author" : [ "P. Satilmis", "T. Bashford-Rogers", "A. Chalmers", "K. Debattista" ],
+      "venue" : "IEEE Computer Graphics and Applications pp. 1–9",
+      "citeRegEx" : "22",
+      "shortCiteRegEx" : null,
+      "year" : 2016
+    }, {
+      "title" : "Learning to predict by the methods of temporal differences",
+      "author" : [ "R. Sutton" ],
+      "venue" : "Machine Learning 3(1), 9–44",
+      "citeRegEx" : "23",
+      "shortCiteRegEx" : null,
+      "year" : 1988
+    }, {
+      "title" : "Introduction to Reinforcement Learning, 1st edn",
+      "author" : [ "R. Sutton", "A. Barto" ],
+      "venue" : "MIT Press, Cambridge, MA, USA",
+      "citeRegEx" : "24",
+      "shortCiteRegEx" : null,
+      "year" : 1998
+    }, {
+      "title" : "Bidirectional estimators for light transport",
+      "author" : [ "E. Veach", "L. Guibas" ],
+      "venue" : "Proc. 5th Eurographics Worshop on Rendering, pp. 147 – 161. Darmstadt, Germany",
+      "citeRegEx" : "25",
+      "shortCiteRegEx" : null,
+      "year" : 1994
+    }, {
+      "title" : "Optimally combining sampling techniques for Monte Carlo rendering",
+      "author" : [ "E. Veach", "L. Guibas" ],
+      "venue" : "SIGGRAPH ’95 Proceedings of the 22nd annual conference on Computer graphics and interactive techniques, pp. 419–428",
+      "citeRegEx" : "26",
+      "shortCiteRegEx" : null,
+      "year" : 1995
+    }, {
+      "title" : "Metropolis light transport",
+      "author" : [ "E. Veach", "L. Guibas" ],
+      "venue" : "T. Whitted (ed.) Proc. SIGGRAPH 1997, Annual Conference Series, pp. 65–76. ACM SIGGRAPH, Addison Wesley",
+      "citeRegEx" : "27",
+      "shortCiteRegEx" : null,
+      "year" : 1997
+    }, {
+      "title" : "On-line learning of parametric mixture models for light transport simulation",
+      "author" : [ "J. Vorba", "O. Karlı́k", "M. Šik", "T. Ritschel", "J. Křivánek" ],
+      "venue" : "ACM Transactions on Graphics (Proceedings of SIGGRAPH 2014) 33(4)",
+      "citeRegEx" : "28",
+      "shortCiteRegEx" : null,
+      "year" : 2014
+    }, {
+      "title" : "Adjoint-driven Russian roulette and splitting in light transport simulation",
+      "author" : [ "J. Vorba", "J. Křivánek" ],
+      "venue" : "ACM Transactions on Graphics (Proceedings of SIGGRAPH 2016) 35(4), 1–11",
+      "citeRegEx" : "29",
+      "shortCiteRegEx" : null,
+      "year" : 2016
+    }, {
+      "title" : "A linear algorithm for generating random numbers with a given distribution",
+      "author" : [ "M. Vose" ],
+      "venue" : "IEEE Trans. on Software Engineering 17(9), 972–975",
+      "citeRegEx" : "30",
+      "shortCiteRegEx" : null,
+      "year" : 1991
+    }, {
+      "title" : "Interactive global illumination in complex and highly occluded environments",
+      "author" : [ "I. Wald", "C. Benthin", "P. Slusallek" ],
+      "venue" : "P. Christensen, D. Cohen-Or (eds.) Rendering Techniques 2003 (Proc. 14th Eurographics Workshop on Rendering), pp. 74–81",
+      "citeRegEx" : "31",
+      "shortCiteRegEx" : null,
+      "year" : 2003
+    }, {
+      "title" : "Interactive global illumination using fast ray tracing",
+      "author" : [ "I. Wald", "T. Kollig", "C. Benthin", "A. Keller", "P. Slusallek" ],
+      "venue" : "P. Debevec, S. Gibson (eds.) Rendering Techniques 2002 (Proc. 13th Eurographics Workshop on Rendering), pp. 15–24",
+      "citeRegEx" : "32",
+      "shortCiteRegEx" : null,
+      "year" : 2002
+    }, {
+      "title" : "Adaptive shadow testing for ray tracing",
+      "author" : [ "G. Ward" ],
+      "venue" : "2nd Eurographics Workshop on Rendering. Barcelona, Spain",
+      "citeRegEx" : "33",
+      "shortCiteRegEx" : null,
+      "year" : 1991
+    }, {
+      "title" : "Q-learning",
+      "author" : [ "C. Watkins", "P. Dayan" ],
+      "venue" : "Machine learning 8(3), 279–292",
+      "citeRegEx" : "34",
+      "shortCiteRegEx" : null,
+      "year" : 1992
+    } ],
+    "referenceMentions" : [ {
+      "referenceID" : 20,
+      "context" : "In such simulation algorithms [21], light transport is modeled by a Fredholm integral equation of the second kind and pixel colors are determined by estimating functionals of the solution of the Fredholm integral equation.",
+      "startOffset" : 30,
+      "endOffset" : 34
+    }, {
+      "referenceID" : 15,
+      "context" : "While a lot of research in computer graphics has been focussing on importance sampling [16, 4, 3, 1, 20], for long there has not been a simple and efficient online method that can substantially reduce the",
+      "startOffset" : 87,
+      "endOffset" : 104
+    }, {
+      "referenceID" : 3,
+      "context" : "While a lot of research in computer graphics has been focussing on importance sampling [16, 4, 3, 1, 20], for long there has not been a simple and efficient online method that can substantially reduce the",
+      "startOffset" : 87,
+      "endOffset" : 104
+    }, {
+      "referenceID" : 2,
+      "context" : "While a lot of research in computer graphics has been focussing on importance sampling [16, 4, 3, 1, 20], for long there has not been a simple and efficient online method that can substantially reduce the",
+      "startOffset" : 87,
+      "endOffset" : 104
+    }, {
+      "referenceID" : 0,
+      "context" : "While a lot of research in computer graphics has been focussing on importance sampling [16, 4, 3, 1, 20], for long there has not been a simple and efficient online method that can substantially reduce the",
+      "startOffset" : 87,
+      "endOffset" : 104
+    }, {
+      "referenceID" : 19,
+      "context" : "While a lot of research in computer graphics has been focussing on importance sampling [16, 4, 3, 1, 20], for long there has not been a simple and efficient online method that can substantially reduce the",
+      "startOffset" : 87,
+      "endOffset" : 104
+    }, {
+      "referenceID" : 27,
+      "context" : "number of light transport paths with zero contribution [28].",
+      "startOffset" : 55,
+      "endOffset" : 59
+    }, {
+      "referenceID" : 25,
+      "context" : "An example for this inefficiency has been investigated early on in computer graphics [26, 27]: The visible part of the synthetic scene shown in Fig.",
+      "startOffset" : 85,
+      "endOffset" : 93
+    }, {
+      "referenceID" : 26,
+      "context" : "An example for this inefficiency has been investigated early on in computer graphics [26, 27]: The visible part of the synthetic scene shown in Fig.",
+      "startOffset" : 85,
+      "endOffset" : 93
+    }, {
+      "referenceID" : 23,
+      "context" : "We therefore propose a method that is based on reinforcement learning [24] and allows one to sample light transport paths that are much more likely to connect lights and sensors.",
+      "startOffset" : 70,
+      "endOffset" : 74
+    }, {
+      "referenceID" : 27,
+      "context" : "Complementary to first approaches of applying machine learning to image synthesis [28], in Sec.",
+      "startOffset" : 82,
+      "endOffset" : 86
+    }, {
+      "referenceID" : 23,
+      "context" : "The setting of reinforcement learning [24] is depicted in Fig.",
+      "startOffset" : 38,
+      "endOffset" : 42
+    }, {
+      "referenceID" : 33,
+      "context" : "Q-learning [34] is a model free reinforcement learning technique.",
+      "startOffset" : 11,
+      "endOffset" : 15
+    }, {
+      "referenceID" : 0,
+      "context" : "may be updated by a fraction of α ∈ [0,1], where r(s,a) is the reward for taking the action resulting in a transition to a state s′.",
+      "startOffset" : 36,
+      "endOffset" : 41
+    }, {
+      "referenceID" : 20,
+      "context" : "For the purpose of this article, we start with a simple forward path tracer [21, 12]: From a virtual camera, rays are traced through the pixels of the screen.",
+      "startOffset" : 76,
+      "endOffset" : 84
+    }, {
+      "referenceID" : 11,
+      "context" : "For the purpose of this article, we start with a simple forward path tracer [21, 12]: From a virtual camera, rays are traced through the pixels of the screen.",
+      "startOffset" : 76,
+      "endOffset" : 84
+    }, {
+      "referenceID" : 4,
+      "context" : "article, we chose the data structure as used for irradiance volumes [5] to approximate Q.",
+      "startOffset" : 68,
+      "endOffset" : 71
+    }, {
+      "referenceID" : 11,
+      "context" : "It is desirable to craft consistent rendering algorithms [12], because then all renderer introduced artifacts, like for example noise, are guaranteed to vanish over time.",
+      "startOffset" : 57,
+      "endOffset" : 61
+    }, {
+      "referenceID" : 5,
+      "context" : "The method resembles the one used to make progressive photon mapping consistent [6], where consistency has been achieved by decreasing the search radius around a query point every time a photon hits sufficiently close.",
+      "startOffset" : 80,
+      "endOffset" : 83
+    }, {
+      "referenceID" : 12,
+      "context" : "Again, such approaches have been explored in consistent photon mapping [13].",
+      "startOffset" : 71,
+      "endOffset" : 75
+    }, {
+      "referenceID" : 12,
+      "context" : "Nevertheless, since all operators are linear, the number of visits will be proportional to the number of light transport paths [13] and consequently as long as Qi(y)> 0 whenever Li(y,ωi)> 0 all Qi(y) will be updated eventually.",
+      "startOffset" : 127,
+      "endOffset" : 131
+    }, {
+      "referenceID" : 29,
+      "context" : "More samples should end up in brighter regions, which is achieved by constructing and sampling from a cumulative distribution function, for example using the alias method [30].",
+      "startOffset" : 171,
+      "endOffset" : 175
+    }, {
+      "referenceID" : 24,
+      "context" : "Learning both Q and W allows one to implement bidirectional path tracing [25] with reinforcement learning for importance sampling to guide both light and camera path segments including visibility information for the first time.",
+      "startOffset" : 73,
+      "endOffset" : 77
+    }, {
+      "referenceID" : 27,
+      "context" : "Note that guiding light transport paths this way may reach efficiency levels that even can make bidirectional path tracing and multiple importance sampling oblivious [28]1.",
+      "startOffset" : 166,
+      "endOffset" : 170
+    }, {
+      "referenceID" : 32,
+      "context" : "Already in [33] the contribution of light sources has been “learned”: A probability per light source has been determined by the number of successful shadow rays divided by the total number of shadow rays shot.",
+      "startOffset" : 11,
+      "endOffset" : 15
+    }, {
+      "referenceID" : 13,
+      "context" : "This idea has been refined subsequently [14, 32, 2, 31].",
+      "startOffset" : 40,
+      "endOffset" : 55
+    }, {
+      "referenceID" : 31,
+      "context" : "This idea has been refined subsequently [14, 32, 2, 31].",
+      "startOffset" : 40,
+      "endOffset" : 55
+    }, {
+      "referenceID" : 1,
+      "context" : "This idea has been refined subsequently [14, 32, 2, 31].",
+      "startOffset" : 40,
+      "endOffset" : 55
+    }, {
+      "referenceID" : 30,
+      "context" : "This idea has been refined subsequently [14, 32, 2, 31].",
+      "startOffset" : 40,
+      "endOffset" : 55
+    }, {
+      "referenceID" : 22,
+      "context" : "It is interesting to see that this is another relation to reinforcement learning: While the Q-learning equation 5 takes into account the values of the next, non-terminal state, the next state in event estimation is always a terminal state and Q-learning coincides with plain temporal difference learning [23] as in equation 6.",
+      "startOffset" : 304,
+      "endOffset" : 308
+    }, {
+      "referenceID" : 8,
+      "context" : "4) can be considered a photon map [9] and may be used in the same way.",
+      "startOffset" : 34,
+      "endOffset" : 37
+    }, {
+      "referenceID" : 10,
+      "context" : "a set of virtual point light sources for for example the instant radiosity [11] algorithm.",
+      "startOffset" : 75,
+      "endOffset" : 79
+    }, {
+      "referenceID" : 24,
+      "context" : "Continuously updating and learning the measurement contribution function W [25] across frames and using the same seed for the pseudo- or quasi-random sequences allows for generating virtual point light sources that expose a certain coherency over time, which reduces temporal artifacts when rendering animations with global illumination.",
+      "startOffset" : 75,
+      "endOffset" : 79
+    }, {
+      "referenceID" : 26,
+      "context" : "A comparison with the Metropolis algorithm for importance sampling [27, 10] reveals much more uniform noise lacking the typical splotchy structure inherent with the local space exploration of Metropolis samplers.",
+      "startOffset" : 67,
+      "endOffset" : 75
+    }, {
+      "referenceID" : 9,
+      "context" : "A comparison with the Metropolis algorithm for importance sampling [27, 10] reveals much more uniform noise lacking the typical splotchy structure inherent with the local space exploration of Metropolis samplers.",
+      "startOffset" : 67,
+      "endOffset" : 75
+    }, {
+      "referenceID" : 15,
+      "context" : "The idea of guiding light transport paths has been explored before [16, 8, 4, 20, 1, 28].",
+      "startOffset" : 67,
+      "endOffset" : 88
+    }, {
+      "referenceID" : 7,
+      "context" : "The idea of guiding light transport paths has been explored before [16, 8, 4, 20, 1, 28].",
+      "startOffset" : 67,
+      "endOffset" : 88
+    }, {
+      "referenceID" : 3,
+      "context" : "The idea of guiding light transport paths has been explored before [16, 8, 4, 20, 1, 28].",
+      "startOffset" : 67,
+      "endOffset" : 88
+    }, {
+      "referenceID" : 19,
+      "context" : "The idea of guiding light transport paths has been explored before [16, 8, 4, 20, 1, 28].",
+      "startOffset" : 67,
+      "endOffset" : 88
+    }, {
+      "referenceID" : 0,
+      "context" : "The idea of guiding light transport paths has been explored before [16, 8, 4, 20, 1, 28].",
+      "startOffset" : 67,
+      "endOffset" : 88
+    }, {
+      "referenceID" : 27,
+      "context" : "The idea of guiding light transport paths has been explored before [16, 8, 4, 20, 1, 28].",
+      "startOffset" : 67,
+      "endOffset" : 88
+    }, {
+      "referenceID" : 27,
+      "context" : "Based on the approach to guide light paths using a pre-trained Gaussian mixture model [28] to represent probabilities, in [29] in addition the density of light transport paths is controlled across the scene using splitting and Russian roulette.",
+      "startOffset" : 86,
+      "endOffset" : 90
+    }, {
+      "referenceID" : 28,
+      "context" : "Based on the approach to guide light paths using a pre-trained Gaussian mixture model [28] to represent probabilities, in [29] in addition the density of light transport paths is controlled across the scene using splitting and Russian roulette.",
+      "startOffset" : 122,
+      "endOffset" : 126
+    }, {
+      "referenceID" : 15,
+      "context" : "An alternative is the adaptive hierarchical approximation to Q as used in [16].",
+      "startOffset" : 74,
+      "endOffset" : 78
+    }, {
+      "referenceID" : 0,
+      "context" : "Yet, another variant would be learning parameters for lobes to guide light transport paths [1].",
+      "startOffset" : 91,
+      "endOffset" : 94
+    }, {
+      "referenceID" : 15,
+      "context" : "Given that Q asymptotically approximates the incident radiance Li, it is worthwhile to investigate how it can be used for the separation of the main part as explored in [16, 20] to further speed up light transport simulation or even as an alternative to importance sampling.",
+      "startOffset" : 169,
+      "endOffset" : 177
+    }, {
+      "referenceID" : 19,
+      "context" : "Given that Q asymptotically approximates the incident radiance Li, it is worthwhile to investigate how it can be used for the separation of the main part as explored in [16, 20] to further speed up light transport simulation or even as an alternative to importance sampling.",
+      "startOffset" : 169,
+      "endOffset" : 177
+    }, {
+      "referenceID" : 18,
+      "context" : "The combination of reinforcement learning and deep neural networks [19, 7, 17, 18] is an obvious avenue of future research: Representing the radiance on hemispheres already has been successfully explored [22] and the interesting question is how well Q can be represented by neural networks.",
+      "startOffset" : 67,
+      "endOffset" : 82
+    }, {
+      "referenceID" : 6,
+      "context" : "The combination of reinforcement learning and deep neural networks [19, 7, 17, 18] is an obvious avenue of future research: Representing the radiance on hemispheres already has been successfully explored [22] and the interesting question is how well Q can be represented by neural networks.",
+      "startOffset" : 67,
+      "endOffset" : 82
+    }, {
+      "referenceID" : 16,
+      "context" : "The combination of reinforcement learning and deep neural networks [19, 7, 17, 18] is an obvious avenue of future research: Representing the radiance on hemispheres already has been successfully explored [22] and the interesting question is how well Q can be represented by neural networks.",
+      "startOffset" : 67,
+      "endOffset" : 82
+    }, {
+      "referenceID" : 17,
+      "context" : "The combination of reinforcement learning and deep neural networks [19, 7, 17, 18] is an obvious avenue of future research: Representing the radiance on hemispheres already has been successfully explored [22] and the interesting question is how well Q can be represented by neural networks.",
+      "startOffset" : 67,
+      "endOffset" : 82
+    }, {
+      "referenceID" : 21,
+      "context" : "The combination of reinforcement learning and deep neural networks [19, 7, 17, 18] is an obvious avenue of future research: Representing the radiance on hemispheres already has been successfully explored [22] and the interesting question is how well Q can be represented by neural networks.",
+      "startOffset" : 204,
+      "endOffset" : 208
+    } ],
+    "year" : 2017,
+    "abstractText" : "We show that the equations of reinforcement learning and light transport simulation are related integral equations. Based on this correspondence, a scheme to learn importance while sampling path space is derived. The new approach is demonstrated in a consistent light transport simulation algorithm that uses reinforcement learning to progressively learn where light comes from. As using this information for importance sampling includes information about visibility, too, the number of light transport paths with non-zero contribution is dramatically increased, resulting in much less noisy images within a fixed time budget.",
+    "creator" : "LaTeX with hyperref package"
+  }
+}

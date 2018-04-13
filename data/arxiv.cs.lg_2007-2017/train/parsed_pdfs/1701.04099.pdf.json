@@ -1,0 +1,655 @@
+{
+  "name" : "1701.04099.pdf",
+  "metadata" : {
+    "source" : "CRF",
+    "title" : "Field-aware Factorization Machines in a Real-world Online Advertising System",
+    "authors" : [ "Yuchin Juan", "Damien Lefortier", "Olivier Chapelle" ],
+    "emails" : [ "yc.juan@criteo.com", "dlefortier@fb.com", "chapelle@google.com" ],
+    "sections" : [ {
+      "heading" : "1. INTRODUCTION",
+      "text" : "Online advertising is a major business for Internet companies and one of the core problem in that field is to be able to match the right advertisement to the right user at the right time. Accurate click-through rate prediction is essential for solving that problem and has been the topic of extensive research, both for search advertising [11, 20] and display advertising [5, 14]. Performance based advertisers measure the performance of their campaigns not only with respect to clicks, but also to conversions – defined as a user action on the website such a purchase – and specific machine learning models have been developed for conversion prediction [15, 23, 3, 26].\nA prominent model for these prediction problems is logistic regression with cross-features [20, 5]. When all crossfeatures are added, the resulting model is equivalent to a polynomial kernel of degree 2 [2]. A Kaggle challenge was hosted by Criteo in 2014 to compare CTR prediction algorithms.1 Logistic regression with cross-features was indeed quite successful in that competition: the 3rd place winner solution was based on this technique [24]. But the winning\n∗Contributed equally to this work. 1https://www.kaggle.com/c/criteo-display-ad-challenge\nACM ISBN 978-1-4503-2138-9.\nDOI: 10.1145/1235\nsolution is a variant of factorization machines [22] called Field-aware Factorization Machines (FFM) [14]. The impressive performance of FFM prompted us to implement it and test it as part of our production system."
+    }, {
+      "heading" : "FFM.",
+      "text" : "Consider the case of categorical features – most features in ad systems are either categorical or can be made categorical through discretization. Let F be the number of features (or fields) and v1, . . . , vF be the values of these features for a given example. The FFM prediction on this example can be written as:2\nF∑ f1=1 F∑ f2=f1+1 wi1 ·wi2 ,\nwhere i1 = Φ(vf1 , f1, f2), i2 = Φ(vf2 , f2, f1), (1)\nwith w ∈ Rd×k the weight matrix and wi ∈ Rk denotes the embedding of the i-th entry. The mapping Φ(v, f1, f2) maps a value v of feature f1 in the context of feature f2 to an index from 1 to d. This may be any hash function or based on dictionary. In the latter case, d will be equal to F × ∑F f=1 cf , with cf the cardinality of the f -th feature.\nIn regular factorization machines, there is a unique embedding for a given feature value; in other words, the indices in (1) for FM are i1 = Φ(vf1 , f1) and i2 = Φ(vf2 , f2). But in field-aware FM, there is a different embedding depending on the other feature of the dot product. As argued in [14] this gives additional modeling flexibility."
+    }, {
+      "heading" : "Related work.",
+      "text" : "A similar effort to ours has been reported by AdRoll in a blog post:3 the author reports substantial gains after deploying FMs in their CTR prediction system. Google [20] and Facebook [12] may not use FMs but have reported some specific challenges they encountered in productionizing their large scale CTR prediction system, which are related to the challenges for productionizing FFM. Factorisation Machine supported Neural Network (FNN) and Sampling-based Neural Network (SNN) [28] are two learning algorithms related to FMs that have also been applied a CTR prediction task. They are both deep neural networks but differ in their embedding layer: SNN uses a regular embedding layer while\n2The prediction here is specific to categorical features while [14] handles the more general case of continuous features. 3http://tech.adroll.com/blog/data-science/2015/08/25/ factorization-machines.html\nar X\niv :1\n70 1.\n04 09\n9v 1\n[ cs\n.L G\n] 1\n5 Ja\nn 20\n17\nFNN is initialized with the result of a factorization machine. The recent interest in factorization machines have led to the development of distributed solvers [18] for these techniques. Finally a hierarchical version of factorization machines has been introduced in [21].\nEven though FFM have been shown to be a state-of-theart method for computational advertising by winning two Kaggle challenges, it is still unclear if they are well suited in a production environment. The Netflix challenge is a reminder that a production system has some specific set of constraints and goals that differ from the ones of an academic competition: ultimately Netflix decided not use the winning solution.4\nThis paper discusses our attempt at implementing FFM in a production system that predicts click-through and conversion rates on display advertisements. Section 2 presents offline and online (A/B test) results and provides some insights on the benefits of this method over standard logistic regression as well as the challenges for using FFM in a production system. These positive results further led us to address one of the main bottleneck encountered with our FFM implementation: training speed. Section 3 investigates how to train FFM in a distributed environment. And Section 4 offers an innovative model seeding procedure to further solve that problem, resulting in a more accurate model with a shorter training time and using less computation resources. Finally Section 5 presents conclusions and future work."
+    }, {
+      "heading" : "2. FFM IN A PRODUCTION SYSTEM",
+      "text" : "In this Section, we describe how we use FFM in our production system, present our offline and online results, and discuss the benefits and challenges of using FFM in such a setting."
+    }, {
+      "heading" : "2.1 Baseline",
+      "text" : "As discussed in Section 1, state-of-the-art advertising systems are based on click-through rate (CTR) and conversion rate (CR) prediction models. In this paper, we consider both CTR and CR prediction models used for bidding in real-time auctions (see, e.g., [5, 26]). To predict the probability of a sale given a display, we use a multiplicative model between a model of the probability of a click given a display and a model of the probability of a sale given a click, as discussed in [3]. So, in the rest of the paper we call these two models CTR and CR.\nOur baseline system for training these models is based on previous work [1, 5, 26]. Indeed, following [1, 5], we use the hashing trick [27] to reduce the dimensionality of our data and to thus reduce the number of parameters to fit. We use logistic regression (LR) with cross-features fitted with L-BFGS warm-started using SGD [1, 5]. Following [26], we also use cost-sensitive learning for the CR model and weight each sale depending on the value of the sale for the advertiser, as this was shown to increase the performance for the CR model both offline and online. We use Hadoop AllReduce for distributing the learning of our models [1].\nBelow, we investigate the usage of FFM instead of LR for training our CTR and CR prediction models. We still use the hashing trick. So, the mapping Φ(v, f1, f2) in (1) is based on a hash which a fixed hashing space (of the order\n4http://techblog.netflix.com/2012/04/netflixrecommendations-beyond-5-stars.html\nof tens of millions)."
+    }, {
+      "heading" : "2.2 Offline comparison",
+      "text" : "We now present results comparing FFM to the state-ofthe-art baseline on an offline dataset."
+    }, {
+      "heading" : "Offline metrics.",
+      "text" : "We use two offline metrics. First, we use the normalized log loss (NLL). This metric shows the relative improvement in log loss (LL) of the model to be evaluated versus a baseline predictor, in our case the average empirical CTR or CR of the dataset, similar to the normalization in [12, 16, 26]. This metric is defined formally for any prediction p as follows, where we denote p̄ the best constant predictor on the test set and N the number of impressions in our dataset.\nLL(p) = − N∑ i=1 yi log(pi) + (1− yi) log(1− pi) (2)\nNLL(p) = LL(p̄)− LL(p)\nLL(p̄) (3)\nWe also use the Utility5 metric [4, 26], which allows to model offline the potential change in profit due to a prediction model change. Since the observed profit in historical data is fixed, this metric makes the assumption that the display costs are determined by the highest second bids coming from a second price auction and that they are generated according to a distribution conditioned on the observed display cost. This metric is defined as follows, where vi is the reward of the ith impression.\nUtility = ∑ i ∫ p(xi)vi 0 (yi · vi − c̃) Pr(c̃ | ci)dc̃ (4)\nThe distribution Pr(c̃ | c) specifies what could have been the second price instead of the observed cost c; [4] suggests a Gamma distribution with α = βc + 1 and free parameter β. The motivation for selecting this distribution is that it interpolates nicely between two limit distributions: a Dirac distribution centered at c (as β → +∞) and a uniform distribution (as β → 0). It can be shown that the utility with a uniform distribution is equivalent to a weighted squared error [13]."
+    }, {
+      "heading" : "Experimental setup.",
+      "text" : "We use internal data from Criteo to do our experiments. Note, however, that, as discussed in Section 1, FFM have been shown to be better than existing methods on many public data sets already [14]. Moreover, the goal of this section is to show we can improve upon our baseline using FFM in a real-world online advertising system, which uses its own data. We need offline experiments to ensure that FFM are performing well in our system (both in terms of predictive performance and scalability) and for parameter tuning, before we can perform a live experiment (A/B test).\nWe use a variant of progressive validation, similar to [20], for our experiments. The day following the training period serves as a validation set. As shown on Figure 1 below, the process is repeated N times, shifting the learning period\n5This metric is called expected Utility in [4], but we refer to it as Utility in this paper.\n(indicated by ”tr”) by 1 day at each step. The final results are the average metrics over all the test sets (indicated by ”te”).\nParameter tuning is done on a separate temporal slice of data from the data of 1 used for the final experiments. Following [14] the following parameters are tuned: the regularization parameter, the learning rate, and the number of latent factors. We use early-stopping to avoid over-fitting.\nBelow and in the rest of the paper, we use confidence intervals computed using bootstraps [10] at the 90% level. Finally the learning of FFMs is multi-threaded as in [14] to reduce the learning time."
+    }, {
+      "heading" : "Latency & memory consumption.",
+      "text" : "One potential drawback of using FFM in a production system is that they require more CPU time for inference [14]. This may lead to increased latency online when responding to bid requests and therefore come more timeouts. FFM also require more memory for storing the model as the number of latent factors and/or the number of fields increase, which may lead to a much larger memory consumption than LR.\nTo solve the memory issue, we propose to reduce the size of the hashing space of FFM models (compared to our baseline) so that FFM models have the same size as the LR models (the exact value depends on the number of fields and on the number of latent factors). Note that if we had not reduced the size of the hashing space, but kept it constant, the size of FFM models would be more than a 100 times larger than our baseline, which would make it impractical. Therefore, in the results below, FFM and LR models have the same number of parameters (unlike in [14]).\nTo solve the latency issue, we propose to reduce the number of latent factors as much as possible without significantly degrading the performance of FFM. Using these two solutions, FFM and LR consume the same amount of memory and we can limit the impact on latency to handle the requirement of our production system, as we will see below."
+    }, {
+      "heading" : "Offline results.",
+      "text" : "We compare LR and FFM on our CTR and CR prediction tasks in terms of NLL (Table 1) and Utility (Table 2). FFM achieves significantly better results with a large effect compared to LR, both in terms of NLL and of Utility for our CTR model, thus confirming the results from [14] on our data. We also observe large gains on our CR model, thus extending the results from [14] to CR models on all our offline metrics.\nWe also observe that the improvements are even larger on small advertisers, which represent a significant portion of our traffic, for both our CTR and CR models on all metrics. Our hypothesis to explain these results has to do with sparse data and unobserved cross-features: LR is unable to predict the value associated with a cross-feature that is not part of the training data; on the other hand, FFMs are able to better generalize through their latent representation (see de-\ntailed explanation and example in [14, Section 2]). For large advertisers LR has enough data to learn a good model, but for small advertisers FFMs handle this data sparsity issue better than LR.\nDuring the tuning of the hyper-parameters, we observed very similar results as in [14] in terms of performance w.r.t each hyper-parameter. The most important parameter is the number of epochs and we use early-stopping to automatically tune it.\nWe also investigated the prediction time of FFM compared to the baseline model, which is expected to increase despite the fact that we constrained our FFM models to be of the same size of the baseline. This is because the number of operations to compute the prediction (1) is O(F 2k) while LR with all cross-features requires only O(F 2) operations. We observed that the slowdown of FFM is indeed proportional to the number of latent factors k. It turns out that k = 2 is a good trade-off: it hardly degrades the accuracy results compared to the results above which were obtained with 4 latent factors (0.1% in NLL) and a 2x in prediction time in our system is acceptable since prediction is is not the most time-consuming part of processing a request (compared to extracting raw features, pre-processing them, etc.)."
+    }, {
+      "heading" : "2.3 Online comparison",
+      "text" : "As the offline results were quite promising, we decided to run an A/B test using FFM for both CTR and CR predictions models. Although FFM require more time for the inference (see above), we did not observe any significant impact on our timeouts while serving live traffic. So, we were able to A/B test FFM on a large portion of our live traffic. This A/B test served ∼5B displays (∼2.5B for each population).\nDuring the A/B test, we ensured that both the baseline model and FFM were refreshed online synchronously since different refresh rates might bias the results. Even with multi-threading, the learning time of FFM is indeed much higher than for our distributed optimization baseline. In Section 3 and 4, we will see how to reduce this learning time, but now we focus only on the performance improvements we can get online with FFM. The results we obtained are the following.\nResults are shown in Table 3. We observed an increase in the number of displays (+4.59%), while the overall display cost stayed almost constant. We observed less clicks, but more conversions leading to more advertiser value for the same cost. Our change therefore resulted in a significant positive impact: +0.97% of Return On Investment (ROI), that is of advertiser value over cost, which is substantial. We also observed that the improvements were even larger on small advertisers (defined as the ones with less than 30 sales per day), which represent a significant portion of our traffic. On small advertisers, we observed an increase in the number of displays (+4.85%), while the overall display cost stayed almost constant too. We also observed less clicks, but even more conversions leading to even more advertiser value for the same cost and to +2.61% of Return On Investment (ROI), which is remarkable.\nThis confirms our offline results and shows that one of the strengths of FFM is indeed their ability to generalize better than logistic regression through their use of a latent representation."
+    }, {
+      "heading" : "2.4 Discussion",
+      "text" : "Our positive online results motivate us to use FFM in production instead of LR. To do so, the code change is rather small if SGD is already available. However, there are a few challenges to keep in mind when using FFM instead of LR in a production system.\nThe main concern with rolling out FFM is the learning time, which is much higher than the baseline as discussed before. This means that our models would be refreshed less often with FFM, at the cost of reducing the performance of the system. All our offline experiments to improve our models would also take much longer. This is not acceptable and we will discuss in the next two sections how to tackle this problem to handle the scale of a large production system, in particular by distributing the learning on multiple machines.\nThere are also other challenges. Above, we discussed the memory consumption and prediction latency issues and we showed how to manage them. Another potential problem is the non-convexity of the objective function of FFM, which may lead to some instability in the performance of FFM due to local minimums. To investigate this, we learned multiple FFMs on the same dataset initialized with random weights as in [14]. We observed that all the models have similar performance (±0.05% of NLL) despite the different initializations. The local minimum issue is thus not a major concern.\nWe also saw above that the number of hyper-parameters in FFM is larger than for LR with the addition of the learning rate (as we use L-BFGS for training our LR models) and of the number of latent factors, while we only had the regularization parameter to tune for LR. This means that tuning takes more time when improving our models. However, and as discussed in [14], this is not a major problem for multiple reasons. First, the performance is not very sensitive to the number of latent factors and to the regularization parameter, while a good value for the learning rate is easy to find. We also found the performance of FFM to be stable over time w.r.t to the hyper-parameters (no need for constant re-tuning).\nAs we have not been able to find a satisfying regularizer for FFM, we use early-stopping to avoid over-fitting [14]— the only solution we have. So, some monitoring should also\nbe added to ensure that we are not under-fitting or overfitting despite using early stopping (e.g., if the small amount of data used for testing and deciding when to stop is not representative).\nNote finally that for efficient regression testing [16], we need to fix the seed used for randomizing the initial weights [14]."
+    }, {
+      "heading" : "3. A SIMPLE DISTRIBUTED SETTING",
+      "text" : "In the previous section, we discussed that the training time of FFM is too slow to meet our production requirement, even after applying the parallelization approach mentioned in [14] on a multi-core machine.\nTo get more speed-up, a natural option is to train FFM on a distributed system. Generally speaking, for sequential algorithms such as SGD or dual coordinate descent, the convergence of their parallelization depends on how often each worker can access the model. In shared-memory systems, because each thread can access the model in real-time, it is possible that the convergence remains the same, as shown in [14]. However, in distributed systems, where we need to use the network for communication, we can no longer share the model among machines in real-time (due to network overhead). There are two main ways of distributing a stochastic gradient algorithm, synchronously and asynchronously. In both cases, each machine has a subset of the data and its own local model and it updates the global model after a batch of data points has been processed. The asynchronous training is often referred to as the parameter server approach [17, 18, 7]: some machines are dedicated to storing the global model and the workers are continuously reading and updating that model with their local model. The synchronous training on the other hand is referred to as iterative parameter mixing (IPM) [19, 29, 1]: all the models are averaged after a certain amount of data has been processed (e.g. every epoch). From an engineering point of view, simplicity is one of the most important factors we consider when choosing an algorithm. A complicated algorithm requires more time for development, is harder to maintain, and is more likely to introduce bugs. Therefore, in practice, if a simpler algorithm can solve our problem, we would not go for a more\nTable 3: Online relative comparison between Logistic Regression (baseline) and FFM on our CTR and CR prediction models in terms of Return On Investment (ROI), i.e. advertiser value over cost, during our A/B test. Statistical significance is indicated by N.\nPrediction model with FFM ROI ROI\non all advertisers on small advertisers\nCTR + CR +0.97%N +2.61%N\nAlgorithm 1 Iterative Parameter Mixing (IPM) for AdaGrad\n1: Split m data points across k machines 2: Initialize w 3: Initialize Gi ← I ∀i ∈ {1, · · · , k} 4: for t ∈ {1, · · · , T} do . T : number of epochs 5: Let wi ← w ∀i ∈ {1, · · · , k} 6: for i ∈ {1, · · · , k} parallel do 7: for each data point do 8: Calculate the gradient g 9: Update Gi: Gi ← Gi + diag(ggT )\n10: Update wi: wi ← wi − ηG−1/2i g 11: w ← ∑k i=1 wi/k\ncomplicated one. As we will see, with IPM we are already be able to speed-up the training time 12x with 32 machines. This already meets our requirement, so we do not investigate the parameter server approach in this paper. IPM for the AdaGrad learning algorithm [9] is described in Algorithm 1.\nThe speed-up of a distributed algorithm can be modeled by the following equation\nspeed-up = #machines× #epochs with multiple machines #epochs with one machine\nThis equation is based on two assumptions:\n1. Each machine finishes the computation at almost the same time.\n2. The communication cost among machines is negligible.\nIn our case, both assumptions indeed hold. The first assumption holds, because we equally distribute the training data to all machines and make sure that each machine has similar computing power. The second one holds because IPM only requires synchronization at the end of each epoch, making the synchronization time much less than computation time.\nThe “real” distributed algorithm is embedded in our internal system and run on our internal datasets, therefore we are not able to release it. For experimental reproducibility, in this paper we use multi-threading to simulate machines, and use the dataset obtained from Criteo’s CTR Prediction Challenge described in Section 1. This simulation is close to reality because the speed-up of a distributed algorithm depends only on the number of machines used and on the slow down in convergence, which can be exactly simulated by multi-threading.\nIf we directly apply IPM, then the convergence gets slower and slower when we keep adding machines. The experiment result is shown in Table 4. Suppose we use 32 machines instead of 1, although the computation is 32 times faster, it"
+    }, {
+      "heading" : "1 8 0.44552",
+      "text" : ""
+    }, {
+      "heading" : "2 15 0.44548",
+      "text" : ""
+    }, {
+      "heading" : "4 29 0.44549",
+      "text" : ""
+    }, {
+      "heading" : "8 47 0.44560",
+      "text" : ""
+    }, {
+      "heading" : "16 100 0.44554",
+      "text" : ""
+    }, {
+      "heading" : "32 157 0.44585",
+      "text" : "also needs 20 times more epochs. Therefore, the speed-up is only 32/(157/8) ≈ 1.6. A natural way to make the convergence faster is to increase the learning rate η. Though increasing the learning rate indeed makes the algorithm converge faster, it also make the log loss worse. This result is shown in Table 5a.\nWe propose the following approach to solve this issue. Remember that, following [14], we use AdaGrad [9] to boost the performance of SGD. AdaGrad records the squared gradient sum (G) to dynamically adjust the learning rate for each dimension. In Algorithm 1, G is not synchronized among machines. It may make G on each machine very small and make the effective learning rate too large. Based on an idea similar to [1], we aggregate G among each machine at the end of each epoch. This new algorithm is described in Algorithm 2. The experiment result is shown in Table 5b. The log loss is much better when a large learning rate is used.\nUnder this setting, if we choose η = 3.0, the speed-up we can achieve is 32×(8/22) ≈ 12. Indeed, after we applied this setting in our system, we observe a similar speed-up, which enables us to train a model as fast as our current system."
+    }, {
+      "heading" : "4. WARM-START",
+      "text" : "As described in Section 2, we regularly re-train models. In Figure 1, suppose each training set contains several days of data, and we move a few hours forward at each step,\nAlgorithm 2 Improved IPM for AdaGrad\n1: Spread m data points into k machines 2: Initialize w 3: Initialize G← I 4: for t ∈ {1, · · · , T} do . T : number of epochs 5: Let wi ← w ∀i ∈ {1, · · · , k} 6: Let Gi ← G ∀i ∈ {1, · · · , k} 7: for i ∈ {1, · · · , k} parallel do 8: for each data point do 9: Calculate the gradient g\n10: Update Gi: Gi ← Gi + diag(ggT ) 11: Update wi: wi ← wi − ηG−1/2i g 12: w ← ∑k i=1 wi/k\n13: G← ∑k i=1Gi\nAlgorithm 3 A naive warm-start\nRequire: an initial model w0 w← w0 calculate the validation loss L0 for t ∈ {1, . . . , T} do\nupdate w wt ← w calculate the validation loss Lt if Lt > Lt−1 then\nreturn wt−1\nthere will be a large amount of overlap between training sets #1 and #2. This means that the model obtained from #1 may be very similar to one obtained from #2. For logistic regression, the training time to obtain model #2 can be significantly reduced by initializing model #2 with model #1. This technique is known as warm-start [6, 25, 8].\nFor logistic regression, a convex optimization problem, the model will eventually converge to the global optimum no matter warm-start is used or not.6 Warm-start only influences the convergence speed. However, this is not the case for FFM. To explain why, we first review an undesired property of FFM that has been investigated in [14] – we do not have a good regularization method for FFM, and hence need to rely on early-stopping to prevent over-fitting. We visualize this property in Figure 2. To obtain the best test accuracy, the number of epochs must be carefully selected – with insufficient epochs, the model can be under-fitting; on the other hand, with too many epochs, the model can be over-fitting. To determine the best number of epochs, we usually use a validation set to monitor the model performance at each epoch. Once the validation loss goes up, we stop the training process. We define three phases to indicate the “maturity” of the model.\n• Pre-mature: the model is trained with too few epochs\n• Mature: the model is trained with enough epochs\n• Post-mature: the model is trained with too many epochs\nThe use of early stopping, however, makes warm-start difficult to be applied. If we seed a mature model to the next step and keep training, then the new model can be postmature. This problem can be demonstrated in the following\n6Assuming an appropriate optimization method and a tight stopping criteria are applied.\nexperiment. We again use Criteo’s CTR Prediction Challenge dataset for reproducibility. We split the data set into 90 blocks, and at each step, 44 blocks are used for training, 1 block for validation, and 1 block for test. Therefore, the entire experiment starts from the 46th block (as test set), moves one block forward at each step, and ends at the 90th block (as test set). The validation set is used to determine the number of epochs. We first compare a baseline setting, which did not use any warm-start approach, with a naive warm-start described in Algorithm 3, which simply seeds the model obtained in the end of each step into the next step.\nThe experiment result shown in Figure 3 indicates that the post-mature problem indeed happens seriously – the test accuracy is getting worse and worse when the experiments move forward. Again note that the goal of a warm-start technique is to reduce training time while keep the same predictability of the model. Clearly, by using a naive warmstart for FFM, this goal is not achieved.\nIn this paper, we propose a new warm-start approach named pre-mature warm-start. The idea is that instead of seeding a mature model to the next step, a pre-mature model is used as the seed. At each step, since the new model is initialized with a pre-mature model, it may be able to learn\nAlgorithm 4 Our proposed “pre-mature” warm-start\nRequire: an initial model w−1 w← w0 ← w−1 calculate the validation loss L0 for t ∈ {1, . . . , T} do\nupdate w wt ← w calculate the validation loss Lt if Lt > Lt−1 then\nfrom the new data without over-fitting to the old data. For example, if the mature model comes at the 6th epoch, then this model will be used for prediction, but the model obtained at the 5th epoch will be seeded to the next step. The algorithm of pre-mature warm-start is described in Algorithm 4. Here, wt−1 is used for prediction and wt−2 is seeded."
+    }, {
+      "heading" : "Offline results.",
+      "text" : "The experiment results in Figure 3 and 4 show that with pre-mature warm-start, the test performance is not worse than the baseline any more, and the number of epochs required is significantly reduced.\nIt is noteworthy that the log loss of FFM with warmstart is getting lower as the experiment moves forward. This suggests that FFM may have some ability to remember the information learnt in the past. Inspired by this observation, we tried reducing the size of training set. Figure 5 shows the comparison among different training sizes with pre-mature warm-start. We see that after sufficient number of steps, pre-mature with only 4 blocks of training set is still better than the baseline using 44 blocks. By using smaller training set, the training becomes much faster. The comparison of training time is shown in Table 6. If we use 4 blocks for training, then it is 20 times faster than the baseline.\nAn extreme case is to reduce the size of training set to only one block. In this case, because there is no overlap between two consecutive steps, we do not have to use pre-\nmature warm-start. (The purpose of pre-mature warm-start is to prevent over-fitting old data.) We illustrate this setting in the following figure, and refer to it as online.\ntr #1 va #1 te #1\ntr #2 va #2 te #2\n...\nFigure 5 shows FFM still can memorize the information under this setting, as it still out-performs the baseline. However, we do not use this setting because of two reasons. First, our proposed approach can achieve better log loss. Second, conceptually, if we only use a very small portion of data for training, the model can be very sensitive to the quality of this small set. Indeed, for example, at the 36th epoch in Figure 5, we see that online is worse than baseline while our proposed approach still out-performs baseline."
+    }, {
+      "heading" : "Discussion.",
+      "text" : "We have proposed two different ways to reduce training time. Distributed learning reduces the training time by adding more machines, but at the same time also increases the amount of computation. (In our previous experiments, when 32 machines are used, we needed roughly 3 times more epochs.) On the other hand, warm-start reduces\nthe training time by initializing a model wisely and require less training epochs, which means the amount of computation is decreased. In a sense, warm-start seems to be a better approach than distributed learning. However, we cannot completely replace distributed learning with warm-start, because sometimes a cold-start is required, which means we need to train an entirely new model. In practice, this can happen when the code is updated or the system encounters unexpected error. In the cold-start scenario, we still need to rely on distributed learning to make sure we can learn the model on time."
+    }, {
+      "heading" : "5. CONCLUSION",
+      "text" : "In this paper, we showed that Field-aware Factorization Machines can be successfully deployed in large scale advertising system, and that it significantly improves business metrics, in particular for small advertisers. One of the strengths of FFM is indeed their ability to generalize better than logistic regression through their use of a latent representation.\nFurther, we proposed two ways to make training FFM faster: distributed learning and warm-start. The code for the experiments in Section 3 and 4 is available online.7 As future works, we plan to try our warm start method on our other non-convex problems that are difficult to regularize, such as a deep neural network."
+    }, {
+      "heading" : "6. REFERENCES",
+      "text" : "[1] A. Agarwal, O. Chapelle, M. Dud́ık, and J. Langford.\nA reliable effective terascale linear learning system. The Journal of Machine Learning Research, 15(1):1111–1133, 2014.\n[2] Y.-W. Chang, C.-J. Hsieh, K.-W. Chang, M. Ringgaard, and C.-J. Lin. Training and testing low-degree polynomial data mappings via linear svm. Journal of Machine Learning Research, 11(Apr):1471–1490, 2010.\n[3] O. Chapelle. Modeling delayed feedback in display advertising. In Proceedings of the 20th ACM SIGKDD international conference on Knowledge discovery and data mining, pages 1097–1105. ACM, 2014.\n[4] O. Chapelle. Offline evaluation of response prediction in online advertising auctions. In Proceedings of the 24th International Conference on World Wide Web Companion, pages 919–922. International World Wide Web Conferences Steering Committee, 2015.\n[5] O. Chapelle, E. Manavoglu, and R. Rosales. Simple and scalable response prediction for display advertising. ACM Transactions on Intelligent Systems and Technology (TIST), 5(4):61, 2014.\n[6] B.-Y. Chu, C.-H. Ho, C.-H. Tsai, C.-Y. Lin, and C.-J. Lin. Warm start for parameter selection of linear classifiers. In KDD, 2015.\n[7] J. Dean, G. S. Corrado, R. Monga, K. Chen, M. Devin, Q. V. Le, M. Z. Mao, M. Ranzato, A. Senior, P. Tucker, K. Yang, and A. Y. Ng. Large scale distributed deep networks. In NIPS, 2012.\n[8] D. DeCoste and K. Wagstaff. Alpha seeding for support vector machines. In KDD, 2000.\n7https://www.csie.ntu.edu.tw/˜r01922136/ffmpaper2/exp/ ffmpaper2-exp.tar\n[9] J. Duchi, E. Hazan, and Y. Singer. Adaptive subgradient methods for online learning and stochastic optimization. JMLR, 12:2121–2159, 2011.\n[10] B. Efron and R. J. Tibshirani. An introduction to the bootstrap. CRC press, 1994.\n[11] T. Graepel, J. Q. Candela, T. Borchert, and R. Herbrich. Web-scale bayesian click-through rate prediction for sponsored search advertising in microsoft’s bing search engine. In Proceedings of the 27th International Conference on Machine Learning (ICML-10), pages 13–20, 2010.\n[12] X. He, J. Pan, O. Jin, T. Xu, B. Liu, T. Xu, Y. Shi, A. Atallah, R. Herbrich, S. Bowers, et al. Practical lessons from predicting clicks on ads at facebook. In Proceedings of 20th ACM SIGKDD Conference on Knowledge Discovery and Data Mining, pages 1–9. ACM, 2014.\n[13] P. Hummel and R. P. McAfee. Loss functions for predicted click through rates in auctions for online advertising. Preprint, Google Inc, 2013.\n[14] Y. Juan, Y. Zhaung, W.-S. Chin, and C.-J. Lin. Field-aware factorization machines for CTR prediction. In RecSys, 2016.\n[15] K.-c. Lee, B. Orten, A. Dasdan, and W. Li. Estimating conversion rate in display advertising from past erformance data. In Proceedings of the 18th ACM SIGKDD international conference on Knowledge discovery and data mining, pages 768–776. ACM, 2012.\n[16] D. Lefortier, A. Truchet, and M. de Rijke. Sources of variability in large-scale machine learning systems. In Machine Learning Systems (NIPS 2015 Workshop), 2015.\n[17] M. Li, D. G. Andersen, A. Smola, and K. Yu. Communication efficient distributed machine learning with the parameter server. In Proceedings of the 27th International Conference on Neural Information Processing Systems, NIPS’14, pages 19–27, Cambridge, MA, USA, 2014. MIT Press.\n[18] M. Li, Z. Liu, A. J. Smola, and Y.-X. Wang. Difacto: Distributed factorization machines. In Proceedings of the Ninth ACM International Conference on Web Search and Data Mining, pages 377–386. ACM, 2016.\n[19] R. McDonald, K. Hall, and G. Mann. Distributed training strategies for the structured perceptron. In Human Language Technologies: The 2010 Annual Conference of the North American Chapter of the Association for Computational Linguistics, HLT ’10, pages 456–464, Stroudsburg, PA, USA, 2010. Association for Computational Linguistics.\n[20] H. B. McMahan, G. Holt, D. Sculley, M. Young, D. Ebner, J. Grady, L. Nie, T. Phillips, E. Davydov, D. Golovin, et al. Ad click prediction: a view from the trenches. In Proceedings of the 19th ACM SIGKDD international conference on Knowledge discovery and data mining, pages 1222–1230. ACM, 2013.\n[21] R. J. Oentaryo, E.-P. Lim, J.-W. Low, D. Lo, and M. Finegold. Predicting response in mobile advertising with hierarchical importance-aware factorization machine. In Proceedings of the 7th ACM international conference on Web search and data mining, pages 123–132. ACM, 2014.\n[22] S. Rendle. Factorization machines with libFM. ACM Transactions on Intelligent Systems and Technology (TIST), 3(3):57, 2012.\n[23] R. Rosales, H. Cheng, and E. Manavoglu. Post-click conversion modeling and analysis for non-guaranteed delivery display advertising. In Proceedings of the fifth ACM international conference on Web search and data mining, pages 293–302. ACM, 2012.\n[24] G. Song. Criteo display advertising challenge. Available at https://www.kaggle.com/c/ criteo-display-ad-challenge/forums/t/10547/ document-and-code-for-the-3rd-place-finish, 2014.\n[25] C.-H. Tsai, C.-Y. Lin, and C.-J. Lin. Incremental and decremental training for linear classification. In KDD, 2014.\n[26] F. Vasile, D. Lefortier, and O. Chapelle. Cost-sensitive learning for utility optimization in online advertising auctions. arXiv preprint arXiv:1603.03713, 2016.\n[27] K. Weinberger, A. Dasgupta, J. Langford, A. Smola, and J. Attenberg. Feature hashing for large scale multitask learning. In Proceedings of the 26th Annual International Conference on Machine Learning, pages 1113–1120. ACM, 2009.\n[28] W. Zhang, T. Du, and J. Wang. Deep learning over multi-field categorical data. In European Conference on Information Retrieval, pages 45–57. Springer, 2016.\n[29] M. Zinkevich, M. Weimer, L. Li, and A. J. Smola. Parallelized stochastic gradient descent. In J. D. Lafferty, C. K. I. Williams, J. Shawe-Taylor, R. S. Zemel, and A. Culotta, editors, Advances in Neural Information Processing Systems 23, pages 2595–2603. Curran Associates, Inc., 2010."
+    } ],
+    "references" : [ {
+      "title" : "A reliable effective terascale linear learning system",
+      "author" : [ "A. Agarwal", "O. Chapelle", "M. Dud́ık", "J. Langford" ],
+      "venue" : "The Journal of Machine Learning Research,",
+      "citeRegEx" : "1",
+      "shortCiteRegEx" : "1",
+      "year" : 2014
+    }, {
+      "title" : "Training and testing low-degree polynomial data mappings via linear svm",
+      "author" : [ "Y.-W. Chang", "C.-J. Hsieh", "K.-W. Chang", "M. Ringgaard", "C.-J. Lin" ],
+      "venue" : "Journal of Machine Learning Research,",
+      "citeRegEx" : "2",
+      "shortCiteRegEx" : "2",
+      "year" : 2010
+    }, {
+      "title" : "Modeling delayed feedback in display advertising",
+      "author" : [ "O. Chapelle" ],
+      "venue" : "In Proceedings of the 20th ACM SIGKDD international conference on Knowledge discovery and data mining,",
+      "citeRegEx" : "3",
+      "shortCiteRegEx" : "3",
+      "year" : 2014
+    }, {
+      "title" : "Offline evaluation of response prediction in online advertising auctions",
+      "author" : [ "O. Chapelle" ],
+      "venue" : "In Proceedings of the 24th International Conference on World Wide Web Companion,",
+      "citeRegEx" : "4",
+      "shortCiteRegEx" : "4",
+      "year" : 2015
+    }, {
+      "title" : "Simple and scalable response prediction for display advertising",
+      "author" : [ "O. Chapelle", "E. Manavoglu", "R. Rosales" ],
+      "venue" : "ACM Transactions on Intelligent Systems and Technology (TIST),",
+      "citeRegEx" : "5",
+      "shortCiteRegEx" : "5",
+      "year" : 2014
+    }, {
+      "title" : "Warm start for parameter selection of linear classifiers",
+      "author" : [ "B.-Y. Chu", "C.-H. Ho", "C.-H. Tsai", "C.-Y. Lin", "C.-J. Lin" ],
+      "venue" : "In KDD,",
+      "citeRegEx" : "6",
+      "shortCiteRegEx" : "6",
+      "year" : 2015
+    }, {
+      "title" : "Large scale distributed deep networks",
+      "author" : [ "J. Dean", "G.S. Corrado", "R. Monga", "K. Chen", "M. Devin", "Q.V. Le", "M.Z. Mao", "M. Ranzato", "A. Senior", "P. Tucker", "K. Yang", "A.Y. Ng" ],
+      "venue" : "In NIPS,",
+      "citeRegEx" : "7",
+      "shortCiteRegEx" : "7",
+      "year" : 2012
+    }, {
+      "title" : "Alpha seeding for support vector machines",
+      "author" : [ "D. DeCoste", "K. Wagstaff" ],
+      "venue" : "In KDD,",
+      "citeRegEx" : "8",
+      "shortCiteRegEx" : "8",
+      "year" : 2000
+    }, {
+      "title" : "Adaptive subgradient methods for online learning and stochastic optimization",
+      "author" : [ "J. Duchi", "E. Hazan", "Y. Singer" ],
+      "venue" : "JMLR, 12:2121–2159,",
+      "citeRegEx" : "9",
+      "shortCiteRegEx" : "9",
+      "year" : 2011
+    }, {
+      "title" : "An introduction to the bootstrap",
+      "author" : [ "B. Efron", "R.J. Tibshirani" ],
+      "venue" : "CRC press,",
+      "citeRegEx" : "10",
+      "shortCiteRegEx" : "10",
+      "year" : 1994
+    }, {
+      "title" : "Web-scale bayesian click-through rate prediction for sponsored search advertising in microsoft’s bing search engine",
+      "author" : [ "T. Graepel", "J.Q. Candela", "T. Borchert", "R. Herbrich" ],
+      "venue" : "In Proceedings of the 27th International Conference on Machine Learning",
+      "citeRegEx" : "11",
+      "shortCiteRegEx" : "11",
+      "year" : 2010
+    }, {
+      "title" : "Practical lessons from predicting clicks on ads at facebook",
+      "author" : [ "X. He", "J. Pan", "O. Jin", "T. Xu", "B. Liu", "Y. Shi", "A. Atallah", "R. Herbrich", "S. Bowers" ],
+      "venue" : "In Proceedings of 20th ACM SIGKDD Conference on Knowledge Discovery and Data Mining,",
+      "citeRegEx" : "12",
+      "shortCiteRegEx" : "12",
+      "year" : 2014
+    }, {
+      "title" : "Loss functions for predicted click through rates in auctions for online advertising",
+      "author" : [ "P. Hummel", "R.P. McAfee" ],
+      "venue" : null,
+      "citeRegEx" : "13",
+      "shortCiteRegEx" : "13",
+      "year" : 2013
+    }, {
+      "title" : "Field-aware factorization machines for CTR prediction",
+      "author" : [ "Y. Juan", "Y. Zhaung", "W.-S. Chin", "C.-J. Lin" ],
+      "venue" : "In RecSys,",
+      "citeRegEx" : "14",
+      "shortCiteRegEx" : "14",
+      "year" : 2016
+    }, {
+      "title" : "Estimating conversion rate in display advertising from past erformance data",
+      "author" : [ "K.-c. Lee", "B. Orten", "A. Dasdan", "W. Li" ],
+      "venue" : "In Proceedings of the 18th ACM SIGKDD international conference on Knowledge discovery and data mining,",
+      "citeRegEx" : "15",
+      "shortCiteRegEx" : "15",
+      "year" : 2012
+    }, {
+      "title" : "Sources of variability in large-scale machine learning systems",
+      "author" : [ "D. Lefortier", "A. Truchet", "M. de Rijke" ],
+      "venue" : "In Machine Learning Systems (NIPS 2015 Workshop),",
+      "citeRegEx" : "16",
+      "shortCiteRegEx" : "16",
+      "year" : 2015
+    }, {
+      "title" : "Communication efficient distributed machine learning with the parameter server",
+      "author" : [ "M. Li", "D.G. Andersen", "A. Smola", "K. Yu" ],
+      "venue" : "In Proceedings of the 27th International Conference on Neural Information Processing Systems,",
+      "citeRegEx" : "17",
+      "shortCiteRegEx" : "17",
+      "year" : 2014
+    }, {
+      "title" : "Difacto: Distributed factorization machines",
+      "author" : [ "M. Li", "Z. Liu", "A.J. Smola", "Y.-X. Wang" ],
+      "venue" : "In Proceedings of the Ninth ACM International Conference on Web Search and Data Mining,",
+      "citeRegEx" : "18",
+      "shortCiteRegEx" : "18",
+      "year" : 2016
+    }, {
+      "title" : "Distributed training strategies for the structured perceptron",
+      "author" : [ "R. McDonald", "K. Hall", "G. Mann" ],
+      "venue" : "In Human Language Technologies: The 2010 Annual Conference of the North American Chapter of the Association for Computational Linguistics,",
+      "citeRegEx" : "19",
+      "shortCiteRegEx" : "19",
+      "year" : 2010
+    }, {
+      "title" : "Ad click prediction: a view from the trenches",
+      "author" : [ "H.B. McMahan", "G. Holt", "D. Sculley", "M. Young", "D. Ebner", "J. Grady", "L. Nie", "T. Phillips", "E. Davydov", "D. Golovin" ],
+      "venue" : "In Proceedings of the 19th ACM SIGKDD international conference on Knowledge discovery and data mining,",
+      "citeRegEx" : "20",
+      "shortCiteRegEx" : "20",
+      "year" : 2013
+    }, {
+      "title" : "Predicting response in mobile advertising with hierarchical importance-aware factorization machine",
+      "author" : [ "R.J. Oentaryo", "E.-P. Lim", "J.-W. Low", "D. Lo", "M. Finegold" ],
+      "venue" : "In Proceedings of the 7th ACM international conference on Web search and data mining,",
+      "citeRegEx" : "21",
+      "shortCiteRegEx" : "21",
+      "year" : 2014
+    }, {
+      "title" : "Factorization machines with libFM",
+      "author" : [ "S. Rendle" ],
+      "venue" : "ACM Transactions on Intelligent Systems and Technology (TIST),",
+      "citeRegEx" : "22",
+      "shortCiteRegEx" : "22",
+      "year" : 2012
+    }, {
+      "title" : "Post-click conversion modeling and analysis for non-guaranteed delivery display advertising",
+      "author" : [ "R. Rosales", "H. Cheng", "E. Manavoglu" ],
+      "venue" : "In Proceedings of the fifth ACM international conference on Web search and data mining,",
+      "citeRegEx" : "23",
+      "shortCiteRegEx" : "23",
+      "year" : 2012
+    }, {
+      "title" : "Criteo display advertising challenge",
+      "author" : [ "G. Song" ],
+      "venue" : "Available at https://www.kaggle.com/c/ criteo-display-ad-challenge/forums/t/10547/ document-and-code-for-the-3rd-place-finish,",
+      "citeRegEx" : "24",
+      "shortCiteRegEx" : "24",
+      "year" : 2014
+    }, {
+      "title" : "Incremental and decremental training for linear classification",
+      "author" : [ "C.-H. Tsai", "C.-Y. Lin", "C.-J. Lin" ],
+      "venue" : "In KDD,",
+      "citeRegEx" : "25",
+      "shortCiteRegEx" : "25",
+      "year" : 2014
+    }, {
+      "title" : "Cost-sensitive learning for utility optimization in online advertising auctions",
+      "author" : [ "F. Vasile", "D. Lefortier", "O. Chapelle" ],
+      "venue" : "arXiv preprint arXiv:1603.03713,",
+      "citeRegEx" : "26",
+      "shortCiteRegEx" : "26",
+      "year" : 2016
+    }, {
+      "title" : "Feature hashing for large scale multitask learning",
+      "author" : [ "K. Weinberger", "A. Dasgupta", "J. Langford", "A. Smola", "J. Attenberg" ],
+      "venue" : "In Proceedings of the 26th Annual International Conference on Machine Learning,",
+      "citeRegEx" : "27",
+      "shortCiteRegEx" : "27",
+      "year" : 2009
+    }, {
+      "title" : "Deep learning over multi-field categorical data",
+      "author" : [ "W. Zhang", "T. Du", "J. Wang" ],
+      "venue" : "In European Conference on Information Retrieval,",
+      "citeRegEx" : "28",
+      "shortCiteRegEx" : "28",
+      "year" : 2016
+    }, {
+      "title" : "Parallelized stochastic gradient descent",
+      "author" : [ "M. Zinkevich", "M. Weimer", "L. Li", "A.J. Smola" ],
+      "venue" : "Advances in Neural Information Processing Systems",
+      "citeRegEx" : "29",
+      "shortCiteRegEx" : "29",
+      "year" : 2010
+    } ],
+    "referenceMentions" : [ {
+      "referenceID" : 10,
+      "context" : "Accurate click-through rate prediction is essential for solving that problem and has been the topic of extensive research, both for search advertising [11, 20] and display advertising [5, 14].",
+      "startOffset" : 151,
+      "endOffset" : 159
+    }, {
+      "referenceID" : 19,
+      "context" : "Accurate click-through rate prediction is essential for solving that problem and has been the topic of extensive research, both for search advertising [11, 20] and display advertising [5, 14].",
+      "startOffset" : 151,
+      "endOffset" : 159
+    }, {
+      "referenceID" : 4,
+      "context" : "Accurate click-through rate prediction is essential for solving that problem and has been the topic of extensive research, both for search advertising [11, 20] and display advertising [5, 14].",
+      "startOffset" : 184,
+      "endOffset" : 191
+    }, {
+      "referenceID" : 13,
+      "context" : "Accurate click-through rate prediction is essential for solving that problem and has been the topic of extensive research, both for search advertising [11, 20] and display advertising [5, 14].",
+      "startOffset" : 184,
+      "endOffset" : 191
+    }, {
+      "referenceID" : 14,
+      "context" : "Performance based advertisers measure the performance of their campaigns not only with respect to clicks, but also to conversions – defined as a user action on the website such a purchase – and specific machine learning models have been developed for conversion prediction [15, 23, 3, 26].",
+      "startOffset" : 273,
+      "endOffset" : 288
+    }, {
+      "referenceID" : 22,
+      "context" : "Performance based advertisers measure the performance of their campaigns not only with respect to clicks, but also to conversions – defined as a user action on the website such a purchase – and specific machine learning models have been developed for conversion prediction [15, 23, 3, 26].",
+      "startOffset" : 273,
+      "endOffset" : 288
+    }, {
+      "referenceID" : 2,
+      "context" : "Performance based advertisers measure the performance of their campaigns not only with respect to clicks, but also to conversions – defined as a user action on the website such a purchase – and specific machine learning models have been developed for conversion prediction [15, 23, 3, 26].",
+      "startOffset" : 273,
+      "endOffset" : 288
+    }, {
+      "referenceID" : 25,
+      "context" : "Performance based advertisers measure the performance of their campaigns not only with respect to clicks, but also to conversions – defined as a user action on the website such a purchase – and specific machine learning models have been developed for conversion prediction [15, 23, 3, 26].",
+      "startOffset" : 273,
+      "endOffset" : 288
+    }, {
+      "referenceID" : 19,
+      "context" : "A prominent model for these prediction problems is logistic regression with cross-features [20, 5].",
+      "startOffset" : 91,
+      "endOffset" : 98
+    }, {
+      "referenceID" : 4,
+      "context" : "A prominent model for these prediction problems is logistic regression with cross-features [20, 5].",
+      "startOffset" : 91,
+      "endOffset" : 98
+    }, {
+      "referenceID" : 1,
+      "context" : "When all crossfeatures are added, the resulting model is equivalent to a polynomial kernel of degree 2 [2].",
+      "startOffset" : 103,
+      "endOffset" : 106
+    }, {
+      "referenceID" : 23,
+      "context" : "Logistic regression with cross-features was indeed quite successful in that competition: the 3rd place winner solution was based on this technique [24].",
+      "startOffset" : 147,
+      "endOffset" : 151
+    }, {
+      "referenceID" : 21,
+      "context" : "1145/1235 solution is a variant of factorization machines [22] called Field-aware Factorization Machines (FFM) [14].",
+      "startOffset" : 58,
+      "endOffset" : 62
+    }, {
+      "referenceID" : 13,
+      "context" : "1145/1235 solution is a variant of factorization machines [22] called Field-aware Factorization Machines (FFM) [14].",
+      "startOffset" : 111,
+      "endOffset" : 115
+    }, {
+      "referenceID" : 13,
+      "context" : "As argued in [14] this gives additional modeling flexibility.",
+      "startOffset" : 13,
+      "endOffset" : 17
+    }, {
+      "referenceID" : 19,
+      "context" : "Google [20] and Facebook [12] may not use FMs but have reported some specific challenges they encountered in productionizing their large scale CTR prediction system, which are related to the challenges for productionizing FFM.",
+      "startOffset" : 7,
+      "endOffset" : 11
+    }, {
+      "referenceID" : 11,
+      "context" : "Google [20] and Facebook [12] may not use FMs but have reported some specific challenges they encountered in productionizing their large scale CTR prediction system, which are related to the challenges for productionizing FFM.",
+      "startOffset" : 25,
+      "endOffset" : 29
+    }, {
+      "referenceID" : 27,
+      "context" : "Factorisation Machine supported Neural Network (FNN) and Sampling-based Neural Network (SNN) [28] are two learning algorithms related to FMs that have also been applied a CTR prediction task.",
+      "startOffset" : 93,
+      "endOffset" : 97
+    }, {
+      "referenceID" : 13,
+      "context" : "The prediction here is specific to categorical features while [14] handles the more general case of continuous features.",
+      "startOffset" : 62,
+      "endOffset" : 66
+    }, {
+      "referenceID" : 17,
+      "context" : "The recent interest in factorization machines have led to the development of distributed solvers [18] for these techniques.",
+      "startOffset" : 97,
+      "endOffset" : 101
+    }, {
+      "referenceID" : 20,
+      "context" : "Finally a hierarchical version of factorization machines has been introduced in [21].",
+      "startOffset" : 80,
+      "endOffset" : 84
+    }, {
+      "referenceID" : 4,
+      "context" : ", [5, 26]).",
+      "startOffset" : 2,
+      "endOffset" : 9
+    }, {
+      "referenceID" : 25,
+      "context" : ", [5, 26]).",
+      "startOffset" : 2,
+      "endOffset" : 9
+    }, {
+      "referenceID" : 2,
+      "context" : "To predict the probability of a sale given a display, we use a multiplicative model between a model of the probability of a click given a display and a model of the probability of a sale given a click, as discussed in [3].",
+      "startOffset" : 218,
+      "endOffset" : 221
+    }, {
+      "referenceID" : 0,
+      "context" : "Our baseline system for training these models is based on previous work [1, 5, 26].",
+      "startOffset" : 72,
+      "endOffset" : 82
+    }, {
+      "referenceID" : 4,
+      "context" : "Our baseline system for training these models is based on previous work [1, 5, 26].",
+      "startOffset" : 72,
+      "endOffset" : 82
+    }, {
+      "referenceID" : 25,
+      "context" : "Our baseline system for training these models is based on previous work [1, 5, 26].",
+      "startOffset" : 72,
+      "endOffset" : 82
+    }, {
+      "referenceID" : 0,
+      "context" : "Indeed, following [1, 5], we use the hashing trick [27] to reduce the dimensionality of our data and to thus reduce the number of parameters to fit.",
+      "startOffset" : 18,
+      "endOffset" : 24
+    }, {
+      "referenceID" : 4,
+      "context" : "Indeed, following [1, 5], we use the hashing trick [27] to reduce the dimensionality of our data and to thus reduce the number of parameters to fit.",
+      "startOffset" : 18,
+      "endOffset" : 24
+    }, {
+      "referenceID" : 26,
+      "context" : "Indeed, following [1, 5], we use the hashing trick [27] to reduce the dimensionality of our data and to thus reduce the number of parameters to fit.",
+      "startOffset" : 51,
+      "endOffset" : 55
+    }, {
+      "referenceID" : 0,
+      "context" : "We use logistic regression (LR) with cross-features fitted with L-BFGS warm-started using SGD [1, 5].",
+      "startOffset" : 94,
+      "endOffset" : 100
+    }, {
+      "referenceID" : 4,
+      "context" : "We use logistic regression (LR) with cross-features fitted with L-BFGS warm-started using SGD [1, 5].",
+      "startOffset" : 94,
+      "endOffset" : 100
+    }, {
+      "referenceID" : 25,
+      "context" : "Following [26], we also use cost-sensitive learning for the CR model and weight each sale depending on the value of the sale for the advertiser, as this was shown to increase the performance for the CR model both offline and online.",
+      "startOffset" : 10,
+      "endOffset" : 14
+    }, {
+      "referenceID" : 0,
+      "context" : "We use Hadoop AllReduce for distributing the learning of our models [1].",
+      "startOffset" : 68,
+      "endOffset" : 71
+    }, {
+      "referenceID" : 11,
+      "context" : "This metric shows the relative improvement in log loss (LL) of the model to be evaluated versus a baseline predictor, in our case the average empirical CTR or CR of the dataset, similar to the normalization in [12, 16, 26].",
+      "startOffset" : 210,
+      "endOffset" : 222
+    }, {
+      "referenceID" : 15,
+      "context" : "This metric shows the relative improvement in log loss (LL) of the model to be evaluated versus a baseline predictor, in our case the average empirical CTR or CR of the dataset, similar to the normalization in [12, 16, 26].",
+      "startOffset" : 210,
+      "endOffset" : 222
+    }, {
+      "referenceID" : 25,
+      "context" : "This metric shows the relative improvement in log loss (LL) of the model to be evaluated versus a baseline predictor, in our case the average empirical CTR or CR of the dataset, similar to the normalization in [12, 16, 26].",
+      "startOffset" : 210,
+      "endOffset" : 222
+    }, {
+      "referenceID" : 3,
+      "context" : "We also use the Utility metric [4, 26], which allows to model offline the potential change in profit due to a prediction model change.",
+      "startOffset" : 31,
+      "endOffset" : 38
+    }, {
+      "referenceID" : 25,
+      "context" : "We also use the Utility metric [4, 26], which allows to model offline the potential change in profit due to a prediction model change.",
+      "startOffset" : 31,
+      "endOffset" : 38
+    }, {
+      "referenceID" : 3,
+      "context" : "The distribution Pr(c̃ | c) specifies what could have been the second price instead of the observed cost c; [4] suggests a Gamma distribution with α = βc + 1 and free parameter β.",
+      "startOffset" : 108,
+      "endOffset" : 111
+    }, {
+      "referenceID" : 12,
+      "context" : "It can be shown that the utility with a uniform distribution is equivalent to a weighted squared error [13].",
+      "startOffset" : 103,
+      "endOffset" : 107
+    }, {
+      "referenceID" : 13,
+      "context" : "Note, however, that, as discussed in Section 1, FFM have been shown to be better than existing methods on many public data sets already [14].",
+      "startOffset" : 136,
+      "endOffset" : 140
+    }, {
+      "referenceID" : 19,
+      "context" : "We use a variant of progressive validation, similar to [20], for our experiments.",
+      "startOffset" : 55,
+      "endOffset" : 59
+    }, {
+      "referenceID" : 3,
+      "context" : "This metric is called expected Utility in [4], but we refer to it as Utility in this paper.",
+      "startOffset" : 42,
+      "endOffset" : 45
+    }, {
+      "referenceID" : 13,
+      "context" : "Following [14] the following parameters are tuned: the regularization parameter, the learning rate, and the number of latent factors.",
+      "startOffset" : 10,
+      "endOffset" : 14
+    }, {
+      "referenceID" : 9,
+      "context" : "Below and in the rest of the paper, we use confidence intervals computed using bootstraps [10] at the 90% level.",
+      "startOffset" : 90,
+      "endOffset" : 94
+    }, {
+      "referenceID" : 13,
+      "context" : "Finally the learning of FFMs is multi-threaded as in [14] to reduce the learning time.",
+      "startOffset" : 53,
+      "endOffset" : 57
+    }, {
+      "referenceID" : 13,
+      "context" : "One potential drawback of using FFM in a production system is that they require more CPU time for inference [14].",
+      "startOffset" : 108,
+      "endOffset" : 112
+    }, {
+      "referenceID" : 13,
+      "context" : "Therefore, in the results below, FFM and LR models have the same number of parameters (unlike in [14]).",
+      "startOffset" : 97,
+      "endOffset" : 101
+    }, {
+      "referenceID" : 13,
+      "context" : "FFM achieves significantly better results with a large effect compared to LR, both in terms of NLL and of Utility for our CTR model, thus confirming the results from [14] on our data.",
+      "startOffset" : 166,
+      "endOffset" : 170
+    }, {
+      "referenceID" : 13,
+      "context" : "We also observe large gains on our CR model, thus extending the results from [14] to CR models on all our offline metrics.",
+      "startOffset" : 77,
+      "endOffset" : 81
+    }, {
+      "referenceID" : 13,
+      "context" : "During the tuning of the hyper-parameters, we observed very similar results as in [14] in terms of performance w.",
+      "startOffset" : 82,
+      "endOffset" : 86
+    }, {
+      "referenceID" : 13,
+      "context" : "To investigate this, we learned multiple FFMs on the same dataset initialized with random weights as in [14].",
+      "startOffset" : 104,
+      "endOffset" : 108
+    }, {
+      "referenceID" : 13,
+      "context" : "However, and as discussed in [14], this is not a major problem for multiple reasons.",
+      "startOffset" : 29,
+      "endOffset" : 33
+    }, {
+      "referenceID" : 13,
+      "context" : "As we have not been able to find a satisfying regularizer for FFM, we use early-stopping to avoid over-fitting [14]— the only solution we have.",
+      "startOffset" : 111,
+      "endOffset" : 115
+    }, {
+      "referenceID" : 15,
+      "context" : "Note finally that for efficient regression testing [16], we need to fix the seed used for randomizing the initial weights [14].",
+      "startOffset" : 51,
+      "endOffset" : 55
+    }, {
+      "referenceID" : 13,
+      "context" : "Note finally that for efficient regression testing [16], we need to fix the seed used for randomizing the initial weights [14].",
+      "startOffset" : 122,
+      "endOffset" : 126
+    }, {
+      "referenceID" : 13,
+      "context" : "In the previous section, we discussed that the training time of FFM is too slow to meet our production requirement, even after applying the parallelization approach mentioned in [14] on a multi-core machine.",
+      "startOffset" : 178,
+      "endOffset" : 182
+    }, {
+      "referenceID" : 13,
+      "context" : "In shared-memory systems, because each thread can access the model in real-time, it is possible that the convergence remains the same, as shown in [14].",
+      "startOffset" : 147,
+      "endOffset" : 151
+    }, {
+      "referenceID" : 16,
+      "context" : "The asynchronous training is often referred to as the parameter server approach [17, 18, 7]: some machines are dedicated to storing the global model and the workers are continuously reading and updating that model with their local model.",
+      "startOffset" : 80,
+      "endOffset" : 91
+    }, {
+      "referenceID" : 17,
+      "context" : "The asynchronous training is often referred to as the parameter server approach [17, 18, 7]: some machines are dedicated to storing the global model and the workers are continuously reading and updating that model with their local model.",
+      "startOffset" : 80,
+      "endOffset" : 91
+    }, {
+      "referenceID" : 6,
+      "context" : "The asynchronous training is often referred to as the parameter server approach [17, 18, 7]: some machines are dedicated to storing the global model and the workers are continuously reading and updating that model with their local model.",
+      "startOffset" : 80,
+      "endOffset" : 91
+    }, {
+      "referenceID" : 18,
+      "context" : "The synchronous training on the other hand is referred to as iterative parameter mixing (IPM) [19, 29, 1]: all the models are averaged after a certain amount of data has been processed (e.",
+      "startOffset" : 94,
+      "endOffset" : 105
+    }, {
+      "referenceID" : 28,
+      "context" : "The synchronous training on the other hand is referred to as iterative parameter mixing (IPM) [19, 29, 1]: all the models are averaged after a certain amount of data has been processed (e.",
+      "startOffset" : 94,
+      "endOffset" : 105
+    }, {
+      "referenceID" : 0,
+      "context" : "The synchronous training on the other hand is referred to as iterative parameter mixing (IPM) [19, 29, 1]: all the models are averaged after a certain amount of data has been processed (e.",
+      "startOffset" : 94,
+      "endOffset" : 105
+    }, {
+      "referenceID" : 8,
+      "context" : "IPM for the AdaGrad learning algorithm [9] is described in Algorithm 1.",
+      "startOffset" : 39,
+      "endOffset" : 42
+    }, {
+      "referenceID" : 13,
+      "context" : "Remember that, following [14], we use AdaGrad [9] to boost the performance of SGD.",
+      "startOffset" : 25,
+      "endOffset" : 29
+    }, {
+      "referenceID" : 8,
+      "context" : "Remember that, following [14], we use AdaGrad [9] to boost the performance of SGD.",
+      "startOffset" : 46,
+      "endOffset" : 49
+    }, {
+      "referenceID" : 0,
+      "context" : "Based on an idea similar to [1], we aggregate G among each machine at the end of each epoch.",
+      "startOffset" : 28,
+      "endOffset" : 31
+    }, {
+      "referenceID" : 5,
+      "context" : "This technique is known as warm-start [6, 25, 8].",
+      "startOffset" : 38,
+      "endOffset" : 48
+    }, {
+      "referenceID" : 24,
+      "context" : "This technique is known as warm-start [6, 25, 8].",
+      "startOffset" : 38,
+      "endOffset" : 48
+    }, {
+      "referenceID" : 7,
+      "context" : "This technique is known as warm-start [6, 25, 8].",
+      "startOffset" : 38,
+      "endOffset" : 48
+    }, {
+      "referenceID" : 13,
+      "context" : "To explain why, we first review an undesired property of FFM that has been investigated in [14] – we do not have a good regularization method for FFM, and hence need to rely on early-stopping to prevent over-fitting.",
+      "startOffset" : 91,
+      "endOffset" : 95
+    } ],
+    "year" : 2017,
+    "abstractText" : "Predicting user response is one of the core machine learning tasks in computational advertising. Field-aware Factorization Machines (FFM) have recently been established as a state-of-the-art method for that problem and in particular won two Kaggle challenges. This paper presents some results from implementing this method in a production system that predicts click-through and conversion rates for display advertising and shows that this method it is not only effective to win challenges but is also valuable in a real-world prediction system. We also discuss some specific challenges and solutions to reduce the training time, namely the use of an innovative seeding algorithm and a distributed learning mechanism.",
+    "creator" : "LaTeX with hyperref package"
+  }
+}

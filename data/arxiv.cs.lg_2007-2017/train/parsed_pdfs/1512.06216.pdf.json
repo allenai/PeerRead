@@ -1,0 +1,576 @@
+{
+  "name" : "1512.06216.pdf",
+  "metadata" : {
+    "source" : "CRF",
+    "title" : "Poseidon: A System Architecture for Efficient GPU-based Deep Learning on Multiple Machines",
+    "authors" : [ "Hao Zhang", "Zhiting Hu", "Jinliang Wei", "Pengtao Xie", "Gunhee Kim", "Qirong Ho", "Eric P. Xing" ],
+    "emails" : [ "epxing}@cs.cmu.edu,", "gunhee@snu.ac.kr,", "hoqirong@gmail.com" ],
+    "sections" : [ {
+      "heading" : null,
+      "text" : "Deep learning models, which learn high-level feature representations from raw data, have become popular for machine learning and artificial intelligence tasks that involve images, audio, and other forms of complex data. A number of software “frameworks” have been developed to expedite the process of designing and training deep neural networks, such as Caffe [11], Torch [4], and Theano [1]. Currently, these frameworks can harness multiple GPUs on the same machine, but are unable to use GPUs that are distributed across multiple machines; because even average-sized deep networks can take days to train on a single GPU when faced with 100s of GBs to TBs of data, distributed GPUs present a prime opportunity for scaling up deep learning. However, the limited inter-machine bandwidth available on commodity Ethernet networks presents a bottleneck to distributed GPU training, and prevents its trivial realization.\nTo investigate how existing software frameworks can be adapted to efficiently support distributed GPUs, we propose Poseidon, a scalable system architecture for distributed inter-machine communication in existing deep learning frameworks. In order to assess Poseidon’s effectiveness, we integrate Poseidon into the Caffe [11] framework and evaluate its performance at training convolutional neural networks for object recognition in images. Poseidon features three key contributions that improve the training speed of deep neural networks on clusters: (i) a three-level hybrid architecture that allows Poseidon to support both CPU-only clusters as well as GPU-equipped clusters, (ii) a distributed wait-free backpropagation (DWBP) algorithm to improve GPU utilization and to balance communication, and (iii) a dedicated structure-aware communication protocol (SACP) to minimize communication overheads. We empirically show that Poseidon converges to the same objective value as a single machine, and achieves state-of-the-art training speedup across multiple models and well-established\ndatasets, using a commodity GPU cluster of 8 nodes (e.g. 4.5× speedup on AlexNet, 4× on GoogLeNet, 4× on CIFAR-10). On the much larger ImageNet 22K dataset, Poseidon with 8 nodes achieves better speedup and competitive accuracy to recent CPU-based distributed deep learning systems such as Adam [2] and Le et al. [16], which use 10s to 1000s of nodes."
+    }, {
+      "heading" : "1 Introduction",
+      "text" : "Deep learning (DL), which refers to a class of neural network models with deep architectures, forms an important and expressive family of machine learning (ML) models. Modern deep learning models, such as convolutional neural networks (CNNs), have achieved notable successes in a wide spectrum of machine learning tasks, including speech recognition [7], visual recognition [14] and language understanding [18]. The explosive prosperity and rapid adoption of CNNs by research community are largely attributed to high performance computing hardware, such as GPUs, as well as a wide range of easy-to-use open source frameworks based on GPUs, including Caffe [11], Torch [4], Theano [1]. As of writing, the current, official versions of these toolkits can harness multiple GPUs on the same machine, but are unable to use GPUs that are distributed across multiple machines, which limits their practical use to smaller datasets.\nOn the other hand, several CPU-based distributed systems for deep learning have been implemented. Zou et al. [30] report the Tencent deep learning platform named as Mariana, which distributes neural network training onto CPU clusters. Google’s DistBelief framework [6] allows training deep networks on CPU-only clusters with up to 1,000 machines, while Le et al. [16] later scale up to a cluster of 16,000 CPU cores by exploiting model parallelism and asynchronous SGD. Recently, Microsoft’s Adam [2] achieved state-of-the-art results on the ImageNet22K classification task, by leveraging distributed systems techniques such as a global parameter server,\nar X\niv :1\n51 2.\n06 21\n6v 1\n[ cs\n.L G\n] 1\n9 D\nec 2\ncache locality, and staleness control between workers. These frameworks demonstrate that there is excellent potential to scale up deep learning using distributed clusters, though they require large clusters with thousands of CPU cores to produce the reported results.\nCompared to CPU-based distributed deep learning, parallelization of deep networks on GPU-equipped clusters is more readily available to researchers, since satisfactory speedups could potentially be achieved with a smaller number of GPU cards [13]. However, different from the setting of a single machine with multiple GPUs where near-linear speedups could be trivially realized, scaling up deep learning on multiple GPUequipped machines faces two major challenges. First, Infiniband networking, which has been responsible for past successes in distributed DL [3], is not available on most cloud computing platforms and lab clusters, where only commodity hardware with limited network bandwidth is installed. Since GPUs are often orders-of-magnitude faster in matrix-dense computations compared to CPUs, in GPU-based distributed training, gigabytes of parameters are generated per second on each device, waiting to be synchronized across multiple machines. Such a high communication load raises the network communication as the main bottleneck given limited bandwidth of commodity Ethernet. Second, managing the computation and communication in a distributed GPU cluster often complicates the algorithm design. Consequently, more algorithm-specific strategies and dedicated communication protocols are necessary to attain maximum performance when designing GPU-based distributed DL.\nIn this paper we investigate how existing software frameworks can be adapted to efficiently support distributed GPUs, given that only commodity Ethernet is available. On one hand, instead of building a new DL framework from scratch, our goal is to develop an efficient system engine for distributed deep learning, and thus enhance existing popular single-machine platforms with distributed GPU capability. Transforming an existing framework rather than designing a completely new one has the following merits: First, it preserves the ecosystem better and saves users the effort of making an expensive switch. Second, it enable us to solely focus on designing fast and efficient distributing strategies, at the same time enjoy any algorithmic advantage brought by the third-party DL framework themselves. On the other hand, in contrast to systems that require specialized hardware [3], we want our solution to effectively harness distributed GPUs installed on commodity servers and connected via Ethernet, so that our software is as accessible as possible to researchers. To this end, we propose an open-source system architecture, Poseidon1, which can\n1Poseidon was initially released in January 2015 along with Petuum v1.0 as an application under the Bösen parameter server, with GPU\nbe deployed on a variety of cluster configurations (such as CPU-only clusters, or GPU-equipped clusters, or clusters with multiple GPUs per machine). Poseidon makes use of any existing single-machine DL framework, and implements a distributed system layer underneath it, in order to harness distributed CPU and GPU clusters with commodity hardware. In our current implementation, we chose Caffe because of its popularity, while noting that Poseidon’s design is compatible with other CNN libraries such as Torch and Theano.\nIn order to efficiently distribute DL on GPU clusters, we propose three key contributions: First, we design Poseidon as a hybrid three-level architecture, which allows Poseidon to work on both CPU-only as well as GPU-equipped clusters. Second, we propose distributed wait-free backpropagation (DWBP), which leverages the chain rule in backpropagation (BP) and the structure of modern CNNs; DWBP improves GPU utilization and balances communication load, by overlapping computation with communication during BP. Third, we develop a structure-aware communication protocol (SACP), which combines a centralized parameter storage with decentralized peer-to-peer broadcasting, to minimize communication overheads. Together, these three components allow Poseidon to address the communication bottleneck in GPU-based DL on commodity clusters — specifically, how to efficiently synchronize parameters across Ethernet networks, particularly when each GPU can generate Gbs of gradients per second. We implemented Poseidon’s distributed layer upon the Petuum distributed ML framework [28], which provides a bounded stale synchronous parallel (SSP) parameter server [9] that preserves data-parallel convergence guarantees, and prioritized network bandwidth allocation [26].\nPoseidon significantly reduces the training time required by state-of-the-art CNN models, while still achieving the same quality of convergence and accuracy. Using a cluster of 8 GPU-equipped Ethernet-connected commodity machines, by significantly alleviating the bottleneck issue raised by the limited bandwidth, Poseidon attains almost the same classification accuracy as a single GPU, but is roughly 4.5× faster when training AlexNet, and 4× faster when training GoogLeNet. These results hold across benchmark datasets of different sizes: CIFAR-10 [12], ILSVRC2012, and ImageNet 22K [22]. For example, on a small task such as CIFAR10 quick solver (where distributed training might not be expected to perform well), 8-node Poseidon can achieve better accuracy than a single machine, in 1/4-th the time. To demonstrate the scalability of Poseidon, we train CNN classifiers on the ImageNet22K dataset, consisting of 14.2M images in 21,841 categories, and achieve\nsupport added in July 2015. All source codes are available at github. com/petuum/poseidon/.\ncompetitive accuracy with state-of-the-art results, in less training time and using fewer machines (e.g. 30% training time and 13% cluster nodes compared to Adam [2]).\nWe summarize our main contributions as follows: (1) We propose Poseidon, a scalable system architecture as a general purpose solution for any single-machine DL framework to be efficiently distributed on GPU clusters with commodity Ethernet, by leveraging the Petuum framework [28] as well as three components: a threelevel architecture, distributed wait-free backpropagation, and structure-aware communication protocol. (2) We empirically show that Poseidon, running on a GPUequipped cluster with commodity hardware and Ethernet, achieves high quality convergence comparable to a single machine, as well as state-of-the-art training speedups on benchmark CNN classification models (e.g. 4.5× on AlexNet, 4× on GoogLeNet, 4× on CIFAR-10, over a single machine) — even for larger datasets such as ImageNet 22K, Poseidon achieve competitive accuracy as compared to the state-of-the-art results, but using only 30% training time and 13% cluster nodes.\nThe rest of the paper is organized as follows. In section 2, we review existing works on GPU-based distributed DL. Section 3 covers the basics of neural network models, and briefly introduces some fundamentals of Petuum PS and data-parallel distributed machine learning. In section 4, we present the architecture and key features of Poseidon. Section 5 evaluates Poseidon on multiple standard dataset with regard to efficiency, scalibility and accuracy. Section 6 concludes the paper."
+    }, {
+      "heading" : "2 Related Work",
+      "text" : "Because of the demand for faster training of neural networks on ever-larger datasets, several frameworks have been proposed that use multiple GPUs on a single machine. For example, Yadan et al. [29] show that mixed parallelism yields better speedups over model-only or data-only parallelism in ImageNet classification with 4 GPUs. Similarly, Krizhevsky [13] also implements mixed parallelism for AlexNet [14] with 8 GPUs which relies on data parallelism in the convolutional layers and on model parallelism in the fully-connected layers. Facebook’s fbcunn [8, 25] implements both model- and dataparallelism on multiple GPUs. However, the aforementioned frameworks focus on parallelization within a single machine with multiple GPUs, and cannot take advantage of distributed computing environments where GPUs are spread out across a cluster.\nDistributed, multi-node GPU-based CNN training is an active area of research. Coates et al. [3] demonstrated that they could train a 11-billion parameter network on a cluster of 16 GPU nodes using model-parallelism, but their implementation required specialized hardware,\nsuch as Infiniband networking. MXNet is an open-source framework for distributed deep learning, that addresses both algorithmic code for DL, which is the role that Caffe plays in this paper, as well as distributed execution, which is the technical focus of this paper. No peerreviewed results for MxNet are available as of writing.\nOur position is to identify reusable systems techniques that can be applied to existing single-machine DL frameworks in order to add value to their mature userbase and software ecosystem. We choose Caffe as our example, but note that our techniques could be used for other single-machine deep learning software such as Torch, Theano. Moreover, we make use of commodity hardware (e.g. machines with 1-2 GPUs and Ethernet networking) instead of specialized hardware that is not readily available from cloud providers or most academic clusters (e.g. Infiniband or machines with ≥ 4 GPUs). Through our work, we hope to enable existing popular frameworks to be scaled up to distributed clusters of GPU machines.\nRecently, Google released their TensorFlow software for deep learning, which does not currently support distributed GPU training, and does not have peer-reviewed results. As with Caffe, we believe the techniques presented herein could be used to produce a distributed version of Tensorflow. Also of note are several efforts to port Caffe onto the Spark platform, such as SparkNet [19], which reports a 4-5 times speedup with 10 machines (and hence less scalability than our results herein), as well as a recent, non-peer-reviewed, effort by Yahoo which exclusively uses Infiniband RDMA. In contrast, our focus is on commodity Ethernet that is readily available in most clusters and cloud providers. We see SparkNet in particular as closest to the spirit and intent of this paper; namely, to scale up existing deep learning frameworks with generic, re-usable distributed techniques, and thus add value to their mature ecosystems."
+    }, {
+      "heading" : "3 Background",
+      "text" : "Poseidon builds upon an existing general-purpose system for distributed machine learning algorithms, Petuum, and extends it with new contributions that specifically improve the performance of GPU-based deep learning. In order to clearly delineate our contributions, we begin with a brief overview of the Petuum features that we build upon, and establish some mathematical notations that will be useful in characterizing Poseidon."
+    }, {
+      "heading" : "3.1 Petuum for Iterative-Convergent ML",
+      "text" : "Poseidon builds upon Petuum, a distributed big machine learning framework that provides a generic interface to a broad spectrum of ML programs [28]. Its design philosophy is rooted in iterative-convergent solutions to loss\nfunction minimization. A number of ML algorithms are formulated in this manner, which involves repeatedly executing update equations that decrease some error functions. Some notable examples include stochastic gradient descent in optimization programs, MCMC and variational methods for graphical models, and proximal optimization for structured sparsity problems, among others.\nIn a mathematical form, the iterative-convergent algorithm can be represented as follows. Given data D and a loss function `, a typical ML problem can be solved by iteratively executing the update equation until the model parameters A reaches some stopping criteria.\nA(t) = F(A(t−1),∆`(A(t−1),D)) (1)\nwhere t denotes the iteration. The update function ∆` performs computation on data D with model parameters A to improve the loss `. The intermediate results are aggregated by function F .\nIn large-scale machine learning, both data D and model A can be very large. In data-parallelism, the data D is partitioned and assigned to computational worker machines (indexed by p = 1, · · · ,P), whereas in modelparallelism, the model A is partitioned and assigned to workers. Since we are interested in data-parallelism, we partition the data D into a set of Dp denoting the p-th data partition (i.e. often called mini-batch), as shown in Figure 1. Then, the update equation becomes\nA(t) = F(A(t−1), P\n∑ p=1 ∆`(A(t−1),Dp)) (2)\nIn each iteration, parameter updates ∆` produced by each partition of data are locally computed on each worker, and then are communicated to each other."
+    }, {
+      "heading" : "3.2 Stale Synchronous Parallel PS",
+      "text" : "A parameter server (PS) is a distributed shared memory system that provides systematic abstraction for iterative-\nconvergent algorithms in data-parallel distributed machine learning. Typically, PS enables each worker to access the global model parameters A via network communications following the client-server scheme. In particular, the training data are partitioned and distributed to a large number of clients (i.e. workers). Data-parallel distributed training can be easily implemented on the PS architecture, by letting the execution of the update ∆(·) take place only on each worker over data subsets therein, and the application of the updates to model parameters A take place on the server, and a consistency scheme coordinate the synchronization among server and clients.\nIn data-parallel ML, iterative-convergent algorithms often enjoy a nice property of error-tolerance, i.e. they still execute and converge correctly even when their model parameters A experience synchronization delays, provided that those delays are strictly bounded [9, 5, 15]. The stale synchronous parallel (SSP) consistency model exploits this error-tolerance property, and try to reduce network communication/synchronization overheads substantially by allowing stale parameter updates while the staleness is bounded by a threshold s. Integrated with a PS, the SSP consistency model ensures that if a worker reads from server at iteration t, it is guaranteed to receive all updates from all workers computed at and before iteration t− s−1. If this is impossible because some straggling worker is more than s iterations behind, the reader will stop until the straggler catches up and sends its updates. For stochastic gradient descent algorithms, SSP has very attractive theoretical properties [5].\nPoseidon’s distributed layer is derived from Bösen [26], a parameter server implementation that supports SSP consistency model. It allows computations to use stale model parameters (to reduce synchronization overheads), but strictly upper-bounds the number of missing iterations, restoring formal convergence guarantees [9].Besides Bösen and SSP, Poseidon provides many advanced features that are beneficial for GPU-based distributed deep learning, as covered in section 4.4."
+    }, {
+      "heading" : "3.3 Data-parallel Distributed Training of Convolutional Neural Networks",
+      "text" : "A neural network has multiple stacked layers, each of which is filled with different types of computing units inside, and layer-wisely interconnected by real or boolean weight matrices as trainable parameters. The basic computing unit in each layer is called a neuron, which is usually composed of a vector of weights corresponding to a row in the weight matrix, and a nonlinear function to introduce rich model expressiveness. Each neuron takes outputs (activations) from its preceding layer as input, applies both linear and nonlinear transformations to produce its own activation, which is then passed to its fol-\nlowing layers as their input. At the bottom of a neural network is an input layer reading and vectorizing different types of data as network inputs, while at the top of the network is usually a loss layer, which are pre-specified by an optimization objective (e.g. a classifier or a regressor).\nConvolutional neural networks (CNNs) have both convolutional layers and fully-connected layers as building blocks. A neuron in a convolutional layer is also called a filter, and is connected with a spatial local region of its previous layer’s output (feature maps), and share the same weights across all possible regions. This weight sharing pattern significantly reduces the number of trainable parameters, making them much easier to train and more agnostic to overfitting. A convolutional layer is usually followed by a nonlinear down-sampling layer, such as an max-pooling layer, which partitions the output feature map into a set of rectangles and outputs the maximum value for each such sub-region.\nCNNs are trained using the stochastic gradient descent (SGD), which falls into the family of iterative-convergent algorithms. Specifically, training is performed by an iterative algorithm, where each iteration consists of a feedforward and a backpropagation pass. In the feedforward pass, the network takes a batch of training samples as input, forwards from bottom to top layers and outputs a prediction for each sample at the end layer. The predictions are then compared to the groundtruth of training samples at the loss layer to compute the error value. In the backpropagation, the error is propagated through the network in a reverse order, during which the weights in each layer are updated towards the direction where the loss decreases. After repeating a sufficient number of training iterations, the network will usually converge to some state where the loss is close to an optimal, and the training is then terminated.\nAccordingly, learning CNNs is another typical distributed ML problem to which the Petuum’s iterativeconvergent strategy is successfully applicable. In the CNN training, the update equation Eq.1 reduces to\nA(t) = A(t−1)+ ε ·∇`(A(t−1),Dp)+Λ(At−1) (3)\nwhere the parameter updates are calculated as the gradients of A over current data batch Dp, controlled by a stepsize ε , and the updating function F reduces to the additive function as in SGD. We often impose a function Λ(At−1), which contains regualization and momentums on the model parameters A.\nSimilarly, in the data-parallel distributed setting, every node holds a replica of the network parameters A. At each iteration, every node p takes a batch of data Dp, performs a feed forward and back propagation pass, and produces a copy of gradients. Gradients are then communicated, aggregated, and applied to update model pa-\nrameters as\nA(t)=A(t−1)+ P\n∑ p=1\n[ ε ·∇`(A(t−1),Dp)+Λ(At−1) ] . (4)"
+    }, {
+      "heading" : "4 Poseidon Architecture",
+      "text" : "Because GPUs are faster in matrix computations than CPUs, the gradient updates are produced faster on GPUs than they can be naively synchronized over the network, thereby the computations during neural network training are usually bottlenecked by communications, as evidenced by Table 1 and Table 2. In particular, Table 1 lists the standards of commonly used Ethernet and Table 2 shows some statistics of modern CNN training 2. Take the AlexNet training as an example: Given a standard solver setting with batch size 256, 61.3 million of gradients will be generated per second on each device. If we distribute the training onto a commodity cluster with 8 nodes each equipped with 1 GPU, ideally the master node need to receive at least 490M float parameters, and then send out another 490M in one second to guarantee that the next iteration of computation on workers will not be blocked. Though adjusting the network configurations (e.g. increasing batch size) may decrease the communication load, the demanded throughput is still far above the maximum throughput that the commodity Ethernet (i.e. 1 GbE and 10GbE Ethernet) can afford3. There-\n2The performance is quoted from the official site of Caffe: caffe. berkeleyvision.org/performance_hardware.html and github.com/BVLC/caffe/issues/1317.\n3Also note that due to issues related with network protocols and software implementations, the actual performance we could achieve in practice is usually lower than standard values as reported.\nAlgorithm 1: CNN training with data-parallelism on Poseidon\nSlave nodes: 1 Partition training data D equally into {Di}Pi=1 and\ndistribute them to all P nodes. 2 Replicate the initial model parameters A to every worker\nthread p as Ap. 3 for t = 1 to T do 4 foreach worker thread p ∈ {1,2, · · · ,P} do 5 Take a batch of training data Dtp from Dp. 6 Perform forward pass. 7 Perform backpropagation pass following the DWBP algorithm (See Algorithm.2). 8 Update local synchronization states to the\nconsistency manager (see section 4).\nMaster node: 1 for t = 1 to T do 2 Collect gradients that are sent by worker nodes. 3 Updates the part of model parameters for which a corresponding gradient is received. 4 Push updated model parameters to worker nodes\naccording to the consistency manager.\nfore, when distributing DL on GPU clusters, the major challenges are how to quickly collect and aggregate the gradients, and how to efficiently synchronize updated parameters across all workers.\nPoseidon presents three key contributions to address these challenges: a three-level hybrid architecture that supports both CPU and GPU computation, a distributed wait-free backpropagation (DWBP) scheme to interleave computation with inter-machine communication, and a structure-aware communication protocol (SACP) that reduces the size of network messages. The three-level architecture improves Poseidon’s generality, by allowing it to work with both CPU- and GPU-based DL software, while DWBP and SACP enable the DL software to communicate quickly and efficiently across the network."
+    }, {
+      "heading" : "4.1 Overview: A Three-level Structure",
+      "text" : "Existing systems for distributed deep learning usually exhibit a traditional client-server structure. For example, in previous CPU-based distributed DL systems [2, 6], a two-level parameter server architecture was built, where the first level has server machines collecting gradients and distributing newly updated model parameters to workers, and the second level has worker nodes (threads) taking batches of training data and generating gradient updates. When deploying them onto GPU clusters, one may need to heavily adjust the implementation, to support more sophisticated cluster configurations ( e.g. a cluster of GPU nodes where each node has multiple\nGPUs), as well as to avoid unnecessary memory access between different types of devices. Moreover, existing architectures only allow connections between server and clients, which limits that the communication can only happen between master and slave nodes.\nIn order to provide a general solution for both CPUonly and GPU-based distributed deep learning as well as to enable more strategic communication approaches, we design Poseidon as a three-level structure, as Fig.2 illustrates. First, We add an additional hierarchy within each worker node, thus allow multiple client threads coexisting in a single worker machine. This design enables Poseidon to support both CPU and GPU users as well as any system configuration, such as a cluster of nodes where each node has multiple GPUs or CPU cores, by binding each worker thread with a specific device (CPU core or GPU). Second and more importantly, instead of the traditional client-server structure, where each client only connects with the server machine, we design a hybrid topology, where peer-to-peer (P2P) connections between pairs of workers, and server-client connections between the server and workers, are both established. It enables more dedicated communication strategies for parameter synchronization among multiple-GPU nodes, which we elaborate in section 4.3.\nAlgorithm 1 presents an overview of the distributed training process of Poseidon. At the beginning of training, every worker thread starts its Caffe engine [11] to perform feedforward and then backpropagation pass for some number of times, via the distributed wait-free backpropagation (DWBP) algorithm (See section 4.2), during which they communicate asynchronously following a consistency model of the bounded stale synchronous scheme [9], as we briefly introduced in section . The DWBP algorithm enables communication to be overlapped with the error propagation computations. The structure-aware communication protocol (SACP) minimizes communication load by exploiting the layer prop-\nerty of neural nets, and passing or receiving the parameter updates by intelligently choosing the optimal solution from the client-server or P2P pipelines (See section 4.3). In the lower level, the communications are further monitored and operated by a bandwidth manager provided by Petuum Bösen [26], as we explain in section 4.3.3."
+    }, {
+      "heading" : "4.2 Distributed Wait-free Backpropagation",
+      "text" : "Backpropagation (BP) [21] is the principle algorithm for training neural networks. Specifically, BP algorithm proceeds as a chain, with many feedforward and backpropagation passes. During the back pass, an error message E is propagated from the top to the bottom of the network, thus a message passing chain is formed.\nFigure.3.(a) shows the process of the original BP in distributed settings on a neural net with L layers {li}Li=1 and layer parameters as A = {Ai}Li=1. At each iteration t, every worker p ∈ {1, · · · ,P} performs the BP computation separately. Only when the propagation reaches at the bottom layer l1 (i.e. all gradients ∇Ap = {∇Apl } L i=1 are generated), each worker is ready to start communication. The worker sends out local parameter updates ∇Ap, waits for the remote master node to collect, aggregate and apply the parameter updates {Ap}Pp=1 from all workers, and then synchronizes with the master node via the network to fetch a new copy of updated parameters A for next iteration t + 1. Therefore, each worker cannot proceed to iteration t +1 until it receives all updated layer parameters {Al}Li=1; the computation and communication occur sequentially as shown in Figure.3.(a).\nThe distributed wait-free backpropagation is designed to reduce the waiting time of parameter synchronizations when backpropagation concurrently executes on multiple machines, so as to improve the GPU utilization. Specif-\nAlgorithm 2: The Distributed Wait-free Backpropagation (DWBP) Algorithm"
+    }, {
+      "heading" : "At iteration t on worker p:",
+      "text" : "Input: Loss `. 1 for i = L to 1 do 2 if i == L then 3 Compute gradients ∇Ai = ∂`∂Ai using `. 4 else 5 Receive error message Ei+1 from layer li+1. 6 Compute gradients ∇Ai = ∂`∂Ai using Ei+1. 7 if i 6= 1 then 8 Compute error message Ei and pass to layer li−1.\n9 Communicate: push out ∇Ai and pull in updated Ai following the SACP protocol (See Algorithm 3);\nically, leveraging the chain structure of BP, once layer li+1 finishes computations and propagates its error message Ei+1 to the preceding layer li, its gradients ∇Ai+1 are ready to be sent out, and its parameters Ai+1 are also ready to be updated. This is because each layer li in the network occupies an independent set of parameters Ai, and the subsequent computations of lower layers {l1, · · · , li} do not affect upper layers {li+1, · · · , lL} any more. Correspondingly, the parameter updating at upper layers {li+1, · · · , lL} does not affect that of lower layers either, because the computations of layer li only depend on the error message Ei+1, which have already been passed.\nAlgorithm 2 with illustration of Fig.3.(b) summarizes the DWBP algorithm, whose intuition is to concurrently schedule the computations of lower layers and the communications of upper layers during BP. It exploits the chain structure of the network, and overlaps the communications at upper layers, with the computations at the lower layers. Different from the original BP, the DWBP enforces each layer to start its communication once its gradients are generated, and allows partial pa-\nrameter updating on the layer. Ideally, when the propagation reaches at the top of the network, both communication and computation are finished, thus the worker can immediately start next iteration.\nThe DWBP is even more effective in GPU clusters with state-of-the-art CNN architectures, such as AlexNet [14] and VGG-16 [23], which stack convolutional (CONV) layers at the bottom, followed by fullyconnected (FC) layers at the top. Table 3 shows the statistics about the sizes of parameters and computations in FLOPs for CONV layers and FC layers in AlexNet and VGG-16. FC layers usually occupy more than 90% of the model parameters, indicating communication costs are mostly consumed at the top FC layers, while the CONV layers only take less than 10% of the model parameters but nearly 90% of FLOPs, meaning that computation costs are mostly spent at the CONV layers. As the DWBP overlaps the communication of top layers with the computation of bottom layers, such structure greatly benefits from the DWBP since 90% of working loads on computation and communication are overlapped, thus the waiting time on GPUs significantly reduces and the GPU utilization greatly increases. We implement the DWBP by creating a separate thread for each independent layer, thereby enable concurrent communications and computations for different layers. The effectiveness of DWBP is empirically evaluated in section 5.2.1."
+    }, {
+      "heading" : "4.3 Structure-Aware Message Passing Protocol",
+      "text" : "Most ML models, such as neural networks, fall into the family of matrix-parameterized models (MPMs), which represent their parameters as a set of matrices. In data-parallel distributed settings, learning MPMs using iterative-convergent algorithms, as in [2, 6], usually needs to repeatedly push out and pull in the whole parameter matrices. Let us take the AlexNet as an example, the weights between the two FC layers fc6 and fc7 are represented as a 4,096×4,096 matrix W as well as its gradients ∇W .At each iteration, every worker sends out ∇W and then synchronizes updated W , which involves heavily communicating two 4,096×4,096 float matrices via the network, as Fig.4.(a) shows. However, the commodity Ethernet only affords maximally several Megabits of data being transmitted per second (as in Table 1). While in practice, the size of parameters to be communicated grows rapidly with the model size, the problem complexity, and the number of nodes in clusters, and GPU-based computing further deceases the per-iteration computation time. Consequently, the parameters to be transferred per second easily exceed the bandwidth of the network, which in turn bottlenecks the computation. To address this challenge, in Poseidon, besides client-server connec-\ntions between servers and workers, we also allow P2P connections between every two workers, based on which we design a new communication protocol to minimize the number of parameters needed to be communicated by exploiting a nice property of neural networks.\nIn this section, we first introduce a novel communication approach of Petuum for distributed machine learning, namely sufficient factor broadcasting (SFB) [27], which exchanges parameters following a P2P scheme. Then we discuss the proposed structure-aware message passing protocol, which is essentially a hybrid communication approach between the centralized parameter server (PS) and decentralized SFB. The SCAP significantly minimizes the communication cost by directly reducing the number of parameters needed to be communicated during neural network training, so as to alleviate the bottleneck raised by limited bandwidth of commodity Ethernet. We conduct internal comparisons and demonstrate the effectiveness of SCAP in section 5.2.1."
+    }, {
+      "heading" : "4.3.1 Sufficient Factor-based Communication",
+      "text" : "Some MPMs, including neural networks, enjoy the following structural property: when training using SGD, their gradient ∇W over a batch of training samples is a low-rank matrix, which can be casted as the outer product of two vectors u and v: ∇W = uv>, where u and v are called sufficient factors (SFs). Consider the training of CNNs, where W is an M×N weight matrix between two FC layers li and li+1. In the forward pass, one data sample is fed into the network and the activations of layer li is produced as ai. During BP, the loss ` is propagated, and an error message Ei+1, which is an M dimensional vector, is passed back from li+1 to li. The gradients ∇W thus can be exactly reconstructed by two vectors Ei+1 and ai:\n∇W = ∂` ∂W = Ei+1a>i , (5)\nSufficient factor broadcasting (SFB) [27] is designed to\nminimize the number of parameters needed to be communicated by leveraging the above property. In a distributed setting with P workers, on worker p, instead of directly communicating two full matrices ∇Wp and Wp with the master node, we recast it to three steps: (1) Decouple ∇Wp into two vectors up and vp; (2) Broadcast up and vp to all other peer workers and also receive sufficient factors ui,vi, i 6= p from them, as Fig.4.(b) shows. (3) Reconstruct {∇Wi}Pi=1 using {ui,vi}Pi=1 as in Eq.(5), and apply the updates locally on every worker.\nCompared to traditional client-server pipeline, SFB can significantly reduce the communication cost in many popular settings. Consider training a CNN with a batch size of K. In each batch, every worker needs to broadcast and receive K sets of M and N dimensional vectors to and from P−1 workers, respectively, thus in total (P−1)2K(M +N) floats need to be transmitted. While, in a traditional parameter server where the full matrices are sent, the size is 2PMN (P,K M,N in modern CNN structures . For instance, when training AlexNet on 4 GPU nodes with K = 256 and M,N = 4,096 for fc6 and fc7, SFB communicates only 18.9M parameters in each iteration, which is 7.1 times less than communication of full matrices 134.2M.\nMicrosoft Adam [2] employs a different SF-based strategy. The SFs from all workers are first sent to the master node following the client-server scheme, then transformed into matrices and aggregated to update model parameters. Then, full parameter matrices are sent back to each worker, as Fig.4.(c) shows. Its communication cost is thus PK(M +N)+PMN. With the previous example, 75.5M parameters need to be communicated, which is 4 times larger than SFB.\nFig.5 compares the aforementioned three strategies in terms of the number of parameters needed to be communicated between layer fc6 and fc7 when training Alexnet with different number of nodes and batch size. SFB usually outperforms another two strategies with a smaller batch size. One potential drawback of SFB is that\nits communication cost increases quadratically with the number of nodes, since it employs the peer-to-peer communication scheme.\nAlgorithm 3: The Structure-aware Communication Protocol (SACP)"
+    }, {
+      "heading" : "At iteration t on worker p:",
+      "text" : "Input: Layer li, M×N gradients ∇Api , number of workers P, batch size K. Task : Push out gradients ∇Api and then update A p i . 1 if li is not an FC layer then 2 Send ∇Api to the master node. 3 Synchronize updated Ai from the master node.\n4 else 5 Recast ∇Api into two SFs, i.e. ∇A p i = u p i v p i >; 6 if (P−1)2K(M+N)≤ PK(M+N)+PMN then 7 Broadcast upi ,v p i to all other workers. 8 Receive SFs u ji ,v j i , j 6= p from all other workers. 9 Update Ai: Ai← Ai +∑ j u j i v j i > +Λ(Ai).\n10 else 11 Send upi ,v p i to the master node. 12 Synchronize updated Ai from the master node."
+    }, {
+      "heading" : "4.3.2 Structure-Aware Communication Protocol",
+      "text" : "We propose the structure-aware communication protocol (SACP), which hybridizes the client-server PS scheme with the P2P SFB scheme, for GPU-based distributed deep learning. The SACP is structure-aware, as it intelligently determines the optimal communication method before communicating the parameters, according to the working layer, the SGD batch size, and the number of workers. In particular, for CONV layers, where layer parameters are sparse, SACP takes the centralized serverclient PS scheme to directly communicate the parameters via the parameter server. On the other hand, for FC layers where layer parameters are dense and enjoy the low-rank property of MPMs, the SACP chooses between the two SF-based communication (i.e. centralized PS and SFB) according to the batch size and the number of workers. Algorithm 3 summarizes how the SACP intelligently controls the communication.\nAs complementary to the Algorithm 2, SACP can be synergetically incorporated into DWBP to significantly reduce communication costs as well as improve GPU utilization. Although the SF-based communication may cause extra computation cost due to the reconstruction of gradients from SFs, in GPU based distributed deep learning, such computations are often negligible compared to communication and SF computation."
+    }, {
+      "heading" : "4.3.3 Bandwidth Management",
+      "text" : "Poseidon also exploits the Bösen-based communication strategy [26], a key component of Petuum that maximizes the network efficiency under a given network bandwidth budget (especially in commodity Ethernet ) while minimizing parallel errors. Cooperating with DWBP and SACP, which are aware of the model and cluster structures, the bandwidth manager further incorporates the prior knowledge on the low-level network bandwidth, and maximizes communication efficiency by prioritizing network bandwidth for messages most significant for algorithm progress. Specifically, it communicates model updates and dirty model parameters as quickly as possible without overusing the network bandwidth budget (full network utilization), and allocates network bandwidth according to the messages’ contribution to convergence. In Poseidon, the bandwidth manager lies at the bottom of DWBP and SACP (as shown in Figure 2), and manages the message passing among server and clients regardless of the message types (matrices or SFs)."
+    }, {
+      "heading" : "4.4 Other Features",
+      "text" : "Poseidon includes features to enhance the usability of the deep learning software system, by addressing issues such as distributed storage and fault tolerance. While not crucial to the performance of distributed GPU-based training, they help to improve the user experience. Distributed Storage. Poseidon allows both shared and private file systems for multiple cluster nodes, so that the training data can be stored either in a shared file system to be simultaneously accessed by all cluster nodes, or in separate file systems that each node has a separate data partitions, to avoid I/O overload. Fault Tolerance. Poseidon provides fault tolerance by checkpointing all clients’ model states. Either in the event of failure or as the user specifies, the entire distributed CNN system can be restarted from the last checkpoint exactly, keeping all model/solver states and database pointers unchanged as before."
+    }, {
+      "heading" : "5 Evaluation",
+      "text" : "We first evaluate Poseidon on image classification tasks with benchmark datasets of CIFAR-10 [12] and ILSVRC2012 [22], and show that Poseidon significantly accelerates the training of modern CNN structures, while guaranteeing the correct convergence, which is important for distributed deep learning. Moreover, we deploy Poseidon on the ImageNet 22K classification, and compare its performance with previously published results such as Adam [2]. Finally, we conduct some internal comparisons to justify the effectiveness of DWBP and SACP.\nCluster Configuration. We conduct all experiments on the PRObE Susitna cluster [17], where each node has 4× 16-core 2.1GHz AMD Opteron 6272 CPUs, 128GB of RAM, and NVIDIA Tesla K20C GPU with 4799MB memory. All cluster nodes have shared access to a NFS with 1x Hitachi 1.0 TB HDD and 2x Hitachi 3.0 TB HDD. We use the 40GbE network for both connecting NFS and communication among workers. For software, we use the Caffe version at Oct 2014 with CUDA 6.5 and CUDNN R2. and NVIDIA driver version 340.29."
+    }, {
+      "heading" : "5.1 Image Classification",
+      "text" : "We demonstrate Poseidon’s performance on three benchmark datasets ranging from small to large, including the CIFAR-10 [12], the ILSVRC2012 and the ImageNet22K[22]. The statistics of the datasets are briefly summarized in Table 4."
+    }, {
+      "heading" : "5.1.1 Classification on CIFAR-10",
+      "text" : "We first evaluate our Poseidon on the CIFAR-10 dataset, which contains 32× 32 images of 10 classes, with 6K images per class. An official train/test split is provided that 50K images are used for training and 10K for testing. Although CIFAR-10 is a relatively small dataset, we experiment to show Poseidon’s capability on achieving better accuracy than single machine at the same time accelerate the training of small CNNs. Settings. We employ the built-in cifar10 quick solver and cifar10 quick train test network structure in Caffe4, consisting of 3 CONV layers and 1 FC layers followed by a 10-way softmax classifier, in total 145,578 parameters. It converges to a 70% test accuracy with 4 epochs of training in a single machine without decreasing the learning rate. We deploy Poseidon onto 8 Susitna nodes. As a larger batch size usually hurts the SGD performance, for both settings, we reduce the batch size from 100 to 50 and also slightly decrease the base learning rate from 0.01 to 0.007, while keeping other solver settings unchanged. All CIFAR-10 images are stored in a single LMDB on NFS with shared access to 8 nodes. For better comparison, in the distributed setting, we set the staleness s to zero (i.e. we use BSP consistency model during training). Performance. Similar to the single machine setting, we train the network to convergence without adjusting the learning rate. The test accuracy achieves nearly 75%. Figure.6(a)-(b) plots how the test error decreases along with training time and iterations for Poseidon on 8 nodes and Caffe on a single node. Under the same setting, the\n4github.com/BVLC/caffe/tree/master/examples/\ncifar10.\nsingle machine Caffe takes more than 4 times of training time to converge to 70% accuracy, while Poseidon quickly converges to 72% in 19 seconds and attain a higher accuracy 75% in 25 seconds with 8 GPU nodes."
+    }, {
+      "heading" : "5.1.2 Classification on ILSVRC 2012",
+      "text" : "We then experiment on ImageNet ILSVRC 2012, consisting of 1.28 million of training images and 50K validation images over 1,000 categories. Following the standards, we downsample all images to 256×256×3 before feeding into the networks, and report the top-1 accuracy on the validation set. These experiments show that Poseidon significantly accelerates the training of modern stateof-the-art CNN architectures at the same time guarantees the correct convergence in a distributed GPU cluster. Settings. We evaluate Poseidon using AlexNet [14] and GoogLeNet [24]. The AlexNet is a de facto standard CNN architecture with 5 CONV layers, 2 FC layers and a 1000-class softmax classifier, in total 61.3 million of parameters. GoogLeNet is a more structural and deeper (22-layer) CNN with only 5 million of parameters by stacking inception modules [24]. For fair comparisons, we employ the open implementations of AlexNet5 and GoogLeNet6 provided in Caffe. Specifically, the bvlc alexnet achieves 57% top-1 accuracy after convergence, and the bvlc googlenet converges to 68.7% top-1 accuracy, both using just the center crop for testing. In single machine training, for AlexNet, we use the standard solver in Caffe, which trains with a batch size 256 for nearly 70 epochs, during which the learning rate is decreased by dividing 10 for 3 times. For GoogLeNet, we employ the quick solver, which uses the polynomial\n5github.com/BVLC/caffe/tree/master/models/bvlc_ alexnet.\n6github.com/BVLC/caffe/tree/master/models/bvlc_ googlenet.\nlearning rate policy, and trains for 60 epochs with batch size set to 32. In the distributed setting, we deploy both AlexNet and GoogLeNet onto 8 GPU nodes with fully data-parallel training, and keep the network structure and the batch size exactly the same, but change to a more suitable solver setting. Specifically, for AlexNet, we train on 8 nodes for about 60K iterations, with the base learning rate set to 0.005 and decreased 5 times during the whole training. For GoogLeNet, we use a standard step policy by setting the base learning rate to 0.005 and decrease 90 times during training. Using a single LMDB on NFS bottlenecks training when it is simultaneously read by 8 nodes, thereby we split it into 8 parts and let every node access a separate part to avoid I/O overload.\nPerformance. Figure.6(c)-(d) and Figure.6(e)-(f) show the performance of training AlexNet and GoogLeNet using Poseidon with a GPU cluster of 8 nodes, compared to single machine Caffe, respectively. For AlexNet, Poseidon attains 56.5% top-1 accuracy on the validation set after training of 27 hours, with a 4.5× speedup as compared to single machine Caffe that needs 5 days. For GoogLeNet, Poseidon converges to 67.1% top-1 accu-\nracy after 130 hours of training, as compared to Caffe, which only achieves 50% top-1 accuracy after 250 hours of training, and 57% after near 350 hours of training on a single Susitna node (Poseidon only needs less than 48 hours to achieve 50% and 75 hours to achieve 57%, with a near 5× speedup), and hard to converge with more than 500 hours of training. Finally, we summarize the convergence speedups of Poseidon in Table.5."
+    }, {
+      "heading" : "5.1.3 Classification on ImageNet 22K",
+      "text" : "ImageNet 22K is the largest public dataset for image classification, including 14,197,087 labeled images from 21,841 categories, which is rarely touched by the research community due to its massive data size and complexity. We experiment on ImageNet 22K to demonstrate the scalability of Poseidon. As no official test data exists for evaluation, following previous settings in [2, 6, 16], we randomly split the whole set into two parts, and use the first 7.1 million of images for training and remained for test. Similar to ILSVRC 2012, we resize all images to 256×256 and report the top-1 test accuracy. Settings. We design a AlexNet-like CNN architecture; specifically, the CNN takes a random 227× 227 crop from the original image, and forwards it into 5 CONV layers and 2 FC layers before making a prediction. The CNN has convolution filters with sizes 7× 7,5× 5 and 3× 3. Similar to AlexNet, the first, second and fifth CONV layers are followed by max pooling layers with size 3× 3 and stride 2. Two FC layers with 3,000 neurons each are put at the top of the network, followed by a softmax layer to be a 21,841-way classier with 120M parameters and 1.8 billion of connections overall. We train the CNN with fully data-parallelism by equally partitioning and distributing the training data into 8 GPU nodes. The batch size and staleness are fixed at 256 and 0, respectively. The network is trained using the step learning rate policy, with base learning rate set to 0.005 and decreased 6 times. Performance. Table 6 compares our result to those of previous work on ImageNet 22K, Adam [2], MXNet, and Le et al. [16]. Note that at this point complete fair comparison between different framework is not possible, because the experiment protocol of ImageNet 22K is not standardized, all the source codes are not fully available yet, and large variations exist in system configurations, models, and implementation details. However, it is clear that Poseidon achieves a competitive accuracy 23.7% with the state-of-the-arts with shorter training time and less machine resources. Compared to Adam [2], we only use 30% training time and 13% machines to achieve 23.7% accuracy with a similar sized model. Promisingly, we achieve a higher training accuracy with 3 days of training using a well-established CNN model — this\nwhich compares favorably to MXNet, which uses the whole set of 14.1 million images to train an inception-BN structure [10] using 4 GPUs in a single machine without network communication, and reports 37.1% train accuracy after 8.5 days of training."
+    }, {
+      "heading" : "5.2 Internal Comparisons",
+      "text" : "In this section, we conduct internal comparisons to study the effectiveness of DWBP and SACP in improving the GPU utilization, as well as reducing communication cost for GPU-based distributed deep learning. Besides, we report the speedups on throughput (i.e. number of images trained per seconds) in Fig.8 when training AlexNet and GoogLeNet using Poseidon on 8 GPU nodes with different staleness settings, compared to single machine Caffe."
+    }, {
+      "heading" : "5.2.1 DWBP and SACP",
+      "text" : "Since DWBP executes asynchronously in a multi-thread and multi-machine setting, it’s difficult to directly monitor how the communication and computation are overlapped. To measure the improvement by DWBP and SACP, we instead evaluate the speedups on throughput, which is defined as the number of images processed per second given a model and a batch size, compared to the single machine Caffe.\nFig.7 compares the speedups for training AlexNet and GoogLeNet under the following three settings with different number of nodes: (1) w/o DWBP: parallel training with traditional BP and full matrices communication; (2) w/ DWBP: parallel training with DWBP enabled; (3) w/ DWBP + SACP, parallel training with both DWBP and SACP enabled. We follow the standard setting, i.e. we set the staleness to 0 (BSP), and the batch size to 256 for AlexNet and 32 for GoogLeNet 7. Obviously, with DWBP to overlap the communication with computation, the waiting time between two iterations is greatly saved, thus the throughput is significantly improved, thereby the GPU utilization ratio is relatively improved. Specifically, as Fig.7.(a) shows, for AlexNet, when training using 8 nodes, DWBP significantly improve the speedup from 2.2 to 4, with nearly 2× more speedups. For GoogLeNet with less parameters, DWBP also brings 30% more speedups.\nWith SACP enabled, the speedup on throughput is further improved. Particularly, when training on 8 nodes, although SACP may bring extra computation costs due to parameter matrix reconstructions, it still greatly increases the speedups of AlexNet training from 4 to 6, with a 50% improvement. For GoogLeNet with fewer\n7Different batch sizes will lead to slightly different speedups on throughput.\nFC layers, SACP provides approximately 20% improvement on the speedup.\nIt is clear to see that, we will suffer more loss on the throughput when increasing the number of nodes. Specifically, when directly parallelizing AlexNet on a 8-node GPU cluster without any system/algorithm optimization, we suffer a 80% loss in throughput, comparing to the ideally linear speedup. However, with DWBP and SACP enabled, we only suffer less than 25% loss, which makes Poseidon much closer to the linear speedup."
+    }, {
+      "heading" : "5.2.2 SSP Consistency Model",
+      "text" : "In this section, we study the efficacy of stale synchronous parallel (SSP) consistency model, which is a unique feature provided by Petuum, on scaling up distributed deep learning. Specifically, we compare the speedup on throughput of training AlexNet and GoogLeNet using Poseidon by varying the value of the staleness threshold s, while keeping all other settingsfixed. Setting staleness values to zero (i.e. s = 0) leads the consistency management to be bulk synchronous parallelization (BSP), where computation uses local model copies that are synchronized only at the end of each iteration and the next iteration may not start until all machines have received up-to-date model parameters. Therefore, with BSP the learning speed is limited by the slowest machine. Compared to the BSP, a positive staleness value produces a short grace period for parameter synchronization between every two iterations, thus enables us to manage the bandwidth for parameter exchanges according to current bandwidth budget and the dirtiness of the updates.\nAs seen in Fig.8.(a), for AlexNet training where communication load is quite heavy, if we set a positive value of s, the throughput is greatly improved; with 4 nodes, the speedup of the fully BSP (s = 0) is improved from 3 to 3.8 (s = 1). For GoogLeNet training on Poseidon in Fig.8.(b), a positive value of s makes Poseidon agnostic to communication cost i.e. we can enjoy near linear speedups of throughput."
+    }, {
+      "heading" : "6 Conclusion",
+      "text" : "We present Poseidon, a highly scalable and efficient system architecture for large-scale deep learning on GPU clusters. Poseidon is built upon Petuum, thus inherits many functionaries and benefits of Petuum. Its design focuses on efficiently harnessing multiple, distributed GPUs on commodity hardware and Ethernet, in order to maximally scale up existing single-machine DL frameworks with a fully data parallel scheme for distributed deep learning. We empirically evaluate Poseidon regarding of throughput, convergence and accuracy on the image classification tasks with multiple standard datasets, and show that Poseidon is able to achieve state-of-theart speedups in accelerating the training of modern CNN structures, at the same time guarantee the correct convergence."
+    } ],
+    "references" : [ {
+      "title" : "Project Adam: Building an Efficient and Scalable Deep Learning Training System",
+      "author" : [ "T. CHILIMBI", "Y.S.J. APACIBLE", "K. KALYANARAMAN" ],
+      "venue" : null,
+      "citeRegEx" : "2",
+      "shortCiteRegEx" : "2",
+      "year" : 2014
+    }, {
+      "title" : "Deep Learning with COTS HPC Systems",
+      "author" : [ "A. COATES", "B. HUVAL", "T. WANG", "D.J. WU", "A.Y. NG", "B. CATANZARO" ],
+      "venue" : null,
+      "citeRegEx" : "3",
+      "shortCiteRegEx" : "3",
+      "year" : 2013
+    }, {
+      "title" : "AND FARABET, C. Torch7: A Matlab-like Environment for Machine Learning",
+      "author" : [ "R. COLLOBERT", "K. KAVUKCUOGLU" ],
+      "venue" : "NIPSW",
+      "citeRegEx" : "4",
+      "shortCiteRegEx" : "4",
+      "year" : 2011
+    }, {
+      "title" : "Analysis of high-performance distributed ml at scale through parameter server consistency models",
+      "author" : [ "W. DAI", "A. KUMAR", "J. WEI", "Q. HO", "G. GIBSON", "E.P. XING" ],
+      "venue" : "In Proceedings of the 29th AAAI Conference on Artificial Intelligence",
+      "citeRegEx" : "5",
+      "shortCiteRegEx" : "5",
+      "year" : 2015
+    }, {
+      "title" : "Recent Advances in Deep Learning for Speech Research at Microsoft",
+      "author" : [ "L. DENG", "J. LI", "HUANG", "YAO J.-T", "YU K", "F. SEIDE", "M.L. SELTZER", "G. ZWEIG", "X. HE", "J. WILLIAMS", "Y. GONG", "A. ACERO" ],
+      "venue" : null,
+      "citeRegEx" : "7",
+      "shortCiteRegEx" : "7",
+      "year" : 2013
+    }, {
+      "title" : "More Effective Distributed ML via a Stale Synchronous Parallel Parameter Server",
+      "author" : [ "Q. HO", "J. CIPAR", "H. CUI", "J.K. KIM", "S. LEE", "P.B. GIBBONS", "G.A. GIBSON", "G.R. GANGER", "E.P. XING" ],
+      "venue" : null,
+      "citeRegEx" : "9",
+      "shortCiteRegEx" : "9",
+      "year" : 2013
+    }, {
+      "title" : "Batch normalization: Accelerating deep network training by reducing internal covariate shift",
+      "author" : [ "S. IOFFE", "C. SZEGEDY" ],
+      "venue" : "arXiv preprint arXiv:1502.03167",
+      "citeRegEx" : "10",
+      "shortCiteRegEx" : "10",
+      "year" : 2015
+    }, {
+      "title" : "Caffe: Convolutional Architecture for Fast Feature Embedding",
+      "author" : [ "Y. JIA", "E. SHELHAMER", "J. DONAHUE", "S. KARAYEV", "J. LONG", "R. GIRSHICK", "S. GUADARRAMA", "T. DARRELL" ],
+      "venue" : "In MM",
+      "citeRegEx" : "11",
+      "shortCiteRegEx" : "11",
+      "year" : 2014
+    }, {
+      "title" : "Learning Multiple Layers of Features from Tiny Images",
+      "author" : [ "A. KRIZHEVSKY" ],
+      "venue" : "Master’s thesis, University of Toronto,",
+      "citeRegEx" : "12",
+      "shortCiteRegEx" : "12",
+      "year" : 2009
+    }, {
+      "title" : "One Weird Trick for Parallelizing Convolutional Neural Networks",
+      "author" : [ "A. KRIZHEVSKY" ],
+      "venue" : null,
+      "citeRegEx" : "13",
+      "shortCiteRegEx" : "13",
+      "year" : 2014
+    }, {
+      "title" : "ImageNet Classification with Deep Convolutional Neural Networks",
+      "author" : [ "A. KRIZHEVSKY", "I. SUTSKEVER", "G.E. HINTON" ],
+      "venue" : null,
+      "citeRegEx" : "14",
+      "shortCiteRegEx" : "14",
+      "year" : 2012
+    }, {
+      "title" : "Building High-level Features Using Large Scale Unsupervised Learning",
+      "author" : [ "Q.V. LE", "R. MONGA", "M. DEVIN", "K. CHEN", "G.S. CORRADO", "J. DEAN", "NG", "A. Y" ],
+      "venue" : null,
+      "citeRegEx" : "16",
+      "shortCiteRegEx" : "16",
+      "year" : 2012
+    }, {
+      "title" : "Stronger Semantics for Low-Latency Geo-Replicated Storage",
+      "author" : [ "W. LLOYD", "M.J. FREEDMAN", "M. KAMINSKY", "D.G. ANDER- SEN" ],
+      "venue" : null,
+      "citeRegEx" : "17",
+      "shortCiteRegEx" : "17",
+      "year" : 2013
+    }, {
+      "title" : "Efficient Estimation of Word Representations in Vector Space",
+      "author" : [ "T. MIKOLOV", "K. CHEN", "G. CORRADO", "J. DEAN" ],
+      "venue" : "ICLRW",
+      "citeRegEx" : "18",
+      "shortCiteRegEx" : "18",
+      "year" : 2013
+    }, {
+      "title" : "Sparknet: Training deep networks in spark",
+      "author" : [ "P. MORITZ", "R. NISHIHARA", "I. STOICA", "M.I. JORDAN" ],
+      "venue" : "arXiv preprint arXiv:1511.06051",
+      "citeRegEx" : "19",
+      "shortCiteRegEx" : "19",
+      "year" : 2015
+    }, {
+      "title" : "Learning internal representations by error propagation",
+      "author" : [ "D.E. RUMELHART", "G.E. HINTON", "R.J. WILLIAMS" ],
+      "venue" : "Tech. rep., DTIC Document,",
+      "citeRegEx" : "21",
+      "shortCiteRegEx" : "21",
+      "year" : 1985
+    }, {
+      "title" : "Very Deep Convolutional Networks for Large-Scale Image Recognition",
+      "author" : [ "K. SIMONYAN", "A. ZISSERMAN" ],
+      "venue" : null,
+      "citeRegEx" : "23",
+      "shortCiteRegEx" : "23",
+      "year" : 2015
+    }, {
+      "title" : "VANHOUCKE, V., AND RABI- NOVICH, A. Going deeper with convolutions",
+      "author" : [ "C. SZEGEDY", "W. LIU", "Y. JIA", "P. SERMANET", "S. REED", "D. ANGUELOV", "D. ERHAN" ],
+      "venue" : null,
+      "citeRegEx" : "24",
+      "shortCiteRegEx" : "24",
+      "year" : 2015
+    }, {
+      "title" : "Fast Convolutional Nets With fbfft: A GPU Performance Evaluation",
+      "author" : [ "N. VASILACHE", "J. JOHNSON", "S. CHINTALA", "S. PIANTINO", "Y. LECUN" ],
+      "venue" : null,
+      "citeRegEx" : "25",
+      "shortCiteRegEx" : "25",
+      "year" : 2015
+    }, {
+      "title" : "Managed Communication and Consistency for Fast Data-parallel Iterative Analytics",
+      "author" : [ "J. WEI", "W. DAI", "A. QIAO", "Q. HO", "H. CUI", "G.R. GANGER", "P.B. GIBBONS", "G.A. GIBSON", "E.P. XING" ],
+      "venue" : "SoCC",
+      "citeRegEx" : "26",
+      "shortCiteRegEx" : "26",
+      "year" : 2015
+    }, {
+      "title" : "Distributed Machine Learning via Sufficient Factor Broadcasting",
+      "author" : [ "XIE P", "KIM J. K", "ZHOU Y", "HO Q", "KUMAR A", "YU Y", "XING E" ],
+      "venue" : null,
+      "citeRegEx" : "27",
+      "shortCiteRegEx" : "27",
+      "year" : 2015
+    }, {
+      "title" : "Petuum: A New Platform for Distributed Machine Learning on Big Data",
+      "author" : [ "XING E. P", "HO Q", "DAI W", "KIM J. K", "WEI J", "LEE S", "ZHENG X", "XIE P", "KUMAR A", "YU" ],
+      "venue" : "KDD",
+      "citeRegEx" : "28",
+      "shortCiteRegEx" : "28",
+      "year" : 2015
+    }, {
+      "title" : "Multi-GPU Training of ConvNets",
+      "author" : [ "O. YADAN", "K. ADAMS", "Y. TAIGMAN", "M. RANZATO" ],
+      "venue" : "ICLRW",
+      "citeRegEx" : "29",
+      "shortCiteRegEx" : "29",
+      "year" : 2014
+    }, {
+      "title" : "Tencent Deep Learning Platform and its Applications",
+      "author" : [ "ZOU Y", "JIN X", "LI Y", "GUO Z", "WANG E", "XIAO", "Mariana B" ],
+      "venue" : "In VLDB Endowment",
+      "citeRegEx" : "30",
+      "shortCiteRegEx" : "30",
+      "year" : 2014
+    } ],
+    "referenceMentions" : [ {
+      "referenceID" : 7,
+      "context" : "A number of software “frameworks” have been developed to expedite the process of designing and training deep neural networks, such as Caffe [11], Torch [4], and Theano [1].",
+      "startOffset" : 140,
+      "endOffset" : 144
+    }, {
+      "referenceID" : 2,
+      "context" : "A number of software “frameworks” have been developed to expedite the process of designing and training deep neural networks, such as Caffe [11], Torch [4], and Theano [1].",
+      "startOffset" : 152,
+      "endOffset" : 155
+    }, {
+      "referenceID" : 7,
+      "context" : "In order to assess Poseidon’s effectiveness, we integrate Poseidon into the Caffe [11] framework and evaluate its performance at training convolutional neural networks for object recognition in images.",
+      "startOffset" : 82,
+      "endOffset" : 86
+    }, {
+      "referenceID" : 0,
+      "context" : "On the much larger ImageNet 22K dataset, Poseidon with 8 nodes achieves better speedup and competitive accuracy to recent CPU-based distributed deep learning systems such as Adam [2] and Le et al.",
+      "startOffset" : 179,
+      "endOffset" : 182
+    }, {
+      "referenceID" : 11,
+      "context" : "[16], which use 10s to 1000s of nodes.",
+      "startOffset" : 0,
+      "endOffset" : 4
+    }, {
+      "referenceID" : 4,
+      "context" : "Modern deep learning models, such as convolutional neural networks (CNNs), have achieved notable successes in a wide spectrum of machine learning tasks, including speech recognition [7], visual recognition [14] and language understanding [18].",
+      "startOffset" : 182,
+      "endOffset" : 185
+    }, {
+      "referenceID" : 10,
+      "context" : "Modern deep learning models, such as convolutional neural networks (CNNs), have achieved notable successes in a wide spectrum of machine learning tasks, including speech recognition [7], visual recognition [14] and language understanding [18].",
+      "startOffset" : 206,
+      "endOffset" : 210
+    }, {
+      "referenceID" : 13,
+      "context" : "Modern deep learning models, such as convolutional neural networks (CNNs), have achieved notable successes in a wide spectrum of machine learning tasks, including speech recognition [7], visual recognition [14] and language understanding [18].",
+      "startOffset" : 238,
+      "endOffset" : 242
+    }, {
+      "referenceID" : 7,
+      "context" : "The explosive prosperity and rapid adoption of CNNs by research community are largely attributed to high performance computing hardware, such as GPUs, as well as a wide range of easy-to-use open source frameworks based on GPUs, including Caffe [11], Torch [4], Theano [1].",
+      "startOffset" : 244,
+      "endOffset" : 248
+    }, {
+      "referenceID" : 2,
+      "context" : "The explosive prosperity and rapid adoption of CNNs by research community are largely attributed to high performance computing hardware, such as GPUs, as well as a wide range of easy-to-use open source frameworks based on GPUs, including Caffe [11], Torch [4], Theano [1].",
+      "startOffset" : 256,
+      "endOffset" : 259
+    }, {
+      "referenceID" : 23,
+      "context" : "[30] report the Tencent deep learning platform named as Mariana, which distributes neural network training onto CPU clusters.",
+      "startOffset" : 0,
+      "endOffset" : 4
+    }, {
+      "referenceID" : 11,
+      "context" : "[16] later scale up to a cluster of 16,000 CPU cores by exploiting model parallelism and asynchronous SGD.",
+      "startOffset" : 0,
+      "endOffset" : 4
+    }, {
+      "referenceID" : 0,
+      "context" : "Recently, Microsoft’s Adam [2] achieved state-of-the-art results on the ImageNet22K classification task, by leveraging distributed systems techniques such as a global parameter server, ar X iv :1 51 2.",
+      "startOffset" : 27,
+      "endOffset" : 30
+    }, {
+      "referenceID" : 9,
+      "context" : "Compared to CPU-based distributed deep learning, parallelization of deep networks on GPU-equipped clusters is more readily available to researchers, since satisfactory speedups could potentially be achieved with a smaller number of GPU cards [13].",
+      "startOffset" : 242,
+      "endOffset" : 246
+    }, {
+      "referenceID" : 1,
+      "context" : "First, Infiniband networking, which has been responsible for past successes in distributed DL [3], is not available on most cloud computing platforms and lab clusters, where only commodity hardware with limited network bandwidth is installed.",
+      "startOffset" : 94,
+      "endOffset" : 97
+    }, {
+      "referenceID" : 1,
+      "context" : "On the other hand, in contrast to systems that require specialized hardware [3], we want our solution to effectively harness distributed GPUs installed on commodity servers and con-",
+      "startOffset" : 76,
+      "endOffset" : 79
+    }, {
+      "referenceID" : 21,
+      "context" : "We implemented Poseidon’s distributed layer upon the Petuum distributed ML framework [28], which provides a bounded stale synchronous parallel (SSP) parameter server [9] that preserves data-parallel convergence guarantees, and prioritized network bandwidth allocation [26].",
+      "startOffset" : 85,
+      "endOffset" : 89
+    }, {
+      "referenceID" : 5,
+      "context" : "We implemented Poseidon’s distributed layer upon the Petuum distributed ML framework [28], which provides a bounded stale synchronous parallel (SSP) parameter server [9] that preserves data-parallel convergence guarantees, and prioritized network bandwidth allocation [26].",
+      "startOffset" : 166,
+      "endOffset" : 169
+    }, {
+      "referenceID" : 19,
+      "context" : "We implemented Poseidon’s distributed layer upon the Petuum distributed ML framework [28], which provides a bounded stale synchronous parallel (SSP) parameter server [9] that preserves data-parallel convergence guarantees, and prioritized network bandwidth allocation [26].",
+      "startOffset" : 268,
+      "endOffset" : 272
+    }, {
+      "referenceID" : 8,
+      "context" : "ent sizes: CIFAR-10 [12], ILSVRC2012, and ImageNet 22K [22].",
+      "startOffset" : 20,
+      "endOffset" : 24
+    }, {
+      "referenceID" : 0,
+      "context" : "30% training time and 13% cluster nodes compared to Adam [2]).",
+      "startOffset" : 57,
+      "endOffset" : 60
+    }, {
+      "referenceID" : 21,
+      "context" : "We summarize our main contributions as follows: (1) We propose Poseidon, a scalable system architecture as a general purpose solution for any single-machine DL framework to be efficiently distributed on GPU clusters with commodity Ethernet, by leveraging the Petuum framework [28] as well as three components: a threelevel architecture, distributed wait-free backpropagation, and structure-aware communication protocol.",
+      "startOffset" : 276,
+      "endOffset" : 280
+    }, {
+      "referenceID" : 22,
+      "context" : "[29] show that mixed parallelism yields better speedups over model-only or data-only parallelism in ImageNet classification with 4 GPUs.",
+      "startOffset" : 0,
+      "endOffset" : 4
+    }, {
+      "referenceID" : 9,
+      "context" : "Similarly, Krizhevsky [13] also implements mixed parallelism for AlexNet [14] with 8 GPUs which",
+      "startOffset" : 22,
+      "endOffset" : 26
+    }, {
+      "referenceID" : 10,
+      "context" : "Similarly, Krizhevsky [13] also implements mixed parallelism for AlexNet [14] with 8 GPUs which",
+      "startOffset" : 73,
+      "endOffset" : 77
+    }, {
+      "referenceID" : 18,
+      "context" : "Facebook’s fbcunn [8, 25] implements both model- and dataparallelism on multiple GPUs.",
+      "startOffset" : 18,
+      "endOffset" : 25
+    }, {
+      "referenceID" : 1,
+      "context" : "[3] demonstrated that they could train a 11-billion parameter network on a cluster of 16 GPU nodes using model-parallelism, but their implementation required specialized hardware, such as Infiniband networking.",
+      "startOffset" : 0,
+      "endOffset" : 3
+    }, {
+      "referenceID" : 14,
+      "context" : "Also of note are several efforts to port Caffe onto the Spark platform, such as SparkNet [19], which reports a 4-5 times speedup with 10 machines (and hence less scalability than our results herein), as well as a recent, non-peer-reviewed, effort by Yahoo which exclusively uses Infiniband RDMA.",
+      "startOffset" : 89,
+      "endOffset" : 93
+    }, {
+      "referenceID" : 21,
+      "context" : "Poseidon builds upon Petuum, a distributed big machine learning framework that provides a generic interface to a broad spectrum of ML programs [28].",
+      "startOffset" : 143,
+      "endOffset" : 147
+    }, {
+      "referenceID" : 5,
+      "context" : "they still execute and converge correctly even when their model parameters A experience synchronization delays, provided that those delays are strictly bounded [9, 5, 15].",
+      "startOffset" : 160,
+      "endOffset" : 170
+    }, {
+      "referenceID" : 3,
+      "context" : "they still execute and converge correctly even when their model parameters A experience synchronization delays, provided that those delays are strictly bounded [9, 5, 15].",
+      "startOffset" : 160,
+      "endOffset" : 170
+    }, {
+      "referenceID" : 3,
+      "context" : "For stochastic gradient descent algorithms, SSP has very attractive theoretical properties [5].",
+      "startOffset" : 91,
+      "endOffset" : 94
+    }, {
+      "referenceID" : 19,
+      "context" : "Poseidon’s distributed layer is derived from Bösen [26], a parameter server implementation that supports SSP consistency model.",
+      "startOffset" : 51,
+      "endOffset" : 55
+    }, {
+      "referenceID" : 5,
+      "context" : "It allows computations to use stale model parameters (to reduce synchronization overheads), but strictly upper-bounds the number of missing iterations, restoring formal convergence guarantees [9].",
+      "startOffset" : 192,
+      "endOffset" : 195
+    }, {
+      "referenceID" : 0,
+      "context" : "ample, in previous CPU-based distributed DL systems [2, 6], a two-level parameter server architecture was built, where the first level has server machines collecting gradients and distributing newly updated model parameters to workers, and the second level has worker nodes (threads) taking batches of training data and generating",
+      "startOffset" : 52,
+      "endOffset" : 58
+    }, {
+      "referenceID" : 7,
+      "context" : "At the beginning of training, every worker thread starts its Caffe engine [11] to",
+      "startOffset" : 74,
+      "endOffset" : 78
+    }, {
+      "referenceID" : 5,
+      "context" : "2), during which they communicate asynchronously following a consistency model of the bounded stale synchronous scheme [9], as we briefly introduced in section .",
+      "startOffset" : 119,
+      "endOffset" : 122
+    }, {
+      "referenceID" : 19,
+      "context" : "In the lower level, the communications are further monitored and operated by a bandwidth manager provided by Petuum Bösen [26], as we explain in section 4.",
+      "startOffset" : 122,
+      "endOffset" : 126
+    }, {
+      "referenceID" : 15,
+      "context" : "Backpropagation (BP) [21] is the principle algorithm for training neural networks.",
+      "startOffset" : 21,
+      "endOffset" : 25
+    }, {
+      "referenceID" : 10,
+      "context" : "fully-connected layers in AlexNet [14] and VGG-16 [23].",
+      "startOffset" : 34,
+      "endOffset" : 38
+    }, {
+      "referenceID" : 16,
+      "context" : "fully-connected layers in AlexNet [14] and VGG-16 [23].",
+      "startOffset" : 50,
+      "endOffset" : 54
+    }, {
+      "referenceID" : 10,
+      "context" : "The DWBP is even more effective in GPU clusters with state-of-the-art CNN architectures, such as AlexNet [14] and VGG-16 [23], which stack convolutional (CONV) layers at the bottom, followed by fullyconnected (FC) layers at the top.",
+      "startOffset" : 105,
+      "endOffset" : 109
+    }, {
+      "referenceID" : 16,
+      "context" : "The DWBP is even more effective in GPU clusters with state-of-the-art CNN architectures, such as AlexNet [14] and VGG-16 [23], which stack convolutional (CONV) layers at the bottom, followed by fullyconnected (FC) layers at the top.",
+      "startOffset" : 121,
+      "endOffset" : 125
+    }, {
+      "referenceID" : 0,
+      "context" : "In data-parallel distributed settings, learning MPMs using iterative-convergent algorithms, as in [2, 6], usually needs to repeatedly push out and pull in the whole parameter matrices.",
+      "startOffset" : 98,
+      "endOffset" : 104
+    }, {
+      "referenceID" : 20,
+      "context" : "In this section, we first introduce a novel communication approach of Petuum for distributed machine learning, namely sufficient factor broadcasting (SFB) [27], which exchanges parameters following a P2P scheme.",
+      "startOffset" : 155,
+      "endOffset" : 159
+    }, {
+      "referenceID" : 20,
+      "context" : "Sufficient factor broadcasting (SFB) [27] is designed to",
+      "startOffset" : 37,
+      "endOffset" : 41
+    }, {
+      "referenceID" : 0,
+      "context" : "Microsoft Adam [2] employs a different SF-based strategy.",
+      "startOffset" : 15,
+      "endOffset" : 18
+    }, {
+      "referenceID" : 19,
+      "context" : "Poseidon also exploits the Bösen-based communication strategy [26], a key component of Petuum that maximizes the network efficiency under a given network bandwidth budget (especially in commodity Ethernet ) while minimizing parallel errors.",
+      "startOffset" : 62,
+      "endOffset" : 66
+    }, {
+      "referenceID" : 8,
+      "context" : "We first evaluate Poseidon on image classification tasks with benchmark datasets of CIFAR-10 [12] and ILSVRC2012 [22], and show that Poseidon significantly accelerates the training of modern CNN structures, while guaranteeing the correct convergence, which is important",
+      "startOffset" : 93,
+      "endOffset" : 97
+    }, {
+      "referenceID" : 0,
+      "context" : "Moreover, we deploy Poseidon on the ImageNet 22K classification, and compare its performance with previously published results such as Adam [2].",
+      "startOffset" : 140,
+      "endOffset" : 143
+    }, {
+      "referenceID" : 12,
+      "context" : "We conduct all experiments on the PRObE Susitna cluster [17], where each node has 4× 16-core 2.",
+      "startOffset" : 56,
+      "endOffset" : 60
+    }, {
+      "referenceID" : 8,
+      "context" : "We demonstrate Poseidon’s performance on three benchmark datasets ranging from small to large, including the CIFAR-10 [12], the ILSVRC2012 and the ImageNet22K[22].",
+      "startOffset" : 118,
+      "endOffset" : 122
+    }, {
+      "referenceID" : 10,
+      "context" : "We evaluate Poseidon using AlexNet [14] and GoogLeNet [24].",
+      "startOffset" : 35,
+      "endOffset" : 39
+    }, {
+      "referenceID" : 17,
+      "context" : "We evaluate Poseidon using AlexNet [14] and GoogLeNet [24].",
+      "startOffset" : 54,
+      "endOffset" : 58
+    }, {
+      "referenceID" : 17,
+      "context" : "GoogLeNet is a more structural and deeper (22-layer) CNN with only 5 million of parameters by stacking inception modules [24].",
+      "startOffset" : 121,
+      "endOffset" : 125
+    }, {
+      "referenceID" : 0,
+      "context" : "As no official test data exists for evaluation, following previous settings in [2, 6, 16], we randomly split the whole set into two parts, and use the first 7.",
+      "startOffset" : 79,
+      "endOffset" : 89
+    }, {
+      "referenceID" : 11,
+      "context" : "As no official test data exists for evaluation, following previous settings in [2, 6, 16], we randomly split the whole set into two parts, and use the first 7.",
+      "startOffset" : 79,
+      "endOffset" : 89
+    }, {
+      "referenceID" : 0,
+      "context" : "Table 6 compares our result to those of previous work on ImageNet 22K, Adam [2], MXNet, and Le et al.",
+      "startOffset" : 76,
+      "endOffset" : 79
+    }, {
+      "referenceID" : 11,
+      "context" : "[16].",
+      "startOffset" : 0,
+      "endOffset" : 4
+    }, {
+      "referenceID" : 0,
+      "context" : "Compared to Adam [2], we only use 30% training time and 13% machines to achieve 23.",
+      "startOffset" : 17,
+      "endOffset" : 20
+    }, {
+      "referenceID" : 6,
+      "context" : "1 million images to train an inception-BN structure [10] using 4 GPUs in a single machine without network communication, and reports 37.",
+      "startOffset" : 52,
+      "endOffset" : 56
+    }, {
+      "referenceID" : 0,
+      "context" : "7% Adam [2] 7.",
+      "startOffset" : 8,
+      "endOffset" : 11
+    }, {
+      "referenceID" : 11,
+      "context" : "[16] w/ pretrain 7.",
+      "startOffset" : 0,
+      "endOffset" : 4
+    } ],
+    "year" : 2015,
+    "abstractText" : "Deep learning models, which learn high-level feature representations from raw data, have become popular for machine learning and artificial intelligence tasks that involve images, audio, and other forms of complex data. A number of software “frameworks” have been developed to expedite the process of designing and training deep neural networks, such as Caffe [11], Torch [4], and Theano [1]. Currently, these frameworks can harness multiple GPUs on the same machine, but are unable to use GPUs that are distributed across multiple machines; because even average-sized deep networks can take days to train on a single GPU when faced with 100s of GBs to TBs of data, distributed GPUs present a prime opportunity for scaling up deep learning. However, the limited inter-machine bandwidth available on commodity Ethernet networks presents a bottleneck to distributed GPU training, and prevents its trivial realization. To investigate how existing software frameworks can be adapted to efficiently support distributed GPUs, we propose Poseidon, a scalable system architecture for distributed inter-machine communication in existing deep learning frameworks. In order to assess Poseidon’s effectiveness, we integrate Poseidon into the Caffe [11] framework and evaluate its performance at training convolutional neural networks for object recognition in images. Poseidon features three key contributions that improve the training speed of deep neural networks on clusters: (i) a three-level hybrid architecture that allows Poseidon to support both CPU-only clusters as well as GPU-equipped clusters, (ii) a distributed wait-free backpropagation (DWBP) algorithm to improve GPU utilization and to balance communication, and (iii) a dedicated structure-aware communication protocol (SACP) to minimize communication overheads. We empirically show that Poseidon converges to the same objective value as a single machine, and achieves state-of-the-art training speedup across multiple models and well-established datasets, using a commodity GPU cluster of 8 nodes (e.g. 4.5× speedup on AlexNet, 4× on GoogLeNet, 4× on CIFAR-10). On the much larger ImageNet 22K dataset, Poseidon with 8 nodes achieves better speedup and competitive accuracy to recent CPU-based distributed deep learning systems such as Adam [2] and Le et al. [16], which use 10s to 1000s of nodes.",
+    "creator" : "LaTeX with hyperref package"
+  }
+}

@@ -1,0 +1,278 @@
+{
+  "name" : "1604.01946.pdf",
+  "metadata" : {
+    "source" : "CRF",
+    "title" : "Optimizing Performance of Recurrent Neural Networks on GPUs",
+    "authors" : [ "Jeremy Appleyard" ],
+    "emails" : [ "jappleyard@nvidia.com", "tomas.kocisky@cs.ox.ac.uk", "phil.blunsom@cs.ox.ac.uk" ],
+    "sections" : [ {
+      "heading" : null,
+      "text" : "ar X\niv :1\n60 4.\n01 94\n6v 1\n[ cs\n.L G\n] 7\nA pr\nAs recurrent neural networks become larger and deeper, training times for single networks are rising into weeks or even months. As such there is a significant incentive to improve the performance and scalability of these networks. While GPUs have become the hardware of choice for training and deploying recurrent models, the implementations employed often make use of only basic optimizations for these architectures. In this article we demonstrate that by exposing parallelism between operations within the network, an order of magnitude speedup across a range of network sizes can be achieved over a naive implementation. We describe three stages of optimization that have been incorporated into the fifth release of NVIDIA’s cuDNN: firstly optimizing a single cell, secondly a single layer, and thirdly the entire network."
+    }, {
+      "heading" : "1 Introduction",
+      "text" : "Recurrent neural networks have become a standard tool for modelling sequential dependencies in discrete time series and have underpinned many recent advances in deep learning, from generative models of images [1, 2] to natural language processing [3, 4, 5, 6, 7, 8, 9]. A key factor in these recent successes has been the availability of powerful Graphics Processing Units (GPUs) which are particularly effective for accelerating the large matrix products at the heart of recurrent networks. However as recurrent networks become deeper [10] and their core units more structured [11, 12], it has become increasingly difficult to maximally utilise the computational capacity of the latest generation of GPUs.\nThere have been several studies optimizing the implementation of neural networks for GPUs, particularly in the case of convolutional neural networks [13, 14]. While GPUs are already widely used to compute RNNs [15, 16, 17, 18], there has been less work on the optimization of RNN runtime.\nIn this article we present a number of options for going beyond straightforward RNN GPU implementations that allow us to achieve close to maximum computational throughput for common network architectures. These enhancements are implemented in the fifth version of NVIDIA’s cuDNN library for Simple RNN, GRU, and LSTM architectures."
+    }, {
+      "heading" : "2 Implementation",
+      "text" : "In this section we will consider the performance of a forward and backward propagation passes through an LSTM network[11]. This is a standard four-gate LSTM network without peephole connections. The equations to compute the output at timestep t in the forward pass of this LSTM are given below:\nfor l in layers for j in iterations i(l,j)’ = A_i(l) * i(l,j) h(l,j)’ = A_h(l) * h(l,j) for pointwiseOp in pointwiseOps\ndo pointwiseOp\nListing 1: Pseudocode demonstrating the starting point for optimization of the forward pass.\nii = σ(Wixi +Riht−1 + bi)\nft = σ(Wfxt +Rfht−1 + bf )\not = σ(Woxt +Roht−1 + bo)\nc′t = tanh(Wcxt +Rcht−1 + bc) ct = ft ◦ c ′ t−1 + it ◦ c ′ t\nht = ot ◦ tanh(ct)\nMost of the same strategies found to be beneficial to LSTM performance are easily transferable to other types of RNN."
+    }, {
+      "heading" : "2.1 Naive implementation",
+      "text" : "There are many ways to naively implement a single propagation step of a recurrent neural network. As a starting point we will consider an implementation where each individual kernel (ie. matrix multiplication, sigmoid, point-wise addition, etc.) is implemented as a separate kernel. While the GPU executes the operations within each kernel in parallel, the kernels are executed back-to-back sequentially. The forward pass performance of this implementation is poor, achieving approximately 0.4 TFLOPS on a test case with hidden state size 512 and minibatch 64, less than 10% of the peak performance of the hardware (approximately 5.8 TFLOPS when running at base clocks).1\nA widely used optimization is to combine matrix operations sharing the same input into a single larger matrix operation. In the forward pass the standard formulation of an LSTM leads to eight matrix matrix multiplications: four operating on the recurrent input (R∗ht−1), four operating on the input from the previous layer (W∗xt). In these groups of four the input is shared, although the weights are not. As such, it is possible to reformulate a group of four matrix multiplications into a single matrix multiplication of four times the size. As larger matrix operations are more parallel (and hence more efficient), this roughly doubles forward pass throughput to 0.8 TFLOPs in the test case described above. This reformulation is very easy to implement in most deep learning frameworks leading to its wide use. A similar optimization is possible for GRU units, with two groups of three matrices able to be grouped. Single gate RNNs cannot benefit from this optimization as they have only one matrix multiplication at each input. The backward pass also benefits from this optimization as four inputs are transformed into one output. Pseudocode for this implementation is given in Listing 1.\nWhile some of the optimizations that follow have been implemented before, those that have are by no means universal nor standard practice."
+    }, {
+      "heading" : "2.2 Single Cell",
+      "text" : ""
+    }, {
+      "heading" : "2.2.1 Streamed matrix operations",
+      "text" : "The matrix multiplications performed by RNNs often have insufficient parallelism for optimal performance on the GPU. Current state-of-the-art GEMM kernels are implemented with each CUDA\n1All runtime and FLOP measurements reported are based off the mean of 100 executions on an NVIDIA M40 GPU (https://images.nvidia.com/content/tesla/pdf/ nvidia-teslam40-datasheet.pdf), at default application clocks with auto-boost disabled. The host CPU is an Intel Xeon CPU E5-2690 v2 @ 3.00GHz.\nfor l in layers for j in iterations set stream 0 i(l,j)’ = A_i(l) * i(l,j) set stream 1 h(l,j)’ = A_h(l) * h(l,j) wait for stream 0 do pointwise ops\nListing 2: Pseudocode demonstrating forward pass single cell optimizations.\nblock computing a rectangular tile of the output. The dimensions of these tiles is typically in the range 32 to 128. Partitioning the matrix multiplications required for the forward pass of a hidden state size 512, minibatch 64 LSTM with 128x64 tiles gives a total of 16 CUDA blocks. As blocks reside on a single GPU streaming multiprocessor (SM), and modern top-of-the-range GPUs (eg. our M40) currently have 24 streaming multiprocessors, this matrix multiplication will use at most two thirds of the available GPU performance. As it is desirable to have multiple blocks per SM to maximise latency hiding it is clear that to achieve better performance, it is required that we increase parallelism.\nOne easy way to increase the parallelism of a single RNN cell is to execute both matrix multiplications on the GPU concurrently. By using CUDA streams we can inform hardware that the matrix multiplications are independent. This doubles the amount of parallelism available to the GPU, increasing performance by up to 2x for small matrix multiplications. For larger matrix multiplications, streaming is still useful as it helps to minimize the so called “tail effect”. If the number of blocks launched to the GPU are only sufficient to fill its SMs a few times they can be thought of as passing through the GPU in waves. All of the blocks in the first wave finishes at approximately the same time, and as they finish the second wave begins. This continues until there is no more work. If the number of waves is small, the last wave will often have less work to do than the others, creating a “tail” of low performance. By increasing parallelism this tail can be overlapped with another operation, reducing the performance penalty."
+    }, {
+      "heading" : "2.2.2 Fusion of point-wise operations",
+      "text" : "Although parallelism comes naturally to point-wise operations, it was found that they were being executed inefficiently. This is for two reasons: firstly because there is a cost associated with launching a kernel to the GPU; secondly because it is inefficient to move the output of one point-wise operation all the way out to GPU main memory before reading it in again moments later for the next. By their nature point-wise operations are independent, and as such, it is possible to fuse all of the point-wise kernels into one larger kernel."
+    }, {
+      "heading" : "2.3 Single Layer",
+      "text" : "A single recurrent layer comprises many cells, the recurrent input of each depending on the output of the previous. The input from the previous layer may not have such a dependency and it is often possible to concatenate the inputs for multiple time steps producing a larger, more efficient, matrix multiplication. Selecting the amount of steps to concatenate over is not trivial: more steps leads to a more efficient matrix multiplication, but fewer steps reduces the time a recurrent operation may potentially be waiting for. The exact amount of steps will depend not only on the hyper-parameters, but also on the target hardware.\nAnother operation that is possible, when considering a layer in its entirety, is re-ordering the layout of the weight matrices. As the same weight matrices are used repeatedly over the course of a layer the cost of reordering is typically small compared to the cost of operating on the matrices. In our tests it was found that pre-transposing the weight matrix lead to noticeable performance improvements. Note that because the transpose of the weight matrix is used in the backward pass this pre-transposition must be performed every pass through the network.\nfor l in layers A_it(l) = transpose(A_i(l)) A_ht(l) = transpose(A_h(l)) for j in iterations, step s set stream 0 i(l,j:j+s)’ = A_it(l) * i(l,j:j+s) for k in 1,s\nset stream 1 h(l,j+k)’ = A_ht(l) * h(l,j+k) wait for stream 0 to complete operation on j+k do pointwise ops\nListing 3: Pseudocode demonstrating optimizations across the forward pass of a layer.\nfor l in layers A_it(l) = transpose(A_i(l)) A_ht(l) = transpose(A_h(l))\nwhile not Complete l,it = get next task for j in it->it+s set stream 0+2*l i(l,j:j+s)’ = A_it(l) * i(l,j:j+s) for k in 1,s\nset stream 1+2*l h(l,j+k)’ = A_ht(l) * h(l,j+k) wait for stream 0+2*l to complete operation on j+k do pointwise ops\nListing 4: Pseudocode demonstrating the final optimized forward pass."
+    }, {
+      "heading" : "2.4 Multiple Layers",
+      "text" : "It is becoming increasingly common for RNNs to feature multiple recurrent layers “stacked” such that each recurrent cell feeds its output directly into a recurrent cell in the next layer. In this situation, it is possible to exploit the parallelism between recurrent layers: the completion of a recurrent cell not only resolves the dependency on the next iteration of the current layer, but also on the current iteration of the next layer. This allows multiple layers to be computed in parallel, greatly increasing the amount of work the GPU has at any given time."
+    }, {
+      "heading" : "2.4.1 Scheduling",
+      "text" : "As launching work to the GPU takes a small, but not insignificant, amount of time it is important to consider the order in which the kernels are launched to the GPU. For example, if GPU resources are available it is almost always preferable to launch a kernel with all of its dependencies resolved, rather than a kernel which may be waiting some time for its dependencies to be cleared. In this way as much parallelism as possible can be exposed. In order to do this we chose a simple scheduling rule whereby the next work to be scheduled is that with the fewest edges to traverse before reaching the “first” recurrent cell. If one considers a recurrent network as a 2D grid of cells, this leads to a diagonal “wave” of launches propagating from the first cell."
+    }, {
+      "heading" : "2.5 Performance",
+      "text" : "The impact of each of the optimizations described on the forward pass of a 1000 step, four layer LSTM network with hidden state size 512 and an input minibatch of 64 is shown in Table 1. For this network we achieve an ~11x speedup over a completely naive implementation, and a ~6x speedup over an implementation with the standard GEMM grouping optimization.\nGiven sufficient recurrent steps there are three variables that are expected to significantly influence performance of an RNN implementation. These are: hidden state size, minibatch size and number of layers. Fixing the number of layers to four, Figure 1 shows the impact of each of these optimizations across a wide range of hidden state sizes and minibatch sizes.\nIn some cases increasing the number of layers from one to four doubles throughput (ie. 4x the work in only 2x the time). This performance improvement is particularly high in low parallelism cases, where the minibatch is small, the hidden state size is small, or both are small. One feature of note is the reduction of performance in the minibatch 32 case at high hidden state size. This is attributable to cuBLAS choosing a different path of execution for matrix multiplications due to an internal heuristic. As cuBLAS is unaware of the algorithm it is being used for, this is arguably reasonable behaviour, and performance for a single layer continues to climb as the problem size increases.\nThe most significant speedup is seen when the minibatch is 64. As the minibatch size increases so does the amount of parallelism already available to the GPU, so optimization strategies focused around increasing parallelism are less effective. Speedup is also lower with larger hidden layer sizes, for the same reason. Despite this, even for the largest problem benchmarked (minibatch 256, hidden state size 4096) the increase in parallelism due to layer overlapping still brings better performance.\nAt larger minibatches it becomes less clear that some of the individual optimizations bring improvement. Batching inputs is actually found to be detrimental in many cases for minibatch sizes other than 32, likely due to the trade-off discussed in Section 2.3. In other cases, changes can bring a significant improvement for particular problem sizes, while causing a slowdown for others. This makes it hard to say for sure that the combination of all optimizations will give the fastest runtime for a given set of hyperparameters, however it is the case that, excepting batched inputs, each optimization helps in most cases."
+    }, {
+      "heading" : "2.6 Weight Update",
+      "text" : "The above optimizations only apply to propagation steps. By completing the gradient propagation before starting the weight update, the weight update becomes very efficient. A single large matrix multiplication can be used to update each matrix with no dependencies and this will usually achieve close to peak performance. Updating the bias weights is very cheap in comparison to updating the matrices."
+    }, {
+      "heading" : "3 cuDNN",
+      "text" : "The optimizations described in Section 2 have been implemented in the fifth version of NVIDIA’s cuDNN library for single gate RNNs, GRUs and LSTMs. The performance of this implementation is shown in Figure 2. For this implementation it was possible to interact at a lower level with cuBLAS than is available via the current interface, and to tune the heuristics used to determine the mode of operation of cuBLAS to this use-case. In particular, cuBLAS will often pick a more parallel but less resource efficient route if it detects that the GPU is likely to be underused by a call. As we know the expected amount of parallelism at a higher level than cuBLAS, overriding this behaviour to favour\nmore resource efficient paths in cases of high streamed parallelism sometimes resulted in an overall speedup. It is hoped that an interface to allow this sort of manual tuning will be incorporated into a future release of cuBLAS."
+    }, {
+      "heading" : "4 Conclusions",
+      "text" : "We have presented a method by which recurrent neural networks can be executed on GPUs at high efficiently. While previous implementations exist achieving good acceleration on GPUs [19, 20], to our knowledge none achieve the levels of performance we achieve using the methods discussed above. The primary strategy used was to expose as much parallelism to the GPU as possible so as to maximize the usage of hardware resources. The methods are particularly efficient when working on smaller deeper recurrent networks where individual layers have less inherent parallelism.\nOne feature of the problem that we do not exploit for performance benefit is the reuse of the parameters between recurrent iterations. It is conceivable that these parameters could be stored in a lower level of GPU memory and reused from iteration to iteration. In bandwidth bound regimes this could potentially greatly improve performance. There are several drawbacks to this method; firstly the amount of storage for parameters is limited, and hence there would be an upper limit on the number of parameters. Secondly, any implementation would have to make assumptions which are invalid in the CUDA programming model, and hence would be prone to unexpected failure.\nSource code able to reproduce the forward pass timings for each optimization step is available at https://github.com/parallel-forall/code-samples/blob/master/ posts/rnn/LSTM.cu. This code closely mirrors the code used to write the core RNN functionality from version 5 of NVIDIA’s cuDNN library, which is available for download at https:// developer.nvidia.com/cudnn."
+    } ],
+    "references" : [ {
+      "title" : "DRAW: A recurrent neural network for image generation",
+      "author" : [ "Karol Gregor", "Ivo Danihelka", "Alex Graves", "Danilo Jimenez Rezende", "Daan Wierstra" ],
+      "venue" : "In Proceedings of the 32nd International Conference on Machine Learning, ICML 2015,",
+      "citeRegEx" : "1",
+      "shortCiteRegEx" : "1",
+      "year" : 2015
+    }, {
+      "title" : "Grid long short-term memory",
+      "author" : [ "Ivo Danihelka Nal Kalchbrenner", "Alex Graves" ],
+      "venue" : "In Proceedings of the International Conference on Learning Representations, ICLR,",
+      "citeRegEx" : "2",
+      "shortCiteRegEx" : "2",
+      "year" : 2016
+    }, {
+      "title" : "Recurrent continuous translation models",
+      "author" : [ "Nal Kalchbrenner", "Phil Blunsom" ],
+      "venue" : "In Proceedings of the 2013 Conference on Empirical Methods in Natural Language Processing,",
+      "citeRegEx" : "3",
+      "shortCiteRegEx" : "3",
+      "year" : 2013
+    }, {
+      "title" : "Neural machine translation by jointly learning to align and translate",
+      "author" : [ "Dzmitry Bahdanau", "Kyunghyun Cho", "Yoshua Bengio" ],
+      "venue" : "In Proceedings of the International Conference on Learning Representations,",
+      "citeRegEx" : "4",
+      "shortCiteRegEx" : "4",
+      "year" : 2015
+    }, {
+      "title" : "Sequence to sequence learning with neural networks",
+      "author" : [ "Ilya Sutskever", "Oriol Vinyals", "Quoc V. V Le" ],
+      "venue" : "In Advances in Neural Information Processing Systems",
+      "citeRegEx" : "5",
+      "shortCiteRegEx" : "5",
+      "year" : 2014
+    }, {
+      "title" : "Show and tell: A neural image caption generator",
+      "author" : [ "Oriol Vinyals", "Alexander Toshev", "Samy Bengio", "Dumitru Erhan" ],
+      "venue" : "In IEEE Conference on Computer Vision and Pattern Recognition,",
+      "citeRegEx" : "6",
+      "shortCiteRegEx" : "6",
+      "year" : 2015
+    }, {
+      "title" : "Show, attend and tell: Neural image caption generation with visual attention",
+      "author" : [ "Kelvin Xu", "Jimmy Ba", "Ryan Kiros", "Kyunghyun Cho", "Aaron C. Courville", "Ruslan Salakhutdinov", "Richard S. Zemel", "Yoshua Bengio" ],
+      "venue" : "In Proceedings of the 32nd International Conference on Machine Learning, ICML 2015,",
+      "citeRegEx" : "7",
+      "shortCiteRegEx" : "7",
+      "year" : 2015
+    }, {
+      "title" : "Recurrent neural network based language model",
+      "author" : [ "Tomas Mikolov", "Martin Karafiát", "Lukás Burget", "Jan Cernocký", "Sanjeev Khudanpur" ],
+      "venue" : "In INTERSPEECH 2010, 11th Annual Conference of the International Speech Communication Association,",
+      "citeRegEx" : "8",
+      "shortCiteRegEx" : "8",
+      "year" : 2010
+    }, {
+      "title" : "Transitionbased dependency parsing with stack long short-term memory",
+      "author" : [ "Chris Dyer", "Miguel Ballesteros", "Wang Ling", "Austin Matthews", "Noah A. Smith" ],
+      "venue" : "In Proceedings of the 53rd Annual Meeting of the Association for Computational Linguistics and the 7th International Joint Conference on Natural Language Processing,",
+      "citeRegEx" : "9",
+      "shortCiteRegEx" : "9",
+      "year" : 2015
+    }, {
+      "title" : "Supervised Sequence Labelling with Recurrent Neural Networks, volume 385 of Studies in Computational Intelligence",
+      "author" : [ "Alex Graves" ],
+      "venue" : null,
+      "citeRegEx" : "10",
+      "shortCiteRegEx" : "10",
+      "year" : 2012
+    }, {
+      "title" : "Long short-term memory",
+      "author" : [ "Sepp Hochreiter", "Jürgen Schmidhuber" ],
+      "venue" : "Neural Computation,",
+      "citeRegEx" : "11",
+      "shortCiteRegEx" : "11",
+      "year" : 1997
+    }, {
+      "title" : "On the properties of neural machine translation: Encoder–decoder approaches",
+      "author" : [ "Kyunghyun Cho", "Bart van Merrienboer", "Dzmitry Bahdanau", "Yoshua Bengio" ],
+      "venue" : "In Proceedings of SSST-8, Eighth Workshop on Syntax, Semantics and Structure in Statistical Translation,",
+      "citeRegEx" : "12",
+      "shortCiteRegEx" : "12",
+      "year" : 2014
+    }, {
+      "title" : "Fast algorithms for convolutional neural networks",
+      "author" : [ "Andrew Lavin" ],
+      "venue" : "CoRR, abs/1509.09308,",
+      "citeRegEx" : "13",
+      "shortCiteRegEx" : "13",
+      "year" : 2015
+    }, {
+      "title" : "Fast convolutional nets with fbfft: A GPU performance evaluation",
+      "author" : [ "Nicolas Vasilache", "Jeff Johnson", "Michaël Mathieu", "Soumith Chintala", "Serkan Piantino", "Yann LeCun" ],
+      "venue" : "CoRR, abs/1412.7580,",
+      "citeRegEx" : "14",
+      "shortCiteRegEx" : "14",
+      "year" : 2014
+    }, {
+      "title" : "Deep speech 2: End-to-end speech recognition in English and Mandarin",
+      "author" : [ "Dario Amodei", "Rishita Anubhai", "Eric Battenberg", "Carl Case", "Jared Casper", "Bryan C. Catanzaro", "Jingdong Chen", "Mike Chrzanowski", "Adam Coates", "Greg Diamos", "Erich Elsen", "Jesse Engel", "Linxi Fan", "Christopher Fougner", "Tony Han", "Awni Y. Hannun", "Billy Jun", "Patrick LeGresley", "Libby Lin", "Sharan Narang", "Andrew Y. Ng", "Sherjil Ozair", "Ryan Prenger", "Jonathan Raiman", "Sanjeev Satheesh", "David Seetapun", "Shubho Sengupta", "Yi Wang", "Zhiqian Wang", "Chong Wang", "Bo Xiao", "Dani Yogatama", "Jun Zhan", "Zhenyao Zhu" ],
+      "venue" : "CoRR, abs/1512.02595,",
+      "citeRegEx" : "15",
+      "shortCiteRegEx" : "15",
+      "year" : 2015
+    }, {
+      "title" : "Exploring the limits of language modeling",
+      "author" : [ "Rafal Józefowicz", "Oriol Vinyals", "Mike Schuster", "Noam Shazeer", "Yonghui Wu" ],
+      "venue" : null,
+      "citeRegEx" : "16",
+      "shortCiteRegEx" : "16",
+      "year" : 2016
+    }, {
+      "title" : "Introducing currennt: The Munich open-source CUDA recurrent neural network toolkit",
+      "author" : [ "Felix Weninger" ],
+      "venue" : "Journal of Machine Learning Research,",
+      "citeRegEx" : "18",
+      "shortCiteRegEx" : "18",
+      "year" : 2015
+    }, {
+      "title" : "Torch-rnn. https://github.com/jcjohnson/torch-rnn, 2016",
+      "author" : [ "Justin Johnson" ],
+      "venue" : null,
+      "citeRegEx" : "20",
+      "shortCiteRegEx" : "20",
+      "year" : 2016
+    } ],
+    "referenceMentions" : [ {
+      "referenceID" : 0,
+      "context" : "Recurrent neural networks have become a standard tool for modelling sequential dependencies in discrete time series and have underpinned many recent advances in deep learning, from generative models of images [1, 2] to natural language processing [3, 4, 5, 6, 7, 8, 9].",
+      "startOffset" : 209,
+      "endOffset" : 215
+    }, {
+      "referenceID" : 1,
+      "context" : "Recurrent neural networks have become a standard tool for modelling sequential dependencies in discrete time series and have underpinned many recent advances in deep learning, from generative models of images [1, 2] to natural language processing [3, 4, 5, 6, 7, 8, 9].",
+      "startOffset" : 209,
+      "endOffset" : 215
+    }, {
+      "referenceID" : 2,
+      "context" : "Recurrent neural networks have become a standard tool for modelling sequential dependencies in discrete time series and have underpinned many recent advances in deep learning, from generative models of images [1, 2] to natural language processing [3, 4, 5, 6, 7, 8, 9].",
+      "startOffset" : 247,
+      "endOffset" : 268
+    }, {
+      "referenceID" : 3,
+      "context" : "Recurrent neural networks have become a standard tool for modelling sequential dependencies in discrete time series and have underpinned many recent advances in deep learning, from generative models of images [1, 2] to natural language processing [3, 4, 5, 6, 7, 8, 9].",
+      "startOffset" : 247,
+      "endOffset" : 268
+    }, {
+      "referenceID" : 4,
+      "context" : "Recurrent neural networks have become a standard tool for modelling sequential dependencies in discrete time series and have underpinned many recent advances in deep learning, from generative models of images [1, 2] to natural language processing [3, 4, 5, 6, 7, 8, 9].",
+      "startOffset" : 247,
+      "endOffset" : 268
+    }, {
+      "referenceID" : 5,
+      "context" : "Recurrent neural networks have become a standard tool for modelling sequential dependencies in discrete time series and have underpinned many recent advances in deep learning, from generative models of images [1, 2] to natural language processing [3, 4, 5, 6, 7, 8, 9].",
+      "startOffset" : 247,
+      "endOffset" : 268
+    }, {
+      "referenceID" : 6,
+      "context" : "Recurrent neural networks have become a standard tool for modelling sequential dependencies in discrete time series and have underpinned many recent advances in deep learning, from generative models of images [1, 2] to natural language processing [3, 4, 5, 6, 7, 8, 9].",
+      "startOffset" : 247,
+      "endOffset" : 268
+    }, {
+      "referenceID" : 7,
+      "context" : "Recurrent neural networks have become a standard tool for modelling sequential dependencies in discrete time series and have underpinned many recent advances in deep learning, from generative models of images [1, 2] to natural language processing [3, 4, 5, 6, 7, 8, 9].",
+      "startOffset" : 247,
+      "endOffset" : 268
+    }, {
+      "referenceID" : 8,
+      "context" : "Recurrent neural networks have become a standard tool for modelling sequential dependencies in discrete time series and have underpinned many recent advances in deep learning, from generative models of images [1, 2] to natural language processing [3, 4, 5, 6, 7, 8, 9].",
+      "startOffset" : 247,
+      "endOffset" : 268
+    }, {
+      "referenceID" : 9,
+      "context" : "However as recurrent networks become deeper [10] and their core units more structured [11, 12], it has become increasingly difficult to maximally utilise the computational capacity of the latest generation of GPUs.",
+      "startOffset" : 44,
+      "endOffset" : 48
+    }, {
+      "referenceID" : 10,
+      "context" : "However as recurrent networks become deeper [10] and their core units more structured [11, 12], it has become increasingly difficult to maximally utilise the computational capacity of the latest generation of GPUs.",
+      "startOffset" : 86,
+      "endOffset" : 94
+    }, {
+      "referenceID" : 11,
+      "context" : "However as recurrent networks become deeper [10] and their core units more structured [11, 12], it has become increasingly difficult to maximally utilise the computational capacity of the latest generation of GPUs.",
+      "startOffset" : 86,
+      "endOffset" : 94
+    }, {
+      "referenceID" : 12,
+      "context" : "There have been several studies optimizing the implementation of neural networks for GPUs, particularly in the case of convolutional neural networks [13, 14].",
+      "startOffset" : 149,
+      "endOffset" : 157
+    }, {
+      "referenceID" : 13,
+      "context" : "There have been several studies optimizing the implementation of neural networks for GPUs, particularly in the case of convolutional neural networks [13, 14].",
+      "startOffset" : 149,
+      "endOffset" : 157
+    }, {
+      "referenceID" : 14,
+      "context" : "While GPUs are already widely used to compute RNNs [15, 16, 17, 18], there has been less work on the optimization of RNN runtime.",
+      "startOffset" : 51,
+      "endOffset" : 67
+    }, {
+      "referenceID" : 15,
+      "context" : "While GPUs are already widely used to compute RNNs [15, 16, 17, 18], there has been less work on the optimization of RNN runtime.",
+      "startOffset" : 51,
+      "endOffset" : 67
+    }, {
+      "referenceID" : 16,
+      "context" : "While GPUs are already widely used to compute RNNs [15, 16, 17, 18], there has been less work on the optimization of RNN runtime.",
+      "startOffset" : 51,
+      "endOffset" : 67
+    }, {
+      "referenceID" : 10,
+      "context" : "In this section we will consider the performance of a forward and backward propagation passes through an LSTM network[11].",
+      "startOffset" : 117,
+      "endOffset" : 121
+    }, {
+      "referenceID" : 17,
+      "context" : "While previous implementations exist achieving good acceleration on GPUs [19, 20], to our knowledge none achieve the levels of performance we achieve using the methods discussed above.",
+      "startOffset" : 73,
+      "endOffset" : 81
+    } ],
+    "year" : 2016,
+    "abstractText" : "As recurrent neural networks become larger and deeper, training times for single networks are rising into weeks or even months. As such there is a significant incentive to improve the performance and scalability of these networks. While GPUs have become the hardware of choice for training and deploying recurrent models, the implementations employed often make use of only basic optimizations for these architectures. In this article we demonstrate that by exposing parallelism between operations within the network, an order of magnitude speedup across a range of network sizes can be achieved over a naive implementation. We describe three stages of optimization that have been incorporated into the fifth release of NVIDIA’s cuDNN: firstly optimizing a single cell, secondly a single layer, and thirdly the entire network.",
+    "creator" : "gnuplot 5.0 patchlevel 3"
+  }
+}

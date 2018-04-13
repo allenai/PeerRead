@@ -1,0 +1,464 @@
+{
+  "name" : "1703.04070.pdf",
+  "metadata" : {
+    "source" : "CRF",
+    "title" : "Prediction and Control with Temporal Segment Models",
+    "authors" : [ "Nikhil Mishra", "Pieter Abbeel", "Igor Mordatch" ],
+    "emails" : [ "<nmishra@berkeley.edu>." ],
+    "sections" : [ {
+      "heading" : "1. Introduction",
+      "text" : "The problem of learning dynamics – where an agent learns a model of how its actions will affect its state and that of its environment – is a key open problem in robotics and reinforcement learning. An agent equipped with a dynamics model can leverage model-predictive control or modelbased reinforcement learning (RL) to perform a wide variety of tasks, whose exact nature need not be known in advance, and without additional access to the environment.\nIn contrast with model-free RL, which seeks to directly learn a policy (mapping from states to actions) in order to accomplish a specific task, learning dynamics has the advantage that dynamics models can be learned without taskspecific supervision. Since dynamics models are decoupled from any particular task, they can be reused across different\n1University of California, Berkeley 2OpenAI. Correspondence to: Nikhil Mishra <nmishra@berkeley.edu>.\nProceedings of the 34 th International Conference on Machine Learning, Sydney, Australia, PMLR 70, 2017. Copyright 2017 by the author(s).\ntasks in the same environment. Additionally, learning differentiable dynamics models (such as those based on neural networks) enables the use of end-to-end backpropagationbased methods for policy and trajectory optimization that are much more efficient than model-free methods.\nTypical approaches to dynamics learning build a one-step model of the dynamics, predicting the next state as a function of the current state and the current action. However, when chained successively for many timesteps into the future, the predictions from a one-step model tend to diverge from the true dynamics, either due to the accumulation of small errors or deviation from the regime represented by the data the model was trained on. Any learned dynamics model is only valid under the distribution of states and actions represented by its training data, and one-step models make no attempt to deal with the fact that they cannot make accurate predictions far outside this distribution.\nWhen the true dynamics are stochastic, or the sensory measurements noisy or unreliable, these problems are only exacerbated. Moreover, the dynamics may be inherently difficult to learn: bifurcations such as collisions induce sharp changes in state that are hard to model with certainty when looking at a single timestep. There may also be hysteresis effects such as gear backlash in robots, or high-order dynamics in hydraulic robot actuators and human muscles that require looking at a history of past states.\nWe present a novel approach to learning dynamics based on a deep generative model over temporal segments: we wish to model the distribution over possible future state trajectories conditioned on planned future actions and a history of past states and actions. By considering an entire segment of future states, our approach can model both uncertainty and complex interactions (like collisions) holistically over a segment, even if it makes small errors at individual timesteps. We also model a prior over action segments using a similar generative model, which can be used to ensure that the action distribution explored during planning is the same as the one the model was trained on. We show that that our method makes better predictions over long horizons than one-step models, is robust to stochastic dynamics and measurements, and can be used in a variety of control settings while only considering actions from the regime where the model is valid. ar X\niv :1\n70 3.\n04 07\n0v 2\n[ cs\n.L G\n] 1\n3 Ju\nl 2 01\n7"
+    }, {
+      "heading" : "2. Related Work",
+      "text" : "A number of options are available for representation of learned dynamics models, including linear functions (Mordatch et al., 2016; Yip & Camarillo, 2014), Gaussian processes (Boedecker et al., 2014; Ko & Fox, 2009; Deisenroth & Rasmussen, 2011), predictive state representations (PSRs) (Littman et al., 2002; Rosencrantz et al., 2004), and deep neural networks (Punjani & Abbeel, 2015; Fragkiadaki et al., 2015; Agrawal et al., 2016). Linear functions are efficient to evaluate and solve controls for, but have limited expressive power. Gaussian processes (Williams & Rasmussen, 1996) provide uncertainty estimates, but scaling them to large datasets remains a challenge (Shen et al.; Lawrence et al., 2003). PSRs and variants make multi-step predictions, but suffer from the same scalability challenges as Gaussian processes. Our method combines the expressiveness and scalability of neural networks with the ability to provide sampling and uncertainty estimates, modeling entire segments to improve stability and robustness.\nAn alternative is to learn dynamics models in an online fashion, constantly adapting the model based on an incoming stream of observed states and actions (Fu et al., 2016; Mordatch et al., 2016; Yip & Camarillo, 2014; Lenz et al., 2015). However, such approaches are slow to adapt to rapidly-changing dynamics modes (such as those arising when making or breaking contact) and may be problematic when applied on robots performing rapid motions.\nSeveral approaches exist to improve the stability of models that make sequential predictions. Abbeel & Ng (2004) and Venkatraman et al. (2015) consider alternative loss functions that improve robustness over long prediction horizons. Bengio et al. (2015) and Venkatraman et al. (2016) also use simple curricula for a similar effect. While they all consider multi-step prediction losses, they only do so in the context of training models that are intrinsically one-step.\nExisting methods for video prediction (Finn & Levine, 2016; Oh et al., 2015) look at a history of previous states and actions to predict the next frame; we take this a step further by modeling a distribution over an entire segment of future states that is also conditioned on future actions. In this work, we focus on demonstrating the benefits of a probabilistic segment-based approach; these methods could easily be incorporated with ours to learn dynamics from images, but we leave this to future work.\nWatter et al. (2015) and Johnson et al. (2016) use variational autoencoders to learn a low-dimensional latent-space representation of image observations. Finn et al. (2016) takes a similar approach, but without the variational aspect. These works utilized autoencoders as a means of dimensionality reduction (rather than for temporal coherence like we do) to enable the use of existing control algorithms based on locally-linear one-step dynamics models.\nTemporally-extended actions were shown to be effective in reinforcement learning, such as the options framework (Sutton et al., 1999b) or sequencing of sub-plans (Vezhnevets et al., 2016). Considering entire trajectories as opposed to single timesteps can also lead to simpler control policies. For example, there are effective and simple manually-designed control laws (Raibert, 1986), (Pratt et al., 2006) that formulate optimal actions as a function of the entire future trajectory rather than a single future state."
+    }, {
+      "heading" : "3. Segment-Based Dynamics Model",
+      "text" : "Suppose we have a non-linear dynamical system with states xt and actions ut. The conventional approach to learning dynamics is to learn a function xt+1 = f(xt, ut) using an approximator such as a neural network (possibly recurrent).\nWe consider a more general formulation of the problem, which is depicted in Figure 1: given segments (of lengthH) of past states X− = {xt−H , . . . , xt−1} and actions U− = {ut−H , . . . , ut−1}, we wish to predict the entire segment of future states X+ = {xt, . . . , xt+H} that would result from taking actions U+ = {ut, . . . , ut+H−1}. Treating these four temporal segments as random variables, then we wish to learn the conditional distribution P (X+|X−, U−, U+). We introduce dependency on past actions U− to support dynamics with delayed or filtered actions.\nWith this in mind, we propose the use of a deep conditional variational autoencoder (Kingma & Welling, 2014): our encoder will learn the distribution Q(x)(Z|X+, X−, U−, U+) over latent codes Z, and our decoder will learn to reconstruct X+ from X−, U−, U+ and a sample from Z, modeling the distribution P (x)(X+|X−, U−, U+, Z). Note that the random variable Z is a vector that describes an entire segment of states, X+. After training is complete, we can discard the\nencoder, and the decoder will allow us to predict the future state trajectory X̂+ using X−, U−, U+, as desired, sampling latent codes from an enforced prior P (Z) = N (0, I). Empirically, we observe that having the encoder model Q(x)(Z|X+) instead of Q(x)(Z|X+, X−, U−, U+) gives equivalent performance, and so we take this approach in all of our experiments for simplicity."
+    }, {
+      "heading" : "3.1. Model Architecture and Training",
+      "text" : "In the previous section we discussed a conditional variational autoencoder whose generative path serves as a stochastic dynamics model. Here we will expand on some of the architectural details. A diagram of the entire training setup is shown in Figure 2. For more details of the architectures used in our experiments, see Appendix A.\nThe encoder network Q(x) explicitly parametrizes a Gaussian distribution over latent codes Z with diagonal covariance. It consists of a stack of 1D-convolutional layers, whose output is flattened and projected into a single vector containing a mean µZ and variance σ2Z . We then sample z ∼ N (µZ , σ2Z) in a differentiable manner using the reparametrization trick (Kingma & Welling, 2014).\nThe decoder network P (x) seeks to model a distribution over a segment of states P (X+) = P (xt, . . . , xt+H). The causal nature of this segment (a particular timestep is only\naffected by the ones that occur before it) suggests that an autoregressive model with dilated convolutions is appropriate, similar to architectures previously used for modeling audio (van den Oord et al., 2016a) and image (van den Oord et al., 2016b) data. Like these works, we use layers with the following activation function:\ntanh(Wf,k ∗ s+ V Tf,kz) σ(Wg,k ∗ s+ V Tg,kz) (1)\nwhere ∗ denotes convolution, denotes elementwise multiplication, σ(·) is the sigmoid function, s is the input to the layer, z is a latent code sampled from the output of the decoder, and W,V are network weights to be learned. We found that residual layers and skip connections between layers give slightly better performance but are not essential.\nWe train the model parameters end-to-end, minimizing the l2-loss between X+ and its reconstruction X̂+, along with the KL-divergence of the latent codeZ ∼ N (µZ , σ2Z) from N (0, I) similarly to Kingma & Welling (2014)."
+    }, {
+      "heading" : "4. Control with Segment-Based Models",
+      "text" : "Once we have learned a dynamics model, we want to utilize it in order to accomplish different tasks, each of which can be expressed as reward function r(xt, ut). Trajectory optimization and policy optimization are two settings where a dynamics model would commonly be used, and provide meaningful ways with which to evaluate a dynamics model."
+    }, {
+      "heading" : "4.1. Trajectory Optimization",
+      "text" : "In trajectory optimization, we wish to find a sequence of actions that can be applied to accomplish a particular instance of a task. Specifically, given a reward function r, we want to maximize the sum of rewards along the trajectory that results from applying the actions u1, . . . , uT , beginning from an initial state x0. This can be summarized by the following optimization problem:\nmax u1,...,uT E\n[ T∑\nt=1\nr(xt, ut)\n]\nwith xt ∼ P (x)(xt|x0:t−1, u1:t) (2)\nwhere r(xt, ut) is the reward received at time t, and X = {x1, . . . , xT } is the sequence of states that would result from taking actions U = {u1, . . . , uT } from initial state x0, under dynamics model P (x). The expectation is taken over state trajectories sampled from the model."
+    }, {
+      "heading" : "4.2. Latent Action Priors",
+      "text" : "If we attempt to solve the optimization problem as posed in (2), the solution will often attempt to apply action sequences outside the manifold where the dynamics model\nis valid: these actions come from a very different distribution than the action distribution of the training data. This can be problematic: the optimization may find actions that achieve high rewards under the model (by exploiting it in a regime where it is invalid) but that do not accomplish the goal when they are executed in the real environment.\nTo mitigate this problem, we propose the use of another conditional variational autoencoder, this one over segments of actions. In particular, given sequences of past actions U− = {ut−H , . . . , ut−1}, and future actions U+ = {ut, . . . , ut+H}, we wish to model the the conditional distribution P (U+|U−). The encoder learnsQ(u)(Z|U+) and the decoder learns P (u)(U+|Z,U−). We condition on U− to support temporal coherence in the generated action sequence. Like the dynamics model introduced in Section 3.1, the encoder uses 1D-convolutional layers, and the decoder is autoregressive, with dilated causal convolutions. The latent space that this autoencoder learns describes a prior over actions that can be used when planning with a dynamics model; hence we refer to this autoencoder over action sequences as a latent action prior.\nTo incorporate a latent action prior, we divide an action sequence U = {u1, . . . , uT } into segments U1, . . . UK of length H (where K is determined such that T = HK, and U0 = 0). Then we can generate action sequences that are similar to the ones in our training set by sampling different latent codes z1, . . . , zK and using the decoder to sample from P (u)(Uk|Uk−1, zk),∀k = 1, . . . ,K. The optimization problem posed in (2) can then be expressed as:\nmax z1,...,zK E\n[ T∑\nt=1\nr(xt, ut)\n]\nwith xt ∼ P (x)(xt|x0:t−1, u1:t) ut ∼ P (u)(ut|u1:t−1, z1:K)\n(3)\nwhere the actions u1, . . . , uT and states x1, . . . , xT are generated by the latent action prior and dynamics model (see Figure 3 for an illustration). Since the dynamics model is differentiable, the above optimization problem can be solved end-to-end with backpropagation. While it is still nonconvex, we are optimizing over fewer variables, and the possible action sequences that are explored will be from the same distribution as the model’s training data. Moreover, the gradients of the rewards with respect to the latent codes are likely to have stronger signal than those with respect to a single action. We used Adam (Kingma & Ba, 2015) with step size 0.01 to perform this optimization and found that it generally converged in around 100 iterations."
+    }, {
+      "heading" : "4.3. Policy Optimization",
+      "text" : "Trajectory optimization enables an agent to accomplish a single instance of a task, but more often, we are interested\nin policy optimization, where the agent learns a policy that dictates optimal behavior in order to accomplish the task in the general case. In particular, a policy is a learned function (with parameters θ) that defines a conditional distribution over actions given states, denoted πθ(u|x). The value of a policy is defined as the expected sum of discounted rewards when acting under the policy, and can be expressed as:\nη(θ) = E\n[ ∞∑\nt=1\nγt · r(xt, ut) ]\n(4)\nwhere the actions are sampled from πθ(ut|xt), and γ is a discount factor. The goal of policy optimization is to maximize the value of the policy with respect to its parameters.\nThe class of algorithms known as policy gradient methods (Sutton et al., 1999a; Peters & Schaal, 2006) attempt to solve this optimization problem without considering a dynamics model. They execute a policy πθ to get samples x1, u1, r1, . . . , xT , uT , rT from the environment, and then update θ to get an improved policy, relying on likelihood ratio methods (Williams, 1992) to estimate the gradient ∂η∂θ because they cannot directly compute the derivatives of the rewards r(xt, ut) with respect to the actions u1, . . . , ut.\nModel-based policy optimization can be more efficient than traditional policy-gradient methods, because the gradient ∂η ∂θ can be computed directly by backpropagation through a differentiable model. However, its success hinges on the\naccuracy of the dynamics model, as the optimization can exploit flaws in the model in the same way as discussed in Section 4.2. Heess et al. (2015) use a model-based approach where a one-step dynamics model is learned jointly with a policy in an online manner. To evaluate the robustness of our models, we experiment with learning policies offline, where the dynamics model is learned through unsupervised exploration of the environment, and no environment interaction is allowed beyond this exploration.\nInstead of a one-step policy of the form πθ(ut|xt), we also explored using a segment-based policy πθ(Z|X−, U−) that generates actions using latent action priorP (u) as follows:\nX−, U− = {xt−H , . . . , xt−1}, {ut−H , . . . , ut−1} sample Z ∼ πθ(Z|X−, U−)\n{ut, . . . , ut+H} = U+ ∼ P (u)(U+|Z,U−) and then acts according to action ut. The resulting policy will learn to accomplish the task while only considering actions for which the dynamics model is valid. In terms of the options framework (Sutton et al., 1999b), we can think of this policy as considering a continuous spectrum of options, all of which are consistent with both past observed states and actions, and the data distribution under which the dynamics model makes good predictions."
+    }, {
+      "heading" : "5. Experiments",
+      "text" : "Our experiments investigate the following questions: (i) How well do segment-based models predict dynamics? (ii) How does prediction accuracy transfer to control applications? How does this scale with the difficulty of the task and stochasticity in the dynamics? (iii) How is this affected by the use of latent action priors? (iv) Is there any meaning or structure encoded by the latent space learned by the dynamics model?"
+    }, {
+      "heading" : "5.1. Environments",
+      "text" : "In order for a dynamics model to be versatile enough for use in control settings, the training data needs to contain a variety of actions that explore a diverse subset of the state space. Efficient exploration strategies are an open problem in reinforcement learning and are not the focus of this work. With this in mind, we base our experiments on a simulated 2-DOF arm moving in a plane (as implemented in the Reacher environment in OpenAI Gym), because performing random actions in this environment results in sufficient exploration. We consider the following environments throughout our experiments (illustrated in Figure 4): (i) The basic, unmodified Reacher environment. (ii) A version containing an obstacle that the arm can collide with: the obstacle cannot move, but its position is randomly chosen at the start of each episode. (iii) A version in which the arm can push a damped cylin-\ndrical object around the arena.\nWhile the segment length and dimensionality of the latent space could be varied, we found that these values were reasonable choices for these environments. As the segment length approaches 1, the model degenerates into a one-step model, and for longer segments, its performance plateaus because the states towards the end of the segment become independent of those at the beginning. Likewise, we observed that this latent-space dimensionality was a good trade-off between expressiveness and information density."
+    }, {
+      "heading" : "5.2. Baselines",
+      "text" : "We compare our method against the following baselines: (i) A one-step model: a learned function xt+1 = f(xt, ut), where f is a fully-connected neural network. It is trained using a one-step-prediction l2-loss on tuples (xt, ut, xt+1). (ii) A one-step model that is rolled out several timesteps at training time. The model is still a learned function xt+1 = f(xt, ut), but it is trained with a multi-step prediction loss, over a horizon of length 2H . While this does not increase the model’s expressive power, we expect it to be more robust to the accumulation of small errors (e.g., Venkatraman et al. (2015); Abbeel & Ng (2004)). (iii) An LSTM model, which can store information about the past in a hidden state ht: xt+1, ht+1 = f(xt, ut, ht), and is trained with the same multi-step prediction loss (also over a horizon of 2H). We expect that the LSTM can learn fairly complex dynamics, but the hidden state dependencies can make trajectory and policy optimization more difficult."
+    }, {
+      "heading" : "5.3. Results",
+      "text" : ""
+    }, {
+      "heading" : "5.3.1. DYNAMICS PREDICTION",
+      "text" : "After learning a dynamics model, we evaluate it on a test set of held-out trajectories by computing the average loglikelihood of the test data under the model.\nFor our method, we do this by obtaining samples from the model, fitting a Gaussian to the samples, and determining the log-likelihood of the true trajectory under the fitted Gaussian. Since the baseline methods do not express uncertainty, but are trained using l2-loss, we interpret their predictions as the mean of a Gaussian distribution whose variance is constant across all state dimensions and timesteps (since minimizing l2-loss is equivalent to maximizing this log-likelihood). We then fit the value of the variance constant to maximize the log-likelihood on the test set.\nFigure 5 compares our method to the baselines in each environment. The values reported are log-likelihoods per timestep, averaged over a test set of 1000 trajectories. Our model and the LSTM are competitive in the basic environment (and both substantially better than the one-step models), but the LSTM’s performance degrades on more challenging environments with collisions.\nBasic Pushing Object With Obstacle\nEnvironment\n32.16\n26.55\n17.95\n28.44\n16.42\n11.96\n18.49\n13.02 11.36\n19.93\n13.98 12.55\nOurs LSTM One Step One Step, rolled out\nFigure 5. Prediction quality of our method compared to several baselines in a range of environments. The reported values are the average log-likelihood per timestep on a test set (higher is better). Our method significantly outperforms the baseline methods, even in environments with complex dynamics such as collisions."
+    }, {
+      "heading" : "5.3.2. CONTROL1",
+      "text" : "Next, we compare our method to the baselines on trajectory and policy optimization. Of interest is both the actual reward achieved in the environment, and the difference between the true reward and the expected reward under the model. If a control algorithm exploits the model to predict unrealistic behavior, then the latter will be large.\nWe consider two tasks: (i) Reaching Task: the arm must move its end effector to a desired position. The reward function is the negative distance between the end effector and the target position, minus a quadratic penalty on applying large torques.\n1 Videos of our experimental results can be seen here: https://sites.google.com/site/temporalsegmentmodels/.\n(ii) Pushing Task: the arm must push a cylindrical object to the desired position. Like in the reaching task, the reward function is the negative distance between the object and the target, again minus a penalty on large torques.\nThe trajectory-optimization results are summarized in Figure 6. For each task and dynamics model, we sampled 100 target positions uniformly at random, solved the optimization problem as described in (2) or (3), and then executed the action sequences in the environment in open loop. Under each model, the optimization finds actions that achieve similar model-predicted rewards, but the baselines suffer from large discrepancies between model prediction and the true dynamics. Qualitatively, we notice that, on the pushing task, the optimization exploits the LSTM and onestep models to predict unrealistic state trajectories, such as the object moving without being touched or the arm passing through the object instead of colliding with it. Our model consistently performs better, and, with a latent action prior, the true execution closely matches the model’s prediction. When it makes inaccurate predictions, it respects physical invariants, such as objects staying still unless they are touched, or not penetrating each other when they collide.\nReaching Pushing\n7.23 7.917.38\n12.15\n8.15\n16.06\n8.69\n19.65\n7.89\n19.01\nNegative Reward in Environment\nReaching Pushing\n0.21 0.131.01\n4.30 1.65\n8.44\n2.27\n11.71\n1.58\n11.47\nDiscrepancy between Model and Environment\nOurs, with latent prior Ours, without latent prior LSTM\nOne Step One Step, rolled out\nFigure 6. Trajectory optimization on the reaching and pushing tasks. The top plot reports the negative reward from open-loop execution of the returned action sequences (lower is better, averaged over 100 trials), and the bottom shows the difference between true reward and model-predicted reward. Our model, with a latent action prior, achieves both the best in-environment performance and the smallest discrepancy between environment and model.\nFigure 7 depicts the results from policy-optimization (Section 4.3) in the form of learning curves for each task and dynamics model. See Appendix A for model architectures and hyperparameters. For comparison, we also plot the performance of a traditional policy gradient method. Although this method and ours eventually achieve similar performance, ours does so much more efficiently, learning the policy offline with fewer samples from the model than the traditional method needed from the environment."
+    }, {
+      "heading" : "5.3.3. SENSORY NOISE AND DELAYED ACTIONS",
+      "text" : "To explore the effects of stochastic dynamics and delayed actions, we consider two more modifications of the Reacher environment, one in which there is considerable Gaussian noise in the state observations (σ = 0.25 on data in the range [−1,+1]), and one in which actions are delayed: they do not take effect for τ = 5 timesteps after they are applied. These challenges commonly arise in realworld robotics applications (Atkeson et al., 2016), and so it is important to be able to learn a useful dynamics model in either setting. For both the noisy-state and delayedaction environments, we learn a dynamics model with each method, and then use it to learn a policy for the reaching task. Figure 8 displays the resulting learning curves. Our dynamics model performs much better than the baselines, both with and without an action prior. Notably, using the LSTM model results in a substantially worse policy than ours even though its prediction accuracy is only slightly lower. Because our model operates over segments, it implicitly learns to filter noisy observations. This removes the need to explicitly apply and tune a filtering process, as is traditionally done."
+    }, {
+      "heading" : "5.3.4. ANALYSIS OF LATENT SPACE",
+      "text" : "Variational autoencoders are known for learning lossy latent codes that preserve high-level semantics of the data, leaving the decoder to determine the low-level details. As a result, we are curious to see whether our dynamics model learns a latent space that possesses similar properties.\nApplied to dynamics data, one might expect a latent code to provide an overall description of what happens in the state trajectory X+ it encodes. Alternatively, per the argument made by Chen et al. (2016), it is also conceivable that the decoder would ignore the latent code entirely, because the segments X−, U−, U+ provide better information than Z about X+. However, we observe that our model does learn a meaningful latent space: one that encodes uncertainty about the future. A particular latent code corresponds to a particular future within the space of possible ones consistent with the given X−, U−, U+.\nWhen the dynamics are simple and deterministic (such as in the original Reacher environment), the model does express certainty by ignoring the latent code. With stochas-\nticity (such as in the previous section), it provides a spread of reasonable state trajectories. Interestingly, when the dynamics are deterministic but complex, the model also uses the latent codes to express uncertainty. This can occur regarding the orientations and velocities of objects immediately following a collision, as illustrated in Figure 9."
+    }, {
+      "heading" : "5.3.5. EFFECT OF LATENT ACTION PRIOR",
+      "text" : "Our earlier experiments demonstrated the benefits of a latent action prior: by only considering actions for which the dynamics model is valid, the discrepancy between the model and the true dynamics is minimized, resulting in higher rewards achieved in the actual environment.\nIn this section, we qualitatively examine how the actions returned by control algorithms differ as a consequence of the latent action prior. An example is illustrated in Figure 10. In the training data, the actions that the agent takes are smooth, random torques, and we observe that when we use an action prior, solutions from trajectory optimization look similar. We contrast this with the solutions from optimizing directly over actions, which are sharp and discontinuous, unlike anything the dynamics model has seen before. This lets us infer that the baselines perform poorly on the pushing task (as shown in Figure 6) because of large discrepancies between the model prediction and the true execution.\n0 20 40 60 80 100\nTimestep\nSample of Actions from Training Data"
+    }, {
+      "heading" : "6. Conclusion and Future Work",
+      "text" : "We presented a novel approach to dynamics learning based on temporal segments, using a variational autoencoder to learn the distribution over future state trajectories conditioned on past states, past actions, and planned future actions. We also introduced the latent action prior, a variational autoencoder that models a prior over action segments, and showed how it can be used to perform control using actions from the same distribution as a dynamics model’s training data. Finally, through experiments involving trajectory optimization and model-based policy optimization, we showed that the resulting method can model complex phenomena such as collisions, is robust to sensory noise and action delays, and learns a meaningful latent space that expresses uncertainty about the future.\nThe most prominent direction for future work that we plan to explore, is the data collection procedure. In our experiments, correlated random actions resulted in sufficient exploration for the tasks we considered and allowed us to demonstrate the benefits of a segment-based approach. However, incorporating a more sophisticated exploration strategy to gather data (in an iterative procedure, potentially using the model’s predictions to guide exploration) would allow us to tackle a more diverse set of environments, both simulated and real-world. The action prior and segmentbased policy could be used as a starting point for hierarchical reinforcement-learning algorithms. Leveraging existing work on few-shot learning could help finetune a dynamics model during the policy learning process. Such approaches could yield significant advances in reinforcement learning, improving both sample efficiency and knowledge transfer between related tasks."
+    }, {
+      "heading" : "Acknowledgements",
+      "text" : "Work done at Berkeley was supported in part by an ONR PECASE award."
+    }, {
+      "heading" : "A. Appendix",
+      "text" : "Here we give a more precise description of the architectures of the models we introduced in the paper. Both the dynamics model and the latent action prior were trained using Adam with the default parameters.\nA.1. Dynamics Model\nThe following figure depicts the detailed encoder and decoder architectures for our dynamics models. The encoder uses 1D-convolutions (across the temporal dimension) and the ReLU activation function. The decoder is autoregressive, using dilated causal 1D-convolutions and the gated activation function described in Section 3.1.\nThe layer sizes indicated below correspond to the model we trained for the basic Reacher environment. For the obstacle and pushing environments, we used the same encoder architecture. The decoder for those environments had 64 channels in all layers, and had an additional 1× 1 convolution with 128 channels before the final layer.\nX+\n2 x 1 conv\nstride 1\n32 c\nEncoder, Q(x)\n2 x 1 conv\nstride 2\n16 c\natten,\nproject\nZ\n2 Z\nZ\nInput Sampled Output\nDecoder, P(x)\nU+\nU\nX\nZ\n32 c\n2 x 1 dilated conv\nrate 1\n32 c\n3 x 1 dilated conv\nrate 2\n32 c\n2 x 1 dilated conv\nrate 4 1 x 1 conv X+\nInput Output\nDynamics Model\nA.2. Latent Action Prior\nThe architecture for the latent action prior is quite similar to that of our dynamics models as depicted on the previous page. We used the same architecture for all experiments.\n2 x 1 conv\nstride 1\n12 c\nEncoder, Q(u)\n2 x 1 conv\nstride 2\n12 c\natten,\nproject\nZ\n2 Z\nZ\nInput Sampled Output\nDecoder, P(u)\nU\nZ\n32 c\n2 x 1 dilated conv\nrate 1\n32 c\n3 x 1 dilated conv\nrate 2\n32 c\n2 x 1 dilated conv\nrate 4 1 x 1 conv\nInput Output\nLatent Action Prior\nA.3. Policy Optimization\nThe one-step policies had two hidden layers of size 64, and used the ReLU activation function.\nThe following figure illustrates the architecture of the segment-based policy, as introduced in Section 4.3. It uses the same gated activation function as the decoders of the other two models. The latent code that the policy produces is used by the action prior to generate a sequence of actions, of which the first one is executed.\nLatent Action Prior, P(u)\n2 x 1 conv\nstride 1\n16 c\nPolicy (Z | X , U )\n3 x 1 conv\nstride 2\n16 c\natten,\nproject\nZ\n2 Z is constant\nZ\nInput\nSample\nP(u) U+\nSegment-Based Policy\nU\nX\nut\nOutput\nFor all policy optimization experiments, we used a discount factor γ = 0.99, and computed the gradient of the policy’s value with respect to its parameters (as discussed in Section 4.3) using backpropagation through time over 50 timesteps. We interpreted each policy’s output as the mean of a diagonal Gaussian distribution, and sampled actions using a constant standard deviation of 0.01. Policy updates were computed using Adam over 20-episode batches, where the step size was initialized to 10−3 and decayed by a factor of 0.9 per 100 iterations until it reached 10−4 (all other parameters were left at the defaults)."
+    } ],
+    "references" : [ {
+      "title" : "Learning first-order markov models for control",
+      "author" : [ "Abbeel", "Pieter", "Ng", "Andrew Y" ],
+      "venue" : "In Advances in Neural Information Processing Systems (NIPS),",
+      "citeRegEx" : "Abbeel et al\\.,? \\Q2004\\E",
+      "shortCiteRegEx" : "Abbeel et al\\.",
+      "year" : 2004
+    }, {
+      "title" : "Learning to poke by poking: Experiential learning of intuitive physics",
+      "author" : [ "Agrawal", "Pulkit", "Nair", "Ashvin", "Abbeel", "Pieter", "Malik", "Jitendra", "Levine", "Sergey" ],
+      "venue" : "In Advances in Neural Information Processing Systems (NIPS),",
+      "citeRegEx" : "Agrawal et al\\.,? \\Q2016\\E",
+      "shortCiteRegEx" : "Agrawal et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "What happened at the darpa robotics challenge, and why. submitted to the DRC",
+      "author" : [ "Atkeson", "Christopher G", "BPW Babu", "N Banerjee", "D Berenson", "CP Bove", "X Cui", "M DeDonato", "R Du", "S Feng", "P Franklin" ],
+      "venue" : "Finals Special Issue of the Journal of Field Robotics,",
+      "citeRegEx" : "Atkeson et al\\.,? \\Q2016\\E",
+      "shortCiteRegEx" : "Atkeson et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Scheduled sampling for sequence prediction with recurrent neural networks",
+      "author" : [ "Bengio", "Samy", "Vinyals", "Oriol", "Jaitly", "Navdeep", "Shazeer", "Noam" ],
+      "venue" : "In Advances in Neural Information Processing Systems (NIPS),",
+      "citeRegEx" : "Bengio et al\\.,? \\Q2015\\E",
+      "shortCiteRegEx" : "Bengio et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "Approximate real-time optimal control based on sparse gaussian process models",
+      "author" : [ "Boedecker", "Joschka", "Springenberg", "Jost Tobias", "Wlfing", "Jan", "Riedmiller", "Martin" ],
+      "venue" : "In Adaptive Dynamic Programming and Reinforcement Learning (ADPRL),",
+      "citeRegEx" : "Boedecker et al\\.,? \\Q2014\\E",
+      "shortCiteRegEx" : "Boedecker et al\\.",
+      "year" : 2014
+    }, {
+      "title" : "Variational lossy autoencoder",
+      "author" : [ "Chen", "Xi", "Kingma", "Diederik P", "Salimans", "Tim", "Duan", "Yan", "Dhariwal", "Prafulla", "Schulman", "John", "Sutskever", "Ilya", "Abbeel", "Pieter" ],
+      "venue" : "arXiv preprint arXiv:1611.02731,",
+      "citeRegEx" : "Chen et al\\.,? \\Q2016\\E",
+      "shortCiteRegEx" : "Chen et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Pilco: A model-based and data-efficient approach to policy search",
+      "author" : [ "Deisenroth", "Marc Peter", "Rasmussen", "Carl Edward" ],
+      "venue" : "In International Conference on Machine Learning (ICML),",
+      "citeRegEx" : "Deisenroth et al\\.,? \\Q2011\\E",
+      "shortCiteRegEx" : "Deisenroth et al\\.",
+      "year" : 2011
+    }, {
+      "title" : "Deep visual foresight for planning robot motion",
+      "author" : [ "Finn", "Chelsea", "Levine", "Sergey" ],
+      "venue" : "arXiv preprint arXiv:1610.00696,",
+      "citeRegEx" : "Finn et al\\.,? \\Q2016\\E",
+      "shortCiteRegEx" : "Finn et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Deep spatial autoencoders for visuomotor learning",
+      "author" : [ "Finn", "Chelsea", "Tan", "Xin Yu", "Duan", "Yan", "Darrell", "Trevor", "Levine", "Sergey", "Abbeel", "Pieter" ],
+      "venue" : "In International Conference on Robotics and Automation (ICRA),",
+      "citeRegEx" : "Finn et al\\.,? \\Q2016\\E",
+      "shortCiteRegEx" : "Finn et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Learning visual predictive models of physics for playing billiards",
+      "author" : [ "Fragkiadaki", "Katerina", "Agrawal", "Pulkit", "Levine", "Sergey", "Malik", "Jitendra" ],
+      "venue" : "In International Conference on Learning Representations (ICLR),",
+      "citeRegEx" : "Fragkiadaki et al\\.,? \\Q2015\\E",
+      "shortCiteRegEx" : "Fragkiadaki et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "One-shot learning of manipulation skills with online dynamics adaptation and neural network priors",
+      "author" : [ "Fu", "Justin", "Levine", "Sergey", "Abbeel", "Pieter" ],
+      "venue" : "In International Conference on Intelligent Robots and Systems (IROS),",
+      "citeRegEx" : "Fu et al\\.,? \\Q2016\\E",
+      "shortCiteRegEx" : "Fu et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Learning continuous control policies by stochastic value gradients",
+      "author" : [ "Heess", "Nicolas", "Wayne", "Gregory", "Silver", "David", "Lillicrap", "Tim", "Erez", "Tom", "Tassa", "Yuval" ],
+      "venue" : "In Advances in Neural Information Processing Systems (NIPS),",
+      "citeRegEx" : "Heess et al\\.,? \\Q2015\\E",
+      "shortCiteRegEx" : "Heess et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "Composing graphical models with neural networks for structured representations and fast inference",
+      "author" : [ "Johnson", "Matthew", "Duvenaud", "David K", "Wiltschko", "Alex", "Adams", "Ryan P", "Datta", "Sandeep R" ],
+      "venue" : "In Advances in Neural Information Processing Systems (NIPS),",
+      "citeRegEx" : "Johnson et al\\.,? \\Q2016\\E",
+      "shortCiteRegEx" : "Johnson et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Adam: A method for stochastic optimization",
+      "author" : [ "Kingma", "Diederik", "Ba", "Jimmy" ],
+      "venue" : "In International Conference on Learning Representations (ICLR),",
+      "citeRegEx" : "Kingma et al\\.,? \\Q2015\\E",
+      "shortCiteRegEx" : "Kingma et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "Auto-encoding variational bayes",
+      "author" : [ "Kingma", "Diederik P", "Welling", "Max" ],
+      "venue" : "In International Conference on Learning Representations (ICLR),",
+      "citeRegEx" : "Kingma et al\\.,? \\Q2014\\E",
+      "shortCiteRegEx" : "Kingma et al\\.",
+      "year" : 2014
+    }, {
+      "title" : "Gp-bayesfilters: Bayesian filtering using gaussian process prediction and observation models",
+      "author" : [ "Ko", "Jonathan", "Fox", "Dieter" ],
+      "venue" : "Auton. Robots,",
+      "citeRegEx" : "Ko et al\\.,? \\Q2009\\E",
+      "shortCiteRegEx" : "Ko et al\\.",
+      "year" : 2009
+    }, {
+      "title" : "Fast sparse gaussian process methods: The informative vector machine",
+      "author" : [ "Lawrence", "Neil", "Seeger", "Matthias", "Herbrich", "Ralf" ],
+      "venue" : "Advances in Neural Information Processing Systems (NIPS),",
+      "citeRegEx" : "Lawrence et al\\.,? \\Q2003\\E",
+      "shortCiteRegEx" : "Lawrence et al\\.",
+      "year" : 2003
+    }, {
+      "title" : "Deepmpc: Learning deep latent features for model predictive control",
+      "author" : [ "Lenz", "Ian", "Knepper", "Ross", "Saxena", "Ashutosh" ],
+      "venue" : "In Robotics: Science and Systems (RSS),",
+      "citeRegEx" : "Lenz et al\\.,? \\Q2015\\E",
+      "shortCiteRegEx" : "Lenz et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "Predictive representations of state",
+      "author" : [ "Littman", "Michael L", "Sutton", "Richard S", "Singh", "Satinder" ],
+      "venue" : "Advances in Neural Information Processing Systems (NIPS),",
+      "citeRegEx" : "Littman et al\\.,? \\Q2002\\E",
+      "shortCiteRegEx" : "Littman et al\\.",
+      "year" : 2002
+    }, {
+      "title" : "Combining model-based policy search with online model learning for control of physical humanoids",
+      "author" : [ "Mordatch", "Igor", "Mishra", "Nikhil", "Eppner", "Clemens", "Abbeel", "Pieter" ],
+      "venue" : "In International Conference on Robotics and Automation (ICRA),",
+      "citeRegEx" : "Mordatch et al\\.,? \\Q2016\\E",
+      "shortCiteRegEx" : "Mordatch et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Action-conditional video prediction using deep networks in atari games",
+      "author" : [ "Oh", "Junhyuk", "Guo", "Xiaoxiao", "Lee", "Honglak", "Lewis", "Richard L", "Singh", "Satinder" ],
+      "venue" : "In Advances in Neural Information Processing Systems (NIPS),",
+      "citeRegEx" : "Oh et al\\.,? \\Q2015\\E",
+      "shortCiteRegEx" : "Oh et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "Policy gradient methods for robotics",
+      "author" : [ "Peters", "Jan", "Schaal", "Stefan" ],
+      "venue" : "In International Conference on Intelligent Robots and Systems (IROS),",
+      "citeRegEx" : "Peters et al\\.,? \\Q2006\\E",
+      "shortCiteRegEx" : "Peters et al\\.",
+      "year" : 2006
+    }, {
+      "title" : "Capture point: A step toward humanoid push recovery",
+      "author" : [ "Pratt", "Jerry", "Carff", "John", "Drakunov", "Sergey", "Goswami", "Ambarish" ],
+      "venue" : "In Proceedings of the Sixth IEEE-RAS International Conference on Humanoid Robots (Humanoids",
+      "citeRegEx" : "Pratt et al\\.,? \\Q2006\\E",
+      "shortCiteRegEx" : "Pratt et al\\.",
+      "year" : 2006
+    }, {
+      "title" : "Deep learning helicopter dynamics models",
+      "author" : [ "Punjani", "Ali", "Abbeel", "Pieter" ],
+      "venue" : "In International Conference on Robotics and Automation (ICRA),",
+      "citeRegEx" : "Punjani et al\\.,? \\Q2015\\E",
+      "shortCiteRegEx" : "Punjani et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "Legged Robots that Balance",
+      "author" : [ "M.H. Raibert" ],
+      "venue" : "URL https://books.google.com/books? id=EXRiBnQ37RwC",
+      "citeRegEx" : "Raibert,? \\Q1986\\E",
+      "shortCiteRegEx" : "Raibert",
+      "year" : 1986
+    }, {
+      "title" : "Learning low dimensional predictive representations",
+      "author" : [ "Rosencrantz", "Matthew", "Gordon", "Geoff", "Thrun", "Sebastian" ],
+      "venue" : "In International Conference on Machine Learning (ICML),",
+      "citeRegEx" : "Rosencrantz et al\\.,? \\Q2004\\E",
+      "shortCiteRegEx" : "Rosencrantz et al\\.",
+      "year" : 2004
+    }, {
+      "title" : "Policy gradient methods for reinforcement learning with function approximation",
+      "author" : [ "Sutton", "Richard S", "McAllester", "David A", "Singh", "Satinder P", "Mansour", "Yishay" ],
+      "venue" : "In Advances in Neural Information Processing Systems (NIPS),",
+      "citeRegEx" : "Sutton et al\\.,? \\Q1999\\E",
+      "shortCiteRegEx" : "Sutton et al\\.",
+      "year" : 1999
+    }, {
+      "title" : "Between mdps and semi-mdps: A framework for temporal abstraction in reinforcement learning",
+      "author" : [ "Sutton", "Richard S", "Precup", "Doina", "Singh", "Satinder" ],
+      "venue" : "Artificial Intelligence,",
+      "citeRegEx" : "Sutton et al\\.,? \\Q1999\\E",
+      "shortCiteRegEx" : "Sutton et al\\.",
+      "year" : 1999
+    }, {
+      "title" : "Wavenet: A generative model for raw audio",
+      "author" : [ "van den Oord", "Aäron", "Dieleman", "Sander", "Zen", "Heiga", "Simonyan", "Karen", "Vinyals", "Oriol", "Graves", "Alex", "Kalchbrenner", "Nal", "Senior", "Andrew W", "Kavukcuoglu", "Koray" ],
+      "venue" : "CoRR, abs/1609.03499,",
+      "citeRegEx" : "Oord et al\\.,? \\Q2016\\E",
+      "shortCiteRegEx" : "Oord et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Conditional image generation with pixelcnn decoders",
+      "author" : [ "van den Oord", "Aaron", "Kalchbrenner", "Nal", "Espeholt", "Lasse", "Vinyals", "Oriol", "Graves", "Alex" ],
+      "venue" : "In Advances in Neural Information Processing Systems (NIPS),",
+      "citeRegEx" : "Oord et al\\.,? \\Q2016\\E",
+      "shortCiteRegEx" : "Oord et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Improving multi-step prediction of learned time series models",
+      "author" : [ "Venkatraman", "Arun", "Hebert", "Martial", "Bagnell", "J Andrew" ],
+      "venue" : "In AAAI,",
+      "citeRegEx" : "Venkatraman et al\\.,? \\Q2015\\E",
+      "shortCiteRegEx" : "Venkatraman et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "Improved learning of dynamics models for control",
+      "author" : [ "Venkatraman", "Arun", "Capobianco", "Roberto", "Pinto", "Lerrel", "Hebert", "Martial", "Nardi", "Daniele", "Bagnell", "J Andrew" ],
+      "venue" : "In International Symposium on Experimental Robotics (ISER),",
+      "citeRegEx" : "Venkatraman et al\\.,? \\Q2016\\E",
+      "shortCiteRegEx" : "Venkatraman et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Strategic attentive writer for learning macro-actions",
+      "author" : [ "Vezhnevets", "Alexander (Sasha", "Mnih", "Volodymyr", "Agapiou", "John", "Osindero", "Simon", "Graves", "Alex", "Vinyals", "Oriol", "Kavukcuoglu", "Koray" ],
+      "venue" : "In Advances in Neural Information Processing Systems (NIPS),",
+      "citeRegEx" : "Vezhnevets et al\\.,? \\Q2016\\E",
+      "shortCiteRegEx" : "Vezhnevets et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Embed to control: A locally linear latent dynamics model for control from raw images",
+      "author" : [ "Watter", "Manuel", "Springenberg", "Jost", "Boedecker", "Joschka", "Riedmiller", "Martin" ],
+      "venue" : "In Advances in Neural Information Processing Systems (NIPS),",
+      "citeRegEx" : "Watter et al\\.,? \\Q2015\\E",
+      "shortCiteRegEx" : "Watter et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "Gaussian processes for regression",
+      "author" : [ "Williams", "Christopher KI", "Rasmussen", "Carl Edward" ],
+      "venue" : "Advances in neural information processing systems,",
+      "citeRegEx" : "Williams et al\\.,? \\Q1996\\E",
+      "shortCiteRegEx" : "Williams et al\\.",
+      "year" : 1996
+    }, {
+      "title" : "Simple statistical gradient-following algorithms for connectionist reinforcement learning",
+      "author" : [ "Williams", "Ronald J" ],
+      "venue" : "Machine learning,",
+      "citeRegEx" : "Williams and J.,? \\Q1992\\E",
+      "shortCiteRegEx" : "Williams and J.",
+      "year" : 1992
+    }, {
+      "title" : "Model-Less Feedback Control of Continuum Manipulators in Constrained Environments",
+      "author" : [ "Yip", "Michael C", "Camarillo", "David B" ],
+      "venue" : "IEEE Transactions on Robotics,",
+      "citeRegEx" : "Yip et al\\.,? \\Q2014\\E",
+      "shortCiteRegEx" : "Yip et al\\.",
+      "year" : 2014
+    } ],
+    "referenceMentions" : [ {
+      "referenceID" : 19,
+      "context" : "Related Work A number of options are available for representation of learned dynamics models, including linear functions (Mordatch et al., 2016; Yip & Camarillo, 2014), Gaussian processes (Boedecker et al.",
+      "startOffset" : 121,
+      "endOffset" : 167
+    }, {
+      "referenceID" : 4,
+      "context" : ", 2016; Yip & Camarillo, 2014), Gaussian processes (Boedecker et al., 2014; Ko & Fox, 2009; Deisenroth & Rasmussen, 2011), predictive state representations (PSRs) (Littman et al.",
+      "startOffset" : 51,
+      "endOffset" : 121
+    }, {
+      "referenceID" : 18,
+      "context" : ", 2014; Ko & Fox, 2009; Deisenroth & Rasmussen, 2011), predictive state representations (PSRs) (Littman et al., 2002; Rosencrantz et al., 2004), and deep neural networks (Punjani & Abbeel, 2015; Fragkiadaki et al.",
+      "startOffset" : 95,
+      "endOffset" : 143
+    }, {
+      "referenceID" : 25,
+      "context" : ", 2014; Ko & Fox, 2009; Deisenroth & Rasmussen, 2011), predictive state representations (PSRs) (Littman et al., 2002; Rosencrantz et al., 2004), and deep neural networks (Punjani & Abbeel, 2015; Fragkiadaki et al.",
+      "startOffset" : 95,
+      "endOffset" : 143
+    }, {
+      "referenceID" : 9,
+      "context" : ", 2004), and deep neural networks (Punjani & Abbeel, 2015; Fragkiadaki et al., 2015; Agrawal et al., 2016).",
+      "startOffset" : 34,
+      "endOffset" : 106
+    }, {
+      "referenceID" : 1,
+      "context" : ", 2004), and deep neural networks (Punjani & Abbeel, 2015; Fragkiadaki et al., 2015; Agrawal et al., 2016).",
+      "startOffset" : 34,
+      "endOffset" : 106
+    }, {
+      "referenceID" : 16,
+      "context" : "Gaussian processes (Williams & Rasmussen, 1996) provide uncertainty estimates, but scaling them to large datasets remains a challenge (Shen et al.; Lawrence et al., 2003).",
+      "startOffset" : 134,
+      "endOffset" : 170
+    }, {
+      "referenceID" : 10,
+      "context" : "An alternative is to learn dynamics models in an online fashion, constantly adapting the model based on an incoming stream of observed states and actions (Fu et al., 2016; Mordatch et al., 2016; Yip & Camarillo, 2014; Lenz et al., 2015).",
+      "startOffset" : 154,
+      "endOffset" : 236
+    }, {
+      "referenceID" : 19,
+      "context" : "An alternative is to learn dynamics models in an online fashion, constantly adapting the model based on an incoming stream of observed states and actions (Fu et al., 2016; Mordatch et al., 2016; Yip & Camarillo, 2014; Lenz et al., 2015).",
+      "startOffset" : 154,
+      "endOffset" : 236
+    }, {
+      "referenceID" : 17,
+      "context" : "An alternative is to learn dynamics models in an online fashion, constantly adapting the model based on an incoming stream of observed states and actions (Fu et al., 2016; Mordatch et al., 2016; Yip & Camarillo, 2014; Lenz et al., 2015).",
+      "startOffset" : 154,
+      "endOffset" : 236
+    }, {
+      "referenceID" : 20,
+      "context" : "Existing methods for video prediction (Finn & Levine, 2016; Oh et al., 2015) look at a history of previous states and actions to predict the next frame; we take this a step further by modeling a distribution over an entire segment of future states that is also conditioned on future actions.",
+      "startOffset" : 38,
+      "endOffset" : 76
+    }, {
+      "referenceID" : 32,
+      "context" : ", 1999b) or sequencing of sub-plans (Vezhnevets et al., 2016).",
+      "startOffset" : 36,
+      "endOffset" : 61
+    }, {
+      "referenceID" : 24,
+      "context" : "For example, there are effective and simple manually-designed control laws (Raibert, 1986), (Pratt et al.",
+      "startOffset" : 75,
+      "endOffset" : 90
+    }, {
+      "referenceID" : 22,
+      "context" : "For example, there are effective and simple manually-designed control laws (Raibert, 1986), (Pratt et al., 2006) that formulate optimal actions as a function of the entire future trajectory rather than a single future state.",
+      "startOffset" : 92,
+      "endOffset" : 112
+    }, {
+      "referenceID" : 1,
+      "context" : ", 2015; Agrawal et al., 2016). Linear functions are efficient to evaluate and solve controls for, but have limited expressive power. Gaussian processes (Williams & Rasmussen, 1996) provide uncertainty estimates, but scaling them to large datasets remains a challenge (Shen et al.; Lawrence et al., 2003). PSRs and variants make multi-step predictions, but suffer from the same scalability challenges as Gaussian processes. Our method combines the expressiveness and scalability of neural networks with the ability to provide sampling and uncertainty estimates, modeling entire segments to improve stability and robustness. An alternative is to learn dynamics models in an online fashion, constantly adapting the model based on an incoming stream of observed states and actions (Fu et al., 2016; Mordatch et al., 2016; Yip & Camarillo, 2014; Lenz et al., 2015). However, such approaches are slow to adapt to rapidly-changing dynamics modes (such as those arising when making or breaking contact) and may be problematic when applied on robots performing rapid motions. Several approaches exist to improve the stability of models that make sequential predictions. Abbeel & Ng (2004) and Venkatraman et al.",
+      "startOffset" : 8,
+      "endOffset" : 1180
+    }, {
+      "referenceID" : 1,
+      "context" : ", 2015; Agrawal et al., 2016). Linear functions are efficient to evaluate and solve controls for, but have limited expressive power. Gaussian processes (Williams & Rasmussen, 1996) provide uncertainty estimates, but scaling them to large datasets remains a challenge (Shen et al.; Lawrence et al., 2003). PSRs and variants make multi-step predictions, but suffer from the same scalability challenges as Gaussian processes. Our method combines the expressiveness and scalability of neural networks with the ability to provide sampling and uncertainty estimates, modeling entire segments to improve stability and robustness. An alternative is to learn dynamics models in an online fashion, constantly adapting the model based on an incoming stream of observed states and actions (Fu et al., 2016; Mordatch et al., 2016; Yip & Camarillo, 2014; Lenz et al., 2015). However, such approaches are slow to adapt to rapidly-changing dynamics modes (such as those arising when making or breaking contact) and may be problematic when applied on robots performing rapid motions. Several approaches exist to improve the stability of models that make sequential predictions. Abbeel & Ng (2004) and Venkatraman et al. (2015) consider alternative loss functions that improve robustness over long prediction horizons.",
+      "startOffset" : 8,
+      "endOffset" : 1210
+    }, {
+      "referenceID" : 1,
+      "context" : ", 2015; Agrawal et al., 2016). Linear functions are efficient to evaluate and solve controls for, but have limited expressive power. Gaussian processes (Williams & Rasmussen, 1996) provide uncertainty estimates, but scaling them to large datasets remains a challenge (Shen et al.; Lawrence et al., 2003). PSRs and variants make multi-step predictions, but suffer from the same scalability challenges as Gaussian processes. Our method combines the expressiveness and scalability of neural networks with the ability to provide sampling and uncertainty estimates, modeling entire segments to improve stability and robustness. An alternative is to learn dynamics models in an online fashion, constantly adapting the model based on an incoming stream of observed states and actions (Fu et al., 2016; Mordatch et al., 2016; Yip & Camarillo, 2014; Lenz et al., 2015). However, such approaches are slow to adapt to rapidly-changing dynamics modes (such as those arising when making or breaking contact) and may be problematic when applied on robots performing rapid motions. Several approaches exist to improve the stability of models that make sequential predictions. Abbeel & Ng (2004) and Venkatraman et al. (2015) consider alternative loss functions that improve robustness over long prediction horizons. Bengio et al. (2015) and Venkatraman et al.",
+      "startOffset" : 8,
+      "endOffset" : 1322
+    }, {
+      "referenceID" : 1,
+      "context" : ", 2015; Agrawal et al., 2016). Linear functions are efficient to evaluate and solve controls for, but have limited expressive power. Gaussian processes (Williams & Rasmussen, 1996) provide uncertainty estimates, but scaling them to large datasets remains a challenge (Shen et al.; Lawrence et al., 2003). PSRs and variants make multi-step predictions, but suffer from the same scalability challenges as Gaussian processes. Our method combines the expressiveness and scalability of neural networks with the ability to provide sampling and uncertainty estimates, modeling entire segments to improve stability and robustness. An alternative is to learn dynamics models in an online fashion, constantly adapting the model based on an incoming stream of observed states and actions (Fu et al., 2016; Mordatch et al., 2016; Yip & Camarillo, 2014; Lenz et al., 2015). However, such approaches are slow to adapt to rapidly-changing dynamics modes (such as those arising when making or breaking contact) and may be problematic when applied on robots performing rapid motions. Several approaches exist to improve the stability of models that make sequential predictions. Abbeel & Ng (2004) and Venkatraman et al. (2015) consider alternative loss functions that improve robustness over long prediction horizons. Bengio et al. (2015) and Venkatraman et al. (2016) also use simple curricula for a similar effect.",
+      "startOffset" : 8,
+      "endOffset" : 1352
+    }, {
+      "referenceID" : 1,
+      "context" : ", 2015; Agrawal et al., 2016). Linear functions are efficient to evaluate and solve controls for, but have limited expressive power. Gaussian processes (Williams & Rasmussen, 1996) provide uncertainty estimates, but scaling them to large datasets remains a challenge (Shen et al.; Lawrence et al., 2003). PSRs and variants make multi-step predictions, but suffer from the same scalability challenges as Gaussian processes. Our method combines the expressiveness and scalability of neural networks with the ability to provide sampling and uncertainty estimates, modeling entire segments to improve stability and robustness. An alternative is to learn dynamics models in an online fashion, constantly adapting the model based on an incoming stream of observed states and actions (Fu et al., 2016; Mordatch et al., 2016; Yip & Camarillo, 2014; Lenz et al., 2015). However, such approaches are slow to adapt to rapidly-changing dynamics modes (such as those arising when making or breaking contact) and may be problematic when applied on robots performing rapid motions. Several approaches exist to improve the stability of models that make sequential predictions. Abbeel & Ng (2004) and Venkatraman et al. (2015) consider alternative loss functions that improve robustness over long prediction horizons. Bengio et al. (2015) and Venkatraman et al. (2016) also use simple curricula for a similar effect. While they all consider multi-step prediction losses, they only do so in the context of training models that are intrinsically one-step. Existing methods for video prediction (Finn & Levine, 2016; Oh et al., 2015) look at a history of previous states and actions to predict the next frame; we take this a step further by modeling a distribution over an entire segment of future states that is also conditioned on future actions. In this work, we focus on demonstrating the benefits of a probabilistic segment-based approach; these methods could easily be incorporated with ours to learn dynamics from images, but we leave this to future work. Watter et al. (2015) and Johnson et al.",
+      "startOffset" : 8,
+      "endOffset" : 2064
+    }, {
+      "referenceID" : 1,
+      "context" : ", 2015; Agrawal et al., 2016). Linear functions are efficient to evaluate and solve controls for, but have limited expressive power. Gaussian processes (Williams & Rasmussen, 1996) provide uncertainty estimates, but scaling them to large datasets remains a challenge (Shen et al.; Lawrence et al., 2003). PSRs and variants make multi-step predictions, but suffer from the same scalability challenges as Gaussian processes. Our method combines the expressiveness and scalability of neural networks with the ability to provide sampling and uncertainty estimates, modeling entire segments to improve stability and robustness. An alternative is to learn dynamics models in an online fashion, constantly adapting the model based on an incoming stream of observed states and actions (Fu et al., 2016; Mordatch et al., 2016; Yip & Camarillo, 2014; Lenz et al., 2015). However, such approaches are slow to adapt to rapidly-changing dynamics modes (such as those arising when making or breaking contact) and may be problematic when applied on robots performing rapid motions. Several approaches exist to improve the stability of models that make sequential predictions. Abbeel & Ng (2004) and Venkatraman et al. (2015) consider alternative loss functions that improve robustness over long prediction horizons. Bengio et al. (2015) and Venkatraman et al. (2016) also use simple curricula for a similar effect. While they all consider multi-step prediction losses, they only do so in the context of training models that are intrinsically one-step. Existing methods for video prediction (Finn & Levine, 2016; Oh et al., 2015) look at a history of previous states and actions to predict the next frame; we take this a step further by modeling a distribution over an entire segment of future states that is also conditioned on future actions. In this work, we focus on demonstrating the benefits of a probabilistic segment-based approach; these methods could easily be incorporated with ours to learn dynamics from images, but we leave this to future work. Watter et al. (2015) and Johnson et al. (2016) use variational autoencoders to learn a low-dimensional latent-space representation of image observations.",
+      "startOffset" : 8,
+      "endOffset" : 2090
+    }, {
+      "referenceID" : 1,
+      "context" : ", 2015; Agrawal et al., 2016). Linear functions are efficient to evaluate and solve controls for, but have limited expressive power. Gaussian processes (Williams & Rasmussen, 1996) provide uncertainty estimates, but scaling them to large datasets remains a challenge (Shen et al.; Lawrence et al., 2003). PSRs and variants make multi-step predictions, but suffer from the same scalability challenges as Gaussian processes. Our method combines the expressiveness and scalability of neural networks with the ability to provide sampling and uncertainty estimates, modeling entire segments to improve stability and robustness. An alternative is to learn dynamics models in an online fashion, constantly adapting the model based on an incoming stream of observed states and actions (Fu et al., 2016; Mordatch et al., 2016; Yip & Camarillo, 2014; Lenz et al., 2015). However, such approaches are slow to adapt to rapidly-changing dynamics modes (such as those arising when making or breaking contact) and may be problematic when applied on robots performing rapid motions. Several approaches exist to improve the stability of models that make sequential predictions. Abbeel & Ng (2004) and Venkatraman et al. (2015) consider alternative loss functions that improve robustness over long prediction horizons. Bengio et al. (2015) and Venkatraman et al. (2016) also use simple curricula for a similar effect. While they all consider multi-step prediction losses, they only do so in the context of training models that are intrinsically one-step. Existing methods for video prediction (Finn & Levine, 2016; Oh et al., 2015) look at a history of previous states and actions to predict the next frame; we take this a step further by modeling a distribution over an entire segment of future states that is also conditioned on future actions. In this work, we focus on demonstrating the benefits of a probabilistic segment-based approach; these methods could easily be incorporated with ours to learn dynamics from images, but we leave this to future work. Watter et al. (2015) and Johnson et al. (2016) use variational autoencoders to learn a low-dimensional latent-space representation of image observations. Finn et al. (2016) takes a similar approach, but without the variational aspect.",
+      "startOffset" : 8,
+      "endOffset" : 2216
+    }, {
+      "referenceID" : 11,
+      "context" : "Heess et al. (2015) use a model-based approach where a one-step dynamics model is learned jointly with a policy in an online manner.",
+      "startOffset" : 0,
+      "endOffset" : 20
+    }, {
+      "referenceID" : 30,
+      "context" : ", Venkatraman et al. (2015); Abbeel & Ng (2004)).",
+      "startOffset" : 2,
+      "endOffset" : 28
+    }, {
+      "referenceID" : 30,
+      "context" : ", Venkatraman et al. (2015); Abbeel & Ng (2004)).",
+      "startOffset" : 2,
+      "endOffset" : 48
+    }, {
+      "referenceID" : 2,
+      "context" : "These challenges commonly arise in realworld robotics applications (Atkeson et al., 2016), and so it is important to be able to learn a useful dynamics model in either setting.",
+      "startOffset" : 67,
+      "endOffset" : 89
+    }, {
+      "referenceID" : 5,
+      "context" : "Alternatively, per the argument made by Chen et al. (2016), it is also conceivable that the decoder would ignore the latent code entirely, because the segments X−, U−, U provide better information than Z about X.",
+      "startOffset" : 40,
+      "endOffset" : 59
+    } ],
+    "year" : 2017,
+    "abstractText" : "We introduce a method for learning the dynamics of complex nonlinear systems based on deep generative models over temporal segments of states and actions. Unlike dynamics models that operate over individual discrete timesteps, we learn the distribution over future state trajectories conditioned on past state, past action, and planned future action trajectories, as well as a latent prior over action trajectories. Our approach is based on convolutional autoregressive models and variational autoencoders. It makes stable and accurate predictions over long horizons for complex, stochastic systems, effectively expressing uncertainty and modeling the effects of collisions, sensory noise, and action delays. The learned dynamics model and action prior can be used for end-to-end, fully differentiable trajectory optimization and model-based policy optimization, which we use to evaluate the performance and sample-efficiency of our method.",
+    "creator" : "LaTeX with hyperref package"
+  }
+}

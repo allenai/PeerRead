@@ -1,0 +1,804 @@
+{
+  "name" : "1704.01696.pdf",
+  "metadata" : {
+    "source" : "CRF",
+    "title" : "A Syntactic Neural Model for General-Purpose Code Generation",
+    "authors" : [ "Pengcheng Yin", "Graham Neubig" ],
+    "emails" : [ "pcyin@cs.cmu.edu", "gneubig@cs.cmu.edu" ],
+    "sections" : [ {
+      "heading" : "1 Introduction",
+      "text" : "Every programmer has experienced the situation where they know what they want to do, but do not have the ability to turn it into a concrete implementation. For example, a Python programmer may want to “sort my list in descending order,” but not be able to come up with the proper syntax sorted(my list, reverse=True) to realize his intention. To resolve this impasse, it is common for programmers to search the web in natural language (NL), find an answer, and modify it into the desired form (Brandt et al., 2009, 2010). However, this is time-consuming, and thus the software engineering literature is ripe with methods to directly generate code from NL descriptions, mostly with hand-engineered methods highly tailored to specific programming languages (Balzer, 1985; Little and Miller, 2009; Gvero and Kuncak, 2015).\nIn parallel, the NLP community has developed methods for data-driven semantic parsing, which attempt to map NL to structured logical forms executable by computers. These logical forms can be general-purpose meaning representations (Clark and Curran, 2007; Banarescu et al., 2013), formalisms for querying knowledge bases (Tang and Mooney, 2001; Zettlemoyer and Collins, 2005; Berant et al., 2013) and instructions for robots or personal assistants (Artzi and Zettlemoyer, 2013; Quirk et al., 2015), among others. While these methods have the advantage of being learnable from data, compared to the programming languages (PLs) in use by programmers, the domainspecific languages targeted by these works have a schema and syntax that is relatively simple.\nRecently, Ling et al. (2016) have proposed a data-driven code generation method for high-level, general-purpose PLs like Python and Java. This work treats code generation as a sequence-tosequence modeling problem, and introduce methods to generate words from character-level models, and copy variable names from input descriptions. However, unlike most work in semantic parsing, it does not consider the fact that code has to be well-defined programs in the target syntax.\nIn this work, we propose a data-driven syntaxbased neural network model tailored for generation of general-purpose PLs like Python. In order to capture the strong underlying syntax of the PL, we define a model that transduces an NL statement into an Abstract Syntax Tree (AST; Fig. 1(a), § 2) for the target PL. ASTs can be deterministically generated for all well-formed programs using standard parsers provided by the PL, and thus give us a way to obtain syntax information with minimal engineering. Once we generate an AST, we can use deterministic generation tools to convert the AST into surface code. We hypothesize that such a structured approach has two benefits. ar X\niv :1\n70 4.\n01 69\n6v 1\n[ cs\n.C L\n] 6\nA pr\n2 01\n7\nFirst, we hypothesize that structure can be used to constrain our search space, ensuring generation of well-formed code. To this end, we propose a syntax-driven neural code generation model. The backbone of our approach is a grammar model (§ 3) which formalizes the generation story of a derivation AST into sequential application of actions that either apply production rules (§ 3.1), or emit terminal tokens (§ 3.2). The underlying syntax of the PL is therefore encoded in the grammar model a priori as the set of possible actions. Our approach frees the model from recovering the underlying grammar from limited training data, and instead enables the system to focus on learning the compositionality among existing grammar rules. Xiao et al. (2016) have noted that this imposition of structure on neural models is useful for semantic parsing, and we expect this to be even more important for general-purpose PLs where the syntax trees are larger and more complex.\nSecond, we hypothesize that structural information helps to model information flow within the neural network, which naturally reflects the recursive structure of PLs. To test this, we extend a standard recurrent neural network (RNN) decoder to allow for additional neural connections which reflect the recursive structure of an AST (§ 4.2). As an example, when expanding the node ? in Fig. 1(a), we make use of the information from both its parent and left sibling (the dashed rectangle). This enables us to locally pass information of relevant code segments via neural network connections, resulting in more confident predictions.\nExperiments (§ 5) on two Python code generation tasks show 11.7% and 9.3% absolute improvements in accuracy against the state-of-the-art system (Ling et al., 2016). Our model also gives competitive performance on a standard semantic parsing benchmark."
+    }, {
+      "heading" : "2 The Code Generation Problem",
+      "text" : "Given an NL description x, our task is to generate the code snippet c in a modern PL based on the in-\ntent of x. We attack this problem by first generating the underlying AST. We define a probabilistic grammar model of generating an AST y given x: p(y|x). The best-possible AST ŷ is then given by\nŷ = argmax y\np(y|x). (1)\nŷ is then deterministically converted to the corresponding surface code c.1 While this paper uses examples from Python code, our method is PLagnostic.\nBefore detailing our approach, we first present a brief introduction of the Python AST and its underlying grammar. The Python abstract grammar contains a set of production rules, and an AST is generated by applying several production rules composed of a head node and multiple child nodes. For instance, the first rule in Tab. 1 is used to generate the function call sorted(·) in Fig. 1(a). It consists of a head node of type Call, and three child nodes of type expr, expr* and keyword*, respectively. Labels of each node are noted within brackets. In an AST, non-terminal nodes sketch the general structure of the target code, while terminal nodes can be categorized into two types: operation terminals and variable terminals. Operation terminals correspond to basic arithmetic operations like AddOp.Variable terminal nodes store values for variables and constants of built-in data types2. For instance, all terminal nodes in Fig. 1(a) are variable terminal nodes."
+    }, {
+      "heading" : "3 Grammar Model",
+      "text" : "Before detailing our neural code generation method, we first introduce the grammar model at its core. Our probabilistic grammar model defines the generative story of a derivation AST. We factorize the generation process of an AST into sequential application of actions of two types:\n• APPLYRULE[r] applies a production rule r to the current derivation tree;\n1We use astor library to convert ASTs into Python code. 2bool, float, int, str.\n• GENTOKEN[v] populates a variable terminal node by appending a terminal token v.\nFig. 1(b) shows the generation process of the target AST in Fig. 1(a). Each node in Fig. 1(b) indicates an action. Action nodes are connected by solid arrows which depict the chronological order of the action flow. The generation proceeds in depth-first, left-to-right order (dotted arrows represent parent feeding, explained in § 4.2.1).\nFormally, under our grammar model, the probability of generating an AST y is factorized as:\np(y|x) = T∏ t=1 p(at|x, a<t), (2)\nwhere at is the action taken at time step t, and a<t is the sequence of actions before t. We will explain how to compute Eq. (2) in § 4. Put simply, the generation process begins from a root node at t0, and proceeds by the model choosing APPLYRULE actions to generate the overall program structure from a closed set of grammar rules, then at leaves of the tree corresponding to variable terminals, the model switches to GENTOKEN actions to generate variables or constants from the open set. We describe this process in detail below."
+    }, {
+      "heading" : "3.1 APPLYRULE Actions",
+      "text" : "APPLYRULE actions generate program structure, expanding the current node (the frontier node at time step t: nft) in a depth-first, left-to-right traversal of the tree. Given a fixed set of production rules, APPLYRULE chooses a rule r from the subset that has a head matching the type of nft , and uses r to expand nft by appending all child nodes specified by the selected production. As an\nexample, in Fig. 1(b), the rule Call 7→ expr. . . expands the frontier node Call at time step t4, and its three child nodes expr, expr* and keyword* are added to the derivation.\nAPPLYRULE actions grow the derivation AST by appending nodes. When a variable terminal node (e.g., str) is added to the derivation and becomes the frontier node, the grammar model then switches to GENTOKEN actions to populate the variable terminal with tokens.\nUnary Closure Sometimes, generating an AST requires applying a chain of unary productions. For instance, it takes three time steps (t9 − t11) to generate the sub-structure expr* 7→ expr 7→ Name 7→ str in Fig. 1(a). This can be effectively reduced to one step of APPLYRULE action by taking the closure of the chain of unary productions and merging them into a single rule: expr* 7→∗ str. Unary closures reduce the number of actions needed, but would potentially increase the size of the grammar. In our experiments we tested our model both with and without unary closures (§ 5)."
+    }, {
+      "heading" : "3.2 GENTOKEN Actions",
+      "text" : "Once we reach a frontier node nft that corresponds to a variable type (e.g., str), GENTOKEN actions are used to fill this node with values. For generalpurpose PLs like Python, variables and constants have values with one or multiple tokens. For instance, a node that stores the name of a function (e.g., sorted) has a single token, while a node that denotes a string constant (e.g., a=‘hello world’) could have multiple tokens. Our model copes with both scenarios by firing GENTOKEN actions at one or more time steps. At each time\nstep, GENTOKEN appends one terminal token to the current frontier variable node. A special </n> token is used to “close” the node. The grammar model then proceeds to the new frontier node.\nTerminal tokens can be generated from a predefined vocabulary, or be directly copied from the input NL. This is motivated by the observation that the input description often contains out-ofvocabulary (OOV) variable names or literal values that are directly used in the target code. For instance, in our running example the variable name my list can be directly copied from the the input at t12. We give implementation details in § 4.2.2."
+    }, {
+      "heading" : "4 Estimating Action Probabilities",
+      "text" : "We estimate action probabilities in Eq. (2) using attentional neural encoder-decoder models with an information flow structured by the syntax trees."
+    }, {
+      "heading" : "4.1 Encoder",
+      "text" : "For an NL description x consisting of n words {wi}ni=1, the encoder computes a context sensitive embedding hi for each wi using a bidirectional Long Short-Term Memory (LSTM) network (Hochreiter and Schmidhuber, 1997), similar to the setting in (Bahdanau et al., 2014). See supplementary materials for detailed equations."
+    }, {
+      "heading" : "4.2 Decoder",
+      "text" : "The decoder uses an RNN to model the sequential generation process of an AST defined as Eq. (2). Each action step in the grammar model naturally grounds to a time step in the decoder RNN. Therefore, the action sequence in Fig. 1(b) can be interpreted as unrolling RNN time steps, with solid arrows indicating RNN connections. The RNN maintains an internal state to track the generation process (§ 4.2.1), which will then be used to compute action probabilities p(at|x, a<t) (§ 4.2.2)."
+    }, {
+      "heading" : "4.2.1 Tracking Generation States",
+      "text" : "Our implementation of the decoder resembles a vanilla LSTM, with additional neural connections (parent feeding, Fig. 1(b)) to reflect the topological structure of an AST. The decoder’s internal hidden state at time step t, st, is given by:\nst = fLSTM([at−1 : ct : pt : nft ], st−1), (3) where fLSTM(·) is the LSTM update function. [:] denotes vector concatenation. st will then be used to compute action probabilities p(at|x, a<t) in Eq. (2). Here, at−1 is the embedding of the previous action. ct is a context vector retrieved from\ninput encodings {hi} via soft attention. pt is a vector that encodes the information of the parent action. nft denotes the node type embedding of the current frontier node nft\n3. Intuitively, feeding the decoder the information of nft helps the model to keep track of the frontier node to expand. Action Embedding at We maintain two action embedding matrices, WR and WG. Each row in WR (WG) corresponds to an embedding vector for an action APPLYRULE[r] (GENTOKEN[v]). Context Vector ct The decoder RNN uses soft attention to retrieve a context vector ct from the input encodings {hi} pertain to the prediction of the current action. We follow Bahdanau et al. (2014) and use a Deep Neural Network (DNN) with a single hidden layer to compute attention weights. Parent Feeding pt Our decoder RNN uses additional neural connections to directly pass information from parent actions. For instance, when computing s9, the information from its parent action step t4 will be used. Formally, we define the parent action step pt as the time step at which the frontier node nft is generated. As an example, for t9, its parent action step p9 is t4, since nf9 is the node ?, which is generated at t4 by the APPLYRULE[Call7→. . .] action.\nWe model parent information pt from two sources: (1) the hidden state of parent action spt , and (2) the embedding of parent action apt . pt is the concatenation. The parent feeding schema enables the model to utilize the information of parent code segments to make more confident predictions. Similar approaches of injecting parent information were also explored in the SEQ2TREE model in Dong and Lapata (2016)4.\n3We maintain an embedding for each node type. 4SEQ2TREE generates tree-structured outputs by condi-"
+    }, {
+      "heading" : "4.2.2 Calculating Action Probabilities",
+      "text" : "In this section we explain how action probabilities p(at|x, a<t) are computed based on st. APPLYRULE The probability of applying rule r as the current action at is given by a softmax5:\np(at = APPLYRULE[r]|x, a<t) = softmax(WR · g(st))ᵀ · e(r) (4)\nwhere g(·) is a non-linearity tanh(W ·st+b), and e(r) the one-hot vector for rule r. GENTOKEN As in § 3.2, a token v can be generated from a predefined vocabulary or copied from the input, defined as the marginal probability:\np(at = GENTOKEN[v]|x, a<t) = p(gen|x, a<t)p(v|gen, x, a<t) + p(copy|x, a<t)p(v|copy, x, a<t).\nThe selection probabilities p(gen|·) and p(copy|·) are given by softmax(WS · st). The probability of generating v from the vocabulary, p(v|gen, x, a<t), is defined similarly as Eq. (4), except that we use the GENTOKEN embedding matrix WG, and we concatenate the context vector ct with st as input. To model the copy probability, we follow recent advances in modeling copying mechanism in neural networks (Gu et al., 2016; Jia and Liang, 2016; Ling et al., 2016), and use a pointer network (Vinyals et al., 2015) to compute the probability of copying the i-th word from the input by attending to input representations {hi}:\np(wi|copy, x, a<t) = exp(ω(hi, st, ct))∑n\ni′=1 exp(ω(hi′ , st, ct)) ,\nwhere ω(·) is a DNN with a single hidden layer. Specifically, if wi is an OOV word (e.g., my list, which is represented by a special <unk> token in encoding), we directly copy the actual word wi to the derivation."
+    }, {
+      "heading" : "4.3 Training and Inference",
+      "text" : "Given a dataset of pairs of NL descriptions xi and code snippets ci, we parse ci into its AST yi and decompose yi into a sequence of oracle actions under the grammar model. The model is then optimized by maximizing the log-likelihood of the oracle action sequence. At inference time, we use beam search to approximate the best AST ŷ in Eq. (1). See supplementary materials for the pseudo-code of the inference algorithm. tioning on the hidden states of parent non-terminals, while our parent feeding uses the states of parent actions.\n5We do not show bias terms for all softmax equations."
+    }, {
+      "heading" : "5 Experimental Evaluation",
+      "text" : ""
+    }, {
+      "heading" : "5.1 Datasets and Metrics",
+      "text" : "HEARTHSTONE (HS) dataset (Ling et al., 2016) is a collection of Python classes that implement cards for the card game HearthStone. Each card comes with a set of fields (e.g., name, cost, and description), which we concatenate to create the input sequence. This dataset is relatively difficult: input descriptions are short, while the target code is in complex class structures, with each AST having 137 nodes on average. DJANGO dataset (Oda et al., 2015) is a collection of lines of code from the Django web framework, each with a manually annotated NL description. Compared with the HS dataset where card implementations are somewhat homogenous, examples in DJANGO are more diverse, spanning a wide variety of real-world use cases like string manipulation, IO operations, and exception handling. IFTTT dataset (Quirk et al., 2015) is a domainspecific benchmark that provides an interesting side comparison. Different from HS and DJANGO which are in a general-purpose PL, programs in IFTTT are written in a domain-specific language used by the IFTTT task automation App. Users of the App write simple instructions (e.g., If Instagram.AnyNewPhotoByYou Then Dropbox.AddFileFromURL) with NL descriptions (e.g., “Autosave your Instagram photos to Dropbox”). Each statement inside the If or Then clause consists of a channel (e.g., Dropbox) and a function (e.g., AddFileFromURL)6. This\n6Like Beltagy and Quirk (2016), we strip function param-\nsimple structure results in much more concise ASTs (7 nodes on average). Because all examples are created by ordinary Apps users, the dataset is highly noisy, with input NL very loosely connected to target ASTs. The authors thus provide a high-quality filtered test set, where each example is verified by at least three annotators. We use this set for evaluation. Also note IFTTT’s grammar has more productions (Tab. 2), but this does not imply that its grammar is more complex. This is because for HS and DJANGO terminal tokens are generated by GENTOKEN actions, but for IFTTT, all the code is generated directly by APPLYRULE actions. Metrics As is standard in semantic parsing, we measure accuracy, the fraction of correctly generated examples. However, because generating an exact match for complex code structures is nontrivial, we follow Ling et al. (2016), and use tokenlevel BLEU-4 with as a secondary metric, defined as the averaged BLEU scores over all examples.7"
+    }, {
+      "heading" : "5.2 Setup",
+      "text" : "Preprocessing All input descriptions are tokenized using NLTK. We perform simple canonicalization for DJANGO, such as replacing quoted strings in the inputs with place holders. See supplementary materials for details. We extract unary closures whose frequency is larger than a threshold k (k = 30 for HS and 50 for DJANGO). Configuration The size of all embeddings is 128, except for node type embeddings, which is 64. The dimensions of RNN states and hidden layers are 256 and 50, respectively. Since our datasets are relatively small for a data-hungry neural model, we impose strong regularization using recurrent dropouts (Gal and Ghahramani, 2016), together with standard dropout layers added to the inputs and outputs of the decoder RNN. We validate the dropout probability from {0, 0.2, 0.3, 0.4}. For decoding, we use a beam size of 15."
+    }, {
+      "heading" : "5.3 Results",
+      "text" : "Evaluation results for Python code generation tasks are listed in Tab. 3. Numbers for our sys-\neters since they are mostly specific to users. 7These two metrics are not ideal: accuracy only measures exact match and thus lacks the ability to give credit to semantically correct code that is different from the reference, while it is not clear whether BLEU provides an appropriate proxy for measuring semantics in the code generation task. A more intriguing metric would be directly measuring semantic/functional code equivalence, for which we present a pilot study at the end of this section (cf. Error Analysis). We leave exploring more sophisticated metrics (e.g. based on static code analysis) as future work.\ntems are averaged over three runs. We compare primarily with two approaches: (1) Latent Predictor Network (LPN), a state-of-the-art sequenceto-sequence code generation model (Ling et al., 2016), and (2) SEQ2TREE, a neural semantic parsing model (Dong and Lapata, 2016). SEQ2TREE generates trees one node at a time, and the target grammar is not explicitly modeled a priori, but implicitly learned from data. We test both the original SEQ2TREE model released by the authors and our revised one (SEQ2TREE–UNK) that uses unknown word replacement to handle rare words (Luong et al., 2015). For completeness, we also compare with a strong neural machine translation (NMT) system (Neubig, 2015) using a standard encoder-decoder architecture with attention and unknown word replacement8, and include numbers from other baselines used in Ling et al. (2016). On the HS dataset, which has relatively large ASTs, we use unary closure for our model and SEQ2TREE, and for DJANGO we do not. System Comparison As in Tab. 3, our model registers 11.7% and 9.3% absolute improvements over LPN in accuracy on HS and DJANGO. This boost in performance strongly indicates the importance of modeling grammar in code generation. For the baselines, we find LPN outperforms others in most cases. We also note that SEQ2TREE achieves a decent accuracy of 13.6% on HS, which is due to the effect of unknown word replacement, since we only achieved 1.5% without it. A closer\n8For NMT, we also attempted to find the best-scoring syntactically correct predictions in the size-5 beam, but this did not yield a significant improvement over the NMT results in Tab. 3.\ncomparison with SEQ2TREE is insightful for understanding the advantage of our syntax-driven approach, since both SEQ2TREE and our system output ASTs: (1) SEQ2TREE predicts one node each time step, and requires additional “dummy” nodes to mark the boundary of a subtree. The sheer number of nodes in target ASTs makes the prediction process error-prone. In contrast, the APPLYRULE actions of our grammar model allows for generating multiple nodes at a single time step. Empirically, we found that in HS, SEQ2TREE takes more than 300 time steps on average to generate a target AST, while our model takes only 170 steps. (2) SEQ2TREE does not directly use productions in the grammar, which possibly leads to grammatically incorrect ASTs and thus empty code outputs. We observe that the ratio of grammatically incorrect ASTs predicted by SEQ2TREE on HS and DJANGO are 21.2% and 10.9%, respectively, while our system guarantees grammaticality. Ablation Study We also ablated our bestperforming models to analyze the contribution of each component. “–frontier embed.” removes the frontier node embedding nft from the decoder RNN inputs (Eq. (3)). This yields worse results on DJANGO while gives slight improvements in accuracy on HS. This is probably because that the grammar of HS has fewer node types, and thus the RNN is able to keep track of nft without depending on its embedding. Next, “–parent feed.” removes the parent feeding mechanism. The accuracy drops significantly on HS, with a marginal deterioration on DJANGO. This result is interesting because it suggests that parent feeding is more important when the ASTs are larger, which will be the case when handling more complicated code generation tasks like HS. Finally, removing the pointer network (“–copy terminals”) in GENTO-\nKEN actions gives poor results, indicating that it is important to directly copy variable names and values from the input.\nThe results with and without unary closure demonstrate that, interestingly, it is effective on HS but not on DJANGO. We conjecture that this is because on HS it significantly reduces the number of actions from 173 to 142 (c.f., Tab. 2), with the number of productions in the grammar remaining unchanged. In contrast, DJANGO has a broader domain, and thus unary closure results in more productions in the grammar (237 for DJANGO vs. 100 for HS), increasing sparsity. Performance by the size of AST We further investigate our model’s performance w.r.t. the size of the gold-standard ASTs in Figs. 3 and 4. Not surprisingly, the performance drops when the size of the reference ASTs increases. Additionally, on the HS dataset, the BLEU score still remains at around 50 even when the size of ASTs grows to 200, indicating that our proposed syntax-driven approach is robust for long code segments. Domain Specific Code Generation Although this is not the focus of our work, evaluation on IFTTT brings us closer to a standard semantic parsing setting, which helps to investigate similarities and differences between generation of more complicated general-purpose code and and more limiteddomain simpler code. Tab. 4 shows the results, following the evaluation protocol in (Beltagy and Quirk, 2016) for accuracies at both channel and full parse tree (channel + function) levels. Our full model performs on par with existing neural network-based methods, while outperforming other neural models in full tree accuracy (82.0%). This score is close to the best classical method (LR), which is based on a logistic regression\nmodel with rich hand-engineered features (e.g., brown clusters and paraphrase). Also note that the performance between NMT and other neural models is much closer compared with the results in Tab. 3. This suggests that general-purpose code generation is more challenging than the simpler IFTTT setting, and therefore modeling structural information is more helpful. Case Studies We present output examples in Tab. 5. On HS, we observe that most of the time our model gives correct predictions by filling learned code templates from training data with arguments (e.g., cost) copied from input. However, we do find interesting examples indicating that the model learns to generalize beyond trivial copying. For instance, the first example is one that our model predicted wrong — it generated code block A instead of the gold B (it also missed a function definition not shown here). However, we find that the block A actually conveys part of the input intent by destroying all, not some, of the minions. Since we are unable to find code block A in the training data, it is clear that the model has learned to generalize to some extent from multiple training card examples with similar semantics or structure.\nThe next two examples are from DJANGO. The first one shows that the model learns the usage of common API calls (e.g., os.path.join), and\nhow to populate the arguments by copying from inputs. The second example illustrates the difficulty of generating code with complex nested structures like lambda functions, a scenario worth further investigation in future studies. More examples are attached in supplementary materials. Error Analysis To understand the sources of errors and how good our evaluation metric (exact match) is, we randomly sampled and labeled 100 and 50 failed examples (with accuracy=0) from DJANGO and HS, resp. We found that around 2% of these examples in the two datasets are actually semantically equivalent. These examples include: (1) using different parameter names when defining a function; (2) omitting (or adding) default values of parameters in function calls. While the rarity of such examples suggests that our exact match metric is reasonable, more advanced evaluation metrics based on statistical code analysis are definitely intriguing future work.\nFor DJANGO, we found that 30% of failed cases were due to errors where the pointer network failed to appropriately copy a variable name into the correct position. 25% were because the generated code only partially implementated the required functionality. 10% and 5% of errors were due to malformed English inputs and preprocessing errors, respectively. The remaining 30% of examples were errors stemming from multiple sources, or errors that could not be easily categorized into the above. For HS, we found that all failed card examples were due to partial implementation errors, such as the one shown in Table 5."
+    }, {
+      "heading" : "6 Related Work",
+      "text" : "Code Generation and Analysis Most existing works on code generation focus on generating code for domain specific languages (DSLs) (Kushman and Barzilay, 2013; Raza et al., 2015; Manshadi et al., 2013), with neural network-based approaches recently explored (Parisotto et al., 2016; Balog et al., 2016). For general-purpose code generation, besides the general framework of Ling et al. (2016), existing methods often use language and task-specific rules and strategies (Lei et al., 2013; Raghothaman et al., 2016). A similar line is to use NL queries for code retrieval (Wei et al., 2015; Allamanis et al., 2015). The reverse task of generating NL summaries from source code has also been explored (Oda et al., 2015; Iyer et al., 2016). Finally, there are probabilistic models of\nsource code (Maddison and Tarlow, 2014; Nguyen et al., 2013). The most relevant work is Allamanis et al. (2015), which uses a factorized model to measure semantic relatedness between NL and ASTs for code retrieval, while our model tackles the more challenging generation task. Semantic Parsing Our work is related to the general topic of semantic parsing, where the target logical forms can be viewed as DSLs. The parsing process is often guided by grammatical formalisms like combinatory categorical grammars (Kwiatkowski et al., 2013; Artzi et al., 2015), dependency-based syntax (Liang et al., 2011; Pasupat and Liang, 2015) or task-specific formalisms (Clarke et al., 2010; Yih et al., 2015; Krishnamurthy et al., 2016; Misra et al., 2015; Mei et al., 2016). Recently, there are efforts in designing neural network-based semantic parsers (Misra and Artzi, 2016; Dong and Lapata, 2016; Neelakantan et al., 2016; Yin et al., 2016). Several approaches have be proposed to utilize grammar knowledge in a neural parser, such as augmenting the training data by generating examples guided by the grammar (Kociský et al., 2016; Jia and Liang, 2016). Liang et al. (2016) used a neural decoder which constrains the space of next valid tokens in the query language for question answering. Finally, the structured prediction approach proposed by Xiao et al. (2016) is closely related to our model in using the underlying grammar as prior knowledge to constrain the generation process of derivation trees, while our method is based on a unified grammar model which jointly captures production rule application and terminal symbol generation, and scales to general purpose code generation tasks."
+    }, {
+      "heading" : "7 Conclusion",
+      "text" : "This paper proposes a syntax-driven neural code generation approach that generates an abstract syntax tree by sequentially applying actions from a grammar model. Experiments on both code generation and semantic parsing tasks demonstrate the effectiveness of our proposed approach."
+    }, {
+      "heading" : "Acknowledgment",
+      "text" : "We are grateful to Wang Ling for his generous help with LPN and setting up the benchmark. We also thank Li Dong for helping with SEQ2TREE and insightful discussions."
+    }, {
+      "heading" : "A Encoder LSTM Equations",
+      "text" : "Suppose the input natural language description x consists of n words {wi}ni=1. Let wi denote the embedding of wi. We use two LSTMs to process x in forward and backward order, and get the sequence of hidden states {~hi}ni=1 and { ~hi}ni=1 in the two directions:\n~hi = f → LSTM(wi, ~hi−1) ~hi = f ← LSTM(wi, ~hi+1),\nwhere f→LSTM and f ← LSTM are standard LSTM update functions. The representation of the i-th word, hi, is given by concatenating ~hi and ~hi.\nB Inference Algorithm\nGiven an NL description, we approximate the best AST ŷ in Eq. 1 using beam search. The inference procedure is listed in Algorithm 1.\nWe maintain a beam of size K. The beam is initialized with one hypothesis AST with a single root node (line 2). At each time step, the decoder enumerates over all hypotheses in the beam. For each hypothesis AST, we first find its frontier node nft (line 6). If nft is a non-terminal node, we collect all syntax rules r with nft as the head node to the actions set (line 10). If nft is a variable terminal node, we add all terminal tokens in the vocabulary and the input description as candidate actions (line 13). We apply each candidate action on the current hypothesis AST to generate a new hypothesis (line 15). We then rank all newly generated hypotheses and keep the top-K scored ones in the beam. A complete hypothesis AST is generated when it has no frontier node. We then convert the top-scored complete AST into the surface code (lines 18-19).\nWe remark that our inference algorithm can be implemented efficiently by expanding multiple hypotheses (lines 5-16) simultaneously using mini-batching on GPU."
+    }, {
+      "heading" : "C Dataset Preprocessing",
+      "text" : "Infrequent Words We replace word types whose frequency is lower than d with a special <unk> token (d = 3 for DJANGO, 3 for HS and 2 for IFTTT). Canonicalization We perform simple canonicalization for the DJANGO dataset: (1) We observe that input descriptions often come with\nquoted string literals (e.g., verbose name is a string ‘cache entry’). We therefore replace quoted strings with indexed placeholders using regular expression. After decoding, we run a postprocessing step to replace all placeholders with their actual values. (2) For descriptions with cascading variable reference (e.g., call method self.makekey), we append after the whole variable name with tokens separated by ‘.’ (e.g., append self and makekey after self.makekey). This gives the pointer network flexibility to copy either partial or whole variable names. Generate Oracle Action Sequence To train our model, we generate the gold-standard action sequence from reference code. For IFTTT, we simply parse the officially provided ASTs into sequences of APPLYRULE actions. For HS and DJANGO, we first convert the Python code into ASTs using the standard ast module. Values inside variable terminal nodes are tokenized by space and camel case (e.g., ClassName is tokenized to Class and Name). We then traverse the AST in pre-order to generate the reference action sequence according to the grammar model."
+    }, {
+      "heading" : "D Additional Decoding Examples",
+      "text" : "We provide extra decoding examples from the DJANGO and HS datasets, listed in Table 6 and Table 7, respectively. The model heavily relies on the pointer network to copy variable names and constants from input descriptions. We find the source of errors in DJANGO is more diverse, with most incorrect examples resulting from missing arguments and incorrect words copied by the pointer network. Errors in HS are mostly due to partially or incorrectly implemented effects. Also note that the first example in Table 6 is semantically correct, although it was considered incorrect under our exact-match metric. This suggests more advanced evaluation metric that takes into account the execution results in future studies.\nAlgorithm 1: Inference Algorithm Input : NL description x Output: code snippet c\n1 call Encoder to encode x 2 Q = {y0 (root)} . Initialize a beam of size K 3 for time step t do 4 Q′ = ∅ 5 foreach hypothesis yt ∈ Q do 6 nft = FrontierNode(yt) 7 A = ∅ . Initialize the set of candidate actions 8 if nft is non-terminal then 9 foreach production rule r with nft as the head node do\n10 A = A ∪ {APPLYRULE[r]} . APPLYRULE actions for non-terminal nodes 11 else 12 foreach terminal token v do 13 A = A ∪ {GENTOKEN[v]} . GENTOKEN actions for variable terminal nodes 14 foreach action at ∈ A do 15 y′t = ApplyAction(yt, at) 16 Q′ = Q′ ∪ {y ′t} 17 Q = top-K scored hypotheses in Q′ 18 ŷ = top-scored complete hypothesis AST 19 convert ŷ to surface code c 20 return c"
+    } ],
+    "references" : [ {
+      "title" : "Bimodal modelling of source code and natural language",
+      "author" : [ "Miltiadis Allamanis", "Daniel Tarlow", "Andrew D. Gordon", "Yi Wei." ],
+      "venue" : "Proceedings of ICML. volume 37.",
+      "citeRegEx" : "Allamanis et al\\.,? 2015",
+      "shortCiteRegEx" : "Allamanis et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "Tree-structured decoding with doubly recurrent neural networks",
+      "author" : [ "David Alvarez-Melis", "Tommi S. Jaakkola." ],
+      "venue" : "Proceedings of ICLR.",
+      "citeRegEx" : "Alvarez.Melis and Jaakkola.,? 2017",
+      "shortCiteRegEx" : "Alvarez.Melis and Jaakkola.",
+      "year" : 2017
+    }, {
+      "title" : "Broad-coverage CCG semantic parsing with AMR",
+      "author" : [ "Yoav Artzi", "Kenton Lee", "Luke Zettlemoyer." ],
+      "venue" : "Proceedings of EMNLP.",
+      "citeRegEx" : "Artzi et al\\.,? 2015",
+      "shortCiteRegEx" : "Artzi et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "Weakly supervised learning of semantic parsers for mapping instructions to actions",
+      "author" : [ "Yoav Artzi", "Luke Zettlemoyer." ],
+      "venue" : "Transaction of ACL 1(1).",
+      "citeRegEx" : "Artzi and Zettlemoyer.,? 2013",
+      "shortCiteRegEx" : "Artzi and Zettlemoyer.",
+      "year" : 2013
+    }, {
+      "title" : "Neural machine translation by jointly learning to align and translate",
+      "author" : [ "Dzmitry Bahdanau", "Kyunghyun Cho", "Yoshua Bengio." ],
+      "venue" : "CoRR abs/1409.0473.",
+      "citeRegEx" : "Bahdanau et al\\.,? 2014",
+      "shortCiteRegEx" : "Bahdanau et al\\.",
+      "year" : 2014
+    }, {
+      "title" : "Deepcoder: Learning to write programs",
+      "author" : [ "Matej Balog", "Alexander L. Gaunt", "Marc Brockschmidt", "Sebastian Nowozin", "Daniel Tarlow." ],
+      "venue" : "CoRR abs/1611.01989.",
+      "citeRegEx" : "Balog et al\\.,? 2016",
+      "shortCiteRegEx" : "Balog et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "A 15 year perspective on automatic programming",
+      "author" : [ "Robert Balzer." ],
+      "venue" : "IEEE Trans. Software Eng. 11(11).",
+      "citeRegEx" : "Balzer.,? 1985",
+      "shortCiteRegEx" : "Balzer.",
+      "year" : 1985
+    }, {
+      "title" : "Abstract meaning representation for sembanking",
+      "author" : [ "Laura Banarescu", "Claire Bonial", "Shu Cai", "Madalina Georgescu", "Kira Griffitt", "Ulf Hermjakob", "Kevin Knight", "Philipp Koehn", "Martha Palmer", "Nathan Schneider." ],
+      "venue" : "Proceedings of the 7th Linguis-",
+      "citeRegEx" : "Banarescu et al\\.,? 2013",
+      "shortCiteRegEx" : "Banarescu et al\\.",
+      "year" : 2013
+    }, {
+      "title" : "Improved semantic parsers for if-then statements",
+      "author" : [ "I. Beltagy", "Chris Quirk." ],
+      "venue" : "Proceedings of ACL.",
+      "citeRegEx" : "Beltagy and Quirk.,? 2016",
+      "shortCiteRegEx" : "Beltagy and Quirk.",
+      "year" : 2016
+    }, {
+      "title" : "Semantic parsing on freebase from question-answer pairs",
+      "author" : [ "Jonathan Berant", "Andrew Chou", "Roy Frostig", "Percy Liang." ],
+      "venue" : "Proceedings of EMNLP.",
+      "citeRegEx" : "Berant et al\\.,? 2013",
+      "shortCiteRegEx" : "Berant et al\\.",
+      "year" : 2013
+    }, {
+      "title" : "Example-centric programming: integrating web search into the development environment",
+      "author" : [ "Joel Brandt", "Mira Dontcheva", "Marcos Weskamp", "Scott R. Klemmer." ],
+      "venue" : "Proceedings of CHI.",
+      "citeRegEx" : "Brandt et al\\.,? 2010",
+      "shortCiteRegEx" : "Brandt et al\\.",
+      "year" : 2010
+    }, {
+      "title" : "Two studies of opportunistic programming: interleaving web foraging, learning, and writing code",
+      "author" : [ "Joel Brandt", "Philip J. Guo", "Joel Lewenstein", "Mira Dontcheva", "Scott R. Klemmer." ],
+      "venue" : "Proceedings of CHI.",
+      "citeRegEx" : "Brandt et al\\.,? 2009",
+      "shortCiteRegEx" : "Brandt et al\\.",
+      "year" : 2009
+    }, {
+      "title" : "Widecoverage efficient statistical parsing with CCG and log-linear models",
+      "author" : [ "Stephen Clark", "James R. Curran." ],
+      "venue" : "Computational Linguistics 33(4).",
+      "citeRegEx" : "Clark and Curran.,? 2007",
+      "shortCiteRegEx" : "Clark and Curran.",
+      "year" : 2007
+    }, {
+      "title" : "Driving semantic parsing from the world’s response",
+      "author" : [ "James Clarke", "Dan Goldwasser", "Ming-Wei Chang", "Dan Roth." ],
+      "venue" : "Proceedings of CoNLL.",
+      "citeRegEx" : "Clarke et al\\.,? 2010",
+      "shortCiteRegEx" : "Clarke et al\\.",
+      "year" : 2010
+    }, {
+      "title" : "Language to logical form with neural attention",
+      "author" : [ "Li Dong", "Mirella Lapata." ],
+      "venue" : "Proceedings of ACL.",
+      "citeRegEx" : "Dong and Lapata.,? 2016",
+      "shortCiteRegEx" : "Dong and Lapata.",
+      "year" : 2016
+    }, {
+      "title" : "A theoretically grounded application of dropout in recurrent neural networks",
+      "author" : [ "Yarin Gal", "Zoubin Ghahramani." ],
+      "venue" : "Proceedings of NIPS.",
+      "citeRegEx" : "Gal and Ghahramani.,? 2016",
+      "shortCiteRegEx" : "Gal and Ghahramani.",
+      "year" : 2016
+    }, {
+      "title" : "Incorporating copying mechanism in sequence-to-sequence learning",
+      "author" : [ "Jiatao Gu", "Zhengdong Lu", "Hang Li", "Victor O.K. Li." ],
+      "venue" : "Proceedings of ACL.",
+      "citeRegEx" : "Gu et al\\.,? 2016",
+      "shortCiteRegEx" : "Gu et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Interactive synthesis using free-form queries",
+      "author" : [ "Tihomir Gvero", "Viktor Kuncak." ],
+      "venue" : "Proceedings of ICSE.",
+      "citeRegEx" : "Gvero and Kuncak.,? 2015",
+      "shortCiteRegEx" : "Gvero and Kuncak.",
+      "year" : 2015
+    }, {
+      "title" : "Long short-term memory",
+      "author" : [ "Sepp Hochreiter", "Jürgen Schmidhuber." ],
+      "venue" : "Neural Computation 9(8).",
+      "citeRegEx" : "Hochreiter and Schmidhuber.,? 1997",
+      "shortCiteRegEx" : "Hochreiter and Schmidhuber.",
+      "year" : 1997
+    }, {
+      "title" : "Summarizing source code using a neural attention model",
+      "author" : [ "Srinivasan Iyer", "Ioannis Konstas", "Alvin Cheung", "Luke Zettlemoyer." ],
+      "venue" : "Proceedings of ACL.",
+      "citeRegEx" : "Iyer et al\\.,? 2016",
+      "shortCiteRegEx" : "Iyer et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Data recombination for neural semantic parsing",
+      "author" : [ "Robin Jia", "Percy Liang." ],
+      "venue" : "Proceedings of ACL.",
+      "citeRegEx" : "Jia and Liang.,? 2016",
+      "shortCiteRegEx" : "Jia and Liang.",
+      "year" : 2016
+    }, {
+      "title" : "Semantic parsing with semi-supervised sequential autoencoders",
+      "author" : [ "Tomás Kociský", "Gábor Melis", "Edward Grefenstette", "Chris Dyer", "Wang Ling", "Phil Blunsom", "Karl Moritz Hermann." ],
+      "venue" : "Proceedings of EMNLP.",
+      "citeRegEx" : "Kociský et al\\.,? 2016",
+      "shortCiteRegEx" : "Kociský et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Semantic parsing to probabilistic programs for situated question answering",
+      "author" : [ "Jayant Krishnamurthy", "Oyvind Tafjord", "Aniruddha Kembhavi." ],
+      "venue" : "Proceedings of EMNLP.",
+      "citeRegEx" : "Krishnamurthy et al\\.,? 2016",
+      "shortCiteRegEx" : "Krishnamurthy et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Using semantic unification to generate regular expressions from natural language",
+      "author" : [ "Nate Kushman", "Regina Barzilay." ],
+      "venue" : "Proceedings of NAACL.",
+      "citeRegEx" : "Kushman and Barzilay.,? 2013",
+      "shortCiteRegEx" : "Kushman and Barzilay.",
+      "year" : 2013
+    }, {
+      "title" : "Scaling semantic parsers with on-the-fly ontology matching",
+      "author" : [ "Tom Kwiatkowski", "Eunsol Choi", "Yoav Artzi", "Luke S. Zettlemoyer." ],
+      "venue" : "Proceedings of the EMNLP.",
+      "citeRegEx" : "Kwiatkowski et al\\.,? 2013",
+      "shortCiteRegEx" : "Kwiatkowski et al\\.",
+      "year" : 2013
+    }, {
+      "title" : "From natural language specifications to program input parsers",
+      "author" : [ "Tao Lei", "Fan Long", "Regina Barzilay", "Martin C. Rinard." ],
+      "venue" : "Proceedings of ACL.",
+      "citeRegEx" : "Lei et al\\.,? 2013",
+      "shortCiteRegEx" : "Lei et al\\.",
+      "year" : 2013
+    }, {
+      "title" : "Neural symbolic machines: Learning semantic parsers on freebase with weak supervision",
+      "author" : [ "Chen Liang", "Jonathan Berant", "Quoc Le", "Kenneth D. Forbus", "Ni Lao." ],
+      "venue" : "CoRR abs/1611.00020.",
+      "citeRegEx" : "Liang et al\\.,? 2016",
+      "shortCiteRegEx" : "Liang et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Learning dependency-based compositional semantics",
+      "author" : [ "Percy Liang", "Michael I. Jordan", "Dan Klein." ],
+      "venue" : "Proceedings of ACL.",
+      "citeRegEx" : "Liang et al\\.,? 2011",
+      "shortCiteRegEx" : "Liang et al\\.",
+      "year" : 2011
+    }, {
+      "title" : "Latent predictor networks for code generation",
+      "author" : [ "Wang Ling", "Phil Blunsom", "Edward Grefenstette", "Karl Moritz Hermann", "Tomás Kociský", "Fumin Wang", "Andrew Senior." ],
+      "venue" : "Proceedings of ACL.",
+      "citeRegEx" : "Ling et al\\.,? 2016",
+      "shortCiteRegEx" : "Ling et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Keyword programming in java",
+      "author" : [ "Greg Little", "Robert C. Miller." ],
+      "venue" : "Autom. Softw. Eng. 16(1).",
+      "citeRegEx" : "Little and Miller.,? 2009",
+      "shortCiteRegEx" : "Little and Miller.",
+      "year" : 2009
+    }, {
+      "title" : "Addressing the rare word problem in neural machine translation",
+      "author" : [ "Thang Luong", "Ilya Sutskever", "Quoc V. Le", "Oriol Vinyals", "Wojciech Zaremba." ],
+      "venue" : "Proceedings of ACL.",
+      "citeRegEx" : "Luong et al\\.,? 2015",
+      "shortCiteRegEx" : "Luong et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "Structured generative models of natural source code",
+      "author" : [ "Chris J. Maddison", "Daniel Tarlow." ],
+      "venue" : "Proceedings of ICML. volume 32.",
+      "citeRegEx" : "Maddison and Tarlow.,? 2014",
+      "shortCiteRegEx" : "Maddison and Tarlow.",
+      "year" : 2014
+    }, {
+      "title" : "Integrating programming by example and natural language programming",
+      "author" : [ "Mehdi Hafezi Manshadi", "Daniel Gildea", "James F. Allen." ],
+      "venue" : "Proceedings of AAAI.",
+      "citeRegEx" : "Manshadi et al\\.,? 2013",
+      "shortCiteRegEx" : "Manshadi et al\\.",
+      "year" : 2013
+    }, {
+      "title" : "Listen, attend, and walk: Neural mapping of navigational instructions to action sequences",
+      "author" : [ "Hongyuan Mei", "Mohit Bansal", "Matthew R. Walter." ],
+      "venue" : "Proceedings of AAAI.",
+      "citeRegEx" : "Mei et al\\.,? 2016",
+      "shortCiteRegEx" : "Mei et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Neural shiftreduce CCG semantic parsing",
+      "author" : [ "Dipendra K. Misra", "Yoav Artzi." ],
+      "venue" : "Proceedings of EMNLP.",
+      "citeRegEx" : "Misra and Artzi.,? 2016",
+      "shortCiteRegEx" : "Misra and Artzi.",
+      "year" : 2016
+    }, {
+      "title" : "Environment-driven lexicon induction for high-level instructions",
+      "author" : [ "Dipendra Kumar Misra", "Kejia Tao", "Percy Liang", "Ashutosh Saxena." ],
+      "venue" : "Proceedings of ACL.",
+      "citeRegEx" : "Misra et al\\.,? 2015",
+      "shortCiteRegEx" : "Misra et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "Neural programmer: Inducing latent programs with gradient descent",
+      "author" : [ "Arvind Neelakantan", "Quoc V. Le", "Ilya Sutskever." ],
+      "venue" : "Proceedings of ICLR.",
+      "citeRegEx" : "Neelakantan et al\\.,? 2016",
+      "shortCiteRegEx" : "Neelakantan et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "lamtram: A toolkit for language and translation modeling using neural networks",
+      "author" : [ "Graham Neubig." ],
+      "venue" : "http://www.github.com/neubig/lamtram.",
+      "citeRegEx" : "Neubig.,? 2015",
+      "shortCiteRegEx" : "Neubig.",
+      "year" : 2015
+    }, {
+      "title" : "A statistical semantic language model for source code",
+      "author" : [ "Tung Thanh Nguyen", "Anh Tuan Nguyen", "Hoan Anh Nguyen", "Tien N. Nguyen." ],
+      "venue" : "Proceedings of ACM SIGSOFT .",
+      "citeRegEx" : "Nguyen et al\\.,? 2013",
+      "shortCiteRegEx" : "Nguyen et al\\.",
+      "year" : 2013
+    }, {
+      "title" : "Learning to generate pseudo-code from source code using statistical machine translation (T)",
+      "author" : [ "Yusuke Oda", "Hiroyuki Fudaba", "Graham Neubig", "Hideaki Hata", "Sakriani Sakti", "Tomoki Toda", "Satoshi Nakamura." ],
+      "venue" : "Proceedings of ASE.",
+      "citeRegEx" : "Oda et al\\.,? 2015",
+      "shortCiteRegEx" : "Oda et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "Neuro-symbolic program synthesis",
+      "author" : [ "Emilio Parisotto", "Abdel-rahman Mohamed", "Rishabh Singh", "Lihong Li", "Dengyong Zhou", "Pushmeet Kohli." ],
+      "venue" : "CoRR abs/1611.01855.",
+      "citeRegEx" : "Parisotto et al\\.,? 2016",
+      "shortCiteRegEx" : "Parisotto et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Compositional semantic parsing on semi-structured tables",
+      "author" : [ "Panupong Pasupat", "Percy Liang." ],
+      "venue" : "Proceedings of ACL.",
+      "citeRegEx" : "Pasupat and Liang.,? 2015",
+      "shortCiteRegEx" : "Pasupat and Liang.",
+      "year" : 2015
+    }, {
+      "title" : "Python abstract grammar",
+      "author" : [ "Python Software Foundation." ],
+      "venue" : "https://docs.python.org/2/library/ast.html.",
+      "citeRegEx" : "Foundation.,? 2016",
+      "shortCiteRegEx" : "Foundation.",
+      "year" : 2016
+    }, {
+      "title" : "Language to code: Learning semantic parsers for if-this-then-that recipes",
+      "author" : [ "Chris Quirk", "Raymond J. Mooney", "Michel Galley." ],
+      "venue" : "Proceedings of ACL.",
+      "citeRegEx" : "Quirk et al\\.,? 2015",
+      "shortCiteRegEx" : "Quirk et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "SWIM: synthesizing what i mean: code search and idiomatic snippet synthesis",
+      "author" : [ "Mukund Raghothaman", "Yi Wei", "Youssef Hamadi." ],
+      "venue" : "Proceedings of ICSE.",
+      "citeRegEx" : "Raghothaman et al\\.,? 2016",
+      "shortCiteRegEx" : "Raghothaman et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Compositional program synthesis from natural language and examples",
+      "author" : [ "Mohammad Raza", "Sumit Gulwani", "Natasa MilicFrayling." ],
+      "venue" : "Proceedings of IJCAI.",
+      "citeRegEx" : "Raza et al\\.,? 2015",
+      "shortCiteRegEx" : "Raza et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "Using multiple clause constructors in inductive logic programming for semantic parsing",
+      "author" : [ "Lappoon R. Tang", "Raymond J. Mooney." ],
+      "venue" : "Proceedings of ECML.",
+      "citeRegEx" : "Tang and Mooney.,? 2001",
+      "shortCiteRegEx" : "Tang and Mooney.",
+      "year" : 2001
+    }, {
+      "title" : "Pointer networks",
+      "author" : [ "Oriol Vinyals", "Meire Fortunato", "Navdeep Jaitly." ],
+      "venue" : "Proceedings of NIPS.",
+      "citeRegEx" : "Vinyals et al\\.,? 2015",
+      "shortCiteRegEx" : "Vinyals et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "Building bing developer assistant",
+      "author" : [ "Yi Wei", "Nirupama Chandrasekaran", "Sumit Gulwani", "Youssef Hamadi." ],
+      "venue" : "Technical report. https://www.microsoft.com/enus/research/publication/building-bing-developer-",
+      "citeRegEx" : "Wei et al\\.,? 2015",
+      "shortCiteRegEx" : "Wei et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "Sequence-based structured prediction for semantic parsing",
+      "author" : [ "Chunyang Xiao", "Marc Dymetman", "Claire Gardent." ],
+      "venue" : "Proceedings of ACL.",
+      "citeRegEx" : "Xiao et al\\.,? 2016",
+      "shortCiteRegEx" : "Xiao et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Semantic parsing via staged query graph generation: Question answering with knowledge base",
+      "author" : [ "Wen-tau Yih", "Ming-Wei Chang", "Xiaodong He", "Jianfeng Gao." ],
+      "venue" : "Proceedings of ACL.",
+      "citeRegEx" : "Yih et al\\.,? 2015",
+      "shortCiteRegEx" : "Yih et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "Neural enquirer: Learning to query tables in natural language",
+      "author" : [ "Pengcheng Yin", "Zhengdong Lu", "Hang Li", "Ben Kao." ],
+      "venue" : "Proceedings of IJCAI.",
+      "citeRegEx" : "Yin et al\\.,? 2016",
+      "shortCiteRegEx" : "Yin et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Learning to map sentences to logical form structured classification with probabilistic categorial grammars",
+      "author" : [ "Luke Zettlemoyer", "Michael Collins." ],
+      "venue" : "Proceedings of UAI.",
+      "citeRegEx" : "Zettlemoyer and Collins.,? 2005",
+      "shortCiteRegEx" : "Zettlemoyer and Collins.",
+      "year" : 2005
+    } ],
+    "referenceMentions" : [ {
+      "referenceID" : 6,
+      "context" : "However, this is time-consuming, and thus the software engineering literature is ripe with methods to directly generate code from NL descriptions, mostly with hand-engineered methods highly tailored to specific programming languages (Balzer, 1985; Little and Miller, 2009; Gvero and Kuncak, 2015).",
+      "startOffset" : 233,
+      "endOffset" : 296
+    }, {
+      "referenceID" : 29,
+      "context" : "However, this is time-consuming, and thus the software engineering literature is ripe with methods to directly generate code from NL descriptions, mostly with hand-engineered methods highly tailored to specific programming languages (Balzer, 1985; Little and Miller, 2009; Gvero and Kuncak, 2015).",
+      "startOffset" : 233,
+      "endOffset" : 296
+    }, {
+      "referenceID" : 17,
+      "context" : "However, this is time-consuming, and thus the software engineering literature is ripe with methods to directly generate code from NL descriptions, mostly with hand-engineered methods highly tailored to specific programming languages (Balzer, 1985; Little and Miller, 2009; Gvero and Kuncak, 2015).",
+      "startOffset" : 233,
+      "endOffset" : 296
+    }, {
+      "referenceID" : 12,
+      "context" : "These logical forms can be general-purpose meaning representations (Clark and Curran, 2007; Banarescu et al., 2013), formalisms for querying knowledge bases (Tang and Mooney, 2001; Zettlemoyer and Collins, 2005; Berant et al.",
+      "startOffset" : 67,
+      "endOffset" : 115
+    }, {
+      "referenceID" : 7,
+      "context" : "These logical forms can be general-purpose meaning representations (Clark and Curran, 2007; Banarescu et al., 2013), formalisms for querying knowledge bases (Tang and Mooney, 2001; Zettlemoyer and Collins, 2005; Berant et al.",
+      "startOffset" : 67,
+      "endOffset" : 115
+    }, {
+      "referenceID" : 46,
+      "context" : ", 2013), formalisms for querying knowledge bases (Tang and Mooney, 2001; Zettlemoyer and Collins, 2005; Berant et al., 2013) and instructions for robots or personal assistants (Artzi and Zettlemoyer, 2013; Quirk et al.",
+      "startOffset" : 49,
+      "endOffset" : 124
+    }, {
+      "referenceID" : 52,
+      "context" : ", 2013), formalisms for querying knowledge bases (Tang and Mooney, 2001; Zettlemoyer and Collins, 2005; Berant et al., 2013) and instructions for robots or personal assistants (Artzi and Zettlemoyer, 2013; Quirk et al.",
+      "startOffset" : 49,
+      "endOffset" : 124
+    }, {
+      "referenceID" : 9,
+      "context" : ", 2013), formalisms for querying knowledge bases (Tang and Mooney, 2001; Zettlemoyer and Collins, 2005; Berant et al., 2013) and instructions for robots or personal assistants (Artzi and Zettlemoyer, 2013; Quirk et al.",
+      "startOffset" : 49,
+      "endOffset" : 124
+    }, {
+      "referenceID" : 3,
+      "context" : ", 2013) and instructions for robots or personal assistants (Artzi and Zettlemoyer, 2013; Quirk et al., 2015), among others.",
+      "startOffset" : 59,
+      "endOffset" : 108
+    }, {
+      "referenceID" : 43,
+      "context" : ", 2013) and instructions for robots or personal assistants (Artzi and Zettlemoyer, 2013; Quirk et al., 2015), among others.",
+      "startOffset" : 59,
+      "endOffset" : 108
+    }, {
+      "referenceID" : 3,
+      "context" : ", 2013) and instructions for robots or personal assistants (Artzi and Zettlemoyer, 2013; Quirk et al., 2015), among others. While these methods have the advantage of being learnable from data, compared to the programming languages (PLs) in use by programmers, the domainspecific languages targeted by these works have a schema and syntax that is relatively simple. Recently, Ling et al. (2016) have proposed a data-driven code generation method for high-level, general-purpose PLs like Python and Java.",
+      "startOffset" : 60,
+      "endOffset" : 394
+    }, {
+      "referenceID" : 28,
+      "context" : "3% absolute improvements in accuracy against the state-of-the-art system (Ling et al., 2016).",
+      "startOffset" : 73,
+      "endOffset" : 92
+    }, {
+      "referenceID" : 48,
+      "context" : "Xiao et al. (2016) have noted that this imposition of structure on neural models is useful for semantic parsing, and we expect this to be even more important for general-purpose PLs where the syntax trees are larger and more complex.",
+      "startOffset" : 0,
+      "endOffset" : 19
+    }, {
+      "referenceID" : 18,
+      "context" : "For an NL description x consisting of n words {wi}i=1, the encoder computes a context sensitive embedding hi for each wi using a bidirectional Long Short-Term Memory (LSTM) network (Hochreiter and Schmidhuber, 1997), similar to the setting in (Bahdanau et al.",
+      "startOffset" : 181,
+      "endOffset" : 215
+    }, {
+      "referenceID" : 4,
+      "context" : "For an NL description x consisting of n words {wi}i=1, the encoder computes a context sensitive embedding hi for each wi using a bidirectional Long Short-Term Memory (LSTM) network (Hochreiter and Schmidhuber, 1997), similar to the setting in (Bahdanau et al., 2014).",
+      "startOffset" : 243,
+      "endOffset" : 266
+    }, {
+      "referenceID" : 4,
+      "context" : "We follow Bahdanau et al. (2014) and use a Deep Neural Network (DNN) with a single hidden layer to compute attention weights.",
+      "startOffset" : 10,
+      "endOffset" : 33
+    }, {
+      "referenceID" : 4,
+      "context" : "We follow Bahdanau et al. (2014) and use a Deep Neural Network (DNN) with a single hidden layer to compute attention weights. Parent Feeding pt Our decoder RNN uses additional neural connections to directly pass information from parent actions. For instance, when computing s9, the information from its parent action step t4 will be used. Formally, we define the parent action step pt as the time step at which the frontier node nft is generated. As an example, for t9, its parent action step p9 is t4, since nf9 is the node ?, which is generated at t4 by the APPLYRULE[Call7→. . .] action. We model parent information pt from two sources: (1) the hidden state of parent action spt , and (2) the embedding of parent action apt . pt is the concatenation. The parent feeding schema enables the model to utilize the information of parent code segments to make more confident predictions. Similar approaches of injecting parent information were also explored in the SEQ2TREE model in Dong and Lapata (2016)4.",
+      "startOffset" : 10,
+      "endOffset" : 1003
+    }, {
+      "referenceID" : 16,
+      "context" : "To model the copy probability, we follow recent advances in modeling copying mechanism in neural networks (Gu et al., 2016; Jia and Liang, 2016; Ling et al., 2016), and use a pointer network (Vinyals et al.",
+      "startOffset" : 106,
+      "endOffset" : 163
+    }, {
+      "referenceID" : 20,
+      "context" : "To model the copy probability, we follow recent advances in modeling copying mechanism in neural networks (Gu et al., 2016; Jia and Liang, 2016; Ling et al., 2016), and use a pointer network (Vinyals et al.",
+      "startOffset" : 106,
+      "endOffset" : 163
+    }, {
+      "referenceID" : 28,
+      "context" : "To model the copy probability, we follow recent advances in modeling copying mechanism in neural networks (Gu et al., 2016; Jia and Liang, 2016; Ling et al., 2016), and use a pointer network (Vinyals et al.",
+      "startOffset" : 106,
+      "endOffset" : 163
+    }, {
+      "referenceID" : 47,
+      "context" : ", 2016), and use a pointer network (Vinyals et al., 2015) to compute the probability of copying the i-th word from the input by attending to input representations {hi}:",
+      "startOffset" : 35,
+      "endOffset" : 57
+    }, {
+      "referenceID" : 28,
+      "context" : "HEARTHSTONE (HS) dataset (Ling et al., 2016) is a collection of Python classes that implement cards for the card game HearthStone.",
+      "startOffset" : 25,
+      "endOffset" : 44
+    }, {
+      "referenceID" : 39,
+      "context" : "DJANGO dataset (Oda et al., 2015) is a collection of lines of code from the Django web framework, each with a manually annotated NL description.",
+      "startOffset" : 15,
+      "endOffset" : 33
+    }, {
+      "referenceID" : 43,
+      "context" : "IFTTT dataset (Quirk et al., 2015) is a domainspecific benchmark that provides an interesting side comparison.",
+      "startOffset" : 14,
+      "endOffset" : 34
+    }, {
+      "referenceID" : 8,
+      "context" : "Like Beltagy and Quirk (2016), we strip function param-",
+      "startOffset" : 5,
+      "endOffset" : 30
+    }, {
+      "referenceID" : 28,
+      "context" : "However, because generating an exact match for complex code structures is nontrivial, we follow Ling et al. (2016), and use tokenlevel BLEU-4 with as a secondary metric, defined as the averaged BLEU scores over all examples.",
+      "startOffset" : 96,
+      "endOffset" : 115
+    }, {
+      "referenceID" : 15,
+      "context" : "Since our datasets are relatively small for a data-hungry neural model, we impose strong regularization using recurrent dropouts (Gal and Ghahramani, 2016), together with standard dropout layers added to the inputs and outputs of the decoder RNN.",
+      "startOffset" : 129,
+      "endOffset" : 155
+    }, {
+      "referenceID" : 28,
+      "context" : "†Results previously reported in Ling et al. (2016).",
+      "startOffset" : 32,
+      "endOffset" : 51
+    }, {
+      "referenceID" : 28,
+      "context" : "We compare primarily with two approaches: (1) Latent Predictor Network (LPN), a state-of-the-art sequenceto-sequence code generation model (Ling et al., 2016), and (2) SEQ2TREE, a neural semantic parsing model (Dong and Lapata, 2016).",
+      "startOffset" : 139,
+      "endOffset" : 158
+    }, {
+      "referenceID" : 14,
+      "context" : ", 2016), and (2) SEQ2TREE, a neural semantic parsing model (Dong and Lapata, 2016).",
+      "startOffset" : 59,
+      "endOffset" : 82
+    }, {
+      "referenceID" : 30,
+      "context" : "We test both the original SEQ2TREE model released by the authors and our revised one (SEQ2TREE–UNK) that uses unknown word replacement to handle rare words (Luong et al., 2015).",
+      "startOffset" : 156,
+      "endOffset" : 176
+    }, {
+      "referenceID" : 37,
+      "context" : "For completeness, we also compare with a strong neural machine translation (NMT) system (Neubig, 2015) using a standard encoder-decoder architecture with attention and unknown word replacement8, and include numbers from other baselines used in Ling et al.",
+      "startOffset" : 88,
+      "endOffset" : 102
+    }, {
+      "referenceID" : 14,
+      "context" : ", 2016), and (2) SEQ2TREE, a neural semantic parsing model (Dong and Lapata, 2016). SEQ2TREE generates trees one node at a time, and the target grammar is not explicitly modeled a priori, but implicitly learned from data. We test both the original SEQ2TREE model released by the authors and our revised one (SEQ2TREE–UNK) that uses unknown word replacement to handle rare words (Luong et al., 2015). For completeness, we also compare with a strong neural machine translation (NMT) system (Neubig, 2015) using a standard encoder-decoder architecture with attention and unknown word replacement8, and include numbers from other baselines used in Ling et al. (2016). On the HS dataset, which has relatively large ASTs, we use unary closure for our model and SEQ2TREE, and for DJANGO we do not.",
+      "startOffset" : 60,
+      "endOffset" : 663
+    }, {
+      "referenceID" : 43,
+      "context" : "Classical Methods posclass (Quirk et al., 2015) 81.",
+      "startOffset" : 27,
+      "endOffset" : 47
+    }, {
+      "referenceID" : 8,
+      "context" : "0 LR (Beltagy and Quirk, 2016) 88.",
+      "startOffset" : 5,
+      "endOffset" : 30
+    }, {
+      "referenceID" : 8,
+      "context" : "7 NN (Beltagy and Quirk, 2016) 88.",
+      "startOffset" : 5,
+      "endOffset" : 30
+    }, {
+      "referenceID" : 14,
+      "context" : "3 SEQ2TREE (Dong and Lapata, 2016) 89.",
+      "startOffset" : 11,
+      "endOffset" : 34
+    }, {
+      "referenceID" : 1,
+      "context" : "2 (Alvarez-Melis and Jaakkola, 2017)",
+      "startOffset" : 2,
+      "endOffset" : 36
+    }, {
+      "referenceID" : 8,
+      "context" : "4 shows the results, following the evaluation protocol in (Beltagy and Quirk, 2016) for accuracies at both channel and full parse tree (channel + function) levels.",
+      "startOffset" : 58,
+      "endOffset" : 83
+    }, {
+      "referenceID" : 23,
+      "context" : "Code Generation and Analysis Most existing works on code generation focus on generating code for domain specific languages (DSLs) (Kushman and Barzilay, 2013; Raza et al., 2015; Manshadi et al., 2013), with neural network-based approaches recently explored (Parisotto et al.",
+      "startOffset" : 130,
+      "endOffset" : 200
+    }, {
+      "referenceID" : 45,
+      "context" : "Code Generation and Analysis Most existing works on code generation focus on generating code for domain specific languages (DSLs) (Kushman and Barzilay, 2013; Raza et al., 2015; Manshadi et al., 2013), with neural network-based approaches recently explored (Parisotto et al.",
+      "startOffset" : 130,
+      "endOffset" : 200
+    }, {
+      "referenceID" : 32,
+      "context" : "Code Generation and Analysis Most existing works on code generation focus on generating code for domain specific languages (DSLs) (Kushman and Barzilay, 2013; Raza et al., 2015; Manshadi et al., 2013), with neural network-based approaches recently explored (Parisotto et al.",
+      "startOffset" : 130,
+      "endOffset" : 200
+    }, {
+      "referenceID" : 40,
+      "context" : ", 2013), with neural network-based approaches recently explored (Parisotto et al., 2016; Balog et al., 2016).",
+      "startOffset" : 64,
+      "endOffset" : 108
+    }, {
+      "referenceID" : 5,
+      "context" : ", 2013), with neural network-based approaches recently explored (Parisotto et al., 2016; Balog et al., 2016).",
+      "startOffset" : 64,
+      "endOffset" : 108
+    }, {
+      "referenceID" : 25,
+      "context" : "(2016), existing methods often use language and task-specific rules and strategies (Lei et al., 2013; Raghothaman et al., 2016).",
+      "startOffset" : 83,
+      "endOffset" : 127
+    }, {
+      "referenceID" : 44,
+      "context" : "(2016), existing methods often use language and task-specific rules and strategies (Lei et al., 2013; Raghothaman et al., 2016).",
+      "startOffset" : 83,
+      "endOffset" : 127
+    }, {
+      "referenceID" : 48,
+      "context" : "A similar line is to use NL queries for code retrieval (Wei et al., 2015; Allamanis et al., 2015).",
+      "startOffset" : 55,
+      "endOffset" : 97
+    }, {
+      "referenceID" : 0,
+      "context" : "A similar line is to use NL queries for code retrieval (Wei et al., 2015; Allamanis et al., 2015).",
+      "startOffset" : 55,
+      "endOffset" : 97
+    }, {
+      "referenceID" : 39,
+      "context" : "The reverse task of generating NL summaries from source code has also been explored (Oda et al., 2015; Iyer et al., 2016).",
+      "startOffset" : 84,
+      "endOffset" : 121
+    }, {
+      "referenceID" : 19,
+      "context" : "The reverse task of generating NL summaries from source code has also been explored (Oda et al., 2015; Iyer et al., 2016).",
+      "startOffset" : 84,
+      "endOffset" : 121
+    }, {
+      "referenceID" : 4,
+      "context" : ", 2016; Balog et al., 2016). For general-purpose code generation, besides the general framework of Ling et al. (2016), existing methods often use language and task-specific rules and strategies (Lei et al.",
+      "startOffset" : 8,
+      "endOffset" : 118
+    }, {
+      "referenceID" : 31,
+      "context" : "source code (Maddison and Tarlow, 2014; Nguyen et al., 2013).",
+      "startOffset" : 12,
+      "endOffset" : 60
+    }, {
+      "referenceID" : 38,
+      "context" : "source code (Maddison and Tarlow, 2014; Nguyen et al., 2013).",
+      "startOffset" : 12,
+      "endOffset" : 60
+    }, {
+      "referenceID" : 24,
+      "context" : "The parsing process is often guided by grammatical formalisms like combinatory categorical grammars (Kwiatkowski et al., 2013; Artzi et al., 2015), dependency-based syntax (Liang et al.",
+      "startOffset" : 100,
+      "endOffset" : 146
+    }, {
+      "referenceID" : 2,
+      "context" : "The parsing process is often guided by grammatical formalisms like combinatory categorical grammars (Kwiatkowski et al., 2013; Artzi et al., 2015), dependency-based syntax (Liang et al.",
+      "startOffset" : 100,
+      "endOffset" : 146
+    }, {
+      "referenceID" : 27,
+      "context" : ", 2015), dependency-based syntax (Liang et al., 2011; Pasupat and Liang, 2015) or task-specific formalisms (Clarke et al.",
+      "startOffset" : 33,
+      "endOffset" : 78
+    }, {
+      "referenceID" : 41,
+      "context" : ", 2015), dependency-based syntax (Liang et al., 2011; Pasupat and Liang, 2015) or task-specific formalisms (Clarke et al.",
+      "startOffset" : 33,
+      "endOffset" : 78
+    }, {
+      "referenceID" : 13,
+      "context" : ", 2011; Pasupat and Liang, 2015) or task-specific formalisms (Clarke et al., 2010; Yih et al., 2015; Krishnamurthy et al., 2016; Misra et al., 2015; Mei et al., 2016).",
+      "startOffset" : 61,
+      "endOffset" : 166
+    }, {
+      "referenceID" : 50,
+      "context" : ", 2011; Pasupat and Liang, 2015) or task-specific formalisms (Clarke et al., 2010; Yih et al., 2015; Krishnamurthy et al., 2016; Misra et al., 2015; Mei et al., 2016).",
+      "startOffset" : 61,
+      "endOffset" : 166
+    }, {
+      "referenceID" : 22,
+      "context" : ", 2011; Pasupat and Liang, 2015) or task-specific formalisms (Clarke et al., 2010; Yih et al., 2015; Krishnamurthy et al., 2016; Misra et al., 2015; Mei et al., 2016).",
+      "startOffset" : 61,
+      "endOffset" : 166
+    }, {
+      "referenceID" : 35,
+      "context" : ", 2011; Pasupat and Liang, 2015) or task-specific formalisms (Clarke et al., 2010; Yih et al., 2015; Krishnamurthy et al., 2016; Misra et al., 2015; Mei et al., 2016).",
+      "startOffset" : 61,
+      "endOffset" : 166
+    }, {
+      "referenceID" : 33,
+      "context" : ", 2011; Pasupat and Liang, 2015) or task-specific formalisms (Clarke et al., 2010; Yih et al., 2015; Krishnamurthy et al., 2016; Misra et al., 2015; Mei et al., 2016).",
+      "startOffset" : 61,
+      "endOffset" : 166
+    }, {
+      "referenceID" : 34,
+      "context" : "Recently, there are efforts in designing neural network-based semantic parsers (Misra and Artzi, 2016; Dong and Lapata, 2016; Neelakantan et al., 2016; Yin et al., 2016).",
+      "startOffset" : 79,
+      "endOffset" : 169
+    }, {
+      "referenceID" : 14,
+      "context" : "Recently, there are efforts in designing neural network-based semantic parsers (Misra and Artzi, 2016; Dong and Lapata, 2016; Neelakantan et al., 2016; Yin et al., 2016).",
+      "startOffset" : 79,
+      "endOffset" : 169
+    }, {
+      "referenceID" : 36,
+      "context" : "Recently, there are efforts in designing neural network-based semantic parsers (Misra and Artzi, 2016; Dong and Lapata, 2016; Neelakantan et al., 2016; Yin et al., 2016).",
+      "startOffset" : 79,
+      "endOffset" : 169
+    }, {
+      "referenceID" : 51,
+      "context" : "Recently, there are efforts in designing neural network-based semantic parsers (Misra and Artzi, 2016; Dong and Lapata, 2016; Neelakantan et al., 2016; Yin et al., 2016).",
+      "startOffset" : 79,
+      "endOffset" : 169
+    }, {
+      "referenceID" : 21,
+      "context" : "Several approaches have be proposed to utilize grammar knowledge in a neural parser, such as augmenting the training data by generating examples guided by the grammar (Kociský et al., 2016; Jia and Liang, 2016).",
+      "startOffset" : 167,
+      "endOffset" : 210
+    }, {
+      "referenceID" : 20,
+      "context" : "Several approaches have be proposed to utilize grammar knowledge in a neural parser, such as augmenting the training data by generating examples guided by the grammar (Kociský et al., 2016; Jia and Liang, 2016).",
+      "startOffset" : 167,
+      "endOffset" : 210
+    }, {
+      "referenceID" : 0,
+      "context" : "The most relevant work is Allamanis et al. (2015), which uses a factorized model to measure semantic relatedness between NL and ASTs for code retrieval, while our model tackles the more challenging generation task.",
+      "startOffset" : 26,
+      "endOffset" : 50
+    }, {
+      "referenceID" : 0,
+      "context" : "The most relevant work is Allamanis et al. (2015), which uses a factorized model to measure semantic relatedness between NL and ASTs for code retrieval, while our model tackles the more challenging generation task. Semantic Parsing Our work is related to the general topic of semantic parsing, where the target logical forms can be viewed as DSLs. The parsing process is often guided by grammatical formalisms like combinatory categorical grammars (Kwiatkowski et al., 2013; Artzi et al., 2015), dependency-based syntax (Liang et al., 2011; Pasupat and Liang, 2015) or task-specific formalisms (Clarke et al., 2010; Yih et al., 2015; Krishnamurthy et al., 2016; Misra et al., 2015; Mei et al., 2016). Recently, there are efforts in designing neural network-based semantic parsers (Misra and Artzi, 2016; Dong and Lapata, 2016; Neelakantan et al., 2016; Yin et al., 2016). Several approaches have be proposed to utilize grammar knowledge in a neural parser, such as augmenting the training data by generating examples guided by the grammar (Kociský et al., 2016; Jia and Liang, 2016). Liang et al. (2016) used a neural decoder which constrains the space of next valid tokens in the query language for question answering.",
+      "startOffset" : 26,
+      "endOffset" : 1104
+    }, {
+      "referenceID" : 0,
+      "context" : "The most relevant work is Allamanis et al. (2015), which uses a factorized model to measure semantic relatedness between NL and ASTs for code retrieval, while our model tackles the more challenging generation task. Semantic Parsing Our work is related to the general topic of semantic parsing, where the target logical forms can be viewed as DSLs. The parsing process is often guided by grammatical formalisms like combinatory categorical grammars (Kwiatkowski et al., 2013; Artzi et al., 2015), dependency-based syntax (Liang et al., 2011; Pasupat and Liang, 2015) or task-specific formalisms (Clarke et al., 2010; Yih et al., 2015; Krishnamurthy et al., 2016; Misra et al., 2015; Mei et al., 2016). Recently, there are efforts in designing neural network-based semantic parsers (Misra and Artzi, 2016; Dong and Lapata, 2016; Neelakantan et al., 2016; Yin et al., 2016). Several approaches have be proposed to utilize grammar knowledge in a neural parser, such as augmenting the training data by generating examples guided by the grammar (Kociský et al., 2016; Jia and Liang, 2016). Liang et al. (2016) used a neural decoder which constrains the space of next valid tokens in the query language for question answering. Finally, the structured prediction approach proposed by Xiao et al. (2016) is closely related to our model in using the underlying grammar as prior knowledge to constrain the generation process of derivation trees, while our method is based on a unified grammar model which jointly captures production rule application and terminal symbol generation, and scales to general purpose code generation tasks.",
+      "startOffset" : 26,
+      "endOffset" : 1295
+    } ],
+    "year" : 2017,
+    "abstractText" : "We consider the problem of parsing natural language descriptions into source code written in a general-purpose programming language like Python. Existing datadriven methods treat this problem as a language generation task without considering the underlying syntax of the target programming language. Informed by previous work in semantic parsing, in this paper we propose a novel neural architecture powered by a grammar model to explicitly capture the target syntax as prior knowledge. Experiments find this an effective way to scale up to generation of complex programs from natural language descriptions, achieving state-of-the-art results that well outperform previous code generation and semantic parsing approaches.",
+    "creator" : "LaTeX with hyperref package"
+  }
+}

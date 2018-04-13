@@ -1,0 +1,491 @@
+{
+  "name" : "1507.00210.pdf",
+  "metadata" : {
+    "source" : "CRF",
+    "title" : "Natural Neural Networks",
+    "authors" : [ "Guillaume Desjardins", "Karen Simonyan", "Razvan Pascanu", "Koray Kavukcuoglu" ],
+    "emails" : [ "gdesjardins@google.com", "simonyan@google.com", "razp@google.com", "korayk@google.com" ],
+    "sections" : [ {
+      "heading" : "1 Introduction",
+      "text" : "Deep networks have proven extremely successful across a broad range of applications. While their deep and complex structure affords them a rich modeling capacity, it also creates complex dependencies between the parameters which can make learning difficult via first order stochastic gradient descent (SGD). As long as SGD remains the workhorse of deep learning, our ability to extract highlevel representations from data may be hindered by difficult optimization, as evidenced by the boost in performance offered by batch normalization (BN) [7] on the Inception architecture [25].\nThough its adoption remains limited, the natural gradient [1] appears ideally suited to these difficult optimization issues. By following the direction of steepest descent on the probabilistic manifold, the natural gradient can make constant progress over the course of optimization, as measured by the Kullback-Leibler (KL) divergence between consecutive iterates. Utilizing the proper distance measure ensures that the natural gradient is invariant to the parametrization of the model. Unfortunately, its application has been limited due to its high computational cost. Natural gradient descent (NGD) typically requires an estimate of the Fisher Information Matrix (FIM) which is square in the number of parameters, and worse, it requires computing its inverse. Truncated Newton methods can avoid explicitly forming the FIM in memory [12, 15], but they require an expensive iterative procedure to compute the inverse. Such computations can be wasteful and do not take into account the smooth change of the Fisher during optimization or the highly structured nature of deep models.\nInspired by recent work on model reparametrizations [17, 13], our approach starts with a simple question: can we devise a neural network architecture whose Fisher is constrained to be identity? This is an important question, as SGD and NGD would be equivalent in the resulting model. The main contribution of this paper is in providing a simple, theoretically justified network reparametrization which approximates via first-order gradient descent, a block-diagonal natural gradient update over layers. Our method is computationally efficient due to the local nature of the reparametrization, based on whitening, and the amortized nature of the algorithm. Our second contribution is in unifying many heuristics commonly used for training neural networks, under the roof of the natural gradient, while highlighting an important connection between model reparametrizations and Mirror Descent [3]. Finally, we showcase the efficiency and the scalability of our method\nar X\niv :1\n50 7.\n00 21\n0v 1\n[ st\nat .M\nL ]\n1 J\nul 2\n01 5\nacross a broad-range of experiments, scaling our method from standard deep auto-encoders to large convolutional models on ImageNet[20], trained across multiple GPUs. This is to our knowledge the first-time a (non-diagonal) natural gradient algorithm is scaled to problems of this magnitude."
+    }, {
+      "heading" : "2 The Natural Gradient",
+      "text" : "This section provides the necessary background and derives a particular form of the FIM whose structure will be key to our efficient approximation. While we tailor the development of our method to the classification setting, our approach generalizes to regression and density estimation."
+    }, {
+      "heading" : "2.1 Overview",
+      "text" : "We consider the problem of fitting the parameters θ ∈ RN of a model p(y | x; θ) to an empirical distribution π(x, y) under the log-loss. We denote by x ∈ X the observation vector and y ∈ Y its associated label. Concretely, this stochastic optimization problem aims to solve:\nθ∗ ∈ argminθ E(x,y)∼π [− log p(y | x, θ)] . (1)\nDefining the per-example loss as `(x, y), Stochastic Gradient Descent (SGD) performs the above minimization by iteratively following the direction of steepest descent, given by the column vector ∇ = Eπ [d`/dθ]. Parameters are updated using the rule θ(t+1) ← θ(t) − α(t)∇(t), where α is a learning rate. An equivalent proximal form of gradient descent [4] reveals the precise nature of α:\nθ(t+1) = argminθ\n{ 〈θ,∇〉+ 1\n2α(t) ∥∥∥θ − θ(t)∥∥∥2 2 } (2)\nNamely, each iterate θ(t+1) is the solution to an auxiliary optimization problem, where α controls the distance between consecutive iterates, using an L2 distance. In contrast, the natural gradient relies on the KL-divergence between iterates, a more appropriate distance measure for probability distributions. Its metric is determined by the Fisher Information matrix,\nFθ = Ex∼π { Ey∼p(y|x,θ) [( ∂ log p\n∂θ\n)( ∂ log p\n∂θ\n)T]} , (3)\ni.e. the covariance of the gradients of the model log-probabilities wrt. its parameters. The natural gradient direction is then obtained as∇N = F−1θ ∇. See [15, 14] for a recent overview of the topic."
+    }, {
+      "heading" : "2.2 Fisher Information Matrix for MLPs",
+      "text" : "We start by deriving the precise form of the Fisher for a canonical multi-layer perceptron (MLP) composed of L layers. We consider the following deep network for binary classification, though our approach generalizes to an arbitrary number of output classes.\np(y = 1 | x) ≡ hL = fL(WLhL−1 + bL) (4) · · · h1 = f1 (W1x+ b1)\nThe parameters of the MLP, denoted θ = {W1, b1, · · · ,WL, bL}, are the weights Wi ∈ RNi×Ni−1 connecting layers i and i− 1, and the biases bi ∈ RNi . fi is an element-wise non-linear function. Let us define δi to be the backpropagated gradient through the i-th non-linearity. We ignore the off block-diagonal components of the Fisher matrix and focus on the block FWi , corresponding to interactions between parameters of layer i. This block takes the form:\nFWi = Ex∼πy∼p [ vec ( δih T i−1 ) vec ( δih T i−t )T ] ,\nwhere vec(X) is the vectorization function yielding a column vector from the rows of matrix X .\nAssuming that δi and activations hi−1 are independent random variables, we can write:\nFWi(km, ln) ≈ Ex∼πy∼p [δi(k)δi(l)]Eπ [hi−1(m)hi−1(n)] , (5)\nwhereX(i, j) is the element at row i and column j of matrixX and x(i) is the i-th element of vector x. FWi(km, ln) is the entry in the Fisher capturing interactions between parameters Wi(k,m) and Wj(l, n). Our hypothesis, verified experimentally in Sec. 4.1, is that we can greatly improve conditioning of the Fisher by enforcing that Eπ [ hih T i ] = I , for all layers of the network, despite ignoring possible correlations in the δ’s and off block diagonal terms of the Fisher."
+    }, {
+      "heading" : "3 Projected Natural Gradient Descent",
+      "text" : "This section introduces Whitened Neural Networks (WNN), which perform approximate whitening of their internal hidden representations. We begin by presenting a novel whitened neural layer, with the assumption that the network statistics µi(θ) = E[hi] and Σi(θ) = E[hihTi ] are fixed. We then show how these layers can be adapted to efficiently track population statistics over the course of training. The resulting learning algorithm is referred to as Projected Natural Gradient Descent (PRONG). We highlight an interesting connection between PRONG and Mirror Descent in Section 3.3."
+    }, {
+      "heading" : "3.1 A Whitened Neural Layer",
+      "text" : "The building block of WNN is the following neural layer,\nhi = fi (ViUi−1 (hi−1 − ci) + di) . (6)\nCompared to Eq. 4, we have introduced an explicit centering parameter ci = µi, which ensures that the input to the dot product has zero mean in expectation. This is analogous to the centering reparametrization for Deep Boltzmann Machines [13]. The weight matrix Ui−1 ∈ RNi−1×Ni−1 is a per-layer ZCA-whitening matrix whose rows are obtained from an eigen-decomposition of Σi−1:\nΣi = Ũi · diag (λi) · ŨTi =⇒ Ui = diag (λi + )− 1 2 · ŨTi . (7)\nThe hyper-parameter is a regularization term controlling the maximal multiplier on the learning rate, or equivalently the size of the trust region. The parameters Vi ∈ RNi×Ni−1 and di ∈ RNi are analogous to the canonical parameters of a neural network as introduced in Eq. 4, though operate in the space of whitened unit activations Ui(hi − ci). This layer can be stacked to form a deep neural network having L layers, with model parameters Ω = {V1, d1, · · ·VL, dL} and whitening coefficients Φ = {U0, c0, · · · , UL−1, cL−1}, as depicted in Fig. 1a. Though the above layer might appear over-parametrized at first glance, we crucially do not learn the whitening coefficients via loss minimization, but instead estimate them directly from the model statistics. These coefficients are thus constants from the point of view of the optimizer and simply serve to improve conditioning of the Fisher with respect to the parameters Ω, denoted FΩ. Indeed, using the same derivation that led to Eq. 5, we can see that the block-diagonal terms of FΩ now involve terms E [ (Uihi)(Uihi) T ] , which equals identity by construction."
+    }, {
+      "heading" : "3.2 Updating the Whitening Coefficients",
+      "text" : "As the whitened model parameters Ω evolve during training, so do the statistics µi and Σi. For our model to remain well conditioned, the whitening coefficients must be updated at regular intervals,\nAlgorithm 1 Projected Natural Gradient Descent 1: Input: training set D, initial parameters θ. 2: Hyper-parameters: reparam. frequency T , number of samples Ns, regularization term . 3: Ui ← I; ci ← 0; t← 0 4: repeat 5: if mod(t, T ) = 0 then . amortize cost of lines [6-11] 6: for all layers i do 7: Compute canonical parameters Wi = ViUi−1; bi = di +Wici. . proj. P−1Φ (Ω) 8: Estimate µi and Σi, using Ns samples from D. 9: Update ci from µi and Ui from eigen decomp. of Σi + I . . update Φ 10: Update parameters Vi ←WiU−1i−1; ci ← bi − Vici. . proj. PΦ(θ) 11: end for 12: end if 13: Perform SGD update wrt. Ω using samples from D. 14: t← t+ 1 15: until convergence\nwhile taking care not to interfere with the convergence properties of gradient descent. This can be achieved by coupling updates to Φ with corresponding updates to Ω such that the overall function implemented by the MLP remains unchanged, e.g. by preserving the product ViUi−1 before and after each update to the whitening coefficients (with an analoguous constraint on the biases).\nUnfortunately, while estimating the mean µi and diag(Σi) could be performed online over a minibatch of samples as in the recent Batch Normalization scheme [7], estimating the full covariance matrix will undoubtedly require a larger number of samples. While statistics could be accumulated online via an exponential moving average as in RMSprop [27] or K-FAC [8], the cost of the eigendecomposition required for computing the whitening matrix Ui remains cubic in the layer size.\nIn the simplest instantiation of our method, we exploit the smoothness of gradient descent by simply amortizing the cost of these operations over T consecutive updates. SGD updates in the whitened model will be closely aligned to NGD immediately following the reparametrization. The quality of this approximation will degrade over time, until the subsequent reparametrization. The resulting algorithm is shown in the pseudo-code of Algorithm 1. We can improve upon this basic amortization scheme by including a diagonal scaling of Ui based on the standard deviation of layer i activations, after each gradient update, thus mimicking the effect of a diagonal natural gradient method. For this update to be valid, this enhanced version of the method, denoted PRONG+, scales the rows of Vi accordingly so as to preserve the feed-forward computation of the network. This can be implemented by combining PRONG with batch normalization."
+    }, {
+      "heading" : "3.3 Duality and Mirror Descent",
+      "text" : "There is an inherent duality between the parameters Ω of our whitened neural layer and the parameters θ of a canonical model. Indeed, there exist linear projections PΦ(θ) and P−1Φ (Ω), which map from canonical parameters θ to whitened parameters Ω, and vice-versa. Pφ(θ) corresponds to line 10 of Algorithm 1, while P−1Φ (Ω) corresponds to line 7. This duality between θ and Ω reveals a close connection between PRONG and Mirror Descent [3].\nMirror Descent (MD) is an online learning algorithm which generalizes the proximal form of gradient descent to the class of Bregman divergences Bψ(q, p), where q, p ∈ Γ and ψ : Γ → R is a strictly convex and differentiable function. Replacing the L2 distance by Bψ , mirror descent solves the proximal problem of Eq. 2 by applying first-order updates in a dual space and then projecting back onto the primal space. Defining Ω = ∇θψ(θ) and θ = ∇∗Ωψ(Ω), with ψ∗ the complex conjugate of ψ, the mirror descent updates are given by:\nΩ(t+1) = ∇θψ ( θ(t) ) − α(t)∇θ (8)\nθ(t+1) = ∇Ωψ∗ ( Ω(t+1) )\n(9)\nIt is well known [26, 18] that the natural gradient is a special case of MD, where the distance generating function 1 is chosen to be ψ(θ) = 12θ TFθ.\nThe mirror updates are somewhat unintuitive however. Why is the gradient ∇θ applied to the dual space if it has been computed in the space of parameters θ ? This is where PRONG relates to MD. It is trivial to show that using the function ψ̃(θ) = 12θ T √ Fθ, instead of the previously defined ψ(θ), enables us to directly update the dual parameters using ∇Ω, the gradient computed directly in the dual space. Indeed, the resulting updates can be shown to implement the natural gradient and are thus equivalent to the updates of Eq. 9 with the appropriate choice of ψ(θ):\nΩ̃(t+1) = ∇θψ̃ ( θ(t) ) − α(t)∇Ω = F 1 2 θ(t) − α(t)Eπ [ d`\ndθ F− 1 2 ] θ̃(t+1) = ∇Ωψ̃∗ ( Ω̃(t+1) ) = θ(t) − α(t)F−1Eπ [ d`\ndθ\n] (10)\nThe operators ∇̃ψ and ∇̃ψ∗ correspond to the projections PΦ(θ) and P−1Φ (Ω) used by PRONG to map from the canonical neural parameters θ to those of the whitened layers Ω. As illustrated in Fig. 1b, the advantage of this whitened form of MD is that one may amortize the cost of the projections over several updates, as gradients can be computed directly in the dual parameter space."
+    }, {
+      "heading" : "3.4 Related Work",
+      "text" : "This work extends the recent contributions of [17] in formalizing many commonly used heuristics for training MLPs: the importance of zero-mean activations and gradients [10, 21], as well as the importance of normalized variances in the forward and backward passes [10, 21, 6]. More recently, Vatanen et al. [28] extended their previous work [17] by introducing a multiplicative constant γi to the centered non-linearity. In contrast, we introduce a full whitening matrix Ui and focus on whitening the feedforward network activations, instead of normalizing a geometric mean over units and gradient variances.\nThe recently introduced batch normalization (BN) scheme [7] quite closely resembles a diagonal version of PRONG, the main difference being that BN normalizes the variance of activations before the non-linearity, as opposed to normalizing the latent activations by looking at the full covariance. Furthermore, BN implements normalization by modifying the feed-forward computations thus requiring the method to backpropagate through the normalization operator. A diagonal version of PRONG also bares an interesting resemblance to RMSprop [27, 5], in that both normalization terms involve the square root of the FIM. An important distinction however is that PRONG applies this update in the whitened parameter space, thus preserving the natural gradient interpretation.\nK-FAC [8] is also closely related to PRONG and was developed concurrently to our method. In one of its implementations, it targets the same block diagonal as PRONG while also exploiting\n1As the Fisher and thus ψθ depend on the parameters θ(t), these should be indexed with a time superscript, which we drop for clarity.\nthe low rank structure of these blocks for efficiency, reminiscent of TONGA[19]. Their method however operates online via low-rank updates to each block, similar to the preconditioning used in the Kaldi speech recognition toolkit [16]. This is in contrast to our approach based on amortization. They also consider the covariance of the backpropagated gradients δi, while PRONG only looks at the covariance of activations hi. K-FAC further proposes a tri-diagonal variant which decorrelates gradients across neighboring layers, though resulting in a more complex algorithm.\nA similar algorithm to PRONG was later found in [23], where it appeared simply as a thought experiment, but with no amortization or recourse for efficiently computing F ."
+    }, {
+      "heading" : "4 Experiments",
+      "text" : "We begin with a set of diagnostic experiments which highlight the effectiveness of our method at improving conditioning. We also illustrate the impact of the hyper-parameters T and , controlling the frequency of the reparametrization and the size of the trust region. Section 4.2 evaluates PRONG on unsupervised learning problems, where models are both deep and fully connected. Section 4.3 then moves onto large convolutional models for image classification."
+    }, {
+      "heading" : "4.1 Introspective Experiments",
+      "text" : "Conditioning. To provide a better understanding of the approximation made by PRONG, we train a small 3-layer MLP with tanh non-linearities, on a downsampled version of MNIST (10x10) [11]. The model size was chosen in order for the full Fisher to be tractable. Fig. 2(a-b) shows the FIM of the middle hidden layers before and after whitening the model activations (we took the absolute value of the entries to improve visibility). Fig. 2c depicts the evolution of the condition number of the FIM during training, measured as a percentage of its initial value (before the first whitening reparametrization in the case of PRONG). We present such curves for SGD, RMSprop and PRONG. The results clearly show that the reparametrization performed by PRONG improves conditioning (reduction of more than 95%). These observations confirm our initial assumption, namely that we can improve conditioning of the block diagonal Fisher by whitening activations alone.\nSensitivity of Hyper-Parameters. Figures 3a- 3b highlight the effect of the eigenvalue regularization term and the reparametrization interval T . The experiments were performed on the best performing auto-encoder of Section 4.2 on the MNIST dataset. Figures 3a- 3b plot the reconstruction error on the training set for various values of and T . As determines a maximum multiplier on the\nlearning rate, learning becomes extremely sensitive when this learning rate is high2. For smaller step sizes however, lowering can yield significant speedups often converging faster than simply using a larger learning rate. This confirms the importance of the manifold curvature for optimization (lower allows for different directions to be scaled drastically different according to their corresponding curvature). Fig 3b compares the impact of T for models having a proper whitened initialization (solid lines), to models being initialized with a standard “fan-in” initialization (dashed lines) [10]. These results are quite surprising in showing the effectiveness of the whitening reparametrization as a simple initialization scheme. That being said, performance can degrade due to ill conditioning when T becomes excessively large (T = 105)."
+    }, {
+      "heading" : "4.2 Unsupervised Learning",
+      "text" : "Following Martens [12], we compare PRONG on the task of minimizing reconstruction error of an 8-layer auto-encoder on the MNIST dataset. The encoder is composed of 4 densely connected sigmoidal layers, with a number of hidden units per layer in {1k, 500, 250, 30}, and a symmetric (untied) decoder. Hyper-parameters were selected by grid search, based on training error, with the following grid specifications: training batch size in {32, 64, 128, 256}, learning rates in {10−1, 10−2, 10−3} and momentum term in {0, 0.9}. For RMSprop, we further tuned the moving average coefficient in {0.99, 0.999} and the regularization term controlling the maximum scaling factor in {0.1, 0.01}. For PRONG, we fixed the natural reparametrization to T = 103, using Ns = 100 samples (i.e. they were not optimized for wallclock time). Reconstruction error with respect to updates and wallclock time are shown in Fig. 3 (c,d).\nWe can see that PRONG significantly outperforms the baseline methods, by up to an order of magnitude in number of updates. With respect to wallclock, our method significantly outperforms the baselines in terms of time taken to reach a certain error threshold, despite the fact that the runtime per epoch for PRONG was 3.2x that of SGD, compared to batch normalization (2.3x SGD) and RMSprop (9x SGD). Note that these timing numbers reflect performance under the optimal choice of hyper-parameters, which in the case of batch normalization yielded a batch size of 256, compared to 128 for all other methods. Further breaking down the performance, 34% of the runtime of PRONG was spent performing the whitening reparametrization, compared to 4% for estimating the per layer means and covariances. This confirms that amortization is paramount to the success of our method.3"
+    }, {
+      "heading" : "4.3 Supervised Learning",
+      "text" : "The next set of experiments addresses the problem of training deep supervised convolutional networks for object recognition. Following [7], we perform whitening across feature maps only: that is we treat pixels in a given feature map as independent samples. This allows us to implement the whitened neural layer as a sequence of two convolutions, where the first is by a 1x1 whitening filter. PRONG is compared to SGD, RMSprop and batch normalization, with each algorithm being accelerated via momentum. Results are presented on both CIFAR-10 [9] and the ImageNet Challenge (ILSVRC12) datasets [20]. In both cases, learning rates were decreased using a “waterfall” annealing schedule, which divided the learning rate by 10 when the validation error failed to improve after a set number of evaluations. 4"
+    }, {
+      "heading" : "4.3.1 CIFAR-10",
+      "text" : "The model used for our CIFAR experiments consists of 8 convolutional layers, having 3×3 receptive fields. 2 × 2 spatial max-pooling was applied between stacks of two convolutional layers, with the exception of the last convolutional layer which computes the class scores and is followed by global max-pooling and soft-max non-linearity. This particular choice of architecture was inspired by the VGG model [22] and held fixed across all experiments. The number of filters per layer is as follows:\n2Unstable combinations of learning rates and are omitted for clarity. 3We note that our implementation of the whitening operations is not optimized, as it does not take advantage of GPU acceleration, as opposed to the neural network computations. Therefore, runtime of our method is expected to improve as we move the eigen-decompositions to GPU.\n4 On CIFAR-10, validation error was estimated every 103 updates and the learning rate decreased by a factor of 10 if the validation error failed to improve by 1% over 4 consecutive evaluations. For ImageNet, we employed a more aggressive schedule which required that the validation error improves by 1% after each epoch.\n64, 64, 128, 128, 256, 256, 512, 10. The model was trained on 24 × 24 random crops with random horizontal reflections. Model selection was performed on a held-out validation set of 5k examples. Results are shown in Fig. 4.\nWith respect to training error, PRONG and batch normalization seem to offer similar speedups compared to SGD with momentum. Our hypothesis is that the benefits of PRONG are more pronounced for densely connected networks, where the number of units per layer is typically larger than the number of maps used in convolutional networks. Interestingly, PRONG generalized better, achieving 7.32% test error vs. 8.22% for batch normalization. This could reflect the findings of [15], which showed how NGD can leverage unlabeled data for better generalization: the “unlabeled” data here comes from the extra perturbations in the training set when estimating the whitening matrices."
+    }, {
+      "heading" : "4.3.2 ImageNet Challenge Dataset",
+      "text" : "Our final set of experiments aims to show the scalability of our method: we thus apply our natural gradient algorithm to the large-scale ILSVRC12 dataset (1.3M images labelled into 1000 categories) using the Inception architecture [7]. In order to scale to problems of this size, we parallelized our training loop so as to split the processing of a single minibatch (of size 256) across multiple GPUs. Note that PRONG can scale well in this setting, as the estimation of the mean and covariance parameters of each layer is also embarassingly parallel. Eight GPUs were used for computing gradients and estimating model statistics, though the eigen decomposition required for whitening was itself not parallelized in the current implementation.\nFor all optimization algorithms, we considered initial learning rates in {10−1, 10−2, 10−3} and used a value of 0.9 as the momentum coefficient. For PRONG we tested reparametrization periods T ∈ {10, 102, 103, 104}, while typically using Ns = 0.1T . Eigenvalues were regularized by adding a small constant ∈ {1, 10−1, 10−2, 10−3} before scaling the eigenvectors 5. Given the difficulty of the task, we employed the enhanced PRONG+ version of the algorithm, as simple periodic whitening of the model proved to be unstable.6\nFigure 4 (c-d) shows that batch normalisation and PRONG+ converge to approximately the same top-1 validation error (28.6% vs 28.9% respectively) for similar cpu-time. In comparison, SGD achieved a validation error of 32.1%. PRONG+ however exhibits much faster convergence initially: after 105 updates it obtains around 36% error compared to 46% for BN alone. We stress that the ImageNet results are somewhat preliminary. While our top-1 error is higher than reported in [7] (25.2%), we used a much less extensive data augmentation pipeline. We are only beginning to explore what natural gradient methods may achieve on these large scale optimization problems and are encouraged by these initial findings.\n5The grid was not searched exhaustively as the cost would have been prohibitive. As our main focus is optimization, regularization consisted of a simple L2 weight decay parameter of 10−4, with no Dropout [24].\n6This instability may have been compounded by momentum, which was initially not reset after each model reparametrization when using standard PRONG."
+    }, {
+      "heading" : "5 Discussion",
+      "text" : "We began this paper by asking whether convergence speed could be improved by simple model reparametrizations, driven by the structure of the Fisher matrix. From a theoretical and experimental perspective, we have shown that Whitened Neural Networks can achieve this via a simple, scalable and efficient whitening reparametrization. They are however one of several possible instantiations of the concept of Natural Neural Networks. In a previous incarnation of the idea, we exploited a similar reparametrization to include whitening of backpropagated gradients7. We favor the simpler approach presented in this paper, as we generally found the alternative less stable with deep networks. Ensuring zero-mean gradients also required the use of skip-connections, with tedious book-keeping to offset the reparametrization of centered non-linearities [17].\nMaintaining whitened activations may also offer additional benefits from the point of view of model compression and generalization. By virtue of whitening, the projection Uihi forms an ordered representation, having least and most significant bits. The sharp roll-off in the eigenspectrum of Σi may explain why deep networks are ammenable to compression [2]. Similarly, one could envision spectral versions of Dropout [24] where the dropout probability is a function of the eigenvalues. Alternative ways of orthogonalizing the representation at each layer should also be explored, via alternate decompositions of Σi, or perhaps by exploiting the connection between linear auto-encoders and PCA. We also plan on pursuing the connection with Mirror Descent and further bridging the gap between deep learning and methods from online convex optimization."
+    }, {
+      "heading" : "Acknowledgments",
+      "text" : "We are extremely grateful to Shakir Mohamed for invaluable discussions and feedback in the preparation of this manuscript. We also thank Philip Thomas, Volodymyr Mnih, Raia Hadsell, Sergey Ioffe and Shane Legg for feedback on the paper."
+    } ],
+    "references" : [ {
+      "title" : "Natural gradient works efficiently in learning",
+      "author" : [ "Shun-ichi Amari" ],
+      "venue" : "Neural Computation,",
+      "citeRegEx" : "1",
+      "shortCiteRegEx" : "1",
+      "year" : 1998
+    }, {
+      "title" : "Do deep nets really need to be deep",
+      "author" : [ "Jimmy Ba", "Rich Caruana" ],
+      "venue" : "In NIPS",
+      "citeRegEx" : "2",
+      "shortCiteRegEx" : "2",
+      "year" : 2014
+    }, {
+      "title" : "Mirror descent and nonlinear projected subgradient methods for convex optimization",
+      "author" : [ "Amir Beck", "Marc Teboulle" ],
+      "venue" : "Oper. Res. Lett.,",
+      "citeRegEx" : "3",
+      "shortCiteRegEx" : "3",
+      "year" : 2003
+    }, {
+      "title" : "Proximal Splitting Methods in Signal Processing",
+      "author" : [ "P.L. Combettes", "J.-C. Pesquet" ],
+      "venue" : "ArXiv e-prints,",
+      "citeRegEx" : "4",
+      "shortCiteRegEx" : "4",
+      "year" : 2009
+    }, {
+      "title" : "Adaptive subgradient methods for online learning and stochastic optimization",
+      "author" : [ "John Duchi", "Elad Hazan", "Yoram Singer" ],
+      "venue" : "In JMLR",
+      "citeRegEx" : "5",
+      "shortCiteRegEx" : "5",
+      "year" : 2011
+    }, {
+      "title" : "Understanding the difficulty of training deep feedforward neural networks",
+      "author" : [ "Xavier Glorot", "Yoshua Bengio" ],
+      "venue" : "In AISTATS,",
+      "citeRegEx" : "6",
+      "shortCiteRegEx" : "6",
+      "year" : 2010
+    }, {
+      "title" : "Batch normalization: Accelerating deep network training by reducing internal covariate shift",
+      "author" : [ "Sergey Ioffe", "Christian Szegedy" ],
+      "venue" : null,
+      "citeRegEx" : "7",
+      "shortCiteRegEx" : "7",
+      "year" : 2015
+    }, {
+      "title" : "Optimizing neural networks with kronecker-factored approximate curvature",
+      "author" : [ "Roger Grosse James Martens" ],
+      "venue" : "In ICML,",
+      "citeRegEx" : "8",
+      "shortCiteRegEx" : "8",
+      "year" : 2015
+    }, {
+      "title" : "Learning multiple layers of features from tiny images",
+      "author" : [ "Alex Krizhevsky" ],
+      "venue" : "Master’s thesis, University of Toronto,",
+      "citeRegEx" : "9",
+      "shortCiteRegEx" : "9",
+      "year" : 2009
+    }, {
+      "title" : "Efficient backprop. In Neural Networks, Tricks of the Trade, Lecture Notes in Computer Science LNCS 1524",
+      "author" : [ "Yann LeCun", "Léon Bottou", "Genevieve B. Orr", "Klaus-Robert Müller" ],
+      "venue" : null,
+      "citeRegEx" : "10",
+      "shortCiteRegEx" : "10",
+      "year" : 1998
+    }, {
+      "title" : "Gradient-based learning applied to document recognition",
+      "author" : [ "Yann Lecun", "Lon Bottou", "Yoshua Bengio", "Patrick Haffner" ],
+      "venue" : "In Proceedings of the IEEE,",
+      "citeRegEx" : "11",
+      "shortCiteRegEx" : "11",
+      "year" : 1998
+    }, {
+      "title" : "Deep learning via Hessian-free optimization",
+      "author" : [ "James Martens" ],
+      "venue" : "In ICML,",
+      "citeRegEx" : "12",
+      "shortCiteRegEx" : "12",
+      "year" : 2010
+    }, {
+      "title" : "Deep boltzmann machines and the centering trick",
+      "author" : [ "K.-R. Müller", "G. Montavon" ],
+      "venue" : "Neural Networks: Tricks of the Trade. Springer,",
+      "citeRegEx" : "13",
+      "shortCiteRegEx" : "13",
+      "year" : 2013
+    }, {
+      "title" : "Revisiting natural gradient for deep networks",
+      "author" : [ "Razvan Pascanu", "Yoshua Bengio" ],
+      "venue" : "In ICLR,",
+      "citeRegEx" : "15",
+      "shortCiteRegEx" : "15",
+      "year" : 2014
+    }, {
+      "title" : "Parallel training of deep neural networks with natural gradient and parameter averaging",
+      "author" : [ "Daniel Povey", "Xiaohui Zhang", "Sanjeev Khudanpur" ],
+      "venue" : "ICLR workshop,",
+      "citeRegEx" : "16",
+      "shortCiteRegEx" : "16",
+      "year" : 2015
+    }, {
+      "title" : "Deep learning made easier by linear transformations in perceptrons",
+      "author" : [ "T. Raiko", "H. Valpola", "Y. LeCun" ],
+      "venue" : "In AISTATS,",
+      "citeRegEx" : "17",
+      "shortCiteRegEx" : "17",
+      "year" : 2012
+    }, {
+      "title" : "The Information Geometry of Mirror Descent",
+      "author" : [ "G. Raskutti", "S. Mukherjee" ],
+      "venue" : null,
+      "citeRegEx" : "18",
+      "shortCiteRegEx" : "18",
+      "year" : 2013
+    }, {
+      "title" : "Topmoumoute online natural gradient algorithm",
+      "author" : [ "Nicolas L. Roux", "Pierre antoine Manzagol", "Yoshua Bengio" ],
+      "venue" : "In Advances in Neural Information Processing Systems",
+      "citeRegEx" : "19",
+      "shortCiteRegEx" : "19",
+      "year" : 2008
+    }, {
+      "title" : "Accelerated gradient descent by factor-centering decomposition",
+      "author" : [ "Nicol N. Schraudolph" ],
+      "venue" : "Technical Report IDSIA-33-98, Istituto Dalle Molle di Studi sull’Intelligenza Artificiale,",
+      "citeRegEx" : "21",
+      "shortCiteRegEx" : "21",
+      "year" : 1998
+    }, {
+      "title" : "Very deep convolutional networks for large-scale image recognition",
+      "author" : [ "K. Simonyan", "A. Zisserman" ],
+      "venue" : "In International Conference on Learning Representations,",
+      "citeRegEx" : "22",
+      "shortCiteRegEx" : "22",
+      "year" : 2015
+    }, {
+      "title" : "The natural gradient by analogy to signal whitening, and recipes and tricks for its use",
+      "author" : [ "Jascha Sohl-Dickstein" ],
+      "venue" : null,
+      "citeRegEx" : "23",
+      "shortCiteRegEx" : "23",
+      "year" : 2012
+    }, {
+      "title" : "Dropout: A simple way to prevent neural networks from overfitting",
+      "author" : [ "Nitish Srivastava", "Geoffrey Hinton", "Alex Krizhevsky", "Ilya Sutskever", "Ruslan Salakhutdinov" ],
+      "venue" : "Journal of Machine Learning Research,",
+      "citeRegEx" : "24",
+      "shortCiteRegEx" : "24",
+      "year" : 2014
+    }, {
+      "title" : "Projected natural actorcritic",
+      "author" : [ "Philip S Thomas", "William C Dabney", "Stephen Giguere", "Sridhar Mahadevan" ],
+      "venue" : "In Advances in Neural Information Processing Systems",
+      "citeRegEx" : "26",
+      "shortCiteRegEx" : "26",
+      "year" : 2013
+    }, {
+      "title" : "Rmsprop: Divide the gradient by a running average of its recent magnitude. coursera: Neural networks for machine",
+      "author" : [ "Tijmen Tieleman", "Geoffrey Hinton" ],
+      "venue" : null,
+      "citeRegEx" : "27",
+      "shortCiteRegEx" : "27",
+      "year" : 2012
+    }, {
+      "title" : "Pushing stochastic gradient towards second-order methods – backpropagation learning with transformations in nonlinearities",
+      "author" : [ "Tommi Vatanen", "Tapani Raiko", "Harri Valpola", "Yann LeCun" ],
+      "venue" : "ICONIP,",
+      "citeRegEx" : "28",
+      "shortCiteRegEx" : "28",
+      "year" : 2013
+    } ],
+    "referenceMentions" : [ {
+      "referenceID" : 6,
+      "context" : "As long as SGD remains the workhorse of deep learning, our ability to extract highlevel representations from data may be hindered by difficult optimization, as evidenced by the boost in performance offered by batch normalization (BN) [7] on the Inception architecture [25].",
+      "startOffset" : 234,
+      "endOffset" : 237
+    }, {
+      "referenceID" : 0,
+      "context" : "Though its adoption remains limited, the natural gradient [1] appears ideally suited to these difficult optimization issues.",
+      "startOffset" : 58,
+      "endOffset" : 61
+    }, {
+      "referenceID" : 11,
+      "context" : "Truncated Newton methods can avoid explicitly forming the FIM in memory [12, 15], but they require an expensive iterative procedure to compute the inverse.",
+      "startOffset" : 72,
+      "endOffset" : 80
+    }, {
+      "referenceID" : 13,
+      "context" : "Truncated Newton methods can avoid explicitly forming the FIM in memory [12, 15], but they require an expensive iterative procedure to compute the inverse.",
+      "startOffset" : 72,
+      "endOffset" : 80
+    }, {
+      "referenceID" : 15,
+      "context" : "Inspired by recent work on model reparametrizations [17, 13], our approach starts with a simple question: can we devise a neural network architecture whose Fisher is constrained to be identity? This is an important question, as SGD and NGD would be equivalent in the resulting model.",
+      "startOffset" : 52,
+      "endOffset" : 60
+    }, {
+      "referenceID" : 12,
+      "context" : "Inspired by recent work on model reparametrizations [17, 13], our approach starts with a simple question: can we devise a neural network architecture whose Fisher is constrained to be identity? This is an important question, as SGD and NGD would be equivalent in the resulting model.",
+      "startOffset" : 52,
+      "endOffset" : 60
+    }, {
+      "referenceID" : 2,
+      "context" : "Our second contribution is in unifying many heuristics commonly used for training neural networks, under the roof of the natural gradient, while highlighting an important connection between model reparametrizations and Mirror Descent [3].",
+      "startOffset" : 234,
+      "endOffset" : 237
+    }, {
+      "referenceID" : 3,
+      "context" : "An equivalent proximal form of gradient descent [4] reveals the precise nature of α:",
+      "startOffset" : 48,
+      "endOffset" : 51
+    }, {
+      "referenceID" : 13,
+      "context" : "See [15, 14] for a recent overview of the topic.",
+      "startOffset" : 4,
+      "endOffset" : 12
+    }, {
+      "referenceID" : 12,
+      "context" : "This is analogous to the centering reparametrization for Deep Boltzmann Machines [13].",
+      "startOffset" : 81,
+      "endOffset" : 85
+    }, {
+      "referenceID" : 5,
+      "context" : "amortize cost of lines [6-11] 6: for all layers i do 7: Compute canonical parameters Wi = ViUi−1; bi = di +Wici.",
+      "startOffset" : 23,
+      "endOffset" : 29
+    }, {
+      "referenceID" : 6,
+      "context" : "amortize cost of lines [6-11] 6: for all layers i do 7: Compute canonical parameters Wi = ViUi−1; bi = di +Wici.",
+      "startOffset" : 23,
+      "endOffset" : 29
+    }, {
+      "referenceID" : 7,
+      "context" : "amortize cost of lines [6-11] 6: for all layers i do 7: Compute canonical parameters Wi = ViUi−1; bi = di +Wici.",
+      "startOffset" : 23,
+      "endOffset" : 29
+    }, {
+      "referenceID" : 8,
+      "context" : "amortize cost of lines [6-11] 6: for all layers i do 7: Compute canonical parameters Wi = ViUi−1; bi = di +Wici.",
+      "startOffset" : 23,
+      "endOffset" : 29
+    }, {
+      "referenceID" : 9,
+      "context" : "amortize cost of lines [6-11] 6: for all layers i do 7: Compute canonical parameters Wi = ViUi−1; bi = di +Wici.",
+      "startOffset" : 23,
+      "endOffset" : 29
+    }, {
+      "referenceID" : 10,
+      "context" : "amortize cost of lines [6-11] 6: for all layers i do 7: Compute canonical parameters Wi = ViUi−1; bi = di +Wici.",
+      "startOffset" : 23,
+      "endOffset" : 29
+    }, {
+      "referenceID" : 6,
+      "context" : "Unfortunately, while estimating the mean μi and diag(Σi) could be performed online over a minibatch of samples as in the recent Batch Normalization scheme [7], estimating the full covariance matrix will undoubtedly require a larger number of samples.",
+      "startOffset" : 155,
+      "endOffset" : 158
+    }, {
+      "referenceID" : 23,
+      "context" : "While statistics could be accumulated online via an exponential moving average as in RMSprop [27] or K-FAC [8], the cost of the eigendecomposition required for computing the whitening matrix Ui remains cubic in the layer size.",
+      "startOffset" : 93,
+      "endOffset" : 97
+    }, {
+      "referenceID" : 7,
+      "context" : "While statistics could be accumulated online via an exponential moving average as in RMSprop [27] or K-FAC [8], the cost of the eigendecomposition required for computing the whitening matrix Ui remains cubic in the layer size.",
+      "startOffset" : 107,
+      "endOffset" : 110
+    }, {
+      "referenceID" : 2,
+      "context" : "This duality between θ and Ω reveals a close connection between PRONG and Mirror Descent [3].",
+      "startOffset" : 89,
+      "endOffset" : 92
+    }, {
+      "referenceID" : 22,
+      "context" : "It is well known [26, 18] that the natural gradient is a special case of MD, where the distance generating function 1 is chosen to be ψ(θ) = 12θ Fθ.",
+      "startOffset" : 17,
+      "endOffset" : 25
+    }, {
+      "referenceID" : 16,
+      "context" : "It is well known [26, 18] that the natural gradient is a special case of MD, where the distance generating function 1 is chosen to be ψ(θ) = 12θ Fθ.",
+      "startOffset" : 17,
+      "endOffset" : 25
+    }, {
+      "referenceID" : 15,
+      "context" : "This work extends the recent contributions of [17] in formalizing many commonly used heuristics for training MLPs: the importance of zero-mean activations and gradients [10, 21], as well as the importance of normalized variances in the forward and backward passes [10, 21, 6].",
+      "startOffset" : 46,
+      "endOffset" : 50
+    }, {
+      "referenceID" : 9,
+      "context" : "This work extends the recent contributions of [17] in formalizing many commonly used heuristics for training MLPs: the importance of zero-mean activations and gradients [10, 21], as well as the importance of normalized variances in the forward and backward passes [10, 21, 6].",
+      "startOffset" : 169,
+      "endOffset" : 177
+    }, {
+      "referenceID" : 18,
+      "context" : "This work extends the recent contributions of [17] in formalizing many commonly used heuristics for training MLPs: the importance of zero-mean activations and gradients [10, 21], as well as the importance of normalized variances in the forward and backward passes [10, 21, 6].",
+      "startOffset" : 169,
+      "endOffset" : 177
+    }, {
+      "referenceID" : 9,
+      "context" : "This work extends the recent contributions of [17] in formalizing many commonly used heuristics for training MLPs: the importance of zero-mean activations and gradients [10, 21], as well as the importance of normalized variances in the forward and backward passes [10, 21, 6].",
+      "startOffset" : 264,
+      "endOffset" : 275
+    }, {
+      "referenceID" : 18,
+      "context" : "This work extends the recent contributions of [17] in formalizing many commonly used heuristics for training MLPs: the importance of zero-mean activations and gradients [10, 21], as well as the importance of normalized variances in the forward and backward passes [10, 21, 6].",
+      "startOffset" : 264,
+      "endOffset" : 275
+    }, {
+      "referenceID" : 5,
+      "context" : "This work extends the recent contributions of [17] in formalizing many commonly used heuristics for training MLPs: the importance of zero-mean activations and gradients [10, 21], as well as the importance of normalized variances in the forward and backward passes [10, 21, 6].",
+      "startOffset" : 264,
+      "endOffset" : 275
+    }, {
+      "referenceID" : 24,
+      "context" : "[28] extended their previous work [17] by introducing a multiplicative constant γi to the centered non-linearity.",
+      "startOffset" : 0,
+      "endOffset" : 4
+    }, {
+      "referenceID" : 15,
+      "context" : "[28] extended their previous work [17] by introducing a multiplicative constant γi to the centered non-linearity.",
+      "startOffset" : 34,
+      "endOffset" : 38
+    }, {
+      "referenceID" : 6,
+      "context" : "The recently introduced batch normalization (BN) scheme [7] quite closely resembles a diagonal version of PRONG, the main difference being that BN normalizes the variance of activations before the non-linearity, as opposed to normalizing the latent activations by looking at the full covariance.",
+      "startOffset" : 56,
+      "endOffset" : 59
+    }, {
+      "referenceID" : 23,
+      "context" : "A diagonal version of PRONG also bares an interesting resemblance to RMSprop [27, 5], in that both normalization terms involve the square root of the FIM.",
+      "startOffset" : 77,
+      "endOffset" : 84
+    }, {
+      "referenceID" : 4,
+      "context" : "A diagonal version of PRONG also bares an interesting resemblance to RMSprop [27, 5], in that both normalization terms involve the square root of the FIM.",
+      "startOffset" : 77,
+      "endOffset" : 84
+    }, {
+      "referenceID" : 7,
+      "context" : "K-FAC [8] is also closely related to PRONG and was developed concurrently to our method.",
+      "startOffset" : 6,
+      "endOffset" : 9
+    }, {
+      "referenceID" : 17,
+      "context" : "the low rank structure of these blocks for efficiency, reminiscent of TONGA[19].",
+      "startOffset" : 75,
+      "endOffset" : 79
+    }, {
+      "referenceID" : 14,
+      "context" : "Their method however operates online via low-rank updates to each block, similar to the preconditioning used in the Kaldi speech recognition toolkit [16].",
+      "startOffset" : 149,
+      "endOffset" : 153
+    }, {
+      "referenceID" : 20,
+      "context" : "A similar algorithm to PRONG was later found in [23], where it appeared simply as a thought experiment, but with no amortization or recourse for efficiently computing F .",
+      "startOffset" : 48,
+      "endOffset" : 52
+    }, {
+      "referenceID" : 10,
+      "context" : "To provide a better understanding of the approximation made by PRONG, we train a small 3-layer MLP with tanh non-linearities, on a downsampled version of MNIST (10x10) [11].",
+      "startOffset" : 168,
+      "endOffset" : 172
+    }, {
+      "referenceID" : 9,
+      "context" : "Fig 3b compares the impact of T for models having a proper whitened initialization (solid lines), to models being initialized with a standard “fan-in” initialization (dashed lines) [10].",
+      "startOffset" : 181,
+      "endOffset" : 185
+    }, {
+      "referenceID" : 11,
+      "context" : "Following Martens [12], we compare PRONG on the task of minimizing reconstruction error of an 8-layer auto-encoder on the MNIST dataset.",
+      "startOffset" : 18,
+      "endOffset" : 22
+    }, {
+      "referenceID" : 6,
+      "context" : "Following [7], we perform whitening across feature maps only: that is we treat pixels in a given feature map as independent samples.",
+      "startOffset" : 10,
+      "endOffset" : 13
+    }, {
+      "referenceID" : 8,
+      "context" : "Results are presented on both CIFAR-10 [9] and the ImageNet Challenge (ILSVRC12) datasets [20].",
+      "startOffset" : 39,
+      "endOffset" : 42
+    }, {
+      "referenceID" : 19,
+      "context" : "This particular choice of architecture was inspired by the VGG model [22] and held fixed across all experiments.",
+      "startOffset" : 69,
+      "endOffset" : 73
+    }, {
+      "referenceID" : 13,
+      "context" : "This could reflect the findings of [15], which showed how NGD can leverage unlabeled data for better generalization: the “unlabeled” data here comes from the extra perturbations in the training set when estimating the whitening matrices.",
+      "startOffset" : 35,
+      "endOffset" : 39
+    }, {
+      "referenceID" : 6,
+      "context" : "3M images labelled into 1000 categories) using the Inception architecture [7].",
+      "startOffset" : 74,
+      "endOffset" : 77
+    }, {
+      "referenceID" : 6,
+      "context" : "While our top-1 error is higher than reported in [7] (25.",
+      "startOffset" : 49,
+      "endOffset" : 52
+    }, {
+      "referenceID" : 21,
+      "context" : "As our main focus is optimization, regularization consisted of a simple L2 weight decay parameter of 10−4, with no Dropout [24].",
+      "startOffset" : 123,
+      "endOffset" : 127
+    }, {
+      "referenceID" : 15,
+      "context" : "Ensuring zero-mean gradients also required the use of skip-connections, with tedious book-keeping to offset the reparametrization of centered non-linearities [17].",
+      "startOffset" : 158,
+      "endOffset" : 162
+    }, {
+      "referenceID" : 1,
+      "context" : "The sharp roll-off in the eigenspectrum of Σi may explain why deep networks are ammenable to compression [2].",
+      "startOffset" : 105,
+      "endOffset" : 108
+    }, {
+      "referenceID" : 21,
+      "context" : "Similarly, one could envision spectral versions of Dropout [24] where the dropout probability is a function of the eigenvalues.",
+      "startOffset" : 59,
+      "endOffset" : 63
+    } ],
+    "year" : 2015,
+    "abstractText" : "We introduce Natural Neural Networks, a novel family of algorithms that speed up convergence by adapting their internal representation during training to improve conditioning of the Fisher matrix. In particular, we show a specific example that employs a simple and efficient reparametrization of the neural network weights by implicitly whitening the representation obtained at each layer, while preserving the feed-forward computation of the network. Such networks can be trained efficiently via the proposed Projected Natural Gradient Descent algorithm (PRONG), which amortizes the cost of these reparametrizations over many parameter updates and is closely related to the Mirror Descent online learning algorithm. We highlight the benefits of our method on both unsupervised and supervised learning tasks, and showcase its scalability by training on the large-scale ImageNet Challenge dataset.",
+    "creator" : "LaTeX with hyperref package"
+  }
+}

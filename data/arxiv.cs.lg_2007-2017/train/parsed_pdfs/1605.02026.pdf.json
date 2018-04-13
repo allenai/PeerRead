@@ -1,0 +1,278 @@
+{
+  "name" : "1605.02026.pdf",
+  "metadata" : {
+    "source" : "META",
+    "title" : "Training Neural Networks Without Gradients:  A Scalable ADMM Approach",
+    "authors" : [ "Gavin Taylor", "Ryan Burmeister", "Zheng Xu", "Bharat Singh", "Ankit Patel", "Tom Goldstein" ],
+    "emails" : [ "TAYLOR@USNA.EDU", "XUZH@CS.UMD.EDU", "BHARAT@CS.UMD.EDU", "ABP4@RICE.EDU", "TOMG@CS.UMD.EDU" ],
+    "sections" : [ {
+      "heading" : "1. Introduction",
+      "text" : "As hardware and algorithms advance, neural network performance is constantly improving for many machine learning tasks. This is particularly true in applications where extremely large datasets are available to train models with\nProceedings of the 33 rd International Conference on Machine Learning, New York, NY, USA, 2016. JMLR: W&CP volume 48. Copyright 2016 by the author(s).\nmany parameters. Because big datasets provide results that (often dramatically) outperform the prior state-of-the-art in many machine learning tasks, researchers are willing to purchase specialized hardware such as GPUs, and commit large amounts of time to training models and tuning hyperparameters.\nGradient-based training methods have several properties that contribute to this need for specialized hardware. First, while large amounts of data can be shared amongst many cores, existing optimization methods suffer when parallelized. Second, training neural nets requires optimizing highly non-convex objectives that exhibit saddle points, poor conditioning, and vanishing gradients, all of which slow down gradient-based methods such as stochastic gradient descent, conjugate gradients, and BFGS. Several mitigating approaches to avoiding this issue have been introduced, including rectified linear units (ReLU) (Nair & Hinton, 2010), Long Short-Term Memory networks (Hochreiter & Schmidhuber, 1997), RPROP (Riedmiller & Braun, 1993), and others, but the fundamental problem remains.\nIn this paper, we introduce a new method for training the parameters of neural nets using the Alternating Direction Method of Multipliers (ADMM) and Bregman iteration. This approach addresses several problems facing classical gradient methods; the proposed method exhibits linear scaling when data is parallelized across cores, and is robust to gradient saturation and poor conditioning. The method decomposes network training into a sequence of sub-steps that are each solved to global optimality. The scalability of the proposed method, combined with the ability to avoid local minima by globally solving each substep, can lead to dramatic speedups.\nWe begin in Section 2 by describing the mathematical notation and context, and providing a discussion of several\nar X\niv :1\n60 5.\n02 02\n6v 1\n[ cs\n.L G\n] 6\nweaknesses of gradient-based methods that we hope to address. Sections 3 and 4 introduce and describe the optimization approach, and Sections 5 and 6 describe in detail the distributed implementation. Section 7 provides an experimental comparison of the new approach with standard implementations of several gradient-based methods on two problems of differing size and difficulty. Finally, Section 8 contains a closing discussion of the paper’s contributions and the future work needed."
+    }, {
+      "heading" : "2. Background and notation",
+      "text" : "Though there are many variations, a typical neural network consists of L layers, each of which is defined by a linear operator Wl, and a non-linear neural activation function hl. Given a (column) vector of input activations, al−1, a single layer computes and outputs the non-linear function al = hl(Wlal−1). A network is formed by layering these units together in a nested fashion to compute a composite function; in the 3-layer case, for example, this would be\nf(a0;W ) =W3(h2(W2h1(W1a0))) (1)\nwhere W = {Wl} denotes the ensemble of weight matrices, and a0 contains input activations for every training sample (one sample per column). The function h3 is absent as it is common for the last layer to not have an activation function.\nTraining the network is the task of tuning the weight matrices W to match the output activations aL to the targets y, given the inputs a0. Using a loss function `, the training problem can be posed as\nmin W `(f(a0;W ), y) (2)\nNote that in our notation, we have included all input activations for all training data into the matrix/tensor a0. This notation benefits our discussion of the proposed algorithm, which operates on all training data simultaneously as a batch.\nAlso, in our formulation the tensor W contains linear operators, but not necessarily dense matrices. These linear operators can be convolutions with an ensemble of filters, in which case (1) represents a convolutional net.\nFinally, the formulation used here assumes a feed-forward architecture. However, our proposed methods can handle more complex network topologies (such as recurrent networks) with little modification."
+    }, {
+      "heading" : "2.1. What’s wrong with backprop?",
+      "text" : "Most networks are trained using stochastic gradient descent (SGD, i.e. backpropagation) in which the gradient of the network loss function is approximated using a small\nnumber of training samples, and then a descent step is taken using this approximate gradient. Stochastic gradient methods work extremely well in the serial setting, but lack scalability. Recent attempts to scale SGD include Downpour, which runs SGD simultaneously on multiple cores. This model averages parameters across cores using multiple communication nodes that store copies of the model. A conceptually similar approach is elastic averaging (Zhang et al., 2015), in which different processors simultaneously run SGD using a quadratic penalty term that prevents different processes from drifting too far from the central average. These methods have found success with modest numbers of processors, but fail to maintain strong scaling for large numbers of cores. For example, for several experiments reported in (Dean et al., 2012), the Downpour distributed SGD method runs slower with 1500 cores than with 500 cores.\nThe scalability of SGD is limited because it relies on a large number of inexpensive minimization steps that each use a small amount of data. Forming a noisy gradient from a small mini-batch requires very little computation. The low cost of this step is an asset in the serial setting where it enables the algorithm to move quickly, but disadvantageous in the parallel setting where each step is too inexpensive to be split over multiple processors. For this reason, SGD is ideally suited for computation on GPUs, where multiple cores can simultaneously work on a small batch of data using a shared memory space with virtually no communication overhead.\nWhen parallelizing over CPUs, it is preferable to have methods that use a small number of expensive minimization steps, preferably involving a large number of data. The work required on each minimization step can then be split across many worker nodes, and the latency of communication is amortized over a large amount of computation. This approach has been suggested by numerous authors who propose batch computation methods (Ngiam et al., 2011), which compute exact gradients on each iteration using the entire dataset, including conjugate gradients (Towsey et al., 1995; Møller, 1993), BFGS, and Hessian-free (Martens & Sutskever, 2011; Sainath et al., 2013) methods.\nUnfortunately, all gradient-based approaches, whether batched or stochastic, also suffer from several other critical drawbacks. First, gradient-based methods suffer from the vanishing gradients. During backpropagation, the derivative of shallow layers in a network are formed using products of weight matrices and derivatives of nonlinearities from downstream layers. When the eigenvalues of the weight matrices are small and the derivatives of nonlinearities are nearly zero (as they often are for sigmoid and ReLU non-linearities), multiplication by these terms annihilates information. The resulting gradients in shallow lay-\ners contain little information about the error (Bengio et al., 1994; Riedmiller & Braun, 1993; Hochreiter & Schmidhuber, 1997).\nSecond, backprop has the potential to get stuck at local minima and saddle points. While recent results suggest that local minimizers of SGD are close to global minima (Choromanska et al., 2014), in practice SGD often lingers near saddle points where gradients are small (Dauphin et al., 2014).\nFinally, backprop does not easily parallelize over layers, a significant bottleneck when considering deep architectures. However, recent work on SGD has successfully used model parallelism by using multiple replicas of the entire network (Dean et al., 2012).\nWe propose a solution that helps alleviate these problems by separating the objective function at each layer of a neural network into two terms: one term measuring the relation between the weights and the input activations, and the other term containing the nonlinear activation function. We then apply an alternating direction method that addresses each term separately. The first term allows the weights to be updated without the effects of vanishing gradients. In the second step, we have a non-convex minimization problem that can be solved globally in closed-form. Also, the form of the objective allows the weights of every layer to be updated independently, enabling parallelization over layers.\nThis approach does not require any gradient steps at all. Rather, the problem of training network parameters is reduced to a series of minimization sub-problems using the alternating direction methods of multipliers. These minimization sub-problems are solved globally in closed form."
+    }, {
+      "heading" : "2.2. Related work",
+      "text" : "Other works have applied least-squares based methods to neural networks. One notable example is the method of auxiliary coordinates (MAC) (Carreira-Perpinán & Wang, 2012) which uses quadratic penalties to approximately enforce equality constraints. Unlike our method, MAC requires iterative solvers for sub-problems, whereas the method proposed here is designed so that all sub-problems have closed form solutions. Also unlike MAC, the method proposed here uses Lagrange multipliers to exactly enforce equality constraints, which we have found to be necessary for training deeper networks.\nAnother related approach is the expectation-maximization (EM) algorithm of (Patel et al., 2015), which is derived from the Deep Rendering Model (DRM), a hierarchical generative model for natural images. They show that feedforward propagation in a deep convolutional net corresponds to inference on their proposed DRM. They derive a new EM learning algorithm for their proposed DRM that\nemploys least-squares parameter updates that are conceptually similar to (but different from) the Parallel Weight Update proposed here (see Section 5). However, there is currently no implementation nor any training results to compare against.\nNote that our work is the first to consider alternating least squares as a method to distribute computation across a cluster, although the authors of (Carreira-Perpinán & Wang, 2012) do consider implementations that are “distributed” in the sense of using multiple threads on a single machine via the Matlab matrix toolbox."
+    }, {
+      "heading" : "3. Alternating minimization for neural networks",
+      "text" : "The idea behind our method is to decouple the weights from the nonlinear link functions using a splitting technique. Rather than feeding the output of the linear operator Wl directly into the activation function hl, we store the output of layer l in a new variable zl = Wlal−1. We also represent the output of the link function as a vector of activations al = hl(zl). We then wish to solve the following problem\nminimize {Wl},{al},{zl} `(zL, y)\nsubject to zl =Wlal−1, for l = 1, 2, · · ·L al = hl(zl), for l = 1, 2, · · ·L− 1.\n(3)\nObserve that solving (3) is equivalent to solving (2). Rather than try to solve (3) directly, we relax the constraints by adding an `2 penalty function to the objective and attack the unconstrained problem\nminimize {Wl},{al},{zl}\n`(zL, y) + βL‖zL −WLaL−1‖2\n+ L−1∑ l=1 [ γl‖al − hl(zl)‖2 + βl‖zl −Wlal−1‖2 ] (4)\nwhere {γl} and {βl} are constants that control the weight of each constraint. The formulation (4) only approximately enforces the constraints in (3). To obtain exact enforcement of the constraints, we add a Lagrange multiplier term to (4), which yields\nminimize {Wl},{al},{zl} `(zL, y) (5)\n+ 〈zL, λ〉+ βL‖zL −WLaL−1‖2\n+ L−1∑ l=1 [ γl‖al − hl(zl)‖2 + βl‖zl −Wlal−1‖2 ] .\nwhere λ is a vector of Lagrange multipliers with the same dimensions as zL. Note that in a classical ADMM formulation, a Lagrange multiplier would be added for each constraint in (3). The formulation above corresponds more\nAlgorithm 1 ADMM for Neural Nets Input: training features {a0}, and labels {y}, Initialize: allocate {al}L=1l=1 , {zl}Ll=1, and λ repeat for l = 1, 2, · · · , L− 1 do Wl ← zla†l−1 al←(βl+1WTl+1Wl+1+γlI)−1(βl+1WTl+1zl+1+γlhl(zl)) zl ← argminz γl‖al − hl(z)‖2 + βl‖zl −Wlal−1‖2\nend for WL ← zLa†L−1 zL ← argminz `(z, y) + 〈zL, λ〉+ βL‖z −WLal−1‖2 λ← λ+ βL(zL −WLaL−1) until converged\nclosely to Bregman iteration, which only requires a Lagrange correction to be added to the objective term (and not the constraint terms), rather than classical ADMM. We have found the Bregman formulation to be far more stable than a full scale ADMM formulation. This issue will be discussed in detail in Section 4.\nThe split formulation (4) is carefully designed to be easily minimized using an alternating direction method in which each sub-step has a simple closed-form solution. The alternating direction scheme proceeds by updating one set of variables at a time – either {Wl}, {al}, or {zl} – while holding the others constant. The simplicity of the proposed scheme comes from the following observation: The minimization of (4) with respect to both {Wl} and {al−1} is a simple linear least-squares problem. Only the minimization of (4) with respect {zl} is nonlinear. However, there is no coupling between the entries of {zl}, and so the problem of minimizing for {zl} decomposes into solving a large number of one-dimensional problems, one for each entry in {zl}. Because each sub-problem has a simple form and only 1 variable, these problems can be solved globally in closed form.\nThe full alternating direction method is listed in Algorithm 1. We discuss the details below."
+    }, {
+      "heading" : "3.1. Minimization sub-steps",
+      "text" : "In this section, we consider the updates for each variable in (5). The algorithm proceeds by minimizing for Wl, al, and zl, and then updating the Lagrange multipliers λ.\nWeight update We first consider the minimization of (4) with respect to {Wl}. For each layer l, the optimal solution minimizes ‖zl −Wlal−1‖2. This is simply a least squares problem, and the solution is given by Wl ← zla†l−1 where a†l−1 represents the pseudoinverse of the (rectangular) activation matrix al−1.\nActivations update Minimization for al is a simple leastsquares problem similar to the weight update. However, in this case the matrix al appears in two penalty terms in (4), and so we must minimize βl‖zl+1 −Wl+1al‖ + γl‖al − hl(zl)‖2 for al, holding all other variables fixed. The new value of al is given by\n(βl+1W T l+1Wl+1 + γlI) −1(βl+1W T l+1zl+1 + γlhl(zl)) (6)\nwhere WTl+1 is the adjoint (transpose) of Wl+1.\nOutputs update The update for zl requires minimizing\nmin z γl‖al − hl(z)‖2 + βl‖z −Wlal−1‖2. (7)\nThis problem is non-convex and non-quadratic (because of the non-linear term h). Fortunately, because the nonlinearity h works entry-wise on its argument, the entries in zl are de-coupled. Solving (7) is particularly easy when h is piecewise linear, as it can be solved in closed form; common piecewise linear choices for h include rectified linear units (ReLUs) and non-differentiable sigmoid functions given by\nhrelu(x) = { x, if x > 0 0, otherwise , hsig(x) =  1, if x ≥ 1 x, if 0 < x < 1 0, otherwise .\nFor such choices of h, the minimizer of (7) is easily computed using simple if-then logic. For more sophistical choices of h, including smooth sigmoid curves, the problem can be solved quickly with a lookup table of precomputed solutions because each 1-dimensional problem only depends on two inputs.\nLagrange multiplier update After minimizing for {Wl}, {al}, and {zl}, the Lagrange multiplier update is given simply by\nλ← λ+ βL(zL −WLaL−1). (8)\nWe discuss this update further in Section 4."
+    }, {
+      "heading" : "4. Lagrange multiplier updates via method of multipliers and Bregman iteration",
+      "text" : "The proposed method can be viewed as solving the constrained problem (3) using Bregman iteration, which is closely related to ADMM. The convergence of Bregman iteration is fairly well understood in the presence of linear constraints (Yin et al., 2008). The convergence of ADMM is fairly well understood for convex problems involving only two separate variable blocks (He & Yuan, 2015). Convergence results also guarantee that a local minima is obtained for two-block non-convex objectives under certain smoothness assumptions (Nocedal & Wright, 2006).\nBecause the proposed scheme involves more than two coupled variable blocks and a non-smooth penalty function, it lies outside the scope of known convergence results for ADMM. In fact, when ADMM is applied to (3) in a conventional way using separate Lagrange multiplier vectors for each constraint, the method is highly unstable because of the de-stabilizing effect of a large number of coupled, non-smooth, non-convex terms.\nFortunately, we will see below that the Bregman Lagrange update method (13) does not involve any non-smooth constraint terms, and the resulting method seems to be extremely stable."
+    }, {
+      "heading" : "4.1. Bregman interpretation",
+      "text" : "Bregman iteration (also known as the method of multipliers) is a general framework for solving constrained optimization problems. Methods of this type have been used extensively in the sparse optimization literature (Yin et al., 2008). Consider the general problem of minimizing\nmin u J(u) subject to Au = b (9)\nfor some convex function J and linear operator A. Bregman iteration repeatedly solves\nuk+1 ← minDJ(u, uk) + 1\n2 ‖Au− b‖2 (10)\nwhere p ∈ ∂J(uk) is a (sub-)gradient of J at uk, and DJ(u, u\nk) = J(u)− J(uk)− 〈u− uk, p〉 is the so-called Bregman distance. The iterative process (10) can be viewed as minimizing the objective J subject to an inexact penalty that approximately obtains Ax ≈ b, and then adding a linear term to the objective to weaken it so that the quadratic penalty becomes more influential on the next iteration.\nThe Lagrange update described in Section 3 can be interpreted as performing Bregman iteration to solve the problem (3), where J(u) = `(zL, y), and A contains the constraints in (3). On each iteration, the outputs zl are updated immediately before the Lagrange step is taken, and so zl−1 satisfies the optimality condition\n0 ∈ ∂z`(zL, y) + βL(zL −WLaL−1) + λ.\nIt follows that\nλ+ βL(zL −WLaL−1) ∈ −∂z`(zL, y).\nFor this reason, the Lagrange update (13) can be interpreted as updating the sub-gradient in the Bregman iterative method for solving (3). The combination of the Bregman iterative update with an alternating minimization strategy makes the proposed algorithm an instance of the split Bregman method (Goldstein & Osher, 2009)."
+    }, {
+      "heading" : "4.2. Interpretation as method of multipliers",
+      "text" : "In addition to the Bregman interpretation, the proposed method can also be viewed as an approximation to the method of multipliers, which solves constrained problems of the form\nmin u J(u) subject to Au = b (11)\nfor some convex function J and (possibly non-linear) operator A. In its most general form (which does not assume linear constraints) the method proceeds using the iterative updates{ uk+1 ← min J(u) + 〈λk, A(u)− b〉+ β2 ‖A(u)− b‖ 2\nλk+1 ← λk + ∂u{β2 ‖A(u)− b‖ 2}\nwhere λk is a vector of Lagrange multipliers that is generally initialized to zero, and β2 ‖A(u) − b‖\n2 is a quadratic penalty term. After each minimization sub-problem, the gradient of the penalty term is added to the Lagrange multipliers. When the operator A is linear, this update takes the form λk+1 ← λk + βAT (Au − b), which is the most common form of the method of multipliers.\nJust like in the Bregman case, we now let J(u) = `(zL, y), and let A contain the constraints in (3). After a minimization pass, we must update the Lagrange multiplier vector. Assuming a good minimizer has been achieved, the derivative of (5) should be nearly zero. All variables except zL appear only in the quadratic penalty, and so these derivatives should be negligibly small. The only major contributor to the gradient of the penalty term is zL,which appears in both the loss function and the quadratic penalty. The gradient of the penalty term with respect to zL, is βL(zL −WLaL−1), which is exactly the proposed multiplier update.\nWhen the objective is approximately minimized by alternately updating separate blocks of variables (as in the proposed method), this becomes an instance of the ADMM (Boyd et al., 2011)."
+    }, {
+      "heading" : "5. Distributed implementation using data parallelism",
+      "text" : "The main advantage of the proposed alternating minimization method is its high degree of scalability. In this section, we explain how the method is distributed.\nConsider distributing the algorithm acrossN worker nodes. The ADMM method is scaled using a data parallelization strategy, in which different nodes store activations and outputs corresponding to different subsets of the training data. For each layer, the activation matrix is broken into columns subsets as ai = (a1, a2, · · · , aN ). The output matrix zl and Lagrange multipliers λ decompose similarly.\nThe optimization sub-steps for updating {al} and {zl} do not require any communication and parallelize trivially. The weight matrix update requires the computation of pseudo-inverses and products involving the matrices {al} and {zl}. This can be done effectively using transpose reduction strategies that reduce the dimensionality of matrices before they are transmitted to a central node.\nParallel Weight update The weight update has the form Wl ← zla†l , where a † l represents the pseudoinverse of the activation matrix al. This pseudoinverse can be written a†l = a T l (ala T l ) −1. Using this expansion, the W update decomposes across nodes as\nWl ← ( N∑ n=1 znl (a n l ) T )( N∑ n=1 anl (a n l ) T )−1 .\nThe individual products znl (a n l ) T and anl (a n l ) T are computed separately on each node, and then summed across nodes using a single reduce operation. Note that the width of anl equals the number of training vectors that are stored on node n, which is potentially very large for big data sets. When the number of features (the number of rows in anl ) is less than the number of training data (columns of anl ), we can exploit transpose reduction when forming these products – the product anl (a n l ) T is much smaller than the matrix anl alone. This dramatically reduces the quantity of data transmitted during the reduce operation.\nOnce these products have been formed and reduced onto a central server, the central node computes the inverse of ala T l , updates Wl, and then broadcasts the result to the worker nodes.\nParallel Activations update The update (6) trivially decomposes across workers, with each worker computing\nanl ← (βl+1WTl+1Wl+1+γI)−1(βl+1WTl+1znl+1+γlhl(znl )).\nEach server maintains a full representation of the entire weight matrix, and can formulate its own local copy of the matrix inverse (βl+1WTl+1Wl+1 + γI) −1.\nParallel Outputs update Like the activations update, the update for zl trivially parallelizes and each worker node solves\nmin znl\nγl‖anl − hl(znl )‖2 + βl‖znl −Wlanl−1‖2. (12)\nEach worker node simply computes Wlanl−1 using local data, and then updates each of the (decoupled) entries in znl by solving a 1-dimensional problem in closed form.\nParallel Lagrange multiplier update The Lagrange multiplier update also trivially splits across nodes, with\nworker n computing\nλn ← λn + βL(znL −WLanL−1) (13)\nusing only local data."
+    }, {
+      "heading" : "6. Implementation details",
+      "text" : "Like many training methods for neural networks, the ADMM approach requires several tips and tricks to get maximum performance. The convergence theory for the method of multipliers requires a good minimizer to be computed before updating the Lagrange multipliers. When the method is initialized with random starting values, the initial iterates are generally far from optimal. For this reason, we frequently “warm start” the ADMM method by running several iterations without Lagrange multiplier updates.\nThe method potentially requires the user to choose a large number of parameters {γi} and {βi}. We choose γi = 10 and βi = 1 for all trials runs reported here, and we have found that this choice works reliably for a wide range of problems and network architectures. Note that in the classical ADMM method, convergence is guaranteed for any choice of the quadratic penalty parameters.\nWe use training data with binary class labels, in which each output entry aL is either 1 or 0. We use a separable loss function with a hinge penalty of the form\n`(z, a) = { max{1− z, 0}, when a = 1, max{a, 0}, when a = 0.\nThis loss function works well in practice, and yields minimization sub-problems that are easily solved in closed form.\nFinally, our implementation simply initializes the activation matrices {al} and output matrices {zl} using i.i.d Gaussian random variables. Because our method updates the weights before anything else, the weight matrices do not require any initialization. The results presented here are using Gaussian random variables with unit variance, and the results seem to be fairly insensitive to the variance of this distribution. This seems to be because the output updates are solved to global optimality on each iteration."
+    }, {
+      "heading" : "7. Experiments",
+      "text" : "In this section, we present experimental results that compare the performance of the ADMM method to other approaches, including SGD, conjugate gradients, and LBFGS on benchmark classification tasks. Comparisons are made across multiple axes. First, we illustrate the scaling of the approach, by varying the number of cores available and clocking the compute time necessary to meet an accuracy threshold on the test set of the problem. Second, we\nshow test set classification accuracy as a function of time to compare the rate of convergence of the optimization methods. Finally, we show these comparisons on two different data sets, one small and relatively easy, and one large and difficult.\nThe new ADMM approach was implemented in Python on a Cray XC30 supercomputer with Ivy Bridge processors, and communication between cores performed via MPI. SGD, conjugate gradients, and L-BFGS are run as implemented in the Torch optim package on NVIDIA Tesla K40 GPUs. These methods underwent a thorough hyperparameter grid search to identify the algorithm parameters that produced the best results. In all cases, timings indicate only the time spent optimizing, excluding time spent loading data and setting up the network.\nExperiments were run on two datasets. The first is a subset of the Street View House Numbers (SVHN) dataset (Netzer et al., 2011). Neural nets were constructed to classify pictures of 0s from 2s using histogram of gradient (HOG) features of the original dataset. Using the “extra” dataset to train, this meant 120,290 training datapoints of 648 features each. The testing set contained 5,893 data points.\nThe second dataset is the far more difficult Higgs dataset (Baldi et al., 2014), consisting of a training set of 10,500,000 datapoints of 28 features each, with each datapoint labelled as either a signal process producing a Higgs boson or a background process which does not. The testing set consists of 500,000 datapoints."
+    }, {
+      "heading" : "7.1. SVHN",
+      "text" : "First, we focus on the problem posed by the SVHN dataset. For this dataset, we optimized a net with two hidden layers of 100 and 50 nodes and ReLU activation functions. This is an easy problem (test accuracy rises quickly) that does not require a large volume of data and is easily handled by gradient-based methods on a GPU. However, Figure 1a demonstrates that ADMM exhibits linear scaling with cores. Even though the implementations of the gradientbased methods enjoy communication via shared memory on the GPU while ADMM required CPU-to-CPU communication, strong scaling allows ADMM on CPU cores to compete with the gradient-based methods on a GPU.\nThis is illustrated clearly in Figure 1b, which shows each method’s performance on the test set as a function of time. With 1,024 compute cores, on an average of 10 runs, ADMM was able to meet the 95% test set accuracy threshold in 13.3 seconds. After an extensive hyperparameter search to find the settings which resulted in the fastest convergence, SGD converged on average in 28.3 seconds, LBFGS in 3.3 seconds, and conjugate gradients in 10.1 seconds. Though the small dataset kept ADMM from taking full advantage of its scalability, it was nonetheless sufficient to allow it to be competitive with GPU implementations."
+    }, {
+      "heading" : "7.2. Higgs",
+      "text" : "For the much larger and more difficult Higgs dataset, we optimized a simple network with ReLU activation functions and a hidden layer of 300 nodes, as suggested in (Baldi et al., 2014). The graph illustrates the amount of time required to optimize the network to a test set pre-\ndiction accuracy of 64%; this parameter was chosen as all batch methods being tested reliably hit this accuracy benchmark over numerous trials. As is clear from Figure 2a, parallelizing over additional cores decreases the time required dramatically, and again exhibits linear scaling.\nIn this much larger problem, the advantageous scaling allowed ADMM to reach the 64% benchmark much faster than the other approaches. Figure 2b illustrates this clearly, with ADMM running on 7200 cores reaching this benchmark in 7.8 seconds. In comparison, L-BFGS required 181 seconds, and conjugate gradients required 44 minutes.1 In seven hours of training, SGD never reached 64% accuracy on the test set. These results suggest that, for large and difficult problems, the strong linear scaling of ADMM enables it to leverage large numbers of cores to (dramatically) out-perform GPU implementations."
+    }, {
+      "heading" : "8. Discussion & Conclusion",
+      "text" : "We present a method for training neural networks without using gradient steps. In addition to avoiding many difficulties of gradient methods (like saturation and choice of learning rates), performance of the proposed method scales linearly up to thousands of cores. This strong scaling enables the proposed approach to out-perform other methods on problems involving extremely large datasets.\n1It is worth noting that though L-BFGS required substantially more time to reach 64% than did ADMM, it was the only method to produce a superior classifier, doing as well as 75% accuracy on the test set."
+    }, {
+      "heading" : "8.1. Looking forward",
+      "text" : "The experiments shown here represent a fairly narrow range of classification problems and are not meant to demonstrate the absolute superiority of ADMM as a training method. Rather, this study is meant to be a proof of concept demonstrating that the caveats of gradient-based methods can be avoided using alternative minimization schemes. Future work will explore the behavior of alternating direction methods in broader contexts.\nWe are particularly interested in focusing future work on recurrent nets and convolutional nets. Recurrent nets, which complicate standard gradient methods (Jaeger, 2002; Lukoševičius, 2012), pose no difficulty for ADMM schemes whatsoever because they decouple layers using auxiliary variables. Convolutional networks are also of interest because ADMM can, in principle, handle them very efficiently. When the linear operators {Wl} represent convolutions rather than dense weight matrices, the least squares problems that arise in the updates for {Wl} and {al} can be solved efficiently using fast Fourier transforms.\nFinally, there are avenues to explore to potentially improve convergence speed. These include adding momentum terms to the weight updates and studying different initialization schemes, both of which are known to be important for gradient-based schemes (Sutskever et al., 2013)."
+    }, {
+      "heading" : "Acknowledgements",
+      "text" : "This work was supported by the National Science Foundation (#1535902), the Office of Naval Research (#N0001415-1-2676 and #N0001415WX01341), and the DoD High Performance Computing Center."
+    } ],
+    "references" : [ {
+      "title" : "Searching for exotic particles in high-energy physics with deep learning",
+      "author" : [ "Baldi", "Pierre", "Sadowski", "Peter", "Whiteson", "Daniel" ],
+      "venue" : "Nature communications,",
+      "citeRegEx" : "Baldi et al\\.,? \\Q2014\\E",
+      "shortCiteRegEx" : "Baldi et al\\.",
+      "year" : 2014
+    }, {
+      "title" : "Learning long-term dependencies with gradient descent is difficult",
+      "author" : [ "Bengio", "Yoshua", "Simard", "Patrice", "Frasconi", "Paolo" ],
+      "venue" : "Neural Networks, IEEE Transactions on,",
+      "citeRegEx" : "Bengio et al\\.,? \\Q1994\\E",
+      "shortCiteRegEx" : "Bengio et al\\.",
+      "year" : 1994
+    }, {
+      "title" : "Distributed optimization of deeply nested systems",
+      "author" : [ "Carreira-Perpinán", "Miguel A", "Wang", "Weiran" ],
+      "venue" : "arXiv preprint arXiv:1212.5921,",
+      "citeRegEx" : "Carreira.Perpinán et al\\.,? \\Q2012\\E",
+      "shortCiteRegEx" : "Carreira.Perpinán et al\\.",
+      "year" : 2012
+    }, {
+      "title" : "The loss surfaces of multilayer networks",
+      "author" : [ "Choromanska", "Anna", "Henaff", "Mikael", "Mathieu", "Michael", "Arous", "Gérard Ben", "LeCun", "Yann" ],
+      "venue" : "arXiv preprint arXiv:1412.0233,",
+      "citeRegEx" : "Choromanska et al\\.,? \\Q2014\\E",
+      "shortCiteRegEx" : "Choromanska et al\\.",
+      "year" : 2014
+    }, {
+      "title" : "The split bregman method for l1-regularized problems",
+      "author" : [ "Goldstein", "Tom", "Osher", "Stanley" ],
+      "venue" : "SIAM Journal on Imaging Sciences,",
+      "citeRegEx" : "Goldstein et al\\.,? \\Q2009\\E",
+      "shortCiteRegEx" : "Goldstein et al\\.",
+      "year" : 2009
+    }, {
+      "title" : "On non-ergodic convergence rate of douglas–rachford alternating direction method of multipliers",
+      "author" : [ "He", "Bingsheng", "Yuan", "Xiaoming" ],
+      "venue" : "Numerische Mathematik,",
+      "citeRegEx" : "He et al\\.,? \\Q2015\\E",
+      "shortCiteRegEx" : "He et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "Long shortterm memory",
+      "author" : [ "Hochreiter", "Sepp", "Schmidhuber", "Jürgen" ],
+      "venue" : "Neural computation,",
+      "citeRegEx" : "Hochreiter et al\\.,? \\Q1997\\E",
+      "shortCiteRegEx" : "Hochreiter et al\\.",
+      "year" : 1997
+    }, {
+      "title" : "Tutorial on training recurrent neural networks, covering BPPT, RTRL, EKF and the” echo state network",
+      "author" : [ "Jaeger", "Herbert" ],
+      "venue" : "approach. GMD-Forschungszentrum Informationstechnik,",
+      "citeRegEx" : "Jaeger and Herbert.,? \\Q2002\\E",
+      "shortCiteRegEx" : "Jaeger and Herbert.",
+      "year" : 2002
+    }, {
+      "title" : "A practical guide to applying echo state networks",
+      "author" : [ "Lukoševičius", "Mantas" ],
+      "venue" : "In Neural Networks: Tricks of the Trade,",
+      "citeRegEx" : "Lukoševičius and Mantas.,? \\Q2012\\E",
+      "shortCiteRegEx" : "Lukoševičius and Mantas.",
+      "year" : 2012
+    }, {
+      "title" : "Learning recurrent neural networks with hessian-free optimization",
+      "author" : [ "Martens", "James", "Sutskever", "Ilya" ],
+      "venue" : "In Proceedings of the 28th International Conference on Machine Learning",
+      "citeRegEx" : "Martens et al\\.,? \\Q2011\\E",
+      "shortCiteRegEx" : "Martens et al\\.",
+      "year" : 2011
+    }, {
+      "title" : "A scaled conjugate gradient algorithm for fast supervised learning",
+      "author" : [ "Møller", "Martin Fodslette" ],
+      "venue" : "Neural networks,",
+      "citeRegEx" : "Møller and Fodslette.,? \\Q1993\\E",
+      "shortCiteRegEx" : "Møller and Fodslette.",
+      "year" : 1993
+    }, {
+      "title" : "Rectified linear units improve restricted boltzmann machines",
+      "author" : [ "Nair", "Vinod", "Hinton", "Geoffrey E" ],
+      "venue" : "In Proceedings of the 27th International Conference on Machine Learning",
+      "citeRegEx" : "Nair et al\\.,? \\Q2010\\E",
+      "shortCiteRegEx" : "Nair et al\\.",
+      "year" : 2010
+    }, {
+      "title" : "Reading digits in natural images with unsupervised feature learning",
+      "author" : [ "Netzer", "Yuval", "Wang", "Tao", "Coates", "Adam", "Bissacco", "Alessandro", "Wu", "Bo", "Ng", "Andrew Y" ],
+      "venue" : "In NIPS workshop on deep learning and unsupervised feature learning,",
+      "citeRegEx" : "Netzer et al\\.,? \\Q2011\\E",
+      "shortCiteRegEx" : "Netzer et al\\.",
+      "year" : 2011
+    }, {
+      "title" : "On optimization methods for deep learning",
+      "author" : [ "Ngiam", "Jiquan", "Coates", "Adam", "Lahiri", "Ahbik", "Prochnow", "Bobby", "Le", "Quoc V", "Ng", "Andrew Y" ],
+      "venue" : "In Proceedings of the 28th International Conference on Machine Learning",
+      "citeRegEx" : "Ngiam et al\\.,? \\Q2011\\E",
+      "shortCiteRegEx" : "Ngiam et al\\.",
+      "year" : 2011
+    }, {
+      "title" : "A probabilistic theory of deep learning",
+      "author" : [ "Patel", "Ankit B", "Nguyen", "Tan", "Baraniuk", "Richard" ],
+      "venue" : "arXiv preprint arXiv:1504.00641,",
+      "citeRegEx" : "Patel et al\\.,? \\Q2015\\E",
+      "shortCiteRegEx" : "Patel et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "A direct adaptive method for faster backpropagation learning: The rprop algorithm",
+      "author" : [ "Riedmiller", "Martin", "Braun", "Heinrich" ],
+      "venue" : "In Neural Networks,",
+      "citeRegEx" : "Riedmiller et al\\.,? \\Q1993\\E",
+      "shortCiteRegEx" : "Riedmiller et al\\.",
+      "year" : 1993
+    }, {
+      "title" : "Accelerating hessian-free optimization for deep neural networks by implicit preconditioning and sampling",
+      "author" : [ "Sainath", "Tara N", "Horesh", "Lior", "Kingsbury", "Brian", "Aravkin", "Aleksandr Y", "Ramabhadran", "Bhuvana" ],
+      "venue" : "In Automatic Speech Recognition and Understanding (ASRU),",
+      "citeRegEx" : "Sainath et al\\.,? \\Q2013\\E",
+      "shortCiteRegEx" : "Sainath et al\\.",
+      "year" : 2013
+    }, {
+      "title" : "On the importance of initialization and momentum in deep learning",
+      "author" : [ "Sutskever", "Ilya", "Martens", "James", "Dahl", "George", "Hinton", "Geoffrey" ],
+      "venue" : "In Proceedings of the 30th international conference on machine learning",
+      "citeRegEx" : "Sutskever et al\\.,? \\Q2013\\E",
+      "shortCiteRegEx" : "Sutskever et al\\.",
+      "year" : 2013
+    }, {
+      "title" : "Training a neural network with conjugate gradient methods",
+      "author" : [ "Towsey", "Michael", "Alpsan", "Dogan", "Sztriha", "Laszlo" ],
+      "venue" : "In Neural Networks,",
+      "citeRegEx" : "Towsey et al\\.,? \\Q1995\\E",
+      "shortCiteRegEx" : "Towsey et al\\.",
+      "year" : 1995
+    }, {
+      "title" : "Bregman iterative algorithms for \\ell 1minimization with applications to compressed sensing",
+      "author" : [ "Yin", "Wotao", "Osher", "Stanley", "Goldfarb", "Donald", "Darbon", "Jerome" ],
+      "venue" : "SIAM Journal on Imaging Sciences,",
+      "citeRegEx" : "Yin et al\\.,? \\Q2008\\E",
+      "shortCiteRegEx" : "Yin et al\\.",
+      "year" : 2008
+    }, {
+      "title" : "Deep learning with elastic averaging sgd",
+      "author" : [ "Zhang", "Sixin", "Choromanska", "Anna E", "LeCun", "Yann" ],
+      "venue" : "In Advances in Neural Information Processing Systems,",
+      "citeRegEx" : "Zhang et al\\.,? \\Q2015\\E",
+      "shortCiteRegEx" : "Zhang et al\\.",
+      "year" : 2015
+    } ],
+    "referenceMentions" : [ {
+      "referenceID" : 20,
+      "context" : "A conceptually similar approach is elastic averaging (Zhang et al., 2015), in which different processors simultaneously run SGD using a quadratic penalty term that prevents different processes from drifting too far from the central average.",
+      "startOffset" : 53,
+      "endOffset" : 73
+    }, {
+      "referenceID" : 13,
+      "context" : "This approach has been suggested by numerous authors who propose batch computation methods (Ngiam et al., 2011), which compute exact gradients on each iteration using the entire dataset, including conjugate gradients (Towsey et al.",
+      "startOffset" : 91,
+      "endOffset" : 111
+    }, {
+      "referenceID" : 18,
+      "context" : ", 2011), which compute exact gradients on each iteration using the entire dataset, including conjugate gradients (Towsey et al., 1995; Møller, 1993), BFGS, and Hessian-free (Martens & Sutskever, 2011; Sainath et al.",
+      "startOffset" : 113,
+      "endOffset" : 148
+    }, {
+      "referenceID" : 16,
+      "context" : ", 1995; Møller, 1993), BFGS, and Hessian-free (Martens & Sutskever, 2011; Sainath et al., 2013) methods.",
+      "startOffset" : 46,
+      "endOffset" : 95
+    }, {
+      "referenceID" : 1,
+      "context" : "ers contain little information about the error (Bengio et al., 1994; Riedmiller & Braun, 1993; Hochreiter & Schmidhuber, 1997).",
+      "startOffset" : 47,
+      "endOffset" : 126
+    }, {
+      "referenceID" : 3,
+      "context" : "While recent results suggest that local minimizers of SGD are close to global minima (Choromanska et al., 2014), in practice SGD often lingers near saddle points where gradients are small (Dauphin et al.",
+      "startOffset" : 85,
+      "endOffset" : 111
+    }, {
+      "referenceID" : 14,
+      "context" : "Another related approach is the expectation-maximization (EM) algorithm of (Patel et al., 2015), which is derived from the Deep Rendering Model (DRM), a hierarchical generative model for natural images.",
+      "startOffset" : 75,
+      "endOffset" : 95
+    }, {
+      "referenceID" : 19,
+      "context" : "The convergence of Bregman iteration is fairly well understood in the presence of linear constraints (Yin et al., 2008).",
+      "startOffset" : 101,
+      "endOffset" : 119
+    }, {
+      "referenceID" : 19,
+      "context" : "Methods of this type have been used extensively in the sparse optimization literature (Yin et al., 2008).",
+      "startOffset" : 86,
+      "endOffset" : 104
+    }, {
+      "referenceID" : 12,
+      "context" : "The first is a subset of the Street View House Numbers (SVHN) dataset (Netzer et al., 2011).",
+      "startOffset" : 70,
+      "endOffset" : 91
+    }, {
+      "referenceID" : 0,
+      "context" : "The second dataset is the far more difficult Higgs dataset (Baldi et al., 2014), consisting of a training set of 10,500,000 datapoints of 28 features each, with each datapoint labelled as either a signal process producing a Higgs boson or a background process which does not.",
+      "startOffset" : 59,
+      "endOffset" : 79
+    }, {
+      "referenceID" : 0,
+      "context" : "For the much larger and more difficult Higgs dataset, we optimized a simple network with ReLU activation functions and a hidden layer of 300 nodes, as suggested in (Baldi et al., 2014).",
+      "startOffset" : 164,
+      "endOffset" : 184
+    }, {
+      "referenceID" : 17,
+      "context" : "These include adding momentum terms to the weight updates and studying different initialization schemes, both of which are known to be important for gradient-based schemes (Sutskever et al., 2013).",
+      "startOffset" : 172,
+      "endOffset" : 196
+    } ],
+    "year" : 2016,
+    "abstractText" : "With the growing importance of large network models and enormous training datasets, GPUs have become increasingly necessary to train neural networks. This is largely because conventional optimization algorithms rely on stochastic gradient methods that don’t scale well to large numbers of cores in a cluster setting. Furthermore, the convergence of all gradient methods, including batch methods, suffers from common problems like saturation effects, poor conditioning, and saddle points. This paper explores an unconventional training method that uses alternating direction methods and Bregman iteration to train networks without gradient descent steps. The proposed method reduces the network training problem to a sequence of minimization substeps that can each be solved globally in closed form. The proposed method is advantageous because it avoids many of the caveats that make gradient methods slow on highly non-convex problems. The method exhibits strong scaling in the distributed setting, yielding linear speedups even when split over thousands of cores.",
+    "creator" : "LaTeX with hyperref package"
+  }
+}

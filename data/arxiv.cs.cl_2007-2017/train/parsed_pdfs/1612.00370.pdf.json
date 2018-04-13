@@ -1,0 +1,539 @@
+{
+  "name" : "1612.00370.pdf",
+  "metadata" : {
+    "source" : "CRF",
+    "title" : "Optimization of image description metrics using policy gradient methods",
+    "authors" : [ "Siqi Liu", "Zhenhai Zhu", "Ning Ye", "Sergio Guadarrama", "Kevin Murphy" ],
+    "emails" : [ "siqi.liu@cs.ox.ac.uk", "zhenhai@google.com", "nye@google.com", "sguada@google.com", "kpmurphy@google.com" ],
+    "sections" : [ {
+      "heading" : "1 Introduction",
+      "text" : "Image description (captioning) is the task of describing the visual content of an image using one or more sentences. This has many applications, including text-based image retrieval, accessibility for blind users, and human-robot interaction. There are many ways to perform this task (see [5] for a recent review). In this paper, we focus on improving the current state of the art method, which is based on encoder-decoder neural networks. In such a model, the image content is encoded using a convolutional neural network (CNN), and then the text is generated, one word at a time, using a recurrent neural network (RNN).\nOne major flaw with current approaches is that they\n∗The major part of this work was done while Siqi Liu was an intern at Google.\nuse (penalized) maximum likelihood estimation (MLE) for training. That is, the model parameters θ are trained to maximize\nL(θ) = 1\nN N∑ n=1 log p(yn|xn,θ)\n= 1\nN N∑ n=1 Tn∑ t=1 log p(ynt |yn1:t−1,xn,θ)\nwhere xn is the n’th image, yn = (yn1 , . . . , y n Tn ) is the ground truth caption of the n’th image and N is the total number of labeled examples. Depending on the dataset, there could be multiple ground truth captions for a given image although it does not affect our derivation of the algorithm. We ignore this distinction in this paper for notational clarity.\nThe main trouble with this objective is that each prediction is conditioned on the previously observed words from the ground truth. However, at test time, the model will be fed its own predictions. This discrepancy has been called “exposure bias” [14], and can lead to poor performance at inference time. In particular, errors made at an intermediate step can quickly accumulate over the following steps, so the model will likely diverge from desired trajectories. One approach to mitigate this, known as “scheduled sampling”, was proposed in [4]; however, this method has been shown to be statistically inconsistent [9], although it improves model performance in practice. Another problem with MLE is that it only evaluates how much probability is assigned to the true sequence; the quality of all other generated sequences is ignored.\nA better approach is to optimize for the same metrics that we use at test time, such as BLEU [13], CIDEr [19], METEOR [3], and ROUGE [10]; we shall call these metrics “BCMR” for short. Although these metrics are not differentiable, we can use policy gradient (PG) methods\n1\nar X\niv :1\n61 2.\n00 37\n0v 1\n[ cs\n.C V\n] 1\n[16] to optimize them, by treating the score of a candidate sentence as analogous to a reward signal in a reinforcement learning setting. In such a framework, the RNN decoder acts like a stochastic policy, where choosing an action corresponds to generating a word.\nThe idea of using PG to optimize BLEU score for image captioning has been previously explored in [14]. These authors used a special case of PG known as REINFORCE [22], which they combined with MLE to create a learning method called “MIXER’. However, in their PG method, they implicitly assumed each intermediate action (word) in a partial sequence has the same reward as the sequence-level reward, which is not true in general.\nIn this paper, we extend this prior work in several ways. First, we use an improved implementation of PG, which estimates the expected future reward of each intermediate action using Monte Carlo rollouts, as in [28]. We also use a learned parametric baseline estimator to reduce the variance of the estimate. The proposed training algorithm is able to surpass the previous state of the art on the MSCOCO captioning leaderboard [11], despite the simplicity of the captioning model itself (Section 4).\nSecond, we extend our technique to directly optimize the recently introduced SPICE metric [1], which has been shown to correlate much more closely with human judgement of semantic quality than previous BCMR metrics. We show that incorporating this metric results in captions that are deemed significantly better when judged by human raters.\nFinally, we show that our proposed method is orthogonal to other techniques proposed in recent literature. As a proof of concept, we show how to integrate an image tagging system [6], which has been pre-trained on a large quantity of noisily labeled web images, as an additional input to the decoder (beyond just the CNN features). We show that this method enables more effective use of such additional inputs, compared to MLE baselines."
+    }, {
+      "heading" : "2 Related work",
+      "text" : "There is an extensive body of work on image captioning, which is too large to review here. See [5] for a recent summary. The most relevant piece of prior work is [21], who proposed one of the first encoder-decoder networks for image captioning, called “Show and Tell” (ST), also known as ”Neural Image Captioner” (NIC). As our contribution is orthogonal to the underlying model architecture, we use the same ST model for most of this paper.\nNumerous extensions to the basic encoder-decoder framework have been proposed, many of which try to enrich the encoder’s representation, so that the image is not represented just by the global features from a CNN. One common approach is to use an attention mechanism, which\nlets the decoder focus on specific parts of the input image. This approach is used in [24], who proposed the “Show, Attend and Tell” model. See also [25] for a more recent extension, that applies an attentional RNN on top of the encoder before passing to the decoder. In this paper, we do not use attention mechanisms; nevertheless, we are able to outperform such models, by optimizing better learning objectives.\nAnother approach is to add high level image visual attributes to the model, enriching the image encoding beyond the CNN. This usually takes the form of an image tagger [23, 26], but can also use specialized modules, such as object detectors [20], or face detection and landmark recognition [18].\nThere is some recent work on optimizing sequence level objective functions, instead of maximum likelihood training, but mostly in the context of machine translation (see e.g. [12, 28, 2, 15]). Recent work in visual explaination such as [8] employed REINFORCE to optimize sequence level reward such that generated captions are class discriminative, which is orthogonal to our goal. As far as we know, the only paper to explore objectives beyond maximum likelihood for image captioning is the MIXER method of [14]. However, we significantly outperform this method, as we show in Section 4, by using an improved and more general PG algorithm."
+    }, {
+      "heading" : "3 Methods",
+      "text" : "In this section, we explain our approach in more detail. First we discuss the policy gradient algorithm, which can be used to optimize any kind of reward function. Next we discuss which reward function to use. We then discuss the model itself, which is a standard CNN-RNN. Finally we discuss an extension to the basic model, which uses a pre-trained image tagger for improved performance."
+    }, {
+      "heading" : "3.1 Training using policy gradient",
+      "text" : "At time step t, we pick a discrete action, which corresponds to choosing a word gt ∈ V , using a stochastic policy or generator πθ(gt|st,x), where st = g1:t−1 is the sequence of words chosen so far, x is the image and θ are the parameters of the model. Note that in our case the state transition function is deterministic: we simply append the word chosen at time t to get st+1 = st; gt, where u; v is the concatenation of the strings u and v.\nWhen we reach the end of the sequence (i.e., once the generator emits the end-of-sentence marker), we get a reward of R(g1:T |xn,yn), which is the score for producing caption g1:T given image xn and ground truth caption (or set of captions) yn. This reward can be any function, such as BCMR or SPICE.\nAlthough rewards are only computed once we have reached the end of the sentence, it is useful to have an indication of the quality of a partial sequence. So we define the value of a state (partial sequence) as its expected future reward:\nVθ(g1:t|xn,yn) = Egt+1:T [R(g1:t; gt+1:T |xn,yn)] (1)\nwhere the expectation is w.r.t. gt+1:T ∼ πθ(·|g1:t,xn). Our goal is optimize the average reward starting from the initial (empty) state s0, averaged over the examples in the training set. Hence we define the following objective, which we wish to maximize:\nJ(θ) = 1\nN N∑ n=1 Vθ(s0|xn,yn) (2)\nWe now discuss how to optimize Eqn. (2). For simplicity, we will consider a single example n, so we will drop the xn and yn notation. To compute the gradient of J(θ), we can use the policy gradient theorem from [16]. In the special case of deterministic transition functions, this theorem simplifies as shown below (see [2] for a proof):\n∇θVθ(s0) = Eg1:T  T∑ t=1 ∑ gt∈V ∇θπθ(gt|g1:t−1)Qθ(g1:t−1, gt)  (3) where we define the Q function for a state-action pair as follows:\nQθ(g1:t−1, gt) = Egt+1:T [R(g1:t−1; gt; gt+1:T )] (4)\nWe can approximate the gradient of the value function with M sample paths, gm1:T ∼ πθ, generated from our policy. This gives\n∇θVθ(s0) ≈ 1\nM M∑ m=1 T∑ t=1 Egt [ ∇θ log πθ(gt|gm1:t−1)\n×Qθ(gm1:t−1, gt) ]\n(5)\nwhere the expectation is w.r.t. gt ∼ πθ(gt|gm1:t−1), and where we have exploited the fact that\n∇θπθ(a|s) = πθ(a|s) ∇θπθ(a|s) πθ(a|s) = πθ(a|s)∇θ log πθ(a|s)\nIf we use M = 1, we can additionally replace the Egt with the value in the sample path, gmt , as in REINFORCE. In our experiment, we used M = 1 and we subsequently drop the superscript m in the rest of this paper for notational clarity.\nThe only remaining question is how to estimate the function Q(st, gt). For this, we will follow [28] and use Monte Carlo rollouts. In particular, we first sample K\ncontinuations of the sequence st; gt to get gkt+1:T . Then we compute the average\nQ(g1:t−1, gt) ≈ 1\nK K∑ k=1 R(g1:t−1; gt; g k t+1:T ) (6)\nIf we are in a terminal state, we define Q(g1:T , EOS) = R(g1:T ). This process is illustrated in Figure 1 where we show the case of K = 3. In English, we estimate how good a particular word choice gt is by averaging over all complete sequences sampled according to the current policy, conditioned on the partial sequence g1:t−1 sampled from the current policy so far.\nThe above gradient estimator is an unbiased but high variance estimator. One way to reduce its variance is to estimate the expected baseline reward Egt [Q(g1:t−1, gt)] using a parametric function; we will denote this baseline as Bφ(g1:t−1). We then subtract this baseline from Qθ(g1:t−1, gt) to get the following estimate for the gradient (using M = 1 sample paths):\n∇θVθ(s0) ≈ T∑ t=1 ∑ gt [πθ(gt|st)∇θ log πθ(gt|st)\n× (Qθ(st, gt)−Bφ(st))] (7)\nwhere st = g1:t−1. Subtracting the baseline does not affect the validity of the estimated gradient gradient, but reduces its variance. Here, we simply refer to prior work ([29], [22]) for a full derivation of this property. We train the parameters φ of the baseline estimator to minimize the following loss:\nLφ = ∑ t EstEgt(Qθ(st, gt)−Bφ(st))2 (8)\nIn our experiments, the baseline estimator is an MLP which takes as input the hidden state of the RNN at step t. To avoid creating a feedback loop, we do not back-propagate gradients through the hidden state from this loss.\nIn language generation settings, a major challenge facing PG algorithms is the large action space. This is the case in our task, where the action space corresponds to the entire vocabulary of 8,855 symbols. To help “warm start” the training, we pre-train the RNN decoder (stochastic policy) using a cross-entropy loss, before switching to PG training. This prevents the agent from performing random walks through exponentially many possible paths at the beginning of the training.\nThe overall algorithm is summarized in Algorithm 1. Note that the Monte Carlo rollouts only require a forward pass through the RNN, which is much more efficient than the forward-backward pass needed for the CNN. Additionally the rollouts can be also be done in parallel for multiple sentences. Consequently, PG training is only about twice as slow as MLE training.\nAlgorithm 1: PG training algorithm 1 Input: D = {(xn,yn) : n = 1 : N} ; 2 Train πθ(g1:T |x) using MLE on D ; 3 Train Bφ using MC estimates of Qθ on a small subset\nof D; 4 for each epoch do 5 for example (xn, yn) do 6 Generate sequence g1:T ∼ πθ(·|xn) ; 7 for t = 1 : T do 8 Compute Q(g1:t−1, gt) for gt with K Monte Carlo rollouts, using (6); 9 Compute estimated baseline Bφ(g1:t−1);\n10 Compute Gθ = ∇θVθ(s0) using (7); 11 Compute Gφ = ∇φLφ; 12 SGD update of θ using Gθ; 13 SGD update of φ using Gφ;"
+    }, {
+      "heading" : "3.2 Reward Functions for the Policy Gradient",
+      "text" : "We can use our PG method to optimize many different reward functions. Common choices include BLEU, CIDEr, METEOR and ROUGE. Code for all of these metrics is available as part of the MSCOCO evaluation toolkit.1 We decided to use a weighted combination of all of these. Since these metrics are not on the same scale, we chose in our experiments the set of weights such that all metrics have approximately the same magnitude. In\n1 https://github.com/tylin/coco-caption.\nparticular, we chose 0.5, 0.5, 1.0, 1.0, 1.0, 5.0, 2.0 for BLEU-1, BLEU-2, BLEU-3, BLEU-4, CIDEr, METEOR and ROUGE respectively. Optimizing this weighted combination of BCMR gives state-of-the-art results on the MSCOCO test set, as we discuss in Section 4.2.\nOne problem with the BCMR metrics is that they are not well correlated with human judgment individually [1]. We therefore also tried optimizing the recently introduced SPICE metric [1], which better reflects human estimates of quality. In particular, SPICE is the only metric that ranks humans above algorithms in terms of captioning quality on the MSCOCO benchmark. We use the open source release of the SPICE code2 to evaluate the metric.\nInterestingly, we have found that just optimizing SPICE tended to result in captions which are very detailed (as desired), but which often had many repeated phrases, as we show in Section 4. This is because SPICE measures semantic similarity (in terms of a scene graph) between sets of sentences, but does not pay attention to syntactical factors (modulo the requirement that the generated sentence be parseable). We therefore combined SPICE with the CIDEr metric (considered as the best of the standard automatic metrics for MSCOCO), a combination we call SPIDEr for short. Based on preliminary experiments, we decided to use an equal weighting for both."
+    }, {
+      "heading" : "3.3 Encoder-decoder architecture",
+      "text" : "We use a CNN-RNN architecture similar to the one proposed in the original Show-Tell paper [21]. A high-level diagram is shown in Figure 2. Each symbol in the vocabulary is embedded as a 512 dimensional dense word embedding vector, whose values are initialized randomly.\nThe encoder CNN is implemented as an Inception-V3 [17] network pretrained on ImageNet3.The\n2 https://github.com/peteanderson80/SPICE. 3We used the open-source implementation available at:\nRNN decoder is a one-layer LSTM with a state size of 512 units, initialized randomly. Each image is encoded by Inception-V3 as a dense feature vector of dimension 2, 048 which is then projected to 512 dimension with a linear layer and used as the initial state of RNN decoder.\nAt training time, we always feed in the ground truth symbol to the RNN decoder; at inference time, the sampled output is fed to the RNN as the next input symbol. We use a greedy decoding procedure, in which we pick the most probable word at each time step. Note that this is suboptimal, since\nT∏ t=1 max gt p(gt|g1:t−1) ≤ max g1:T T∏ t=1 p(gt|g1:t−1) (9)\nWe can better approximate the globally optimal sequence by using beam search. However, we find that models trained with PG do not benefit from this in practice, since they tend to concentrate their probability mass on a very small number of actions at each step."
+    }, {
+      "heading" : "3.4 Adding visual tags",
+      "text" : "In this section, we describe a simple extension to the basic model from Section 3.3. In particular, we leverage an in-house image tagging system, which is trained on a large, but noisily labeled, dataset called JFT (see [6] for details). This system returns a vector of probability scores p = {p0, p1, ..., pN} for a set of N = 3, 713 classes, where pi ∈ [0, 1] indicates the probability of presence of a visual attribute of class i in the image. Typically 60–70 tags have a non-zero confidence score for each image. See Figure 1 for some example outputs from this system. A high-level diagram of this architecture is shown in Figure 3.\nhttps://github.com/tensorflow/models/blob/master/ slim/nets/inception_v3.py\nGiven the visual tag score vector, we compute the input to the decoder RNN at time t by combining the scores from the tagger with the previous word in the sequence as follows:\nxt = Twwt +Tpp (10)\nwhere wt is the embedding of the t’th word, Tw ∈ Rdh×dw maps the word embedding to the RNN state space, p is the vector of tag probabilities, and Tp ∈ Rdh×dp maps from the dp = N tags to the RNN state space. We shall call our model Show-Tell-Tag.\nOur attribute augmented model is similar to LSTM-A5, recently introduced in [26]. The main difference lies in the choice of CNN (we used Inception-V3 as opposed to ResNet) as well as the vocabulary of visual tags (we train on an internal dataset with 3k noisy tags, whereas they use multi-instance learning to train a classifier to predict the top 1k words in MSCOCO). (See also [23] for some related work on using visual tags for image captioning.)"
+    }, {
+      "heading" : "4 Results",
+      "text" : "In this section, we report results obtained by different methods on the MSCOCO dataset. This has 82,081 training images, and 40,137 validation images, each with at least 5 ground truth captions. Following standard practice for methods that evaluate on the MSCOCO test server, we hold out a small subset of 1,665 validation images for hyper-parameter tuning, and use the remaining combined training and validation set for training.\nWe preprocess the text data by lower casing, and replacing words which occur less than 4 times in the 82k training set with UNK; this results in a vocabulary size of 8,855 (identical to the one used in [21]). At training time, we keep all captions to their maximum lengths. At testing time, the generated sequences are truncated to 30 symbols in all experiments.\nWe report results of the following 7 systems:\n• MLE: the Show-Tell model, trained with maximum likelihood estimation. This is our baseline approach, and is close to state of the art. Note that our implementation gives similar results to [21], which uses the same model, but was trained with scheduled sampling.\n• MLE-TAG: the Show-Tell-Tag model trained with MLE.\n• PG-BCMR: the Show-Tell model trained using PG to optimize the BCMR metric.\n• PG-BCMR-TAG: the Show-Tell-Tag model trained using PG to optimize the BCMR metric.\n• PG-SPICE: the Show-Tell model trained using PG to optimize the SPICE metric.\n• PG-SPIDEr: the Show-Tell model trained using PG to optimize the SPIDEr metric (with equal weight on SPICE and on CIDEr).\n• PG-SPIDEr-TAG: the Show-Tell-Tag model trained using PG to optimize the SPIDEr metric (with equal weight on SPICE and on CIDEr)."
+    }, {
+      "heading" : "4.1 Qualitative Analysis",
+      "text" : "Table 1 shows some example captions generated by the 7 different systems. We see that PG-SPICE tends to generate ungrammatical sentences, with a lot of repeated phrases. This is because SPICE measures how well the scene graph induced by a sentence matches the ground truth scene graph, but is relatively insensitive to syntactic quality. However, we also see that by combining SPICE with CIDEr, we get much better results. Henceforth we shall only consider the SPIDEr metric, and will ignore pure SPICE."
+    }, {
+      "heading" : "4.2 Results using automatic metrics on MSCOCO",
+      "text" : "In this section, we quantitatively evaluate the methods using the MSCOCO online evaluation server 4.\nTable 2 shows the performance of various state-of-the-art models in the literature for image captioning. In particular, we show the best performing models according to the official MSCOCO C-5 leaderboard at the time of writing (Nov 2016). We also report the results of 6 experiments we ran, which include all our models except for PG-SPICE.\nWe start by discussing the results of our baseline ST models, without using the image tagger. We see that all the PG methods outperform MLE training. We also see that the PG methods significantly outperform all previous methods, even the ones which use more sophisticated models, such as those based on attention (Montreal/Toronto, ATT, Review Net), those that use more complex decoders (Berkeley LRCN), and those that use high-level visual attributes (MSM@MSRA, ATT).\nOur PG method also outperforms MIXER [14], which is the only prior work (to the best of our knowledge) which uses PG for image captioning. Note, however, that the BLEU-4 metric quoted for MIXER is not directly comparable to our numbers, as the authors only performed evaluation on 5, 000 images from the MSCOCO validation set, not on the official test server. (Their code for image captioning is not available, so we have not been able to do an apples-to-apples comparison.)\n4mscoco.org/dataset/#captions-leaderboard\nFinally, we see that adding visual tags conistently improves the performance of PG-SPIDEr (especially on the CIDEr metric), but not when using MLE or PG-BCMR training. A detailed investigation into why this is the case is left to future work."
+    }, {
+      "heading" : "4.3 Results using human metrics on MSCOCO",
+      "text" : "Since we know that BCMR metrics are not well correlated with human measures of quality, we decided to evaluate the methods using human raters. In particular, we use a crowd sourcing platform, using raters who have prior experience with evaluating image captioning and other computer vision models. We showed each image-caption pair to 3 different raters, and asked them to evaluate it on a 4 point scale, depending on whether the caption is “bad”, “okay”, “good” or “excellent”.5 We then take the majority vote to get the final rating. If no majority is found, the rating is considered unknown, and this image is excluded from the analysis.\nTo simplify the presentation, we just focus on measuring the fraction of captions that are classified as “not bad”, which we interpret as the union of “okay”, “good” and “excellent”. (The reason for this is that we want to be sure\n5 The definitions of these terms, which we gave to raters, is as follows. Excellent: “The caption correctly, specifically and completely describes the foreground/main objects/events/theme of the image.” Good: “The caption correctly and specifically describes most of the foreground/main objects/events/theme of the image, but has minor mistakes in some minor aspects.” Okay: “The caption correctly describes some of the foreground/main objects/events/theme of the image, but is not specific to the image and has minor mistakes in some minor aspects.” Bad: “The caption misses the foreground/main objects/events/theme of the image or the caption contains obviously hallucinated objects/activities/relationships.”\nthat any image captioning system we use does not make bad or embarassing mistakes.)\nAs a sanity check, we first evaluated 505 ground truth captions from the validation set. Humans said that 87% of these captions were “not bad”. Some of the 13% of captions that were labeled “bad” do indeed contain errors6, due to the fact that MSCOCO captions were generated by AMT workers who are not perfect. On the other hand, some captions seem reasonable to us, but did not meet the strict quality criteria our raters were looking for. In any case, 87% is an an approximate upper bound on performance we can hope to achieve on the MSCOCO test set.\nWe then randomly sampled 492 images from the test set (for which we do not have access to the ground truth captions), and generated captions from all of them using our 6 systems, and sent them for human evaluation. Figure 4 shows the fraction of captions that are “not bad” compared to the MLE baseline of 38%. We draw the following conclusions:\n• All methods are far below the human ceiling of 87%, and no system is good enough for use in the real world. • All PG methods outperform MLE training by a very significant margin (see Table 3 for pairwise p-value analysis). This is because the PG methods optimize metrics that are much more closely related to caption quality than the likelihood score. • PG-SPIDEr outperforms PG-BCMR by a 4% margin, despite the fact that PG-BCMR outperforms PG-SPIDEr on all the automatic metrics. This is because SPIDEr captures both fluency and semantic properties of the caption, both of which human raters are told to pay attention to, whereas BCMR is a more syntactic measure. • Adding the image tagger seems to hurt performance, even though PG-SPIDEr-TAG is superior to PG-SPIDEr according to automatic metrics. We are not entirely sure of the reason for this, and plan to investigate it in future work."
+    }, {
+      "heading" : "5 Conclusion and future work",
+      "text" : "In this paper, we have shown how using policy gradient methods to optimize the BCMR and SPICE metrics results in much better performance than standard maximum likelihood training. However, we have also seen that none of these existing metrics is perfect; in fact, to get our best results (as judged by humans) we had to combine the SPICE and CIDEr metrics. In future work, we would like\n6 For example, some captions contain repeated words, e.g., “this is an image image of a modern kitchen”. Others contain typos, e.g., “a blue and white truck with pants in it’s flat bed”. And some do not make semantic sense, e.g., “A crowd of people parked near a double decker bus”.\nto explore the possibility of using sequence GANs [28] to automatically learn to distinguish good from bad captions, without having to specify the quality metric explicitly.\nWe would also like to explore alternatives to the simple PG method we used in this paper. For example, we might investigate an actor-critic method, similar to [2], or the ML-PG hybrid described in [12].\nFinally, from a computer vision point of view, we would like to explore the use of more sophisticated representations of the scene, going beyond the generic encoding provided by the CNN. Our use of visual tags was a first step in that direction, but this did not seem to provide much benefit. We would like to investigate this further, by examining performance on other datasets, and using methods that are more sophisticated than image tagging, such as object detectors (cf. [20])."
+    } ],
+    "references" : [ {
+      "title" : "Spice: Semantic propositional image caption evaluation",
+      "author" : [ "P. Anderson", "B. Fernando", "M. Johnson", "S. Gould" ],
+      "venue" : "In ECCV, 2016",
+      "citeRegEx" : "1",
+      "shortCiteRegEx" : "1",
+      "year" : 2016
+    }, {
+      "title" : "An Actor-Critic algorithm for sequence",
+      "author" : [ "D. Bahdanau", "P. Brakel", "K. Xu", "A. Goyal", "R. Lowe", "J. Pineau", "A. Courville", "Y. Bengio" ],
+      "venue" : "prediction. Arxiv,",
+      "citeRegEx" : "2",
+      "shortCiteRegEx" : "2",
+      "year" : 2016
+    }, {
+      "title" : "METEOR: An automatic metric for MT evaluation with improved correlation with human judgments. In Proc. ACL workshop on intrinsic and extrinsic evaluation measures for machine translation",
+      "author" : [ "S. Banerjee", "A. Lavie" ],
+      "venue" : "and/or summarization,",
+      "citeRegEx" : "3",
+      "shortCiteRegEx" : "3",
+      "year" : 2005
+    }, {
+      "title" : "Scheduled sampling for sequence prediction with recurrent neural networks",
+      "author" : [ "S. Bengio", "O. Vinyals", "N. Jaitly", "N. Shazeer" ],
+      "venue" : "In NIPS,",
+      "citeRegEx" : "4",
+      "shortCiteRegEx" : "4",
+      "year" : 2015
+    }, {
+      "title" : "Automatic description generation from images: A survey of models, datasets, and evaluation measures",
+      "author" : [ "R. Bernardi", "R. Cakici", "D. Elliott", "A. Erdem", "E. Erdem", "N. Ikizler-Cinbis", "F. Keller", "A. Muscat", "B. Plank" ],
+      "venue" : "J. of AI Research,",
+      "citeRegEx" : "5",
+      "shortCiteRegEx" : "5",
+      "year" : 2016
+    }, {
+      "title" : "Information-theoretical label embeddings for large-scale image classification",
+      "author" : [ "F. Chollet" ],
+      "venue" : "Arxiv, 19 July 2016",
+      "citeRegEx" : "6",
+      "shortCiteRegEx" : "6",
+      "year" : 2016
+    }, {
+      "title" : "Long-term recurrent convolutional networks for visual recognition and description",
+      "author" : [ "J. Donahue", "L. Anne Hendricks", "S. Guadarrama", "M. Rohrbach", "S. Venugopalan", "K. Saenko", "T. Darrell" ],
+      "venue" : "In CVPR,",
+      "citeRegEx" : "7",
+      "shortCiteRegEx" : "7",
+      "year" : 2015
+    }, {
+      "title" : "Generating visual explanations",
+      "author" : [ "L.A. Hendricks", "Z. Akata", "M. Rohrbach", "J. Donahue", "B. Schiele", "T. Darrell" ],
+      "venue" : "ECCV, 2016",
+      "citeRegEx" : "8",
+      "shortCiteRegEx" : "8",
+      "year" : 2016
+    }, {
+      "title" : "How (not) to train your generative model: Scheduled sampling, likelihood",
+      "author" : [ "F. Huszár" ],
+      "venue" : "adversary? Arxiv,",
+      "citeRegEx" : "9",
+      "shortCiteRegEx" : "9",
+      "year" : 2015
+    }, {
+      "title" : "Automatic evaluation of summaries using n-gram co-occurrence statistics",
+      "author" : [ "C.-Y. Lin", "E. Hovy" ],
+      "venue" : "In NAACL, pages 71–78,",
+      "citeRegEx" : "10",
+      "shortCiteRegEx" : "10",
+      "year" : 2003
+    }, {
+      "title" : "Microsoft  Under review as a conference paper at CVPR 2017 COCO: Common objects in context",
+      "author" : [ "T.-Y. Lin", "M. Maire", "S. Belongie", "J. Hays", "P. Perona", "D. Ramanan", "P. Dollár", "C. Lawrence Zitnick" ],
+      "venue" : "In ECCV,",
+      "citeRegEx" : "11",
+      "shortCiteRegEx" : "11",
+      "year" : 2014
+    }, {
+      "title" : "Reward augmented maximum likelihood for neural structured prediction",
+      "author" : [ "M. Norouzi", "S. Bengio", "Z. Chen", "N. Jaitly", "M. Schuster", "Y. Wu", "D. Schuurmans" ],
+      "venue" : "In NIPS,",
+      "citeRegEx" : "12",
+      "shortCiteRegEx" : "12",
+      "year" : 2016
+    }, {
+      "title" : "BLEU: A method for automatic evaluation of machine translation",
+      "author" : [ "K. Papineni", "S. Roukos", "T. Ward", "W.-J. Zhu" ],
+      "venue" : "In Proc. ACL,",
+      "citeRegEx" : "13",
+      "shortCiteRegEx" : "13",
+      "year" : 2002
+    }, {
+      "title" : "Sequence level training with recurrent neural networks",
+      "author" : [ "M. Ranzato", "S. Chopra", "M. Auli", "W. Zaremba" ],
+      "venue" : "Arxiv,",
+      "citeRegEx" : "14",
+      "shortCiteRegEx" : "14",
+      "year" : 2015
+    }, {
+      "title" : "Minimum risk training for neural machine translation",
+      "author" : [ "S. Shen", "Y. Cheng", "Z. He", "W. He", "H. Wu", "M. Sun", "Y. Liu" ],
+      "venue" : "In Proc. ACL,",
+      "citeRegEx" : "15",
+      "shortCiteRegEx" : "15",
+      "year" : 2016
+    }, {
+      "title" : "Policy gradient methods for reinforcement learning with function approximation",
+      "author" : [ "R.S. Sutton", "D. Mc Allester", "S. Singh", "Y. Mansour" ],
+      "venue" : "In NIPS,",
+      "citeRegEx" : "16",
+      "shortCiteRegEx" : "16",
+      "year" : 1999
+    }, {
+      "title" : "Rethinking the inception architecture for computer vision",
+      "author" : [ "C. Szegedy", "V. Vanhoucke", "S. Ioffe", "J. Shlens", "Z. Wojna" ],
+      "venue" : "arXiv preprint arXiv:1512.00567,",
+      "citeRegEx" : "17",
+      "shortCiteRegEx" : "17",
+      "year" : 2015
+    }, {
+      "title" : "Rich image captioning in the wild",
+      "author" : [ "K. Tran", "X. He", "L. Zhang", "J. Sun", "C. Carapcea", "C. Thrasher", "C. Buehler", "C. Sienkiewicz" ],
+      "venue" : "In CVPR,",
+      "citeRegEx" : "18",
+      "shortCiteRegEx" : "18",
+      "year" : 2016
+    }, {
+      "title" : "Cider: Consensus-based image description evaluation",
+      "author" : [ "R. Vedantam", "C. Lawrence Zitnick", "D. Parikh" ],
+      "venue" : "In CVPR, pages 4566–4575,",
+      "citeRegEx" : "19",
+      "shortCiteRegEx" : "19",
+      "year" : 2015
+    }, {
+      "title" : "Captioning images with diverse",
+      "author" : [ "S. Venugopalan", "L.A. Hendricks", "M. Rohrbach", "R. Mooney", "T. Darrell", "K. Saenko" ],
+      "venue" : "objects. Arxiv,",
+      "citeRegEx" : "20",
+      "shortCiteRegEx" : "20",
+      "year" : 2016
+    }, {
+      "title" : "Show and tell: A neural image caption generator",
+      "author" : [ "O. Vinyals", "A. Toshev", "S. Bengio", "D. Erhan" ],
+      "venue" : "In CVPR,",
+      "citeRegEx" : "21",
+      "shortCiteRegEx" : "21",
+      "year" : 2015
+    }, {
+      "title" : "Simple statistical gradient-following algorithms for connectionist reinforcement learning",
+      "author" : [ "R.J. Williams" ],
+      "venue" : "Machine Learning J., 8(3-4):229–256,",
+      "citeRegEx" : "22",
+      "shortCiteRegEx" : "22",
+      "year" : 1992
+    }, {
+      "title" : "What value high level concepts in vision to language problems",
+      "author" : [ "Q. Wu", "C. Shen", "A. van den Hengel", "L. Liu", "A. Dick" ],
+      "venue" : "In CVPR,",
+      "citeRegEx" : "23",
+      "shortCiteRegEx" : "23",
+      "year" : 2016
+    }, {
+      "title" : "Show, attend and tell: Neural image caption generation with visual attention",
+      "author" : [ "K. Xu", "J. Ba", "R. Kiros", "K. Cho", "A. Courville", "R. Salakhutdinov", "R. Zemel", "Y. Bengio" ],
+      "venue" : "In ICML,",
+      "citeRegEx" : "24",
+      "shortCiteRegEx" : "24",
+      "year" : 2015
+    }, {
+      "title" : "Review networks for caption generation",
+      "author" : [ "Z. Yang", "Y. Yuan", "Y. Wu", "R. Salakhutdinov", "W.W. Cohen" ],
+      "venue" : "In NIPS,",
+      "citeRegEx" : "25",
+      "shortCiteRegEx" : "25",
+      "year" : 2016
+    }, {
+      "title" : "Boosting image captioning with attributes",
+      "author" : [ "T. Yao", "Y. Pan", "Y. Li", "Z. Qiu", "T. Mei" ],
+      "venue" : "In OpenReview,",
+      "citeRegEx" : "26",
+      "shortCiteRegEx" : "26",
+      "year" : 2016
+    }, {
+      "title" : "Image captioning with semantic attention",
+      "author" : [ "Q. You", "H. Jin", "Z. Wang", "C. Fang", "J. Luo" ],
+      "venue" : "arXiv preprint arXiv:1603.03925,",
+      "citeRegEx" : "27",
+      "shortCiteRegEx" : "27",
+      "year" : 2016
+    }, {
+      "title" : "SeqGAN: Sequence generative adversarial nets with policy gradient",
+      "author" : [ "L. Yu", "W. Zhang", "J. Wang", "Y. Yu" ],
+      "venue" : "Arxiv, 18 Sept. 2016",
+      "citeRegEx" : "28",
+      "shortCiteRegEx" : "28",
+      "year" : 2016
+    }, {
+      "title" : "Reinforcement learning neural turing machines-revised",
+      "author" : [ "W. Zaremba", "I. Sutskever" ],
+      "venue" : "arXiv preprint arXiv:1505.00521,",
+      "citeRegEx" : "29",
+      "shortCiteRegEx" : "29",
+      "year" : 2015
+    } ],
+    "referenceMentions" : [ {
+      "referenceID" : 4,
+      "context" : "There are many ways to perform this task (see [5] for a recent review).",
+      "startOffset" : 46,
+      "endOffset" : 49
+    }, {
+      "referenceID" : 13,
+      "context" : "This discrepancy has been called “exposure bias” [14], and can lead to poor performance at inference time.",
+      "startOffset" : 49,
+      "endOffset" : 53
+    }, {
+      "referenceID" : 3,
+      "context" : "One approach to mitigate this, known as “scheduled sampling”, was proposed in [4]; however, this method has been shown to be statistically inconsistent [9], although it improves model performance in practice.",
+      "startOffset" : 78,
+      "endOffset" : 81
+    }, {
+      "referenceID" : 8,
+      "context" : "One approach to mitigate this, known as “scheduled sampling”, was proposed in [4]; however, this method has been shown to be statistically inconsistent [9], although it improves model performance in practice.",
+      "startOffset" : 152,
+      "endOffset" : 155
+    }, {
+      "referenceID" : 12,
+      "context" : "A better approach is to optimize for the same metrics that we use at test time, such as BLEU [13], CIDEr [19], METEOR [3], and ROUGE [10]; we shall call these metrics “BCMR” for short.",
+      "startOffset" : 93,
+      "endOffset" : 97
+    }, {
+      "referenceID" : 18,
+      "context" : "A better approach is to optimize for the same metrics that we use at test time, such as BLEU [13], CIDEr [19], METEOR [3], and ROUGE [10]; we shall call these metrics “BCMR” for short.",
+      "startOffset" : 105,
+      "endOffset" : 109
+    }, {
+      "referenceID" : 2,
+      "context" : "A better approach is to optimize for the same metrics that we use at test time, such as BLEU [13], CIDEr [19], METEOR [3], and ROUGE [10]; we shall call these metrics “BCMR” for short.",
+      "startOffset" : 118,
+      "endOffset" : 121
+    }, {
+      "referenceID" : 9,
+      "context" : "A better approach is to optimize for the same metrics that we use at test time, such as BLEU [13], CIDEr [19], METEOR [3], and ROUGE [10]; we shall call these metrics “BCMR” for short.",
+      "startOffset" : 133,
+      "endOffset" : 137
+    }, {
+      "referenceID" : 15,
+      "context" : "[16] to optimize them, by treating the score of a candidate sentence as analogous to a reward signal in a reinforcement learning setting.",
+      "startOffset" : 0,
+      "endOffset" : 4
+    }, {
+      "referenceID" : 13,
+      "context" : "The idea of using PG to optimize BLEU score for image captioning has been previously explored in [14].",
+      "startOffset" : 97,
+      "endOffset" : 101
+    }, {
+      "referenceID" : 21,
+      "context" : "These authors used a special case of PG known as REINFORCE [22], which they combined with MLE to create a learning method called “MIXER’.",
+      "startOffset" : 59,
+      "endOffset" : 63
+    }, {
+      "referenceID" : 27,
+      "context" : "First, we use an improved implementation of PG, which estimates the expected future reward of each intermediate action using Monte Carlo rollouts, as in [28].",
+      "startOffset" : 153,
+      "endOffset" : 157
+    }, {
+      "referenceID" : 10,
+      "context" : "The proposed training algorithm is able to surpass the previous state of the art on the MSCOCO captioning leaderboard [11], despite the simplicity of the captioning model itself (Section 4).",
+      "startOffset" : 118,
+      "endOffset" : 122
+    }, {
+      "referenceID" : 0,
+      "context" : "Second, we extend our technique to directly optimize the recently introduced SPICE metric [1], which has been shown to correlate much more closely with human judgement of semantic quality than previous BCMR metrics.",
+      "startOffset" : 90,
+      "endOffset" : 93
+    }, {
+      "referenceID" : 5,
+      "context" : "As a proof of concept, we show how to integrate an image tagging system [6], which has been pre-trained on a large quantity of noisily labeled web images, as an additional input to the decoder (beyond just the CNN features).",
+      "startOffset" : 72,
+      "endOffset" : 75
+    }, {
+      "referenceID" : 4,
+      "context" : "See [5] for a recent summary.",
+      "startOffset" : 4,
+      "endOffset" : 7
+    }, {
+      "referenceID" : 20,
+      "context" : "The most relevant piece of prior work is [21], who proposed one of the first encoder-decoder networks for image captioning, called “Show and Tell” (ST), also known as ”Neural Image Captioner” (NIC).",
+      "startOffset" : 41,
+      "endOffset" : 45
+    }, {
+      "referenceID" : 23,
+      "context" : "This approach is used in [24], who proposed the “Show, Attend and Tell” model.",
+      "startOffset" : 25,
+      "endOffset" : 29
+    }, {
+      "referenceID" : 24,
+      "context" : "See also [25] for a more recent extension, that applies an attentional RNN on top of the encoder before passing to the decoder.",
+      "startOffset" : 9,
+      "endOffset" : 13
+    }, {
+      "referenceID" : 22,
+      "context" : "This usually takes the form of an image tagger [23, 26], but can also use specialized modules, such as object detectors [20], or face detection and landmark recognition [18].",
+      "startOffset" : 47,
+      "endOffset" : 55
+    }, {
+      "referenceID" : 25,
+      "context" : "This usually takes the form of an image tagger [23, 26], but can also use specialized modules, such as object detectors [20], or face detection and landmark recognition [18].",
+      "startOffset" : 47,
+      "endOffset" : 55
+    }, {
+      "referenceID" : 19,
+      "context" : "This usually takes the form of an image tagger [23, 26], but can also use specialized modules, such as object detectors [20], or face detection and landmark recognition [18].",
+      "startOffset" : 120,
+      "endOffset" : 124
+    }, {
+      "referenceID" : 17,
+      "context" : "This usually takes the form of an image tagger [23, 26], but can also use specialized modules, such as object detectors [20], or face detection and landmark recognition [18].",
+      "startOffset" : 169,
+      "endOffset" : 173
+    }, {
+      "referenceID" : 11,
+      "context" : "[12, 28, 2, 15]).",
+      "startOffset" : 0,
+      "endOffset" : 15
+    }, {
+      "referenceID" : 27,
+      "context" : "[12, 28, 2, 15]).",
+      "startOffset" : 0,
+      "endOffset" : 15
+    }, {
+      "referenceID" : 1,
+      "context" : "[12, 28, 2, 15]).",
+      "startOffset" : 0,
+      "endOffset" : 15
+    }, {
+      "referenceID" : 14,
+      "context" : "[12, 28, 2, 15]).",
+      "startOffset" : 0,
+      "endOffset" : 15
+    }, {
+      "referenceID" : 7,
+      "context" : "Recent work in visual explaination such as [8] employed REINFORCE to optimize sequence level reward such that generated captions are class discriminative, which is orthogonal to our goal.",
+      "startOffset" : 43,
+      "endOffset" : 46
+    }, {
+      "referenceID" : 13,
+      "context" : "As far as we know, the only paper to explore objectives beyond maximum likelihood for image captioning is the MIXER method of [14].",
+      "startOffset" : 126,
+      "endOffset" : 130
+    }, {
+      "referenceID" : 15,
+      "context" : "To compute the gradient of J(θ), we can use the policy gradient theorem from [16].",
+      "startOffset" : 77,
+      "endOffset" : 81
+    }, {
+      "referenceID" : 1,
+      "context" : "In the special case of deterministic transition functions, this theorem simplifies as shown below (see [2] for a proof): ∇θVθ(s0) = Eg1:T  T ∑",
+      "startOffset" : 103,
+      "endOffset" : 106
+    }, {
+      "referenceID" : 27,
+      "context" : "For this, we will follow [28] and use Monte Carlo rollouts.",
+      "startOffset" : 25,
+      "endOffset" : 29
+    }, {
+      "referenceID" : 28,
+      "context" : "Here, we simply refer to prior work ([29], [22]) for a full derivation of this property.",
+      "startOffset" : 37,
+      "endOffset" : 41
+    }, {
+      "referenceID" : 21,
+      "context" : "Here, we simply refer to prior work ([29], [22]) for a full derivation of this property.",
+      "startOffset" : 43,
+      "endOffset" : 47
+    }, {
+      "referenceID" : 20,
+      "context" : "Figure 2: Model architecture of Show and Tell image captioning system [21].",
+      "startOffset" : 70,
+      "endOffset" : 74
+    }, {
+      "referenceID" : 0,
+      "context" : "One problem with the BCMR metrics is that they are not well correlated with human judgment individually [1].",
+      "startOffset" : 104,
+      "endOffset" : 107
+    }, {
+      "referenceID" : 0,
+      "context" : "We therefore also tried optimizing the recently introduced SPICE metric [1], which better reflects human estimates of quality.",
+      "startOffset" : 72,
+      "endOffset" : 75
+    }, {
+      "referenceID" : 20,
+      "context" : "We use a CNN-RNN architecture similar to the one proposed in the original Show-Tell paper [21].",
+      "startOffset" : 90,
+      "endOffset" : 94
+    }, {
+      "referenceID" : 16,
+      "context" : "The encoder CNN is implemented as an Inception-V3 [17] network pretrained on ImageNet3.",
+      "startOffset" : 50,
+      "endOffset" : 54
+    }, {
+      "referenceID" : 5,
+      "context" : "In particular, we leverage an in-house image tagging system, which is trained on a large, but noisily labeled, dataset called JFT (see [6] for details).",
+      "startOffset" : 135,
+      "endOffset" : 138
+    }, {
+      "referenceID" : 0,
+      "context" : ", pN} for a set of N = 3, 713 classes, where pi ∈ [0, 1] indicates the probability of presence of a visual attribute of class i in the image.",
+      "startOffset" : 50,
+      "endOffset" : 56
+    }, {
+      "referenceID" : 25,
+      "context" : "Our attribute augmented model is similar to LSTM-A5, recently introduced in [26].",
+      "startOffset" : 76,
+      "endOffset" : 80
+    }, {
+      "referenceID" : 22,
+      "context" : "(See also [23] for some related work on using visual tags for image captioning.",
+      "startOffset" : 10,
+      "endOffset" : 14
+    }, {
+      "referenceID" : 20,
+      "context" : "We preprocess the text data by lower casing, and replacing words which occur less than 4 times in the 82k training set with UNK; this results in a vocabulary size of 8,855 (identical to the one used in [21]).",
+      "startOffset" : 202,
+      "endOffset" : 206
+    }, {
+      "referenceID" : 20,
+      "context" : "Note that our implementation gives similar results to [21], which uses the same model, but was trained with scheduled sampling.",
+      "startOffset" : 54,
+      "endOffset" : 58
+    }, {
+      "referenceID" : 13,
+      "context" : "Our PG method also outperforms MIXER [14], which is the only prior work (to the best of our knowledge) which uses PG for image captioning.",
+      "startOffset" : 37,
+      "endOffset" : 41
+    }, {
+      "referenceID" : 25,
+      "context" : "MSM@MSRA [26] 0.",
+      "startOffset" : 9,
+      "endOffset" : 13
+    }, {
+      "referenceID" : 24,
+      "context" : "330 Review Net [25] 0.",
+      "startOffset" : 15,
+      "endOffset" : 19
+    }, {
+      "referenceID" : 26,
+      "context" : "313 ATT [27] 0.",
+      "startOffset" : 8,
+      "endOffset" : 12
+    }, {
+      "referenceID" : 20,
+      "context" : "316 Google [21] 0.",
+      "startOffset" : 11,
+      "endOffset" : 15
+    }, {
+      "referenceID" : 6,
+      "context" : "309 Berkeley LRCN [7] 0.",
+      "startOffset" : 18,
+      "endOffset" : 21
+    }, {
+      "referenceID" : 13,
+      "context" : "306 MIXER* [14] 0.",
+      "startOffset" : 11,
+      "endOffset" : 15
+    }, {
+      "referenceID" : 23,
+      "context" : "292 Montreal/Toronto [24] 0.",
+      "startOffset" : 21,
+      "endOffset" : 25
+    }, {
+      "referenceID" : 27,
+      "context" : "to explore the possibility of using sequence GANs [28] to automatically learn to distinguish good from bad captions, without having to specify the quality metric explicitly.",
+      "startOffset" : 50,
+      "endOffset" : 54
+    }, {
+      "referenceID" : 1,
+      "context" : "For example, we might investigate an actor-critic method, similar to [2], or the ML-PG hybrid described in [12].",
+      "startOffset" : 69,
+      "endOffset" : 72
+    }, {
+      "referenceID" : 11,
+      "context" : "For example, we might investigate an actor-critic method, similar to [2], or the ML-PG hybrid described in [12].",
+      "startOffset" : 107,
+      "endOffset" : 111
+    }, {
+      "referenceID" : 19,
+      "context" : "[20]).",
+      "startOffset" : 0,
+      "endOffset" : 4
+    } ],
+    "year" : 2016,
+    "abstractText" : "In this paper, we propose a novel training procedure for image captioning models based on policy gradient methods. This allows us to directly optimize for the metrics of interest, rather than just maximizing likelihood of human generated captions. We show that by optimizing for standard metrics such as BLEU, CIDEr, METEOR and ROUGE, we can develop a system that improve on the metrics and ranks first on the MSCOCO image captioning leader board, even though our CNN-RNN model is much simpler than state of the art models. We further show that by also optimizing for the recently introduced SPICE metric, which measures semantic quality of captions, we can produce a system that significantly outperforms other methods as measured by human evaluation. Finally, we show how we can leverage extra sources of information, such as pre-trained image tagging models, to further improve quality.",
+    "creator" : "LaTeX with hyperref package"
+  }
+}

@@ -1,0 +1,584 @@
+{
+  "name" : "1704.07926.pdf",
+  "metadata" : {
+    "source" : "CRF",
+    "title" : "From Language to Programs: Bridging Reinforcement Learning and Maximum Marginal Likelihood",
+    "authors" : [ "Kelvin Guu", "Panupong Pasupat", "Evan Zheran Liu", "Percy Liang" ],
+    "emails" : [ "kguu@stanford.edu", "ppasupat@stanford.edu", "evanliu@stanford.edu", "pliang@cs.stanford.edu" ],
+    "sections" : [ {
+      "heading" : "1 Introduction",
+      "text" : "We are interested in learning a semantic parser that maps natural language utterances into executable programs (e.g., logical forms). For example, in Figure 1, a program corresponding to the utterance transforms an initial world state into a new world state. We would like to learn from indirect supervision, where each training example is only labeled with the correct output (e.g. a target world state), but not the program that produced that out-\nz*\nz'0.1\n0.1\n0.1 0.1 0.1\n0.1 0.1 0.1 0.1 0.1\np(z') = 10-4\np(z*) = 10-6\nred\nyellow hasHat blue hasShirt leftOf move\nmove1hasShirt\nput (Clarke et al., 2010; Liang et al., 2011; Krishnamurthy and Mitchell, 2012; Artzi and Zettlemoyer, 2013; Liang et al., 2017).\nThe process of constructing a program can be formulated as a sequential decision-making process, where feedback is only received at the end of the sequence when the completed program is executed. In the natural language processing literature, there are two common approaches for handling this situation: 1) reinforcement learning (RL), particularly the REINFORCE algorithm (Williams, 1992; Sutton et al., 1999), which maximizes the expected reward of a sequence of actions; and 2) maximum marginal likelihood (MML), which treats the sequence of actions as a latent variable, and then maximizes the marginal likelihood of observing the correct program output (Dempster et al., 1977).\nWhile the two approaches have enjoyed success on many tasks, we found them to work poorly out of the box for our task. This is because in addition to the sparsity of correct programs, our task also requires weeding out spurious programs (Pasupat and Liang, 2016): incorrect interpretations\nar X\niv :1\n70 4.\n07 92\n6v 1\n[ cs\n.A I]\n2 5\nA pr\n2 01\n7\nof the utterances that accidentally produce the correct output, as illustrated in Figure 1.\nWe show that MML and RL optimize closely related objectives. Furthermore, both MML and RL methods have a mechanism for exploring program space in search of programs that generate the correct output. We explain why this exploration tends to quickly concentrate around short spurious programs, causing the model to sometimes overlook the correct program. To address this problem, we propose RANDOMER, a new learning algorithm with two parts:\nFirst, we propose randomized beam search, an exploration strategy which combines the systematic beam search traditionally employed in MML with the randomized off-policy exploration of RL. This increases the chance of finding correct programs even when the beam size is small or the parameters are not pre-trained.\nSecond, we observe that even with good exploration, the gradients of both the RL and MML objectives may still upweight entrenched spurious programs more strongly than correct programs with low probability under the current model. We propose a meritocratic parameter update rule, a modification to the MML gradient update, which more equally upweights all programs that produce the correct output. This makes the model less likely to overfit spurious programs.\nWe apply RANDOMER to train a new neural semantic parser, which outputs programs in a stackbased programming language. We evaluate our resulting system on SCONE, the context-dependent semantic parsing dataset of Long et al. (2016). Our approach outperforms standard RL and MML methods in a direct comparison, and achieves new state-of-the-art results, improving over Long et al. (2016) in all three domains of SCONE, and by over 30% accuracy on the most challenging one."
+    }, {
+      "heading" : "2 Task",
+      "text" : "We consider the semantic parsing task in the SCONE dataset1 (Long et al., 2016). As illustrated in Figure 1, each example consists of a world containing several objects (e.g., people), each with certain properties (e.g., shirt color and hat color). Given the initial world state w0 and a sequence of M natural language utterances u = (u1, . . . , uM ), the task is to generate a program that manipulates the world state according to the utterances. Each\n1 https://nlp.stanford.edu/projects/scone\nutterance um describes a single action that transforms the world state wm−1 into a new world state wm. For training, the system receives weakly supervised examples with input x = (u, w0) and the target final world state y = wM .\nThe dataset includes 3 domains: ALCHEMY, TANGRAMS, and SCENE. The description of each domain can be found in Appendix B. The domains highlight different linguistic phenomena: ALCHEMY features ellipsis (e.g., “throw the rest out”, “mix”); TANGRAMS features anaphora on actions (e.g., “repeat step 3”, “bring it back”); and SCENE features anaphora on entities (e.g., “he moves back”, “. . . to his left”). Each domain contains roughly 3,700 training and 900 test examples. Each example contains 5 utterances and is labeled with the target world state after each utterance, but not the target program.\nSpurious programs. Given a training example (u, w0, wM ), our goal is to find the true underlying program z∗ which reflects the meaning of u. The constraint that z∗ must transformw0 intowM , i.e. z(w0) = wM , is not enough to uniquely identify the true z∗, as there are often many z satisfying z(w0) = wM : in our experiments, we found at least 1600 on average for each example. Almost all do not capture the meaning of u (see Figure 1). We refer to these incorrect z’s as spurious programs. Such programs encourage the model to learn an incorrect mapping from language to program operations: e.g., the spurious program in Figure 1 would cause the model to learn that “man in the yellow hat” maps to hasShirt(red).\nSpurious programs in SCONE. In this dataset, utterances often reference objects in different ways (e.g. a person can be referenced by shirt color, hat color, or position). Hence, any target programming language must also support these different reference strategies. As a result, even a single action such as moving a person to a target destination can be achieved by many different programs, each selecting the person and destination in a different way. Across multiple actions, the number of programs grows combinatorially.2 Only a few programs actually implement the correct reference strategy as defined by the utterance. This problem would be more severe in any more general-purpose language (e.g. Python).\n2The number of well-formed programs in SCENE exceeds 1015"
+    }, {
+      "heading" : "3 Model",
+      "text" : "We formulate program generation as a sequence prediction problem. We represent a program as a sequence of program tokens in postfix notation; for example, move(hasHat(yellow), leftOf(hasShirt(blue))) is linearized as yellow hasHat blue hasShirt leftOf move. This representation also allows us to incrementally execute programs from left to right using a stack: constants (e.g., yellow) are pushed onto the stack, while functions (e.g., hasHat) pop appropriate arguments from the stack and push back the computed result (e.g., the list of people with yellow hats). Appendix B lists the full set of program tokens, Z , and how they are executed. Note that each action always ends with an action token (e.g., move).\nGiven an input x = (u, w0), the model generates program tokens z1, z2, . . . from left to right using a neural encoder-decoder model with attention (Bahdanau et al., 2015). Throughout the generation process, the model maintains an utterance pointer, m, initialized to 1. To generate zt, the model’s encoder first encodes the utterance um into a vector em. Then, based on em and previously generated tokens z1:t−1, the model’s decoder defines a distribution p(zt | x, z1:t−1) over the possible values of zt ∈ Z . The next token zt is sampled from this distribution. If an action token (e.g., move) is generated, the model increments the utterance pointer m. The process terminates when all M utterances are processed. The final probability of generating a particular program z = (z1, . . . , zT ) is p(z | x) = ∏T t=1 p(zt | x, z1:t−1).\nEncoder. The utterance um under the pointer is encoded using a bidirectional LSTM:\nhFi = LSTM(h F i−1,Φu(um,i)) hBi = LSTM(h B i+1,Φu(um,i))\nhi = [h F i ;h B i ],\nwhere Φu(um,i) is the fixed GloVe word embedding (Pennington et al., 2014) of the ith word in um. The final utterance embedding is the concatenation em = [hF|um|;h B 1 ].\nDecoder. Unlike Bahdanau et al. (2015), which used a recurrent network for the decoder, we opt for a feed-forward network for simplicity. We use em and an embedding f(z1:t−1) of the previous execution history (described later) as inputs to\ncompute an attention vector ct:\nqt = ReLU(Wq[em; f(z1:t−1)]) αi ∝ exp(q>t Wahi) (i = 1, . . . , |um|)\nct = ∑ i αihi.\nFinally, after concatenating qt with ct, the distribution over the set Z of possible program tokens is computed via a softmax:\np(zt | x, z1:t−1) ∝ exp(Φz(zt)>Ws[qt; ct]),\nwhere Φz(zt) is the embedding for token zt.\nExecution history embedding. We compare two options for f(z1:t−1), our embedding of the execution history. A standard approach is to simply take the k most recent tokens zt−k:t−1 and concatenate their embeddings. We will refer to this as TOKENS and use k = 4 in our experiments.\nWe also consider a new approach which leverages our ability to incrementally execute programs using a stack. We summarize the execution history by embedding the state of the stack at time t − 1, achieved by concatenating the embeddings of all values on the stack. (We limit the maximum stack size to 3.) We refer to this as STACK."
+    }, {
+      "heading" : "4 Reinforcement learning versus maximum marginal likelihood",
+      "text" : "Having formulated our task as a sequence prediction problem, we must still choose a learning algorithm. We first compare two standard paradigms: reinforcement learning (RL) and maximum marginal likelihood (MML). In the next section, we propose a better alternative."
+    }, {
+      "heading" : "4.1 Comparing objective functions",
+      "text" : "Reinforcement learning. From an RL perspective, given a training example (x, y), a policy makes a sequence of decisions z = (z1, . . . , zT ), and then receives a reward at the end of the episode: R(z) = 1 if z executes to y and 0 otherwise (dependence on x and y has been omitted from the notation).\nWe focus on policy gradient methods, in which a stochastic policy function is trained to maximize the expected reward. In our setup, pθ(z | x) is the policy (with parameters θ), and its expected reward on a given example (x, y) is\nG(x, y) = ∑ z R(z) pθ(z | x), (1)\nwhere the sum is over all possible programs. The overall RL objective, JRL, is the expected reward across examples:\nJRL = ∑ (x,y) G(x, y). (2)\nMaximum marginal likelihood. The MML perspective assumes that y is generated by a partially-observed random process: conditioned on x, a latent program z is generated, and conditioned on z, the observation y is generated. This implies the marginal likelihood:\npθ(y | x) = ∑ z p(y | z) pθ(z | x). (3)\nNote that since the execution of z is deterministic, pθ(y | z) = 1 if z executes to y and 0 otherwise. The log marginal likelihood of the data is then\nJMML = logLMML, (4) where LMML = ∏ (x,y) pθ(y | x). (5)\nTo estimate our model parameters θ, we maximize JMML with respect to θ.\nWith our choice of reward, the RL expected reward (1) is equal to the MML marginal probability (3). Hence the only difference between the two formulations is that in RL we optimize the sum of expected rewards (2), whereas in MML we optimize the product (5).3"
+    }, {
+      "heading" : "4.2 Comparing gradients",
+      "text" : "In both policy gradient and MML, the objectives are typically optimized via (stochastic) gradient ascent. The gradients of JRL and JMML are closely related. They both have the form:\n∇θJ = ∑ (x,y) Ez∼q [R(z)∇ log pθ(z | x)] (6)\n= ∑ (x,y) ∑ z q(z)R(z)∇ log pθ(z | x),\nwhere q(z) equals\nqRL(z) = pθ(z | x) for JRL, (7)\nqMML(z) = R(z)pθ(z | x)∑ z̃R(z̃)pθ(z̃ | x)\n(8)\n= pθ(z | x,R(z) 6= 0) for JMML. 3 Note that the log of the product in (5) does not equal the\nsum in (2).\nTaking a step in the direction of∇ log pθ(z | x) upweights the probability of z, so we can heuristically think of the gradient as attempting to upweight each reward-earning program z by a gradient weight q(z). In Subsection 5.2, we argue why qMML is better at guarding against spurious programs, and propose an even better alternative."
+    }, {
+      "heading" : "4.3 Comparing gradient approximation strategies",
+      "text" : "It is often intractable to compute the gradient (6) because it involves taking an expectation over all possible programs. So in practice, the expectation is approximated.\nIn the policy gradient literature, Monte Carlo integration (MC) is the typical approximation strategy. For example, the popular REINFORCE algorithm (Williams, 1992) uses Monte Carlo sampling to compute an unbiased estimate of the gradient:\n∆MC = 1\nB ∑ z∈S [R(z)− c]∇ log pθ(z | x), (9)\nwhere S is a collection of B samples z(b) ∼ q(z), and c is a baseline (Williams, 1992) used to reduce the variance of the estimate without altering its expectation.\nIn the MML literature for latent sequences, the expectation is typically approximated via numerical integration (NUM) instead:\n∆NUM = ∑ z∈S q(z)R(z)∇ log pθ(z | x). (10)\nwhere the programs in S come from beam search.\nBeam search. Beam search generates a set of programs via the following process. At step t of beam search, we maintain a beam Bt of at most B search states. Each state s ∈ Bt represents a partially constructed program, s = (z1, . . . , zt) (the first t tokens of the program). For each state s in the beam, we generate all possible continuations,\ncont(s) = cont((z1, . . . , zt))\n= {(z1, . . . , zt, zt+1) | zt+1 ∈ Z} .\nWe then take the union of these continuations, cont(Bt) = ⋃ s∈Bt cont(s). The new beam Bt+1 is simply the highest scoringB continuations in cont(Bt), as scored by the policy, pθ(s | x). Search is halted after a fixed number of iterations\nor when there are no continuations possible. S is then the set of all complete programs discovered during beam search. We will refer to this as beam search MML (BS-MML).\nIn both policy gradient and MML, we think of the procedure used to produce the set of programs S as an exploration strategy which searches for programs that produce reward. One advantage of numerical integration is that it allows us to decouple the exploration strategy from the gradient weights assigned to each program."
+    }, {
+      "heading" : "5 Tackling spurious programs",
+      "text" : "In this section, we illustrate why spurious programs are problematic for the most commonly used methods in RL (REINFORCE) and MML (beam search MML). We describe two key problems and propose a solution to each, based on insights gained from our comparison of RL and MML in Section 4."
+    }, {
+      "heading" : "5.1 Spurious programs bias exploration",
+      "text" : "As mentioned in Section 4, REINFORCE and BSMML both employ an exploration strategy to approximate their respective gradients. In both methods, exploration is guided by the current model policy, whereby programs with high probability under the current policy are more likely to be explored. A troubling implication is that programs with low probability under the current policy are likely to be overlooked by exploration.\nIf the current policy incorrectly assigns low probability to the correct program z∗, it will likely fail to discover z∗ during exploration, and will consequently fail to upweight the probability of z∗. This repeats on every gradient step, keeping the probability of z∗ perpetually low. The same feedback loop can also cause already highprobability spurious programs to gain even more probability. From this, we see that exploration is sensitive to initial conditions: the rich get richer, and the poor get poorer.\nSince there are often thousands of spurious programs and only a few correct programs, spurious programs are usually found first. Once spurious programs get a head start, exploration increasingly biases towards them.\nAs a remedy, one could try initializing parameters such that the model puts a uniform distribution over all possible programs. A seemingly reasonable tactic is to initialize parameters such that the\n\"The man in the yellow hat moves to the left of the woman in blue.”\nSpurious: move(hasShirt(red), 1) Correct: move(hasHat(yellow), leftOf(hasShirt(blue)))\n1 2 3 1 2 3\nBEFORE AFTER\nmodel policy puts near-uniform probability over the decisions at each time step. However, this causes shorter programs to have orders of magnitude higher probability than longer programs, as illustrated in Figure 2 and as we empirically observe. A more sophisticated approach might involve approximating the total number of programs reachable from each point in the programgenerating decision tree. However, we instead propose to reduce sensitivity to the initial distribution over programs.\nSolution: randomized beam search One solution to biased exploration is to simply rely less on the untrustworthy current policy. We can do this by injecting random noise into exploration.\nIn REINFORCE, a common solution is to sample from an -greedy variant of the current policy. On the other hand, MML exploration with beam search is deterministic. However, it has a key advantage over REINFORCE-style sampling: even if one program occupies almost all probability under the current policy (a peaky distribution), beam search will still use its remaining beam capacity to explore at least B− 1 other programs. In contrast, sampling methods will repeatedly visit the mode of the distribution.\nTo get the best of both worlds, we propose a simple -greedy randomized beam search. Like regular beam search, at iteration t we compute the set of all continuations cont(Bt) and sort them by their model probability pθ(s | x). But instead of selecting the B highest-scoring continuations, we choose B continuations one by one without replacement from cont(Bt). When choosing a continuation from the remaining pool, we either uniformly sample a random continuation with probability , or pick the highest-scoring continuation in the pool with probability 1− . Empirically, we\nfind that this performs much better than both classic beam search and -greedy sampling (Table 3)."
+    }, {
+      "heading" : "5.2 Spurious programs dominate gradients",
+      "text" : "In both RL and MML, even if exploration is perfect and the gradient is exactly computed, spurious programs can still be problematic.\nEven if perfect exploration visits every program, we see from the gradient weights q(z) in (7) and (8) that programs are weighted proportional to their current policy probability. If a spurious program z′ has 100 times higher probability than z∗ as in Figure 2, the gradient will spend roughly 99% of its magnitude upweighting towards z′ and only 1% towards z∗ even though the two programs get the same reward.\nThis implies that it would take many updates for z∗ to catch up. In fact, z∗ may never catch up, depending on the gradient updates for other training examples. Simply increasing the learning rate is inadequate, as it would cause the model to take overly large steps towards z′, potentially causing optimization to diverge.\nSolution: the meritocratic update rule To solve this problem, we want the upweighting to be more “meritocratic”: any program that obtains reward should be upweighted roughly equally.\nWe first observe that JMML already improves over JRL in this regard. From (6), we see that the gradient weight qMML(z) is the policy distribution restricted to and renormalized over only rewardearning programs. This renormalization makes the gradient weight uniform across examples: even if all reward-earning programs for a particular example have very low model probability, their combined gradient weight ∑ z qMML(z) is always 1. In our experiments, JMML performs significantly better than JRL (Table 4).\nHowever, while JMML assigns uniform weight across examples, it is still not uniform over the programs within each example. Hence we propose a new update rule which goes one step further in pursuing uniform updates. Extending qMML(z), we define a β-smoothed version:\nqβ(z) = qMML(z) β∑ z̃ qMML(z̃) β . (11)\nWhen β = 0, our weighting is completely uniform across all reward-earning programs within an example while β = 1 recovers the original MML weighting. Our new update rule is to simply take\na modified gradient step where q = qβ .4 We will refer to this as the β-meritocratic update rule."
+    }, {
+      "heading" : "5.3 Summary of the proposed approach",
+      "text" : "We described two problems5 and their solutions: we reduce exploration bias using -greedy randomized beam search and perform more balanced optimization using the β-meritocratic parameter update rule. We call our resulting approach RANDOMER. Table 1 summarizes how RANDOMER combines desirable qualities from both REINFORCE and BS-MML."
+    }, {
+      "heading" : "6 Experiments",
+      "text" : "Evaluation. We evaluate our proposed methods on all three domains of the SCONE dataset. Accuracy is defined as the percentage of test examples where the model produces the correct final world state wM . All test examples have M = 5 (5utts), but we also report accuracy after processing the first 3 utterances (3utts). To control for the effects of randomness, we train 5 instances of each model with different random seeds. We report the median accuracy of the instances unless otherwise noted.\nTraining. Following Long et al. (2016), we decompose each training example into smaller examples. Given an example with 5 utterances, u = [u1, . . . , u5], we consider all length-1 and length-2 substrings of u: [u1], [u2], . . . , [u3, u4], [u4, u5] (9 total). We form a new training example from each substring, e.g., (u′, w′0, w ′ M ) where u\n′ = [u4, u5], w′0 = w3 and w ′ M = w5.\nAll models are implemented in TensorFlow (Abadi et al., 2015). Model parameters are randomly initialized (Glorot and Bengio, 2010), with no pre-training. We use the Adam optimizer (Kingma and Ba, 2014) (which is applied to the gradient in (6)), a learning rate of 0.001, a minibatch size of 8 examples (different from the beam size), and train until accuracy on the validation set converges (on average about 13,000 steps). We\n4 Also, note that if exploration were exhaustive, β = 0 would be equivalent to supervised learning using the set of all reward-earning programs as targets.\n5 These problems concern the gradient w.r.t. a single example. The full gradient averages over multiple examples, which helps separate correct from spurious. E.g., if multiple examples all mention “yellow hat”, we will find a correct program parsing this as hasHat(yellow) for each example, whereas the spurious programs we find will follow no consistent pattern. Consequently, spurious gradient contributions may cancel out while correct program gradients will all “vote” in the same direction.\nuse fixed GloVe vectors (Pennington et al., 2014) to embed the words in each utterance.\nHyperparameters. For all models, we performed a grid search over hyperparameters to maximize accuracy on the validation set. Hyperparameters include the learning rate, the baseline in REINFORCE, -greediness and βmeritocraticness. For REINFORCE, we also experimented with a regression-estimated baseline (Ranzato et al., 2015), but found it to perform worse than a constant baseline."
+    }, {
+      "heading" : "6.1 Main results",
+      "text" : "Comparison to prior work. Table 2 compares RANDOMER to results from Long et al. (2016) as well as two baselines, REINFORCE and BSMML (using the same neural model but different learning algorithms). Our approach achieves new state-of-the-art results by a significant margin, especially on the SCENE domain, which features the most complex program syntax. We report the results for REINFORCE, BS-MML, and RANDOMER on the seed and hyperparameters that achieve the best validation accuracy.\nWe note that REINFORCE performs very well on TANGRAMS but worse on ALCHEMY and very poorly on SCENE. This might be because the program syntax for TANGRAMS is simpler than the other two: there is no other way to refer to objects except by index.\nWe also found that REINFORCE required - greedy exploration to make any progress. Using -greedy greatly skews the Monte Carlo approximation of ∇JRL, making it more uniformly weighted over programs in a similar spirit to using β-meritocratic gradient weights qβ . However, qβ increases uniformity over reward-earning programs only, rather than over all programs.\nEffect of randomized beam search. Table 3 shows that -greedy randomized beam search consistently outperforms classic beam search. Even when we increase the beam size of classic beam\nsearch to 128, it still does not surpass randomized beam search with a beam of 32, and further increases yield no additional improvement.\nEffect of β-meritocratic updates. Table 4 evaluates the impact of β-meritocratic parameter updates (gradient weight qβ). More uniform upweighting across reward-earning programs leads to higher accuracy and fewer spurious programs, especially in SCENE. However, no single value of β performs best over all domains.\nChoosing the right value of β in RANDOMER significantly accelerates training. Figure 3 illustrates that while β = 0 and β = 1 ultimately achieve similar accuracy on ALCHEMY, β = 0 reaches good performance in half the time.\nSince lowering β reduces trust in the model policy, β < 1 helps in early training when the current policy is untrustworthy. However, as it grows more trustworthy, β < 1 begins to pay a price for ignoring it. Hence, it may be worthwhile to anneal β towards 1 over time.\nEffect of execution history embedding. Table 5 compares our two proposals for embedding the execution history: TOKENS and STACK. STACK performs better in the two domains where an object can be referenced in multiple ways (SCENE and ALCHEMY). STACK directly embeds objects on the stack, invariant to the way in which they were pushed onto the stack, unlike TOKENS. We hypothesize that this invariance increases robustness to spurious behavior: if a program accidentally pushes the right object onto the stack via spurious means, the model can still learn the remaining steps of the program without conditioning on a spurious history.\nFitting vs overfitting the training data. Table 6 reveals that BS-MML and RANDOMER use different strategies to fit the training data. On the depicted training example, BS-MML actually achieves higher expected reward / marginal probability than RANDOMER, but it does so by putting most of its probability on a spurious program— a form of overfitting. In contrast, RANDOMER spreads probability mass over multiple rewardearning programs, including the correct ones.\nAs a consequence of overfitting, we observed at test time that BS-MML only references people by positional indices instead of by shirt or hat color, whereas RANDOMER successfully learns to use multiple reference strategies."
+    }, {
+      "heading" : "7 Related work and discussion",
+      "text" : "Semantic parsing from indirect supervision. Our work is motivated by the classic problem of learning semantic parsers from indirect supervision (Clarke et al., 2010; Liang et al., 2011; Artzi\nand Zettlemoyer, 2011, 2013; Reddy et al., 2014; Pasupat and Liang, 2015). We are interested in the initial stages of training from scratch, where getting any training signal is difficult due to the combinatorially large search space. We also highlighted the problem of spurious programs which capture reward but give incorrect generalizations.\nMaximum marginal likelihood with beam search (BS-MML) is traditionally used to learn semantic parsers from indirect supervision.\nReinforcement learning. Concurrently, there has been a recent surge of interest in reinforcement learning, along with the wide application of the classic REINFORCE algorithm (Williams, 1992)—to troubleshooting (Branavan et al., 2009), dialog generation (Li et al., 2016), game playing (Narasimhan et al., 2015), coreference resolution (Clark and Manning, 2016), machine translation (Norouzi et al., 2016), and even semantic parsing (Liang et al., 2017). Indeed, the challenge of training semantic parsers from indirect supervision is perhaps better captured by the notion of sparse rewards in reinforcement learning.\nThe RL answer would be better exploration, which can take many forms including simple action-dithering such as -greedy, entropy regularization (Williams and Peng, 1991), Monte Carlo tree search (Coulom, 2006), randomized value functions (Osband et al., 2014, 2016), and methods which prioritize learning environment dynamics (Duff, 2002) or under-explored states (Kearns and Singh, 2002; Bellemare et al., 2016; Nachum et al., 2016). The majority of these methods employ Monte Carlo sampling for exploration. In\ncontrast, we find randomized beam search to be more suitable in our setting, because it explores low-probability states even when the policy distribution is peaky. Our β-meritocratic update also depends on the fact that beam search returns an entire set of reward-earning programs rather than one, since it renormalizes over the reward-earning set. While similar to entropy regularization, βmeritocratic update is more targeted as it only increases uniformity of the gradient among rewardearning programs, rather than across all programs.\nOur strategy of using randomized beam search and meritocratic updates lies closer to MML than RL, but this does not imply that RL has nothing to offer in our setting. With the simple connection between RL and MML we established, much of the literature on exploration and variance reduction in RL can be directly applied to MML problems. Of special interest are methods which incorporate a value function such as actor-critic.\nMaximum likelihood and RL. It is tempting to group our approach with sequence learning methods which interpolate between supervised learning and reinforcement learning (Ranzato et al., 2015; Venkatraman et al., 2015; Ross et al., 2011; Norouzi et al., 2016; Bengio et al., 2015; Levine,\n2014). These methods generally seek to make RL training easier by pre-training or “warm-starting” with fully supervised learning. This requires each training example to be labeled with a reasonably correct output sequence. In our setting, this would amount to labeling each example with the correct program, which is not known. Hence, these methods cannot be directly applied.\nWithout access to correct output sequences, we cannot directly maximize likelihood, and instead resort to maximizing the marginal likelihood (MML). Rather than proposing MML as a form of pre-training, we argue that MML is a superior substitute for the standard RL objective, and that the β-meritocratic update is even better.\nSimulated annealing. Our β-meritocratic update employs exponential smoothing, which bears resemblance to the simulated annealing strategy of Och (2003); Smith and Eisner (2006); Shen et al. (2015). However, a key difference is that these methods smooth the objective function whereas we smooth an expectation in the gradient. To underscore the difference, we note that fixing β = 0 in our method (total smoothing) is quite effective, whereas total smoothing in the simulated annealing methods would correspond to a completely flat objective function, and an uninformative gradient of zero everywhere.\nNeural semantic parsing. There has been recent interest in using recurrent neural networks for semantic parsing, both for modeling logical forms (Dong and Lapata, 2016; Jia and Liang, 2016; Liang et al., 2017) and for end-to-end execution (Yin et al., 2015; Neelakantan et al., 2016). We develop a neural model for the context-dependent setting, which is made possible by a new stackbased language similar to Riedel et al. (2016).\nAcknowledgments. This work was supported by the NSF Graduate Research Fellowship under No. DGE-114747 and the NSF CAREER Award under No. IIS-1552635.\nReproducibility. Our code is made available at https://github.com/kelvinguu/lang2program. Reproducible experiments are available at https://worksheets.codalab.org/worksheets/ 0x88c914ee1d4b4a4587a07f36f090f3e5/."
+    }, {
+      "heading" : "A Hyperparameters in Table 2",
+      "text" : "System ALCHEMY TANGRAMS SCENE\nREINFORCE\nSample size 32 Baseline 10−2\n= 0.15 embed TOKENS\nSample size 32 Baseline 10−2\n= 0.15 embed TOKENS\nSample size 32 Baseline 10−4\n= 0.15 embed TOKENS\nBS-MML Beam size 128 embed TOKENS Beam size 128 embed TOKENS Beam size 128 embed TOKENS\nRANDOMER β = 1 = 0.05 embed TOKENS β = 1 = 0.15 embed TOKENS β = 0 = 0.15 embed STACK\nB SCONE domains and program tokens token type semantics Shared across ALCHEMY, TANGRAMS, SCENE 1, 2, 3, . . . constant push: number -1, -2, -3, . . . red, yellow, green, constant push: color orange, purple, brown allObjects constant push: the list of all objects index function pop: a list L and a number i\npush: the object L[i] (the index starts from 1; negative indices are allowed) prevArgj (j = 1, 2) function pop: a number i push: the j argument from the ith action prevAction action pop: a number i perform: fetch the ith action and execute it using the arguments on the stack Additional tokens for the ALCHEMY domain An ALCHEMY world contains 7 beakers. Each beaker may contain up to 4 units of colored chemical. 1/1 constant push: fraction (used in the drain action) hasColor function pop: a color c push: list of beakers with chemical color c drain action pop: a beaker b and a number or fraction a perform: remove a units of chemical (or all chemical if a = 1/1) from b pour action pop: two beakers b1 and b2 perform: transfer all chemical from b1 to b2 mix action pop: a beaker b perform: turn the color of the chemical in b to brown Additional tokens for the TANGRAMS domain A TANGRAMS world contains a row of tangram pieces with different shapes. The shapes are anonymized; a tangram can be referred to by an index or a history reference, but not by shape. swap action pop: two tangrams t1 and t2 perform: exchange the positions of t1 and t2 remove action pop: a tangram t perform: remove t from the stage add action pop: a number i and a previously removed tangram t perform: insert t to position i Additional tokens for the SCENE domain A SCENE world is a linear stage with 10 positions. Each position may be occupied by a person with a colored shirt and optionally a colored hat. There are usually 1-5 people on the stage. noHat constant push: pseudo-color (indicating that the person is not wearing a hat) hasShirt, hasHat function pop: a color c push: the list of all people with shirt or hat color c hasShirtHat function pop: two colors c1 and c2 push: the list of all people with shirt color c1 and hat color c2 leftOf, rightOf function pop: a person p push: the location index left or right of p create action pop: a number i and two colors c1, c2 perform: add a new person at position i with shirt color c1 and hat color c2 move action pop: a person p and a number i perform: move p to position i swapHats action pop: two people p1 and p2 perform: have p1 and p2 exchange their hats leave action pop: a person p\nperform: remove p from the stage"
+    } ],
+    "references" : [ {
+      "title" : "Tensorflow: Large-scale machine learning on heterogeneous distributed systems",
+      "author" : [ "Tucker", "V. Vanhoucke", "V. Vasudevan", "F.B. Viégas", "O. Vinyals", "P. Warden", "M. Wattenberg", "M. Wicke", "Y. Yu", "X. Zheng." ],
+      "venue" : "arXiv preprint arXiv:1603.04467 .",
+      "citeRegEx" : "Tucker et al\\.,? 2015",
+      "shortCiteRegEx" : "Tucker et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "Bootstrapping semantic parsers from conversations",
+      "author" : [ "Y. Artzi", "L. Zettlemoyer." ],
+      "venue" : "Empirical Methods in Natural Language Processing (EMNLP). pages 421–432.",
+      "citeRegEx" : "Artzi and Zettlemoyer.,? 2011",
+      "shortCiteRegEx" : "Artzi and Zettlemoyer.",
+      "year" : 2011
+    }, {
+      "title" : "Weakly supervised learning of semantic parsers for mapping instructions to actions",
+      "author" : [ "Y. Artzi", "L. Zettlemoyer." ],
+      "venue" : "Transactions of the Association for Computational Linguistics (TACL) 1:49–62.",
+      "citeRegEx" : "Artzi and Zettlemoyer.,? 2013",
+      "shortCiteRegEx" : "Artzi and Zettlemoyer.",
+      "year" : 2013
+    }, {
+      "title" : "Neural machine translation by jointly learning to align and translate",
+      "author" : [ "D. Bahdanau", "K. Cho", "Y. Bengio." ],
+      "venue" : "International Conference on Learning Representations (ICLR).",
+      "citeRegEx" : "Bahdanau et al\\.,? 2015",
+      "shortCiteRegEx" : "Bahdanau et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "Unifying countbased exploration and intrinsic motivation",
+      "author" : [ "M. Bellemare", "S. Srinivasan", "G. Ostrovski", "T. Schaul", "D. Saxton", "R. Munos." ],
+      "venue" : "Advances in Neural Information Processing Systems (NIPS). pages 1471–1479.",
+      "citeRegEx" : "Bellemare et al\\.,? 2016",
+      "shortCiteRegEx" : "Bellemare et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Scheduled sampling for sequence prediction with recurrent neural networks",
+      "author" : [ "S. Bengio", "O. Vinyals", "N. Jaitly", "N. Shazeer." ],
+      "venue" : "Advances in Neural Information Processing Systems (NIPS). pages 1171– 1179.",
+      "citeRegEx" : "Bengio et al\\.,? 2015",
+      "shortCiteRegEx" : "Bengio et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "Reinforcement learning for mapping instructions to actions",
+      "author" : [ "S. Branavan", "H. Chen", "L.S. Zettlemoyer", "R. Barzilay." ],
+      "venue" : "Association for Computational Linguistics and International Joint Conference on Natural Language Processing (ACL-",
+      "citeRegEx" : "Branavan et al\\.,? 2009",
+      "shortCiteRegEx" : "Branavan et al\\.",
+      "year" : 2009
+    }, {
+      "title" : "Deep reinforcement learning for mention-ranking coreference models",
+      "author" : [ "K. Clark", "C.D. Manning." ],
+      "venue" : "arXiv preprint arXiv:1609.08667 .",
+      "citeRegEx" : "Clark and Manning.,? 2016",
+      "shortCiteRegEx" : "Clark and Manning.",
+      "year" : 2016
+    }, {
+      "title" : "Driving semantic parsing from the world’s response",
+      "author" : [ "J. Clarke", "D. Goldwasser", "M. Chang", "D. Roth." ],
+      "venue" : "Computational Natural Language Learning (CoNLL). pages 18–27.",
+      "citeRegEx" : "Clarke et al\\.,? 2010",
+      "shortCiteRegEx" : "Clarke et al\\.",
+      "year" : 2010
+    }, {
+      "title" : "Efficient selectivity and backup operators in Monte-Carlo tree search",
+      "author" : [ "R. Coulom." ],
+      "venue" : "International Conference on Computers and Games. pages 72–83.",
+      "citeRegEx" : "Coulom.,? 2006",
+      "shortCiteRegEx" : "Coulom.",
+      "year" : 2006
+    }, {
+      "title" : "Maximum likelihood from incomplete data via the EM algorithm",
+      "author" : [ "L.N.M.A.P. Dempster", "R.D.B." ],
+      "venue" : "Journal of the Royal Statistical Society: Series B 39(1):1–38.",
+      "citeRegEx" : "Dempster and ,? 1977",
+      "shortCiteRegEx" : "Dempster and ",
+      "year" : 1977
+    }, {
+      "title" : "Language to logical form with neural attention",
+      "author" : [ "L. Dong", "M. Lapata." ],
+      "venue" : "Association for Computational Linguistics (ACL).",
+      "citeRegEx" : "Dong and Lapata.,? 2016",
+      "shortCiteRegEx" : "Dong and Lapata.",
+      "year" : 2016
+    }, {
+      "title" : "Optimal Learning: Computational procedures for Bayes-adaptive Markov decision processes",
+      "author" : [ "M.O. Duff." ],
+      "venue" : "Ph.D. thesis, University of Massachusetts Amherst.",
+      "citeRegEx" : "Duff.,? 2002",
+      "shortCiteRegEx" : "Duff.",
+      "year" : 2002
+    }, {
+      "title" : "Understanding the difficulty of training deep feedforward neural networks",
+      "author" : [ "X. Glorot", "Y. Bengio." ],
+      "venue" : "International Conference on Artificial Intelligence and Statistics.",
+      "citeRegEx" : "Glorot and Bengio.,? 2010",
+      "shortCiteRegEx" : "Glorot and Bengio.",
+      "year" : 2010
+    }, {
+      "title" : "Data recombination for neural semantic parsing",
+      "author" : [ "R. Jia", "P. Liang." ],
+      "venue" : "Association for Computational Linguistics (ACL).",
+      "citeRegEx" : "Jia and Liang.,? 2016",
+      "shortCiteRegEx" : "Jia and Liang.",
+      "year" : 2016
+    }, {
+      "title" : "Near-optimal reinforcement learning in polynomial time",
+      "author" : [ "M. Kearns", "S. Singh." ],
+      "venue" : "Machine Learning 49(2):209–232.",
+      "citeRegEx" : "Kearns and Singh.,? 2002",
+      "shortCiteRegEx" : "Kearns and Singh.",
+      "year" : 2002
+    }, {
+      "title" : "Adam: A method for stochastic optimization",
+      "author" : [ "D. Kingma", "J. Ba." ],
+      "venue" : "arXiv preprint arXiv:1412.6980 .",
+      "citeRegEx" : "Kingma and Ba.,? 2014",
+      "shortCiteRegEx" : "Kingma and Ba.",
+      "year" : 2014
+    }, {
+      "title" : "Weakly supervised training of semantic parsers",
+      "author" : [ "J. Krishnamurthy", "T. Mitchell." ],
+      "venue" : "Empirical Methods in Natural Language Processing and Computational Natural Language Learning (EMNLP/CoNLL). pages 754–765.",
+      "citeRegEx" : "Krishnamurthy and Mitchell.,? 2012",
+      "shortCiteRegEx" : "Krishnamurthy and Mitchell.",
+      "year" : 2012
+    }, {
+      "title" : "Motor Skill Learning with Local Trajectory Methods",
+      "author" : [ "S. Levine." ],
+      "venue" : "Ph.D. thesis, Stanford University.",
+      "citeRegEx" : "Levine.,? 2014",
+      "shortCiteRegEx" : "Levine.",
+      "year" : 2014
+    }, {
+      "title" : "Deep reinforcement learning for dialogue generation",
+      "author" : [ "J. Li", "W. Monroe", "A. Ritter", "D. Jurafsky", "M. Galley", "J. Gao." ],
+      "venue" : "Empirical Methods in Natural Language Processing (EMNLP).",
+      "citeRegEx" : "Li et al\\.,? 2016",
+      "shortCiteRegEx" : "Li et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Neural symbolic machines: Learning semantic parsers on Freebase with weak supervision",
+      "author" : [ "C. Liang", "J. Berant", "Q. Le", "K.D.F.N. Lao." ],
+      "venue" : "Association for Computational Linguistics (ACL).",
+      "citeRegEx" : "Liang et al\\.,? 2017",
+      "shortCiteRegEx" : "Liang et al\\.",
+      "year" : 2017
+    }, {
+      "title" : "Learning dependency-based compositional semantics",
+      "author" : [ "P. Liang", "M.I. Jordan", "D. Klein." ],
+      "venue" : "Association for Computational Linguistics (ACL). pages 590–599.",
+      "citeRegEx" : "Liang et al\\.,? 2011",
+      "shortCiteRegEx" : "Liang et al\\.",
+      "year" : 2011
+    }, {
+      "title" : "Simpler context-dependent logical forms via model projections",
+      "author" : [ "R. Long", "P. Pasupat", "P. Liang." ],
+      "venue" : "Association for Computational Linguistics (ACL).",
+      "citeRegEx" : "Long et al\\.,? 2016",
+      "shortCiteRegEx" : "Long et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Improving policy gradient by exploring under-appreciated rewards",
+      "author" : [ "O. Nachum", "M. Norouzi", "D. Schuurmans." ],
+      "venue" : "arXiv preprint arXiv:1611.09321 .",
+      "citeRegEx" : "Nachum et al\\.,? 2016",
+      "shortCiteRegEx" : "Nachum et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Language understanding for text-based games using deep reinforcement learning",
+      "author" : [ "K. Narasimhan", "T. Kulkarni", "R. Barzilay." ],
+      "venue" : "arXiv preprint arXiv:1506.08941 .",
+      "citeRegEx" : "Narasimhan et al\\.,? 2015",
+      "shortCiteRegEx" : "Narasimhan et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "Neural programmer: Inducing latent programs with gradient descent",
+      "author" : [ "A. Neelakantan", "Q.V. Le", "I. Sutskever." ],
+      "venue" : "International Conference on Learning Representations (ICLR).",
+      "citeRegEx" : "Neelakantan et al\\.,? 2016",
+      "shortCiteRegEx" : "Neelakantan et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Reward augmented maximum likelihood for neural structured prediction",
+      "author" : [ "M. Norouzi", "S. Bengio", "N. Jaitly", "M. Schuster", "Y. Wu", "D. Schuurmans" ],
+      "venue" : "In Advances In Neural Information Processing Systems",
+      "citeRegEx" : "Norouzi et al\\.,? \\Q2016\\E",
+      "shortCiteRegEx" : "Norouzi et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Minimum error rate training in statistical machine translation",
+      "author" : [ "F.J. Och." ],
+      "venue" : "Association for Computational Linguistics (ACL). pages 160–167.",
+      "citeRegEx" : "Och.,? 2003",
+      "shortCiteRegEx" : "Och.",
+      "year" : 2003
+    }, {
+      "title" : "Deep exploration via bootstrapped DQN",
+      "author" : [ "I. Osband", "C. Blundell", "A. Pritzel", "B.V. Roy." ],
+      "venue" : "Advances In Neural Information Processing Systems. pages 4026–4034.",
+      "citeRegEx" : "Osband et al\\.,? 2016",
+      "shortCiteRegEx" : "Osband et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Generalization and exploration via randomized value functions",
+      "author" : [ "I. Osband", "B.V. Roy", "Z. Wen." ],
+      "venue" : "arXiv preprint arXiv:1402.0635 .",
+      "citeRegEx" : "Osband et al\\.,? 2014",
+      "shortCiteRegEx" : "Osband et al\\.",
+      "year" : 2014
+    }, {
+      "title" : "Compositional semantic parsing on semi-structured tables",
+      "author" : [ "P. Pasupat", "P. Liang." ],
+      "venue" : "Association for Computational Linguistics (ACL).",
+      "citeRegEx" : "Pasupat and Liang.,? 2015",
+      "shortCiteRegEx" : "Pasupat and Liang.",
+      "year" : 2015
+    }, {
+      "title" : "Inferring logical forms from denotations",
+      "author" : [ "P. Pasupat", "P. Liang." ],
+      "venue" : "Association for Computational Linguistics (ACL).",
+      "citeRegEx" : "Pasupat and Liang.,? 2016",
+      "shortCiteRegEx" : "Pasupat and Liang.",
+      "year" : 2016
+    }, {
+      "title" : "Glove: Global vectors for word representation",
+      "author" : [ "J. Pennington", "R. Socher", "C.D. Manning." ],
+      "venue" : "Empirical Methods in Natural Language Processing (EMNLP).",
+      "citeRegEx" : "Pennington et al\\.,? 2014",
+      "shortCiteRegEx" : "Pennington et al\\.",
+      "year" : 2014
+    }, {
+      "title" : "Sequence level training with recurrent neural networks",
+      "author" : [ "M. Ranzato", "S. Chopra", "M. Auli", "W. Zaremba." ],
+      "venue" : "arXiv preprint arXiv:1511.06732 .",
+      "citeRegEx" : "Ranzato et al\\.,? 2015",
+      "shortCiteRegEx" : "Ranzato et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "Largescale semantic parsing without question-answer pairs",
+      "author" : [ "S. Reddy", "M. Lapata", "M. Steedman." ],
+      "venue" : "Transactions of the Association for Computational Linguistics (TACL) 2(10):377–392.",
+      "citeRegEx" : "Reddy et al\\.,? 2014",
+      "shortCiteRegEx" : "Reddy et al\\.",
+      "year" : 2014
+    }, {
+      "title" : "Programming with a differentiable forth interpreter",
+      "author" : [ "S. Riedel", "M. Bosnjak", "T. Rocktäschel." ],
+      "venue" : "CoRR, abs/1605.06640 .",
+      "citeRegEx" : "Riedel et al\\.,? 2016",
+      "shortCiteRegEx" : "Riedel et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "A reduction of imitation learning and structured prediction to noregret online learning",
+      "author" : [ "S. Ross", "G. Gordon", "A. Bagnell." ],
+      "venue" : "Artificial Intelligence and Statistics (AISTATS).",
+      "citeRegEx" : "Ross et al\\.,? 2011",
+      "shortCiteRegEx" : "Ross et al\\.",
+      "year" : 2011
+    }, {
+      "title" : "Minimum risk training for neural machine translation",
+      "author" : [ "S. Shen", "Y. Cheng", "Z. He", "W. He", "H. Wu", "M. Sun", "Y. Liu." ],
+      "venue" : "arXiv preprint arXiv:1512.02433 .",
+      "citeRegEx" : "Shen et al\\.,? 2015",
+      "shortCiteRegEx" : "Shen et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "Minimum risk annealing for training log-linear models",
+      "author" : [ "D.A. Smith", "J. Eisner." ],
+      "venue" : "International Conference on Computational Linguistics and Association for Computational Linguistics (COLING/ACL). pages 787–794.",
+      "citeRegEx" : "Smith and Eisner.,? 2006",
+      "shortCiteRegEx" : "Smith and Eisner.",
+      "year" : 2006
+    }, {
+      "title" : "Policy gradient methods for reinforcement learning with function approximation",
+      "author" : [ "R. Sutton", "D. McAllester", "S. Singh", "Y. Mansour." ],
+      "venue" : "Advances in Neural Information Processing Systems (NIPS).",
+      "citeRegEx" : "Sutton et al\\.,? 1999",
+      "shortCiteRegEx" : "Sutton et al\\.",
+      "year" : 1999
+    }, {
+      "title" : "Improving multi-step prediction of learned time series models",
+      "author" : [ "A. Venkatraman", "M. Hebert", "J.A. Bagnell." ],
+      "venue" : "Association for the Advancement of Artificial Intelligence (AAAI). pages 3024–3030. R. J. Williams. 1992. Simple statistical gradient-",
+      "citeRegEx" : "Venkatraman et al\\.,? 2015",
+      "shortCiteRegEx" : "Venkatraman et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "Neural enquirer: Learning to query tables",
+      "author" : [ "P. Yin", "Z. Lu", "H. Li", "B. Kao." ],
+      "venue" : "arXiv preprint arXiv:1512.00965 .",
+      "citeRegEx" : "Yin et al\\.,? 2015",
+      "shortCiteRegEx" : "Yin et al\\.",
+      "year" : 2015
+    } ],
+    "referenceMentions" : [ {
+      "referenceID" : 8,
+      "context" : "put (Clarke et al., 2010; Liang et al., 2011; Krishnamurthy and Mitchell, 2012; Artzi and Zettlemoyer, 2013; Liang et al., 2017).",
+      "startOffset" : 4,
+      "endOffset" : 128
+    }, {
+      "referenceID" : 21,
+      "context" : "put (Clarke et al., 2010; Liang et al., 2011; Krishnamurthy and Mitchell, 2012; Artzi and Zettlemoyer, 2013; Liang et al., 2017).",
+      "startOffset" : 4,
+      "endOffset" : 128
+    }, {
+      "referenceID" : 17,
+      "context" : "put (Clarke et al., 2010; Liang et al., 2011; Krishnamurthy and Mitchell, 2012; Artzi and Zettlemoyer, 2013; Liang et al., 2017).",
+      "startOffset" : 4,
+      "endOffset" : 128
+    }, {
+      "referenceID" : 2,
+      "context" : "put (Clarke et al., 2010; Liang et al., 2011; Krishnamurthy and Mitchell, 2012; Artzi and Zettlemoyer, 2013; Liang et al., 2017).",
+      "startOffset" : 4,
+      "endOffset" : 128
+    }, {
+      "referenceID" : 20,
+      "context" : "put (Clarke et al., 2010; Liang et al., 2011; Krishnamurthy and Mitchell, 2012; Artzi and Zettlemoyer, 2013; Liang et al., 2017).",
+      "startOffset" : 4,
+      "endOffset" : 128
+    }, {
+      "referenceID" : 39,
+      "context" : "In the natural language processing literature, there are two common approaches for handling this situation: 1) reinforcement learning (RL), particularly the REINFORCE algorithm (Williams, 1992; Sutton et al., 1999), which maximizes the expected reward of a sequence of actions; and 2) maximum marginal likelihood (MML), which treats the sequence of actions as a latent variable, and then maximizes the marginal likelihood of observing the correct program output (Dempster et al.",
+      "startOffset" : 177,
+      "endOffset" : 214
+    }, {
+      "referenceID" : 31,
+      "context" : "This is because in addition to the sparsity of correct programs, our task also requires weeding out spurious programs (Pasupat and Liang, 2016): incorrect interpretations ar X iv :1 70 4.",
+      "startOffset" : 118,
+      "endOffset" : 143
+    }, {
+      "referenceID" : 22,
+      "context" : "We evaluate our resulting system on SCONE, the context-dependent semantic parsing dataset of Long et al. (2016). Our approach outperforms standard RL and MML methods in a direct comparison, and achieves new state-of-the-art results, improving over Long et al.",
+      "startOffset" : 93,
+      "endOffset" : 112
+    }, {
+      "referenceID" : 22,
+      "context" : "We evaluate our resulting system on SCONE, the context-dependent semantic parsing dataset of Long et al. (2016). Our approach outperforms standard RL and MML methods in a direct comparison, and achieves new state-of-the-art results, improving over Long et al. (2016) in all three domains of SCONE, and by over 30% accuracy on the most challenging one.",
+      "startOffset" : 93,
+      "endOffset" : 267
+    }, {
+      "referenceID" : 22,
+      "context" : "We consider the semantic parsing task in the SCONE dataset1 (Long et al., 2016).",
+      "startOffset" : 60,
+      "endOffset" : 79
+    }, {
+      "referenceID" : 3,
+      "context" : "from left to right using a neural encoder-decoder model with attention (Bahdanau et al., 2015).",
+      "startOffset" : 71,
+      "endOffset" : 94
+    }, {
+      "referenceID" : 32,
+      "context" : "where Φu(um,i) is the fixed GloVe word embedding (Pennington et al., 2014) of the ith word in um.",
+      "startOffset" : 49,
+      "endOffset" : 74
+    }, {
+      "referenceID" : 3,
+      "context" : "Unlike Bahdanau et al. (2015), which used a recurrent network for the decoder, we opt for a feed-forward network for simplicity.",
+      "startOffset" : 7,
+      "endOffset" : 30
+    }, {
+      "referenceID" : 22,
+      "context" : "Following Long et al. (2016), we decompose each training example into smaller examples.",
+      "startOffset" : 10,
+      "endOffset" : 29
+    }, {
+      "referenceID" : 13,
+      "context" : "Model parameters are randomly initialized (Glorot and Bengio, 2010), with no pre-training.",
+      "startOffset" : 42,
+      "endOffset" : 67
+    }, {
+      "referenceID" : 16,
+      "context" : "We use the Adam optimizer (Kingma and Ba, 2014) (which is applied to the gradient in (6)), a learning rate of 0.",
+      "startOffset" : 26,
+      "endOffset" : 47
+    }, {
+      "referenceID" : 32,
+      "context" : "use fixed GloVe vectors (Pennington et al., 2014) to embed the words in each utterance.",
+      "startOffset" : 24,
+      "endOffset" : 49
+    }, {
+      "referenceID" : 33,
+      "context" : "For REINFORCE, we also experimented with a regression-estimated baseline (Ranzato et al., 2015), but found it to perform worse than a constant baseline.",
+      "startOffset" : 73,
+      "endOffset" : 95
+    }, {
+      "referenceID" : 22,
+      "context" : "Table 2 compares RANDOMER to results from Long et al. (2016) as well as two baselines, REINFORCE and BSMML (using the same neural model but different learning algorithms).",
+      "startOffset" : 42,
+      "endOffset" : 61
+    }, {
+      "referenceID" : 22,
+      "context" : "LONG+16 results are directly from Long et al. (2016). Hyperparameters are chosen by best performance on validation set (see Appendix A).",
+      "startOffset" : 34,
+      "endOffset" : 53
+    }, {
+      "referenceID" : 6,
+      "context" : "Concurrently, there has been a recent surge of interest in reinforcement learning, along with the wide application of the classic REINFORCE algorithm (Williams, 1992)—to troubleshooting (Branavan et al., 2009), dialog generation (Li et al.",
+      "startOffset" : 186,
+      "endOffset" : 209
+    }, {
+      "referenceID" : 19,
+      "context" : ", 2009), dialog generation (Li et al., 2016), game playing (Narasimhan et al.",
+      "startOffset" : 27,
+      "endOffset" : 44
+    }, {
+      "referenceID" : 24,
+      "context" : ", 2016), game playing (Narasimhan et al., 2015), coreference resolution (Clark and Manning, 2016), machine translation (Norouzi et al.",
+      "startOffset" : 22,
+      "endOffset" : 47
+    }, {
+      "referenceID" : 7,
+      "context" : ", 2015), coreference resolution (Clark and Manning, 2016), machine translation (Norouzi et al.",
+      "startOffset" : 32,
+      "endOffset" : 57
+    }, {
+      "referenceID" : 26,
+      "context" : ", 2015), coreference resolution (Clark and Manning, 2016), machine translation (Norouzi et al., 2016), and even semantic parsing (Liang et al.",
+      "startOffset" : 79,
+      "endOffset" : 101
+    }, {
+      "referenceID" : 20,
+      "context" : ", 2016), and even semantic parsing (Liang et al., 2017).",
+      "startOffset" : 35,
+      "endOffset" : 55
+    }, {
+      "referenceID" : 9,
+      "context" : "The RL answer would be better exploration, which can take many forms including simple action-dithering such as -greedy, entropy regularization (Williams and Peng, 1991), Monte Carlo tree search (Coulom, 2006), randomized value functions (Osband et al.",
+      "startOffset" : 194,
+      "endOffset" : 208
+    }, {
+      "referenceID" : 12,
+      "context" : ", 2014, 2016), and methods which prioritize learning environment dynamics (Duff, 2002) or under-explored states (Kearns and Singh, 2002; Bellemare et al.",
+      "startOffset" : 74,
+      "endOffset" : 86
+    }, {
+      "referenceID" : 15,
+      "context" : ", 2014, 2016), and methods which prioritize learning environment dynamics (Duff, 2002) or under-explored states (Kearns and Singh, 2002; Bellemare et al., 2016; Nachum et al., 2016).",
+      "startOffset" : 112,
+      "endOffset" : 181
+    }, {
+      "referenceID" : 4,
+      "context" : ", 2014, 2016), and methods which prioritize learning environment dynamics (Duff, 2002) or under-explored states (Kearns and Singh, 2002; Bellemare et al., 2016; Nachum et al., 2016).",
+      "startOffset" : 112,
+      "endOffset" : 181
+    }, {
+      "referenceID" : 23,
+      "context" : ", 2014, 2016), and methods which prioritize learning environment dynamics (Duff, 2002) or under-explored states (Kearns and Singh, 2002; Bellemare et al., 2016; Nachum et al., 2016).",
+      "startOffset" : 112,
+      "endOffset" : 181
+    }, {
+      "referenceID" : 33,
+      "context" : "It is tempting to group our approach with sequence learning methods which interpolate between supervised learning and reinforcement learning (Ranzato et al., 2015; Venkatraman et al., 2015; Ross et al., 2011; Norouzi et al., 2016; Bengio et al., 2015; Levine, 2014).",
+      "startOffset" : 141,
+      "endOffset" : 265
+    }, {
+      "referenceID" : 40,
+      "context" : "It is tempting to group our approach with sequence learning methods which interpolate between supervised learning and reinforcement learning (Ranzato et al., 2015; Venkatraman et al., 2015; Ross et al., 2011; Norouzi et al., 2016; Bengio et al., 2015; Levine, 2014).",
+      "startOffset" : 141,
+      "endOffset" : 265
+    }, {
+      "referenceID" : 36,
+      "context" : "It is tempting to group our approach with sequence learning methods which interpolate between supervised learning and reinforcement learning (Ranzato et al., 2015; Venkatraman et al., 2015; Ross et al., 2011; Norouzi et al., 2016; Bengio et al., 2015; Levine, 2014).",
+      "startOffset" : 141,
+      "endOffset" : 265
+    }, {
+      "referenceID" : 26,
+      "context" : "It is tempting to group our approach with sequence learning methods which interpolate between supervised learning and reinforcement learning (Ranzato et al., 2015; Venkatraman et al., 2015; Ross et al., 2011; Norouzi et al., 2016; Bengio et al., 2015; Levine, 2014).",
+      "startOffset" : 141,
+      "endOffset" : 265
+    }, {
+      "referenceID" : 5,
+      "context" : "It is tempting to group our approach with sequence learning methods which interpolate between supervised learning and reinforcement learning (Ranzato et al., 2015; Venkatraman et al., 2015; Ross et al., 2011; Norouzi et al., 2016; Bengio et al., 2015; Levine, 2014).",
+      "startOffset" : 141,
+      "endOffset" : 265
+    }, {
+      "referenceID" : 18,
+      "context" : "It is tempting to group our approach with sequence learning methods which interpolate between supervised learning and reinforcement learning (Ranzato et al., 2015; Venkatraman et al., 2015; Ross et al., 2011; Norouzi et al., 2016; Bengio et al., 2015; Levine, 2014).",
+      "startOffset" : 141,
+      "endOffset" : 265
+    }, {
+      "referenceID" : 11,
+      "context" : "There has been recent interest in using recurrent neural networks for semantic parsing, both for modeling logical forms (Dong and Lapata, 2016; Jia and Liang, 2016; Liang et al., 2017) and for end-to-end execution (Yin et al.",
+      "startOffset" : 120,
+      "endOffset" : 184
+    }, {
+      "referenceID" : 14,
+      "context" : "There has been recent interest in using recurrent neural networks for semantic parsing, both for modeling logical forms (Dong and Lapata, 2016; Jia and Liang, 2016; Liang et al., 2017) and for end-to-end execution (Yin et al.",
+      "startOffset" : 120,
+      "endOffset" : 184
+    }, {
+      "referenceID" : 20,
+      "context" : "There has been recent interest in using recurrent neural networks for semantic parsing, both for modeling logical forms (Dong and Lapata, 2016; Jia and Liang, 2016; Liang et al., 2017) and for end-to-end execution (Yin et al.",
+      "startOffset" : 120,
+      "endOffset" : 184
+    }, {
+      "referenceID" : 41,
+      "context" : ", 2017) and for end-to-end execution (Yin et al., 2015; Neelakantan et al., 2016).",
+      "startOffset" : 37,
+      "endOffset" : 81
+    }, {
+      "referenceID" : 25,
+      "context" : ", 2017) and for end-to-end execution (Yin et al., 2015; Neelakantan et al., 2016).",
+      "startOffset" : 37,
+      "endOffset" : 81
+    }, {
+      "referenceID" : 5,
+      "context" : ", 2016; Bengio et al., 2015; Levine, 2014). These methods generally seek to make RL training easier by pre-training or “warm-starting” with fully supervised learning. This requires each training example to be labeled with a reasonably correct output sequence. In our setting, this would amount to labeling each example with the correct program, which is not known. Hence, these methods cannot be directly applied. Without access to correct output sequences, we cannot directly maximize likelihood, and instead resort to maximizing the marginal likelihood (MML). Rather than proposing MML as a form of pre-training, we argue that MML is a superior substitute for the standard RL objective, and that the β-meritocratic update is even better. Simulated annealing. Our β-meritocratic update employs exponential smoothing, which bears resemblance to the simulated annealing strategy of Och (2003); Smith and Eisner (2006); Shen et al.",
+      "startOffset" : 8,
+      "endOffset" : 892
+    }, {
+      "referenceID" : 5,
+      "context" : ", 2016; Bengio et al., 2015; Levine, 2014). These methods generally seek to make RL training easier by pre-training or “warm-starting” with fully supervised learning. This requires each training example to be labeled with a reasonably correct output sequence. In our setting, this would amount to labeling each example with the correct program, which is not known. Hence, these methods cannot be directly applied. Without access to correct output sequences, we cannot directly maximize likelihood, and instead resort to maximizing the marginal likelihood (MML). Rather than proposing MML as a form of pre-training, we argue that MML is a superior substitute for the standard RL objective, and that the β-meritocratic update is even better. Simulated annealing. Our β-meritocratic update employs exponential smoothing, which bears resemblance to the simulated annealing strategy of Och (2003); Smith and Eisner (2006); Shen et al.",
+      "startOffset" : 8,
+      "endOffset" : 917
+    }, {
+      "referenceID" : 5,
+      "context" : ", 2016; Bengio et al., 2015; Levine, 2014). These methods generally seek to make RL training easier by pre-training or “warm-starting” with fully supervised learning. This requires each training example to be labeled with a reasonably correct output sequence. In our setting, this would amount to labeling each example with the correct program, which is not known. Hence, these methods cannot be directly applied. Without access to correct output sequences, we cannot directly maximize likelihood, and instead resort to maximizing the marginal likelihood (MML). Rather than proposing MML as a form of pre-training, we argue that MML is a superior substitute for the standard RL objective, and that the β-meritocratic update is even better. Simulated annealing. Our β-meritocratic update employs exponential smoothing, which bears resemblance to the simulated annealing strategy of Och (2003); Smith and Eisner (2006); Shen et al. (2015). However, a key difference is that these methods smooth the objective function whereas we smooth an expectation in the gradient.",
+      "startOffset" : 8,
+      "endOffset" : 937
+    }, {
+      "referenceID" : 5,
+      "context" : ", 2016; Bengio et al., 2015; Levine, 2014). These methods generally seek to make RL training easier by pre-training or “warm-starting” with fully supervised learning. This requires each training example to be labeled with a reasonably correct output sequence. In our setting, this would amount to labeling each example with the correct program, which is not known. Hence, these methods cannot be directly applied. Without access to correct output sequences, we cannot directly maximize likelihood, and instead resort to maximizing the marginal likelihood (MML). Rather than proposing MML as a form of pre-training, we argue that MML is a superior substitute for the standard RL objective, and that the β-meritocratic update is even better. Simulated annealing. Our β-meritocratic update employs exponential smoothing, which bears resemblance to the simulated annealing strategy of Och (2003); Smith and Eisner (2006); Shen et al. (2015). However, a key difference is that these methods smooth the objective function whereas we smooth an expectation in the gradient. To underscore the difference, we note that fixing β = 0 in our method (total smoothing) is quite effective, whereas total smoothing in the simulated annealing methods would correspond to a completely flat objective function, and an uninformative gradient of zero everywhere. Neural semantic parsing. There has been recent interest in using recurrent neural networks for semantic parsing, both for modeling logical forms (Dong and Lapata, 2016; Jia and Liang, 2016; Liang et al., 2017) and for end-to-end execution (Yin et al., 2015; Neelakantan et al., 2016). We develop a neural model for the context-dependent setting, which is made possible by a new stackbased language similar to Riedel et al. (2016).",
+      "startOffset" : 8,
+      "endOffset" : 1771
+    } ],
+    "year" : 2017,
+    "abstractText" : "Our goal is to learn a semantic parser that maps natural language utterances into executable programs when only indirect supervision is available: examples are labeled with the correct execution result, but not the program itself. Consequently, we must search the space of programs for those that output the correct result, while not being misled by spurious programs: incorrect programs that coincidentally output the correct result. We connect two common learning paradigms, reinforcement learning (RL) and maximum marginal likelihood (MML), and then present a new learning algorithm that combines the strengths of both. The new algorithm guards against spurious programs by combining the systematic search traditionally employed in MML with the randomized exploration of RL, and by updating parameters such that probability is spread more evenly across consistent programs. We apply our learning algorithm to a new neural semantic parser and show significant gains over existing state-of-theart results on a recent context-dependent semantic parsing task.",
+    "creator" : "LaTeX with hyperref package"
+  }
+}

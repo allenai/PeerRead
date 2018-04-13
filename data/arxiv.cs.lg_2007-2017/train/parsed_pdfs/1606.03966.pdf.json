@@ -1,0 +1,685 @@
+{
+  "name" : "1606.03966.pdf",
+  "metadata" : {
+    "source" : "CRF",
+    "title" : "A Multiworld Testing Decision Service",
+    "authors" : [ "Alekh Agarwal", "Sarah Bird", "Markus Cozowicz", "Luong Hoang", "John Langford", "Stephen Lee", "Jiaji Li", "Dan Melamed", "Gal Oshri", "Oswaldo Ribas", "Siddhartha Sen", "Alex Slivkins" ],
+    "emails" : [ ],
+    "sections" : [ {
+      "heading" : null,
+      "text" : "The system is general: it works for any discrete choices, with respect to any reward metric, and can work with many learning algorithms and feature representations. The service has a simple API, and was designed to be modular and reproducible to ease deployment and debugging, respectively. We demonstrate how these properties enable learning systems that are robust and safe.\nOur evaluation shows that the Decision Service makes decisions in real time and incorporates new data quickly into learned policies. A large-scale deployment for a personalized news website has been handling all traffic since Jan. 2016, resulting in a 25% relative lift in clicks. By making the Decision Service externally available, we hope to make optimal decision making available to all."
+    }, {
+      "heading" : "1 Introduction",
+      "text" : "Machine Learning has well-known high-value applications, yet effective deployment is fraught with difficulties in practice [14, 49]. Machine-learned models for recommendation, ranking, and spam detection all become obsolete unless they are regularly infused with new data. Safely using data is actually quite tricky–thus the growing demand for data scientists. How do we create a machine learning system that safely generates and uses new data?\nA complete 4-step loop is required: explore to collect the data, log this data correctly, learn a good model, and deploy it in the application (see Fig. 1). We see two major challenges to implementing this loop effectively:\n1. Exploration is essential to enable correct learning but is often neglected and difficult to get right.\n2. Often, each part of the loop is managed independently, resulting in the complete process being inefficient, expensive, slow and error-prone.\nThese challenges are subtle and non-trivial to avoid through best practices alone, yet most machine learning efforts focus on training and deploying models, neglecting the other two essential steps: exploration and logging.\nThroughout this paper, we discuss a typical application that repeatedly takes actions (e.g., which type of news article to show) when faced with a particular context (e.g., user demographics) to obtain a desirable outcome quantified as a reward (e.g., a click). Machine learning finds a good policy mapping contexts to actions, e.g., show politics articles to adults, and sports articles to teenagers. As a running example, we use a simple news website (News) displaying one news article for each visitor.\nExploration and Multiworld Testing. Learning can be biased when the decisions made by an algorithm affect the data collected to train that algorithm [14, 49]. For example, it is not possible to learn that a news article about sports generates more clicks than one about politics when shown to a particular demographic, without showing both types of articles to this demographic at least some of the time. Hence, there is a need to explore so as to acquire the right data. Restated, collecting a biased dataset, no matter\nar X\niv :1\n60 6.\n03 96\n6v 1\n[ cs\n.L G\n] 1\n3 Ju\nn 20\n16\nhow large, does not ensure good learning 1. A common methodology for exploration is A/B testing [31, 32]: policy A is tested against policy B by running both live on a small percentage of user traffic. Outcomes are measured statistically so as to determine whether B is better than A. This methodology requires data scaling linearly with the number of policies to be tested and it requires that the policy to be evaluated is known during data collection.\nContextual bandits [3, 34] is a line of work in machine learning allowing testing and optimization over exponentially more policies for a given number of events2. We refer to this dramatic improvement in capability as Multiworld Testing (MWT). The essential reason for such an improvement is that each data point can be used to evaluate all the policies picking the same action for the same context (i.e., make the same decision for the same input features rather than just a single policy as in A/B testing. An important property of MWT is that policies being tested do not need to be approved, implemented in production, and run live for a period of time (thus saving much business and engineering effort). Furthermore, the policies do not even need to be known during data collection. The MWT Decision Service. Creating a learning system that supports complete data lifecycle requires solving a number of technical issues. How do you record the correct action and context for learning? When rewards arrive with a considerable delay after the actions are chosen, how do you join with the corresponding context and action? And how do you do it with high throughput? How do you learn from the data and deploy a model quickly enough to exploit the solution? And how do you fit all these pieces together into a single easy-to-use system? Because of these issues, implementing MWT for a particular application requires a substantial amount of new programming and considerable infrastructure. Due to the complexity and subtlety of creating a correct system3 tackling this task is well beyond the capability of most people hoping to apply machine learning effectively.\nOur experience suggests that a dedicated system is the only feasible way to deploy principled experimentation and data analysis. Many of the pertinent issues are better addressed once and for all, rather than re-developed for each application. To meet this need, we provide programming and infrastructure support for MWT via a unified system suitable for many applications. We present a general modular design for the system, incorporating all four\n1Section 2.3 of [14] contains a classic example of this phenomenon. 2E.g., in one realistic scenario, one can handle 1 billion policies for the data collection cost of 21 A/B tests [44]. 3Although failures are not published, we know of several failed attempts to employ online learning.\ncomponents of the learning cycle in Figure 1. We define the functionality of the components and the ways they interact with one another. Modularity allows implementation details to be customized to the infrastructure available in a given organization. Using this design, we build our own system for MWT, called the MWT Decision Service, which includes both the algorithms and the supporting infrastructure. The system consists of several modules which can be used jointly or separately depending on application-specific needs. The system is fully functional and publicly available.\nWe deployed the Decision Service in production to recommend personalized news articles on a heavilytrafficked major news site at MSN. All previous machine learning approaches failed in this setting, yet the system provided a 25% relative lift in click-through rate.\nIn summary, we make the following contributions:\n• We describe a methodology for MWT that provides strong theoretical guarantees while addressing many practical concerns (Section 2).\n• We present a service for MWT that eliminates most sources of error by design. This is achieved through a simple API (Section 3) and modular component interfaces (Section 4), as well as techniques for robust randomization and offline reproducibility.\n• We describe our experience deploying the service with MSN in a live production environment (Section 6), and also evaluate performance using systems as well as learning criteria (Section 7)."
+    }, {
+      "heading" : "2 Machine learning methodology",
+      "text" : "From the machine learning perspective, we implement Multiworld Testing (MWT): the capability to test and optimize over K policies, using an amount of data and computation that scales logarithmically in K, without necessarily knowing these policies during data collection.\nOur methodology synthesizes ideas from the contextual bandits (e.g., [3, 34]) and policy evaluation (e.g., [36, 37]) literatures. The methodology emphasizes modularity: exploration is separate from policy learning, and policy learning is reduced to cost-sensitive classification, a wellstudied problem in machine learning. Modularity of the methodology maps to modularity in the system design.\nThe exposition below makes a few simplifying assumptions for clarity, and revisits them later in the section. Contextual decisions. Consider an application APP that interacts with its environment, such as a news website with users, a health device with its owner, or a data center with job requests. Each interaction t follows the same broadly applicable protocol:\n1. A context xt arrives and is observed by APP. 2. APP chooses an action at to take. 3. A reward rt for at is observed by APP.\nTable 1 shows real examples from each of the three scenarios. The set of feasible actions may be fixed or vary over time depending on context. Both contexts and actions are usually represented as feature vectors. APP chooses actions by applying a policy π that inputs a context and returns an action. The objective is finding a policy maximizing total rewards when deployed over the observed interactions. A good reward metric provides a good proxy for the “true\" long-term objective of the APP, such as long-term user satisfaction.\nWe assume that APP faces a stationary environment4, so that the performance of a policy can be summarized by its expected reward per interaction. Exploration and logging. An exploration policy is used to randomize each choice of action. The randomization need not be uniform and for best performance should not be [3, 8]. The simplest non-uniform policy is EpsilonGreedy: with probability 0 it chooses an action uniformly at random, and uses a default policy π0 otherwise. The default policy might be the one currently deployed in production or the current best guess for an optimal policy. 0 controls an explore-exploit tradeoff : the default policy guarantees a minimum performance level while randomization enables finding better alternatives. The parameters of an exploration policy, such as 0 and π0, can be revised over time. The literature on contextual bandits provides several other exploration policies including near-optimal schemes.\nEach interaction t is logged as a tuple (xt, at, rt, pt), where pt is the exploration policy’s probability of action at. Recording pt is crucial for policy learning. These data points, one per interaction, comprise the exploration data. Policy learning. Exploration data can be used to evaluate any policy π (i.e., estimate its reward) regardless of how it was collected. The simplest approach for this is inverse propensity scoring (ips):\nµ̂ips(π) = 1 N ∑N t=1 1{π(xt)=at} rt/pt, (1)\nwhere N is the number of data points and 1{} has value 1 when its argument is true and 0 otherwise. This estimator has three important properties. First, it is data-efficient. Each interaction on which π matches the exploration data can be used in evaluating π, regardless of the policy collecting the data. In contrast, A/B testing only uses data collected using π to evaluate π. Second, the division by\n4Stationary here means the context and the reward given the contextaction pair are drawn independently from fixed distributions.\npt makes it statistically unbiased: it converges to the true reward as N → ∞. Third, the estimator can be recomputed incrementally when new data arrives.\nThus, using a fixed exploration dataset, accurate counterfactual estimates of how arbitrary policies would have performed can be computed without actually running them in real time. This is precisely the question A/B testing attempts to answer, except A/B testing must run a live experiment to test each policy.\nLet us compare the statistical efficiency of MWT to that of A/B testing. Suppose N data points are collected using an exploration policy which places probability at least on each action (for EpsilonGreedy, = 0/#actions), and we wish to evaluate K different policies. Then the ips estimators for all K policies have confidence inter-\nvals whose width is √\nC N log K δ , with probability at least\n1−δ, whereC is a small absolute constant.5 This is an exponential (in K) improvement over A/B testing since an A/B test of K policies collecting N data points has con-\nfidence intervals of width C √\nK N log K δ . This also shows\nthe necessity of exploration for policy learning. If = 0, we cannot correctly evaluate arbitrary policies.\nPolicy training finds a policy that approximately maximizes the estimated reward (usually given by the ips estimator). A naive but computationally inefficient solution is to evaluate every allowed policy and output the one with highest estimated reward. A better approach is to use a reduction to cost-sensitive classification [23], for which many practical algorithms have been designed and implemented. The choice of algorithm implicitly defines the class of allowed policies: for example, there are algorithms for policy classes specified by linear representations, decision trees, and neural networks.6 All such policies tend to be very fast to execute. Regardless of the policy training procedure, the confidence bound above implies that the expected reward of the trained policy tends to its estimated reward using ips. Non-stationarity. While predictions about future performance rely on the stationarity assumption, applications exhibit only periods of (near-)stationarity in practice. We use the informal term stationarity timescale: the time interval during which expected rewards do not change much. To cope with a changing environment, we use a continuous loop in the vein of Fig. 1. This has two implications for policy training. First, an online learning algorithm is (almost) necessary, so that new datapoints can\n5This holds for any δ > 0 and any N > 1\n, by an application of a Bernstein’s Inequality, a well-known tool from statistics.\n6Even though the prior discussion considers only finite numberK of policies, conclusions extend to continuous sets such as linear representations using standard statistical arguments (see e.g. [34]).\nbe incorporated efficiently without restarting the training. Second, while most online learning algorithms gradually become less sensitive to new data, we set the sensitivity according to the stationarity timescale. This means that learning stabilizes during the timescale, but can adapt to new trends over longer periods of time. This can be achieved by occasionally resetting the step-sizes present in most online learning algorithms.\nWithin the timescale, we need enough completed interactions to enable policy learning. A rare but crucial reward outcome—e.g., clicks are rare– is a learning bottleneck. A good rule of thumb for learning (with a linear representation) is that the number of rare outcomes in the timescale should be much larger than #actions × #features.\nNon-stationarity can often be partially mitigated by choosing features with a more persistent effect, and/or a learning algorithm that adapts in a changing environment.\nFraming. “Framing\" the problem—defining context/features, action set, and reward metric—is often non-trivial. Similar issues arise in many applications of machine learning and do not have generic, clear-cut solutions. The Decision Service makes the framing task easier by allowing testing of different framings without collecting new data (see “Offline Learner\" in Section 4.2).\nIn practice, there may be several reasonable ways to define rewards, especially when the outcome of an interaction consists of multiple observations such as a click and dwell time. Additionally, the reward metric often is changed or refined over time, and auxiliary metrics may be added. Our methodology does not require committing to a particular reward metric during exploration; switching to a new reward metric is only a simple postprocessing of the exploration dataset as long as the required observations are logged.\nIn some applications, a set of ordered actions (a slate) such as a ranked list of search results or news articles is chosen in each interaction. Treating the entire slate as a single action is inefficient, because too many slates are possible. One practical approach, adopted in our MSN deployment, is to implement MWT for the top slot, and use the learned policy for other slots. A more principled ap-\nproach explores and learns for all slots at once [33]."
+    }, {
+      "heading" : "3 An API for Making Decisions",
+      "text" : "We have designed a simple API to expose MWT to applications. In our Decision Service implementation, this API is exposed through both a client library and a web API. The web API provides easy to use and cross-platform support without code dependencies, while the client library provides millisecond-scale latencies and more customizability.\nThe web API uses a JSON format and an authorization token in the HTTP header like this:\n1. The Application sends a context to Decision Service: https://{hostname}/api/decision? defaultAction=5\nwhere the request body contains the context: {\"Age\":\"25\",\"Location\":\"New York\",...} . 2. The Decision Service responds with an action (e.g., which article to show) {\"Action\":2, \"EventId\":\"YYY\"} . 3. The application reports a reward (e.g., 1 = click) using the provided event ID: https://{hostname}/ api/reward?reward=1&eventId=YYY .\nThe application should take the action returned by the Decision Service, and faithfully report back the reward. Once a reward is reported, the interaction is complete and the corresponding (x, a, r, p) tuple can be used by the Decision Service for policy learning, resulting in recommendations improving over time. The “default action” in the first HTTP request represents the application’s default choice in the absence of exploration.\nThe web API allows for some customization, but full flexibility is provided by the client library. For example, the interaction above can be customized as follows:\nvar cfg = new DecisionServiceConfiguration(\".. authToken ..\"); using (var cl = DecisionService.WithPolicy(cfg) .With<MyContext>() .ExploitUntilModelReady(new MyPolicy()) .WithEpsilonGreedy(.05f)) { var key = new UniqueEventID() { ... } var x = new MyContext { Age = 25, ... } var action = cl.ChooseAction(key, x); cl.ReportReward(1, key);\n} The ChooseAction and ReportReward calls correspond to the HTTP requests in steps 1 and 3, resp. The code uses a custom context class (MyContext) and a default policy class (MyPolicy) that satisfies a simple policy interface (that is, it maps a context of type MyContext to an action). Alternatively, the client library can mimic the web API via a JSON string and a default action in the call to ChooseAction. The choice of exploration policy, currently set to EpsilonGreedy, can be changed to any exploration policy supported by the client library.\nThe client library provides a flexible interface for specifying contexts that serialize to JSON. In particular, annotations can specify which members of a class should be treated as features. For example:\npublic class MyContext { // Feature: Age:25 public int Age { get; set; } // Feature: l:New_York [JsonProperty(\"l\")] public string Location { get; set; } // Logged but not used due to _ [JsonProperty(\"_SessionId\")] public string SessionId { get; set; } // Not logged, not used as feature [JsonIgnore] public bool SomeField { get; set; } }\nThis context includes a regular feature (Age), a renamed feature (Location), a field that is logged but not used for policy training (SessionId), and a field that is completely ignored (SomeField). Logging unused features can be useful for future evaluation of policies using them.\nBoth interfaces permit actions represented as feature vectors. The features are specified in a separate class using similar annotations to the above with an array embedded in the context class allowing the set of actions to depend on the context and change over time."
+    }, {
+      "heading" : "4 Decision Service: System Design",
+      "text" : "In this section, we present the architecture of the MWT Decision Service. Our implementation (Section 5) is on Microsoft Azure [40], but the architecture is cloud-agnostic and could easily be migrated to another provider."
+    }, {
+      "heading" : "4.1 Challenges and design requirements",
+      "text" : "The Decision Service is designed to implement a complete machine learning loop and harness the power of MWT for a wide range of potential applications, while preventing many of the errors we have encountered deploying in practice. Below we describe the associated challenges and design requirements.\nData collection. MWT relies crucially on accurate logging of the (x, a, r, p) tuples. The system must record (x, a, p) at the time of decision and match the appropriate reward r to it. There are many ways we have seen data collection go wrong in practice. For example, the probabilities p may be incorrectly recorded or accidentally included as action features. Features may be stored as a reference to a database which is updated. Consequently, the feature values available at the time of policy evaluation might differ from the ones at the time the interaction was recorded. When optimizing an intermediate step in a complex system, the action chosen initially might be overridden by downstream business logic, and the recorded action might incorrectly be this final outcome rather than the initially chosen action. Finally, the rewards, which are often delayed and may arrive from entirely different paths within a given application, may be lost or incorrectly joined to the decision.\nLatency. For interactive high-value applications serving latency tends to be directly linked to user experience and revenue [48]. Many applications now seek to keep their total response times within 100 ms, so the Decision Service should make decisions in 10 ms or less.\nSome applications must quickly incorporate new data into the machine-learned policy (e.g. for breaking news stories) so the Decision Service should be able to update the policy every few minutes.\nScalability. The Decision Service needs to efficiently support applications with both high and low volumes of data. The volume of in-memory data depends on the size of the interaction tuple, the interaction arrival rate, and the typical delay until the reward is observed. The online learning algorithm should be able to handle the data arrival rate. Finally, reproducibility may demand additional buffering due to reordering from scale-out components.\nUsability and flexibility. The Decision Service should be modular so as to integrate easily with an application’s existing infrastructure. That is, it should consist of components which are usable independently or in combination with well-defined interfaces that admit multiple consistent implementations. This avoids costly re-implementation of existing functionality, and allows the service to improve seamlessly as better implementations become available. Supporting multiple programming languages and avoiding mandatory dependencies on particular external libraries reduces the barrier to adoption, as applications use different programming languages and environments, and some hesitate to take additional dependencies. Finally, the service should be easy to try out, since application developers may be wary of automatic learning systems. Overall, the design should not enforce a ones-size-\nfits-all approach, but provide sensible defaults for every component to reduce setup complexity for common cases.\nRobustness. The application must continue making decisions despite any failures in the components of the Decision Service. Conversely, the Decision Service must be able to recover from the failures, restarts or reconfigurations in the application itself. Even in the businessas-usual mode, data collection may be skewed in time, and some of the data may not reach the service. Either way, the Decision Service should not lose data that was received, and should recover the previously learned policies and other valuable state of the learning algorithm.\nDebugging. Systems which span many components and interact with users are often notoriously difficult to debug. In particular, events may be delayed, re-ordered or dropped and affect the system in complex ways, making it difficult to reproduce bugs offline. This generic difficulty is magnified when the system is continuously learning, because the system is no longer stationary, and it’s difficult to disentangle issues in the learning algorithms from systems issues. Therefore, it is essential to be able to fully reproduce an online run of the service offline.\nMachine learning. The service should provide adequate systems support for machine learning, which means supporting a variety of algorithms and processes used by data scientists in practice to explore, tune, and adapt policies. As much as possible, we would like to not be tied to a particular learning library or policy structure, so that applications can add the Decision Service on to their existing ML workflow. Also, in order to adapt to a changing environment and workloads the Decision Service should be able to revise the learned policies continuously and support real-time resets/reconfigurations of the learning algorithms. Furthermore, there is plenty of prior art in machine learning (e.g., supervised learning) that should be leveraged when appropriate. Finally, the service should support offline experimentation (using exploration data instead of additional live experiments) to tune and try out exploration/learning algorithms in realistic conditions."
+    }, {
+      "heading" : "4.2 Architecture and Semantics",
+      "text" : "The high-level architecture of the Decision Service depicted in Fig. 2 roughly maps to the four steps of the loop in Fig. 1. The Client Library interfaces with the application, makes decisions, performs exploration and issues logging requests. The Join Service is responsible for joining and logging exploration data. The Online/Offline Learner components perform policy learning, and optimized policies are deployed back to the Client Library.\nEach module below has a well-defined interface, meaning each component can be used in isolation or replaced\nwith customized implementations to suit the application’s environment. For example: the Client Library supports custom logging classes, which can send interaction data to an external learning system; the Join Service can be implemented by any key-value store that supports expiration timers; the Online Learner can take (x, a, r, p) tuples generated by an external source, and can be implemented using any ML package that understands this data. We leverage this flexibility in our deployment with MSN.\nClient Library: This module correctly implements various exploration policies from the contextual bandit literature. Concretely, it takes as input context features x and an event key k from APP, and outputs an action a. Separately, a keyed tuple 〈k, (x, a, p)〉 is transmitted to the Join Service, where p is the probability of the chosen action a according to the exploration policy. Later, a reward r and key k are input from APP, triggering a separate transmission of 〈k, (r)〉 to the Join Service. The exploration policy is defined based on the Client Library configuration and can depend on a default action, a default policy and/or the output of the Online Learner.\nJoin Service: This logging module collects exploration data: each (x, a, p) tuple is joined with the reward r from the same interaction, often arriving after a substantial delay or from an entirely different component. How long to wait for the reward to arrive (experimental duration) can be configured to suit a particular application. The Join Service thus takes a stream of keyed observations (k, o)∗ and emits a stream of joined observations (o1, o2, ...)∗ where observations are joined if they share the same key and occur within this experimental duration. In particular, when a key is first observed a timer is started. All observations with the same key are joined and emitted when the timer reaches zero. The joined tuples (x, a, r, p) are then output to the Online Learner (via a queue), and also sent to storage for offline learning.\nOnline Learner: This component performs policy training online, i.e., quickly updating the policy to incorporate\na stream (x, a, r, p)∗ of examples output by the Join Service. It can run continuously and adapt to changing workloads or application environments. The Online Learner also evaluates arbitrary policies in real time, including the current trained policy, using Eq. 1 on the exploration data. We use these statistics for safeguards (Section 4.6) and to display performance on a dashboard [41].\nThe Online Learner, in a bit more detail, consists of a Reader Module to process the data stream, and an ML Module for policy training. In principle, any ML package providing online learning from contextual bandit exploration data can be used for the ML Module. Policies are generated and checkpointed at a configurable rate and pulled by the Client Library at another configurable rate.\nOffline Learner: The Offline Learner allows for extensive offline experimentation with the exploration data. Training and evaluating policies via alternative algorithms (such as those which cannot be updated online, using different hyper-parameters, estimators other than ips, or different policy classes), trying out and tuning new algorithms for exploration and policy learning, experimenting with unused logged features, and switching to different reward metrics are all possible. The MWT methodology guarantees offline experimentation is counterfactually accurate [21, 23, 36, 37]. Improvements generated through offline experimentation can be integrated into the online loop by simply restarting the Online Learner with the newly optimized policy or algorithm."
+    }, {
+      "heading" : "4.3 Robust logging and randomization",
+      "text" : "Written and verified jointly by experts in systems, machine learning, and software development, the Client Library consolidates all randomization and logging logic in the application, which prevents many bugs and simplifies further development of exploration capabilities.\nMost systems for machine learning assume reward information is available at the same time as the interaction, which is rarely the case in practice. As previously noted in Section 4.1, many bugs arise due to incorrect joining of this information. Our design systematically eliminates such bugs by ensuring the (x, a, p) tuple is set aside for logging at the point of decision and is correctly joined with the reward later. This guarantees the feature values used for policy evaluation are consistent with the interaction, the correct probabilities are recorded and the action chosen by the randomization is correctly logged even if downstream logic overrides it.\nRecording or using probabilities incorrectly has been the other key cause of many past failures we have observed. The Client Library implements randomization using a two-layer design: various exploration policies sit-\nting in the lower layer take as input a context and output a distribution over actions; then the top layer samples randomly from this distribution. Thus all randomization logic exists in one place. Randomization occurs by seeding a pseudorandom number generator (PRG) using the key k and an application ID. The PRG is invoked exactly once per interaction and is never reused across interactions. Including the application ID in the seed ensures that the randomization from multiple uses of the Decision Service in the same stack are not correlated."
+    }, {
+      "heading" : "4.4 Low latency learning",
+      "text" : "The Decision Service enables efficient, low latency learning through a coordinated design across components.\nIn the client library, the current policy can be invoked for prediction in a multi-threaded manner without duplicating its state, resulting in sub-millisecond parallel decisions with low memory overhead. Context processing is optimized in two ways. Since the same context class (e.g., MyContext in Section 3) is sent to the Join Service repeatedly, we construct and reuse an abstract syntax tree to speed up the serialization of the class. In addition, we use a simple caching scheme for repeated fragments of a context to substantially reduce data transfer. Such fragments are sent explicitly only periodically, and are replaced with references otherwise.\nThe Join Service adds negligible delay on top of the experimental duration, but must be scaled to handle the throughput of events generated by potentially numerous Client Library instances. Since scale out may cause events to be reordered, the Reader Module in the Online Learner buffers data to deal with references that arrive before the actual context due to the feature caching. The Online Learner trains a policy with an efficient online learning algorithm that adds only milliseconds of latency to the learning process. A policy is periodically saved and published for the Client Library to consume.\nAll components support configurable batching to improve throughput. Without batching, the end-to-end latency of submitting an interaction and receiving a policy that incorporates it is about 7 seconds (see Section 7)."
+    }, {
+      "heading" : "4.5 Full reproducibility",
+      "text" : "The Decision Service is unique in its ability to fully reproduce online results offline, despite the presence of randomized exploration and continuously updated policies. Each component plays a role in achieving this.\nPolicies from the Online Learner are identified by unique IDs and published to the Data store in Fig. 2. The Client Library records the ID of any policy used for each decision. Since the event and application IDs seed the PRG for exploration, all outcomes are reproducible.\nThe Online Learner may encounter unordered events from the Join Service, so it records the order in which interactions are processed with the stored policies. Since we periodically reset the learning rate to favor recent events, these resets are also recorded. Together, this ensures each trained policy is reproducible.\nWe have not yet implemented full reproducibility for systems with multiple Online Learners because we have not required more than one thus far. However, it could easily be added by recording a few additional values such as the parallel learning configuration."
+    }, {
+      "heading" : "4.6 Safeguards",
+      "text" : "The Decision Service enables a fully automated online machine learning loop: automated and machine learning are key selling points of the service. However, they are also liabilities, because it can be difficult to verify the behavior statically. As a result, applications engineers may not trust the behavior of such a system. The Decision Service has two key properties that make it possible to safeguard a deployed system and alleviate these concerns.\nThe first is compatibility with business logic and environmental constraints. The Decision Service allows arbitrary business logic to exist downstream that may alter, bound, or reverse any of its choices. Such logic can be used to implement fail-safes against violations of business policy or human safety. As long as this logic remains stationary, it will not affect MWT’s ability to provide unbiased counterfactual estimates of policy performance.\nThe second property is the ability to evaluate any policy in real-time, as provided by the online learner. This allow an accurate estimate of a policy’s performance before deployment and also allows real-time comparison with a default or “safe” policy. This feedback can be incorporated into a control loop that changes the deployed policy in a reactive fashion to satisfy desirable goals."
+    }, {
+      "heading" : "5 Implementation",
+      "text" : "Client Library. We have implemented versions of the client library in C#, C++, and Java. The code is opensource [20]. The C# library is about 5K lines of code: 1.5K for the various exploration policies and another 1.5K which handle batched uploads to the Join Service. The Client Library may link to the ML Module to invoke policies, but does not do any policy training or evaluation.\nJoin Service. We have implemented the Join Service using Azure Stream Analytics (ASA) [10], which allows us to specify a delayed join with 4 lines of query language— the delay is set to the experimental duration. ASA can be scaled up/down and handles failures/restarts by storing incoming data in a fault-tolerant queue (an Azure Event\nHub), and replaying data as needed. Online Learner. The Online Learner is implemented in 1.8K lines of C# as a stand-alone Azure worker role. For our ML Module, we use Vowpal Wabbit (VW) [58], an open-source online learning library. To reduce the memory overhead of parallel predictions in the Client Library, we modified VW slightly to support sharing policy state across VW instances. The Reader Module translates the interaction data from the on-the-wire JSON format used by the Client Library and Join Service to a VW format. VW solves the policy training problem by reducing it to cost-sensitive classification. By default, we train a policy with linear representation (a vector of weights), although many other representations are available. VW also supports parallel online learning using the AllReduce communication primitive [1], which provides scaling across cores and machines. Thus far we have not needed parallel learning for our deployments. Offline learner. The Offline Learner is currently implemented using Azure Data Factory, which schedules batch jobs for policy training or evaluation.\nOur implementation of the Decision Service can be deployed with the push of a button after registering the application [45]. Currently deployment takes around 6 minutes due to the time required to deploy various Azure components. It is also possible to deploy the entire Decision Service loop on a single machine. This mode could be particularly useful for testing the Decision Service as well as optimizing decisions in simulated environments (e.g., network simulators like Mininet [42])."
+    }, {
+      "heading" : "6 Deployment in MSN",
+      "text" : "We have deployed the Decision Service to personalize the news stories displayed on the MSN homepage shown in Fig. 3. This deployment is now the production default, handling thousands of requests per second. We describe the deployment and lessons learned.\nWe face essentially the News problem: a user requests the homepage and MSN’s front-end servers must decide how to order the articles on the page. If a user is logged in, there is context: demographics (e.g., age, location) and the kinds of news stories they have clicked on in the past. Otherwise only location is available. The action choices are the current set of news articles selected and ranked by the editors (tens of articles, typically). Each article has features that describe its topic. The reward signal is clicks.\nMSN uses the Decision Service to optimize the clickthrough rate (CTR) on the article for the most prominent slot of the segment, and uses the resulting policies to pick articles for all slots.7 The default exploration pol-\n7We are currently evaluating an approach for optimizing all slots si-\nicy EpsilonGreedy is used with = 33%8. The experimental duration is set to 10 minutes, and a new model is deployed to the Client Library every 5 minutes.\nLive experiments. MSN did several experiments before moving to production use of the Decision Service. In each experiment, the Decision Service was compared to the editorial ordering using standard A/B testing procedures. Editorial ordering was the production default which beat several previous attempts to use machine learning.\nExperiments on the Slate proportion of the page (shown in Fig. 3) were very successful, revealing a >25% CTR improvement over a two-week period. Fig. 4 shows the per-day CTR lift of this run. There is day-to-day variation due to the availability of articles, but the Decision Service consistently delivered at least 18% lift and a maximum of 55% lift in the period. Based on offline experimentation, we believe roughly half of the CTR lift comes from our algorithm optimizing with the users’ demographics and the other half from the users’ reading history.\nThe above gains were achieved while maintaining or improving longer-term engagement metrics such as sessions per unique user and average session length, showing that the easily-optimized CTR metric is aligned with longer-term goals in this case. We expect a more sophisticated exploration policy to further improve CTR.\nThe success of the experiments led MSN to make it the default in production for all logged-in users. The MSN team has since begun experimenting with using the Decision Service on more users and areas of the site9 revealing further higher impact applications. These later experiments have been run by the MSN team on their own, showing the system is usable by non-experts.\nmultaneously [33]. 8This choice of was driven by the stationarity timescale and click rate of the application. 9One nice property of the Decision Service is that extending to different areas of the site can be implemented easily as different applications.\nDeployment characteristics. MSN deployed a custom version of the Decision Service using some of our components and reimplementing others as required. They used the C# Client Library in front-end servers for low-latency.\nMSN implemented their own version of the Join Service based on Redis Cluster [47]. It is configured to accommodate a request rate in the low thousands per second, interaction size in the thousands of bytes, and a 10 minute experimental duration. Scale is primarily driven by request rate, since memory pressure is low for short experimental durations. Clicks are reported directly from user web browsers via web requests. The Join Service is shared across multiple applications (corresponding to different page segments) distinguished by id. A separate Online Learner is used for each application to isolate the trained models. Each Learner requires one core.\nBefore an experiment can go live, the Decision Service must pass various performance regression tests. MSN’s front-end servers are CPU limited, so CPU/request is a metric they monitor carefully. The Decision Service increased CPU/request by 4.9%, which was deemed acceptable. The majority of this overhead is a result of the time it takes to evaluate the machine-learned policy. We used the Offline Learner, with no additional live experiments to tune the default learning and exploration algorithms.\nLessons learned. We learned several lessons from the MSN deployment.\nReward encodings matter. In our initial experiment, we found poor performance, which was traced down to a combination of low CTR and an click/no-click reward encoding as {−1, 0} instead of {0, 1}. This seemingly minor difference had a huge impact on the variance of estimators. Since then, we have modified the core learning algorithms to better compensate for encoding errors.\nLarge Risk for Large Reward. It is a natural urge to want to shield the most critical and high-value portions of an\napplication from exploration. This results, for example, in editors locking important slots away from the recommendations of the Decision Service. While this limits the negative impact, it also places a low ceiling on possible improvements as we can only optimize less impactful portions of the page. In our deployment, we found each time the editors unlocked a more important slot, the CTR and engagement overall improved significantly.\nReproducibility is key. The ability to reproduce offline any failure mode or performance degradation observed in the logs was instrumental in fixing numerous issues we encountered over the deployment."
+    }, {
+      "heading" : "7 Evaluation",
+      "text" : "The previous section reported results from a live deployment with MSN on real user traffic. In this section, we use the data collected from this deployment to evaluate various aspects of the Decision Service design. We answer the following questions:\n1. How quickly are decisions made and policies learned? 2. Can high data rates be handled? 3. Are policy evaluation estimates reliable? Can poli-\ncies be compared in real-time? 4. How important is it to continuously train the policy? 5. What effect does bad logging have on the policy?"
+    }, {
+      "heading" : "7.1 Experimental setup and methodology",
+      "text" : "The Decision Service was deployed in our Azure subscription for these experiments. The sample code distributed with the Client Library was deployed on several large A4 instances (8 cores, 14GB memory, 1Gbps NIC). The Join Service uses ASA, which provides scalability through a configurable number of streaming units. The Event Hub queues feeding the Join Service and storing its output can also be scaled as needed. The Online Learner is as a stand-alone worker role on a single D5 instance (16 cores, 56GB memory).\nAll of our experiments use exploration data from the MSN deployment for a three-day period in April; this data contains the real (x, a, p, r) tuples generated on those days with x consisting of approximately 1000 features per action. By joining this data with browser click logs, we can determine both the time of decision and the time of click, for a realistic replay of the data. To evaluate the performance of a trained policy or any other policy (e.g., the editorial ranking), we use the policy evaluation capability of the Online Learner, which gives us accurate estimates of online performance according to MWT guarantees."
+    }, {
+      "heading" : "7.2 Latency of learning and decisions",
+      "text" : "We are interested in two quantities: the decision latency and learning latency. Decision latency is the time to make a decision in the Client Library (i.e., the ChooseAction call). Learning latency is the time from when an interaction is complete (i.e., ReportReward has been called) to when it affects a deployed policy in the Client Library.\nWe measured the decision latency by training a policy on one hour of MSN data, deploying this policy in the Client Library, and then repeatedly calling ChooseAction. The average latency measured is 0.2ms.\nTo measure learning latency, we first removed any configurable sources of delay: we disabled batching and caching (due to reordering-related delays) in the Client Library and configured it to poll for new models every 100ms; we set the Join Service experimental duration to 1 second; and configured the Online Learner to publish an updated policy after every interaction. We then replayed one interaction of the MSN data and waited for a policy to appear. The average learning latency is 7.3 seconds."
+    }, {
+      "heading" : "7.3 High data rates",
+      "text" : "Both our Join Service implementation (based on ASA) and the one used by MSN (based on Redis) are inherently scalable services so we focus on the Online Learner.\nThe data rates seen in production so far have been adequately handled by learning on a single core. To saturate the Online Learner, we preloaded MSN data into the Join Service’s output queue and processed it at full speed. We used the Client Library’s compression scheme to mimic what MSN does. The throughput achieved by the learner was stable at 2000 interactions/sec, implying 100 million interaction/day applications are viable. Buffering for reordered events whose compressed features were not yet available was minimal, remaining at 0 most of the time with occasional spikes up to 2250 buffered interactions.\nIn the case of MSN, the throughput of policy training is directly affected by the number of articles (actions) in each interaction. We measured this effect for different representative article counts; the corresponding through-\nputs are shown in Fig. 5. The average number of articles in a typical day is close to 20."
+    }, {
+      "heading" : "7.4 Reliable real-time policy comparison",
+      "text" : "While policy estimation using ips as per Eq. 1 has theoretical guarantees, it is prudent to verify this empirically. We took 3 simple policies, which always choose the first, second and third article respectively from the editorial ranking for the top slot. The first policy corresponds to the editorial baseline, while others are reasonable alternatives. For each policy, we computed an ips estimate of its value from a day’s worth of data for two different days in April. Additionally, we estimated the performance of each policy in the control flight with a very high precision. Across all policies and days, the relative difference between the ips and control values was no more than 2.5%, and all ips estimates were within a 95% confidence interval around the control values.\nWe next use similar ips estimates to capture the speed of learning. The policies currently in production in MSN have been continuously trained for months (with daily resets of the learning rate). How quickly does a policy achieve good performance when starting from scratch? To investigate this, we played a full day of MSN data and compared the trained policy to the editorial policy. We leveraged the Online Learner’s support for evaluating arbitrary policies in real-time. Fig. 6 shows the results, where each datapoint was captured within an average of 10 seconds of the corresponding interaction tuple. Both the trained and editorial policies exhibit high variance and become statistically significant with more data. The trained policy starts outperforming editorial after just 65K interactions—for a request rate of 1000/sec, this is about 1 minute—and eventually achieves a 42% improvement by end of day."
+    }, {
+      "heading" : "7.5 Continuous policy training",
+      "text" : "To demonstrate the importance of continuous training, we used the policy from the previous experiment (trained on day 1) and tested it on day 2 and day 3. We compared this to a policy trained on the corresponding day, and recorded relative performance:\nPolicy from: Day 1 Day 2 Day 3 Same day 1.0 1.0 1.0 Day 1 1.0 0.73 0.46\nIn other words, day 1’s policy achieves 73% of the CTR of day 2’s policy when tested on day 2, and 46% of day 3’s policy on day 3. This suggests that the environment and articles have changed, and day 1’s policy is stale. Continuous training solves this problem."
+    }, {
+      "heading" : "7.6 Data collection failures",
+      "text" : "Our motivation for building the Decision Service came from witnessing past failures to apply MWT. Many of these failures were due to incorrect exploration data. We simulated two failure modes using the offline logs from MSN. For each experiment, we took a day’s data and randomly allocated 80% of it for training and 20% for testing while preserving time order, approximating the normal train/test split methodology of supervised learning.\nThe Decision Service using the training set simulates the policy learned in production, while the test set simulates the performance of this policy when deployed online. This simulation is imperfect because training occurs on fewer events and because the policy evaluated on the test set is not adaptive. When training on the train set progressive validation techniques [13] allow an unbiased estimate of policy value deployed with zero delay. When evaluating the final trained policy on the test set, only a 0.9 fraction of performance is observed, implying that intraday nonstationarity is important.\nWe simulated incorrect logging of probabilities which could be caused by editors overriding 10% of the actions and recording the override rather than chosen action. We trained a policy on the training set and evaluated it on the test set. The progressive validation CTR from training was 3 times higher than performance on the test set. Hence, the offline estimates of a policy’s quality carry little meaning once the probabilities are corrupted.\nThe second experiment simulates a common error whereby the identity or probability of the random action chosen by exploration might be used as a feature for downstream learning. We simulated this by adding a new feature to our training data which was 1 for the action sampled by Decision Service in our logs and 0 for all the other actions. The test data was not augmented with this feature since the random choice is not available\nto the policy at prediction time, but is rather based on the policy’s prediction. We found the progressive validation CTR was nearly 8.7 times larger than that observed on test data, again making the offline estimates meaningless."
+    }, {
+      "heading" : "8 Related work",
+      "text" : "Here we discuss other machine learning approaches related to MWT and experimentation and machine learning systems related to the Decision Service."
+    }, {
+      "heading" : "8.1 Machine learning with exploration",
+      "text" : "There are hundreds of papers related to exploration and machine learning which broadly fall into 3 categories. The simplest of these is active learning [12, 29, 30, 50] where the algorithm helps select examples to label in partnership with a user in order to improve model performance. A maximally general setting is reinforcement learning [53, 54] where an algorithm repeatedly chooses among actions and receives rewards and other feedback depending on the chosen actions. A more minimal setting is multi-armed bandits (MAB) where only a single action affects observed reward [15, 25]. Our methodology builds on contextual bandits with policy sets [2, 3, 8, 22, 34] which reduces policy optimization on exploration data to a supervised learning problem, allowing incorporation of tools developed for supervised learning (see [11] for background on learning reductions). Our methodology also incorporates offline policy evaluation in contextual bandits [21, 23, 36, 37]. Alternative approaches for contextual bandits typically impose substantial modeling assumptions such as linearity [7, 17, 36], Lipschitz rewards [39, 51], or availability of (correct) Bayesian priors [5], which often limits applicability."
+    }, {
+      "heading" : "8.2 Systems for ML and experimentation",
+      "text" : "A/B testing. A/B testing refers to randomized experiments with subjects randomly partitioned amongst treatments. It is routinely used in medicine and social science, and has become standard in many Internet services [32, 31], as well supported by statistical theory [24]. A more advanced version, “multi-variate testing\", runs many A/B tests in parallel. Several commercialized systems provide A/B testing in web services (Google Analytics [26], Optimizely [46], MixPanel [43], etc.). The Decision Service instead builds on MWT, a paradigm exponentially more efficient in data usage than A/B testing. Bandit learning systems. Several platforms support bandit learning for web services. Google Analytics [26] supports Thompson Sampling [56], a well-known algorithm for the basic Multi-Arm Bandit problem. Yelp MOE [60] is an open-source software package which implements optimization over a large parameter space via sequential\nA/B tests. Bayesian optimization and Gaussian Processes are used to compute parameters for the “next\" A/B test. SigOpt.com is a commercial platform which builds on Yelp MOE. However, these systems do not support contextual bandit learning, and they do not instrument automatic deployment of learned policies (and hence do not “close the loop\" in Figure 1).\nContextual bandits deployments. There have been several applications of contextual bandit learning in web services that we are aware of (e.g., news recommendation [4, 36, 37] and Advertising [14]); however, they all have been completely custom rather than a generalpurpose system like the Decision Service.\nSystems for supervised Machine Learning. There are many systems designed for supervised machine learning such as CNTK [18], GraphLab [28], Parameter Server [38], MLlib [52], TensorFlow [55], Torch [57], Minerva [59] and Vowpal Wabbit [58] to name a few. These principally support Machine Learning model development. A few more, such as Google Cloud ML [27], Amazon ML [6], and AzureML [9] are designed to support development and deployment. However, these systems do not support data gathering or exploration.\nVelox [19] is an open-source system that supports model serving and batch training. Velox can adapt models online to users by adjusting preference weights in the user profile. It collects data that can be used to retrain models via Spark [61]. Velox does not perform exploration.\nWe know of two other systems designed to fully support data collection with exploration, model development, and deployment: LUIS [35] (based on ICE [50]), and Next [30]. These systems support active learning, and hence make exploration decisions for labeling in the backend (unlike the Decision Service which makes decisions to guide customer-facing application behavior), and do not provide MWT capability."
+    }, {
+      "heading" : "9 The Future",
+      "text" : "We have presented the Decision Service: a powerful tool to support the complete data lifecycle, which automates many of the burdensome tasks that data scientists face such as gathering the right data and deploying in an appropriate manner. Instead, a data scientist can focus on more core tasks such as finding the right features, representation, or signal to optimize against.\nThe data lifecycle support also makes basic application of the Decision Service feasible without a data scientist. To assist in lowering the barrier to entry, we are exploring techniques based on expert learning [16] and hyperparameter search that may further automate the process. Since the policy evaluation techniques can provide accu-\nrate predictions of online performance, such automations are guaranteed to be statistically sound. We are also focusing on making the decision service easy to deploy and use because we believe this is key to goal of democratizing machine learning for everyone.\nThe Decision Service can also naturally be extended to a greater variety of problems, all of which can benefit from data lifecycle support. Plausible extensions might address advanced variants like reinforcement and active learning, and simpler ones like supervised learning."
+    } ],
+    "references" : [ {
+      "title" : "A reliable effective terascale linear learning system",
+      "author" : [ "A. Agarwal", "O. Chapelle", "M. Dudík", "J. Langford" ],
+      "venue" : "The Journal of Machine Learning Research,",
+      "citeRegEx" : "1",
+      "shortCiteRegEx" : "1",
+      "year" : 2014
+    }, {
+      "title" : "Contextual bandit learning with predictable rewards",
+      "author" : [ "A. Agarwal", "M. Dudík", "S. Kale", "J. Langford", "R.E. Schapire" ],
+      "venue" : "In 15th Intl. Conf. on Artificial Intelligence and Statistics (AISTATS),",
+      "citeRegEx" : "2",
+      "shortCiteRegEx" : "2",
+      "year" : 2012
+    }, {
+      "title" : "Taming the monster: A fast and simple algorithm for contextual bandits",
+      "author" : [ "A. Agarwal", "D. Hsu", "S. Kale", "J. Langford", "L. Li", "R. Schapire" ],
+      "venue" : "In 31st Intl. Conf. on Machine Learning (ICML),",
+      "citeRegEx" : "3",
+      "shortCiteRegEx" : "3",
+      "year" : 2014
+    }, {
+      "title" : "Personalizing linkedin feed",
+      "author" : [ "D. Agarwal", "B.-C. Chen", "Q. He", "Z. Hua", "G. Lebanon", "Y. Ma", "P. Shivaswamy", "H.-P. Tseng", "J. Yang", "L. Zhang" ],
+      "venue" : "In Proceedings of the 21th ACM SIGKDD International Conference on Knowledge Discovery and Data Mining,",
+      "citeRegEx" : "4",
+      "shortCiteRegEx" : "4",
+      "year" : 2015
+    }, {
+      "title" : "Thompson sampling for contextual bandits with linear payoffs",
+      "author" : [ "S. Agrawal", "N. Goyal" ],
+      "venue" : "In 30th Intl. Conf. on Machine Learning (ICML),",
+      "citeRegEx" : "5",
+      "shortCiteRegEx" : "5",
+      "year" : 2013
+    }, {
+      "title" : "Using confidence bounds for exploitationexploration trade-offs",
+      "author" : [ "P. Auer" ],
+      "venue" : "J. of Machine Learning Research (JMLR),",
+      "citeRegEx" : "7",
+      "shortCiteRegEx" : "7",
+      "year" : 2002
+    }, {
+      "title" : "The nonstochastic multiarmed bandit problem",
+      "author" : [ "P. Auer", "N. Cesa-Bianchi", "Y. Freund", "R.E. Schapire" ],
+      "venue" : "SIAM J. Comput.,",
+      "citeRegEx" : "8",
+      "shortCiteRegEx" : "8",
+      "year" : 2002
+    }, {
+      "title" : "Learning reductions that really work",
+      "author" : [ "A. Beygelzimer", "H.D. III", "J. Langford", "P. Mineiro" ],
+      "venue" : "Proceedings of the IEEE,",
+      "citeRegEx" : "11",
+      "shortCiteRegEx" : "11",
+      "year" : 2016
+    }, {
+      "title" : "Agnostic active learning without constraints",
+      "author" : [ "A. Beygelzimer", "J. Langford", "Z. Tong", "D.J. Hsu" ],
+      "venue" : "In Advances in Neural Information Processing Systems,",
+      "citeRegEx" : "12",
+      "shortCiteRegEx" : "12",
+      "year" : 2010
+    }, {
+      "title" : "Beating the hold-out: Bounds for k-fold and progressive cross-validation",
+      "author" : [ "A. Blum", "A. Kalai", "J. Langford" ],
+      "venue" : "In Proceedings of the Twelfth Annual Conference on Computational Learning Theory, COLT",
+      "citeRegEx" : "13",
+      "shortCiteRegEx" : "13",
+      "year" : 1999
+    }, {
+      "title" : "Counterfactual reasoning and learning systems: The example of computational advertising",
+      "author" : [ "L. Bottou", "J. Peters", "J. Quinonero-Candela", "D.X. Charles", "D.M. Chickering", "E. Portugaly", "D. Ray", "P. Simard", "E. Snelson" ],
+      "venue" : "J. of Machine Learning Research (JMLR),",
+      "citeRegEx" : "14",
+      "shortCiteRegEx" : "14",
+      "year" : 2013
+    }, {
+      "title" : "Regret Analysis of Stochastic and Nonstochastic Multi-armed Bandit Problems",
+      "author" : [ "S. Bubeck", "N. Cesa-Bianchi" ],
+      "venue" : "Foundations and Trends in Machine Learning,",
+      "citeRegEx" : "15",
+      "shortCiteRegEx" : "15",
+      "year" : 2012
+    }, {
+      "title" : "Prediction, learning, and games",
+      "author" : [ "N. Cesa-Bianchi", "G. Lugosi" ],
+      "venue" : "Cambridge university press,",
+      "citeRegEx" : "16",
+      "shortCiteRegEx" : "16",
+      "year" : 2006
+    }, {
+      "title" : "Contextual Bandits with Linear Payoff Functions",
+      "author" : [ "W. Chu", "L. Li", "L. Reyzin", "R.E. Schapire" ],
+      "venue" : "In 14th Intl. Conf. on Artificial Intelligence and Statistics (AISTATS),",
+      "citeRegEx" : "17",
+      "shortCiteRegEx" : "17",
+      "year" : 2011
+    }, {
+      "title" : "The missing piece in complex analytics: Low latency, scalable model management and serving with velox",
+      "author" : [ "D. Crankshaw", "P. Bailis", "J.E. Gonzalez", "H. Li", "Z. Zhang", "M.J. Franklin", "A. Ghodsi", "M.I. Jordan" ],
+      "venue" : "CIDR",
+      "citeRegEx" : "19",
+      "shortCiteRegEx" : "19",
+      "year" : 2015
+    }, {
+      "title" : "Sampleefficient nonstationary policy evaluation for contextual bandits",
+      "author" : [ "M. Dudík", "D. Erhan", "J. Langford", "L. Li" ],
+      "venue" : "In 28th Conf. on Uncertainty in Artificial Intelligence (UAI),",
+      "citeRegEx" : "21",
+      "shortCiteRegEx" : "21",
+      "year" : 2012
+    }, {
+      "title" : "Efficient optimal leanring for contextual bandits",
+      "author" : [ "M. Dudik", "D. Hsu", "S. Kale", "N. Karampatziakis", "J. Langford", "L. Reyzin", "T. Zhang" ],
+      "venue" : "In 27th Conf. on Uncertainty in Artificial Intelligence (UAI),",
+      "citeRegEx" : "22",
+      "shortCiteRegEx" : "22",
+      "year" : 2011
+    }, {
+      "title" : "Doubly robust policy evaluation and learning",
+      "author" : [ "M. Dudík", "J. Langford", "L. Li" ],
+      "venue" : "In 28th Intl. Conf. on Machine Learning (ICML),",
+      "citeRegEx" : "23",
+      "shortCiteRegEx" : "23",
+      "year" : 2011
+    }, {
+      "title" : "Field Experiments: Design, Analysis, and Interpretation",
+      "author" : [ "A.S. Gerber", "D.P. Green" ],
+      "venue" : "W.W. Norton&Co, Inc.,",
+      "citeRegEx" : "24",
+      "shortCiteRegEx" : "24",
+      "year" : 2012
+    }, {
+      "title" : "Multi- Armed Bandit Allocation Indices",
+      "author" : [ "J. Gittins", "K. Glazebrook", "R. Weber" ],
+      "venue" : null,
+      "citeRegEx" : "25",
+      "shortCiteRegEx" : "25",
+      "year" : 2011
+    }, {
+      "title" : "Theory of disagreement-based active learning",
+      "author" : [ "S. Hanneke" ],
+      "venue" : "Foundations and Trends R  © in Machine Learning,",
+      "citeRegEx" : "29",
+      "shortCiteRegEx" : "29",
+      "year" : 2014
+    }, {
+      "title" : "Next: A system for real-world development, evaluation, and application of active learning",
+      "author" : [ "K.G. Jamieson", "L. Jain", "C. Fernandez", "N.J. Glattard", "R. Nowak" ],
+      "venue" : "In Advances in Neural Information Processing Systems,",
+      "citeRegEx" : "30",
+      "shortCiteRegEx" : "30",
+      "year" : 2015
+    }, {
+      "title" : "Online controlled experiments and a/b tests",
+      "author" : [ "R. Kohavi", "R. Longbotham" ],
+      "venue" : "Encyclopedia of Machine Learning and Data Mining. Springer,",
+      "citeRegEx" : "31",
+      "shortCiteRegEx" : "31",
+      "year" : 2015
+    }, {
+      "title" : "Controlled experiments on the web: survey and practical guide",
+      "author" : [ "R. Kohavi", "R. Longbotham", "D. Sommerfield", "R.M. Henne" ],
+      "venue" : "Data Min. Knowl. Discov.,",
+      "citeRegEx" : "32",
+      "shortCiteRegEx" : "32",
+      "year" : 2009
+    }, {
+      "title" : "Efficient contextual semi-bandit learning",
+      "author" : [ "A. Krishnamurthy", "A. Agarwal", "M. Dudík" ],
+      "venue" : "arxiv.org, abs/1502.05890,",
+      "citeRegEx" : "33",
+      "shortCiteRegEx" : "33",
+      "year" : 2015
+    }, {
+      "title" : "The Epoch-Greedy Algorithm for Contextual Multi-armed Bandits",
+      "author" : [ "J. Langford", "T. Zhang" ],
+      "venue" : "In 21st Advances in Neural Information Processing Systems (NIPS),",
+      "citeRegEx" : "34",
+      "shortCiteRegEx" : "34",
+      "year" : 2007
+    }, {
+      "title" : "A contextual-bandit approach to personalized news article recommendation",
+      "author" : [ "L. Li", "W. Chu", "J. Langford", "R.E. Schapire" ],
+      "venue" : "In 19th Intl. World Wide Web Conf. (WWW),",
+      "citeRegEx" : "36",
+      "shortCiteRegEx" : "36",
+      "year" : 2010
+    }, {
+      "title" : "Unbiased offline evaluation of contextual-bandit-based news article recommendation algorithms",
+      "author" : [ "L. Li", "W. Chu", "J. Langford", "X. Wang" ],
+      "venue" : "In 4th ACM Intl. Conf. on Web Search and Data Mining (WSDM),",
+      "citeRegEx" : "37",
+      "shortCiteRegEx" : "37",
+      "year" : 2011
+    }, {
+      "title" : "Scaling distributed machine learning with the parameter server",
+      "author" : [ "M. Li", "D.G. Andersen", "J.W. Park", "A.J. Smola", "A. Ahmed", "V. Josifovski", "J. Long", "E.J. Shekita", "B.-Y. Su" ],
+      "venue" : "In 11th USENIX Symposium on Operating Systems Design and Implementation",
+      "citeRegEx" : "38",
+      "shortCiteRegEx" : "38",
+      "year" : 2014
+    }, {
+      "title" : "Showing Relevant Ads via Lipschitz Context Multi-Armed Bandits",
+      "author" : [ "T. Lu", "D. Pál", "M. Pál" ],
+      "venue" : "In 14th Intl. Conf. on Artificial Intelligence and Statistics (AISTATS),",
+      "citeRegEx" : "39",
+      "shortCiteRegEx" : "39",
+      "year" : 2010
+    }, {
+      "title" : "The user and business impact of server delays, additional bytes, and http chunking in web search",
+      "author" : [ "E. Schurman", "J. Brutlag" ],
+      "venue" : "In Velocity,",
+      "citeRegEx" : "48",
+      "shortCiteRegEx" : "48",
+      "year" : 2009
+    }, {
+      "title" : "Machine learning: The high-interest credit card of technical debt",
+      "author" : [ "D. Sculley", "G. Holt", "D. Golovin", "E. Davydov", "T. Phillips", "D. Ebner", "V. Chaudhary", "M. Young" ],
+      "venue" : "In SE4ML: Software Engineering 4 Machine Learning,",
+      "citeRegEx" : "49",
+      "shortCiteRegEx" : "49",
+      "year" : 2014
+    }, {
+      "title" : "Ice: enabling non-experts to build models interactively for large-scale lopsided problems",
+      "author" : [ "P. Simard", "D. Chickering", "A. Lakshmiratan", "D. Charles", "L. Bottou", "C.G.J. Suarez", "D. Grangier", "S. Amershi", "J. Verwey", "J. Suh" ],
+      "venue" : "arXiv preprint arXiv:1409.4814,",
+      "citeRegEx" : "50",
+      "shortCiteRegEx" : "50",
+      "year" : 2014
+    }, {
+      "title" : "Contextual bandits with similarity information",
+      "author" : [ "A. Slivkins" ],
+      "venue" : "J. of Machine Learning Research (JMLR),",
+      "citeRegEx" : "51",
+      "shortCiteRegEx" : "51",
+      "year" : 2014
+    }, {
+      "title" : "Reinforcement Learning: An Introduction",
+      "author" : [ "R.S. Sutton", "A.G. Barto" ],
+      "venue" : null,
+      "citeRegEx" : "53",
+      "shortCiteRegEx" : "53",
+      "year" : 1998
+    }, {
+      "title" : "Algorithms for Reinforcement Learning",
+      "author" : [ "C. Szepesvári" ],
+      "venue" : "Synthesis Lectures on Artificial Intelligence and Machine Learning. Morgan & Claypool Publishers,",
+      "citeRegEx" : "54",
+      "shortCiteRegEx" : "54",
+      "year" : 2010
+    }, {
+      "title" : "On the likelihood that one unknown probability exceeds another in view of the evidence of two samples",
+      "author" : [ "W.R. Thompson" ],
+      "venue" : null,
+      "citeRegEx" : "56",
+      "shortCiteRegEx" : "56",
+      "year" : 1933
+    }, {
+      "title" : "Minerva: A scalable and highly efficient training platform for deep learning",
+      "author" : [ "M. Wang", "T. Xiao", "J. Li", "J. Zhang", "C. Hong", "Z. Zhang" ],
+      "venue" : "In NIPS Workshop, Distributed Machine Learning and Matrix Computations,",
+      "citeRegEx" : "59",
+      "shortCiteRegEx" : "59",
+      "year" : 2014
+    }, {
+      "title" : "Spark: Cluster computing with working sets",
+      "author" : [ "M. Zaharia", "M. Chowdhury", "M.J. Franklin", "S. Shenker", "I. Stoica" ],
+      "venue" : "In Proceedings of the 2Nd USENIX Conference on Hot Topics in Cloud Computing,",
+      "citeRegEx" : "61",
+      "shortCiteRegEx" : "61",
+      "year" : 2010
+    } ],
+    "referenceMentions" : [ {
+      "referenceID" : 10,
+      "context" : "Machine Learning has well-known high-value applications, yet effective deployment is fraught with difficulties in practice [14, 49].",
+      "startOffset" : 123,
+      "endOffset" : 131
+    }, {
+      "referenceID" : 31,
+      "context" : "Machine Learning has well-known high-value applications, yet effective deployment is fraught with difficulties in practice [14, 49].",
+      "startOffset" : 123,
+      "endOffset" : 131
+    }, {
+      "referenceID" : 10,
+      "context" : "Learning can be biased when the decisions made by an algorithm affect the data collected to train that algorithm [14, 49].",
+      "startOffset" : 113,
+      "endOffset" : 121
+    }, {
+      "referenceID" : 31,
+      "context" : "Learning can be biased when the decisions made by an algorithm affect the data collected to train that algorithm [14, 49].",
+      "startOffset" : 113,
+      "endOffset" : 121
+    }, {
+      "referenceID" : 22,
+      "context" : "A common methodology for exploration is A/B testing [31, 32]: policy A is tested against policy B by running both live on a small percentage of user traffic.",
+      "startOffset" : 52,
+      "endOffset" : 60
+    }, {
+      "referenceID" : 23,
+      "context" : "A common methodology for exploration is A/B testing [31, 32]: policy A is tested against policy B by running both live on a small percentage of user traffic.",
+      "startOffset" : 52,
+      "endOffset" : 60
+    }, {
+      "referenceID" : 2,
+      "context" : "Contextual bandits [3, 34] is a line of work in machine learning allowing testing and optimization over exponentially more policies for a given number of events2.",
+      "startOffset" : 19,
+      "endOffset" : 26
+    }, {
+      "referenceID" : 25,
+      "context" : "Contextual bandits [3, 34] is a line of work in machine learning allowing testing and optimization over exponentially more policies for a given number of events2.",
+      "startOffset" : 19,
+      "endOffset" : 26
+    }, {
+      "referenceID" : 10,
+      "context" : "3 of [14] contains a classic example of this phenomenon.",
+      "startOffset" : 5,
+      "endOffset" : 9
+    }, {
+      "referenceID" : 2,
+      "context" : ", [3, 34]) and policy evaluation (e.",
+      "startOffset" : 2,
+      "endOffset" : 9
+    }, {
+      "referenceID" : 25,
+      "context" : ", [3, 34]) and policy evaluation (e.",
+      "startOffset" : 2,
+      "endOffset" : 9
+    }, {
+      "referenceID" : 26,
+      "context" : ", [36, 37]) literatures.",
+      "startOffset" : 2,
+      "endOffset" : 10
+    }, {
+      "referenceID" : 27,
+      "context" : ", [36, 37]) literatures.",
+      "startOffset" : 2,
+      "endOffset" : 10
+    }, {
+      "referenceID" : 2,
+      "context" : "The randomization need not be uniform and for best performance should not be [3, 8].",
+      "startOffset" : 77,
+      "endOffset" : 83
+    }, {
+      "referenceID" : 6,
+      "context" : "The randomization need not be uniform and for best performance should not be [3, 8].",
+      "startOffset" : 77,
+      "endOffset" : 83
+    }, {
+      "referenceID" : 17,
+      "context" : "A better approach is to use a reduction to cost-sensitive classification [23], for which many practical algorithms have been designed and implemented.",
+      "startOffset" : 73,
+      "endOffset" : 77
+    }, {
+      "referenceID" : 25,
+      "context" : "[34]).",
+      "startOffset" : 0,
+      "endOffset" : 4
+    }, {
+      "referenceID" : 24,
+      "context" : "A more principled approach explores and learns for all slots at once [33].",
+      "startOffset" : 69,
+      "endOffset" : 73
+    }, {
+      "referenceID" : 30,
+      "context" : "For interactive high-value applications serving latency tends to be directly linked to user experience and revenue [48].",
+      "startOffset" : 115,
+      "endOffset" : 119
+    }, {
+      "referenceID" : 15,
+      "context" : "The MWT methodology guarantees offline experimentation is counterfactually accurate [21, 23, 36, 37].",
+      "startOffset" : 84,
+      "endOffset" : 100
+    }, {
+      "referenceID" : 17,
+      "context" : "The MWT methodology guarantees offline experimentation is counterfactually accurate [21, 23, 36, 37].",
+      "startOffset" : 84,
+      "endOffset" : 100
+    }, {
+      "referenceID" : 26,
+      "context" : "The MWT methodology guarantees offline experimentation is counterfactually accurate [21, 23, 36, 37].",
+      "startOffset" : 84,
+      "endOffset" : 100
+    }, {
+      "referenceID" : 27,
+      "context" : "The MWT methodology guarantees offline experimentation is counterfactually accurate [21, 23, 36, 37].",
+      "startOffset" : 84,
+      "endOffset" : 100
+    }, {
+      "referenceID" : 0,
+      "context" : "VW also supports parallel online learning using the AllReduce communication primitive [1], which provides scaling across cores and machines.",
+      "startOffset" : 86,
+      "endOffset" : 89
+    }, {
+      "referenceID" : 24,
+      "context" : "multaneously [33].",
+      "startOffset" : 13,
+      "endOffset" : 17
+    }, {
+      "referenceID" : 9,
+      "context" : "When training on the train set progressive validation techniques [13] allow an unbiased estimate of policy value deployed with zero delay.",
+      "startOffset" : 65,
+      "endOffset" : 69
+    }, {
+      "referenceID" : 8,
+      "context" : "The simplest of these is active learning [12, 29, 30, 50] where the algorithm helps select examples to label in partnership with a user in order to improve model performance.",
+      "startOffset" : 41,
+      "endOffset" : 57
+    }, {
+      "referenceID" : 20,
+      "context" : "The simplest of these is active learning [12, 29, 30, 50] where the algorithm helps select examples to label in partnership with a user in order to improve model performance.",
+      "startOffset" : 41,
+      "endOffset" : 57
+    }, {
+      "referenceID" : 21,
+      "context" : "The simplest of these is active learning [12, 29, 30, 50] where the algorithm helps select examples to label in partnership with a user in order to improve model performance.",
+      "startOffset" : 41,
+      "endOffset" : 57
+    }, {
+      "referenceID" : 32,
+      "context" : "The simplest of these is active learning [12, 29, 30, 50] where the algorithm helps select examples to label in partnership with a user in order to improve model performance.",
+      "startOffset" : 41,
+      "endOffset" : 57
+    }, {
+      "referenceID" : 34,
+      "context" : "A maximally general setting is reinforcement learning [53, 54] where an algorithm repeatedly chooses among actions and receives rewards and other feedback depending on the chosen actions.",
+      "startOffset" : 54,
+      "endOffset" : 62
+    }, {
+      "referenceID" : 35,
+      "context" : "A maximally general setting is reinforcement learning [53, 54] where an algorithm repeatedly chooses among actions and receives rewards and other feedback depending on the chosen actions.",
+      "startOffset" : 54,
+      "endOffset" : 62
+    }, {
+      "referenceID" : 11,
+      "context" : "A more minimal setting is multi-armed bandits (MAB) where only a single action affects observed reward [15, 25].",
+      "startOffset" : 103,
+      "endOffset" : 111
+    }, {
+      "referenceID" : 19,
+      "context" : "A more minimal setting is multi-armed bandits (MAB) where only a single action affects observed reward [15, 25].",
+      "startOffset" : 103,
+      "endOffset" : 111
+    }, {
+      "referenceID" : 1,
+      "context" : "Our methodology builds on contextual bandits with policy sets [2, 3, 8, 22, 34] which reduces policy optimization on exploration data to a supervised learning problem, allowing incorporation of tools developed for supervised learning (see [11] for background on learning reductions).",
+      "startOffset" : 62,
+      "endOffset" : 79
+    }, {
+      "referenceID" : 2,
+      "context" : "Our methodology builds on contextual bandits with policy sets [2, 3, 8, 22, 34] which reduces policy optimization on exploration data to a supervised learning problem, allowing incorporation of tools developed for supervised learning (see [11] for background on learning reductions).",
+      "startOffset" : 62,
+      "endOffset" : 79
+    }, {
+      "referenceID" : 6,
+      "context" : "Our methodology builds on contextual bandits with policy sets [2, 3, 8, 22, 34] which reduces policy optimization on exploration data to a supervised learning problem, allowing incorporation of tools developed for supervised learning (see [11] for background on learning reductions).",
+      "startOffset" : 62,
+      "endOffset" : 79
+    }, {
+      "referenceID" : 16,
+      "context" : "Our methodology builds on contextual bandits with policy sets [2, 3, 8, 22, 34] which reduces policy optimization on exploration data to a supervised learning problem, allowing incorporation of tools developed for supervised learning (see [11] for background on learning reductions).",
+      "startOffset" : 62,
+      "endOffset" : 79
+    }, {
+      "referenceID" : 25,
+      "context" : "Our methodology builds on contextual bandits with policy sets [2, 3, 8, 22, 34] which reduces policy optimization on exploration data to a supervised learning problem, allowing incorporation of tools developed for supervised learning (see [11] for background on learning reductions).",
+      "startOffset" : 62,
+      "endOffset" : 79
+    }, {
+      "referenceID" : 7,
+      "context" : "Our methodology builds on contextual bandits with policy sets [2, 3, 8, 22, 34] which reduces policy optimization on exploration data to a supervised learning problem, allowing incorporation of tools developed for supervised learning (see [11] for background on learning reductions).",
+      "startOffset" : 239,
+      "endOffset" : 243
+    }, {
+      "referenceID" : 15,
+      "context" : "Our methodology also incorporates offline policy evaluation in contextual bandits [21, 23, 36, 37].",
+      "startOffset" : 82,
+      "endOffset" : 98
+    }, {
+      "referenceID" : 17,
+      "context" : "Our methodology also incorporates offline policy evaluation in contextual bandits [21, 23, 36, 37].",
+      "startOffset" : 82,
+      "endOffset" : 98
+    }, {
+      "referenceID" : 26,
+      "context" : "Our methodology also incorporates offline policy evaluation in contextual bandits [21, 23, 36, 37].",
+      "startOffset" : 82,
+      "endOffset" : 98
+    }, {
+      "referenceID" : 27,
+      "context" : "Our methodology also incorporates offline policy evaluation in contextual bandits [21, 23, 36, 37].",
+      "startOffset" : 82,
+      "endOffset" : 98
+    }, {
+      "referenceID" : 5,
+      "context" : "Alternative approaches for contextual bandits typically impose substantial modeling assumptions such as linearity [7, 17, 36], Lipschitz rewards [39, 51], or availability of (correct) Bayesian priors [5], which often limits applicability.",
+      "startOffset" : 114,
+      "endOffset" : 125
+    }, {
+      "referenceID" : 13,
+      "context" : "Alternative approaches for contextual bandits typically impose substantial modeling assumptions such as linearity [7, 17, 36], Lipschitz rewards [39, 51], or availability of (correct) Bayesian priors [5], which often limits applicability.",
+      "startOffset" : 114,
+      "endOffset" : 125
+    }, {
+      "referenceID" : 26,
+      "context" : "Alternative approaches for contextual bandits typically impose substantial modeling assumptions such as linearity [7, 17, 36], Lipschitz rewards [39, 51], or availability of (correct) Bayesian priors [5], which often limits applicability.",
+      "startOffset" : 114,
+      "endOffset" : 125
+    }, {
+      "referenceID" : 29,
+      "context" : "Alternative approaches for contextual bandits typically impose substantial modeling assumptions such as linearity [7, 17, 36], Lipschitz rewards [39, 51], or availability of (correct) Bayesian priors [5], which often limits applicability.",
+      "startOffset" : 145,
+      "endOffset" : 153
+    }, {
+      "referenceID" : 33,
+      "context" : "Alternative approaches for contextual bandits typically impose substantial modeling assumptions such as linearity [7, 17, 36], Lipschitz rewards [39, 51], or availability of (correct) Bayesian priors [5], which often limits applicability.",
+      "startOffset" : 145,
+      "endOffset" : 153
+    }, {
+      "referenceID" : 4,
+      "context" : "Alternative approaches for contextual bandits typically impose substantial modeling assumptions such as linearity [7, 17, 36], Lipschitz rewards [39, 51], or availability of (correct) Bayesian priors [5], which often limits applicability.",
+      "startOffset" : 200,
+      "endOffset" : 203
+    }, {
+      "referenceID" : 23,
+      "context" : "It is routinely used in medicine and social science, and has become standard in many Internet services [32, 31], as well supported by statistical theory [24].",
+      "startOffset" : 103,
+      "endOffset" : 111
+    }, {
+      "referenceID" : 22,
+      "context" : "It is routinely used in medicine and social science, and has become standard in many Internet services [32, 31], as well supported by statistical theory [24].",
+      "startOffset" : 103,
+      "endOffset" : 111
+    }, {
+      "referenceID" : 18,
+      "context" : "It is routinely used in medicine and social science, and has become standard in many Internet services [32, 31], as well supported by statistical theory [24].",
+      "startOffset" : 153,
+      "endOffset" : 157
+    }, {
+      "referenceID" : 36,
+      "context" : "Google Analytics [26] supports Thompson Sampling [56], a well-known algorithm for the basic Multi-Arm Bandit problem.",
+      "startOffset" : 49,
+      "endOffset" : 53
+    }, {
+      "referenceID" : 3,
+      "context" : ", news recommendation [4, 36, 37] and Advertising [14]); however, they all have been completely custom rather than a generalpurpose system like the Decision Service.",
+      "startOffset" : 22,
+      "endOffset" : 33
+    }, {
+      "referenceID" : 26,
+      "context" : ", news recommendation [4, 36, 37] and Advertising [14]); however, they all have been completely custom rather than a generalpurpose system like the Decision Service.",
+      "startOffset" : 22,
+      "endOffset" : 33
+    }, {
+      "referenceID" : 27,
+      "context" : ", news recommendation [4, 36, 37] and Advertising [14]); however, they all have been completely custom rather than a generalpurpose system like the Decision Service.",
+      "startOffset" : 22,
+      "endOffset" : 33
+    }, {
+      "referenceID" : 10,
+      "context" : ", news recommendation [4, 36, 37] and Advertising [14]); however, they all have been completely custom rather than a generalpurpose system like the Decision Service.",
+      "startOffset" : 50,
+      "endOffset" : 54
+    }, {
+      "referenceID" : 28,
+      "context" : "There are many systems designed for supervised machine learning such as CNTK [18], GraphLab [28], Parameter Server [38], MLlib [52], TensorFlow [55], Torch [57], Minerva [59] and Vowpal Wabbit [58] to name a few.",
+      "startOffset" : 115,
+      "endOffset" : 119
+    }, {
+      "referenceID" : 37,
+      "context" : "There are many systems designed for supervised machine learning such as CNTK [18], GraphLab [28], Parameter Server [38], MLlib [52], TensorFlow [55], Torch [57], Minerva [59] and Vowpal Wabbit [58] to name a few.",
+      "startOffset" : 170,
+      "endOffset" : 174
+    }, {
+      "referenceID" : 14,
+      "context" : "Velox [19] is an open-source system that supports model serving and batch training.",
+      "startOffset" : 6,
+      "endOffset" : 10
+    }, {
+      "referenceID" : 38,
+      "context" : "It collects data that can be used to retrain models via Spark [61].",
+      "startOffset" : 62,
+      "endOffset" : 66
+    }, {
+      "referenceID" : 32,
+      "context" : "We know of two other systems designed to fully support data collection with exploration, model development, and deployment: LUIS [35] (based on ICE [50]), and Next [30].",
+      "startOffset" : 148,
+      "endOffset" : 152
+    }, {
+      "referenceID" : 21,
+      "context" : "We know of two other systems designed to fully support data collection with exploration, model development, and deployment: LUIS [35] (based on ICE [50]), and Next [30].",
+      "startOffset" : 164,
+      "endOffset" : 168
+    }, {
+      "referenceID" : 12,
+      "context" : "To assist in lowering the barrier to entry, we are exploring techniques based on expert learning [16] and hyperparameter search that may further automate the process.",
+      "startOffset" : 97,
+      "endOffset" : 101
+    } ],
+    "year" : 2016,
+    "abstractText" : "Applications and systems are constantly faced with decisions to make, often using a policy to pick from a set of actions based on some contextual information. We create a service that uses machine learning to accomplish this goal. The service uses exploration, logging, and online learning to create a counterfactually sound system supporting a full data lifecycle. The system is general: it works for any discrete choices, with respect to any reward metric, and can work with many learning algorithms and feature representations. The service has a simple API, and was designed to be modular and reproducible to ease deployment and debugging, respectively. We demonstrate how these properties enable learning systems that are robust and safe. Our evaluation shows that the Decision Service makes decisions in real time and incorporates new data quickly into learned policies. A large-scale deployment for a personalized news website has been handling all traffic since Jan. 2016, resulting in a 25% relative lift in clicks. By making the Decision Service externally available, we hope to make optimal decision making available to all.",
+    "creator" : "LaTeX with hyperref package"
+  }
+}

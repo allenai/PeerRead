@@ -1,0 +1,417 @@
+{
+  "name" : "1611.01276.pdf",
+  "metadata" : {
+    "source" : "CRF",
+    "title" : "A Communication-Efficient Parallel Algorithm for Decision Tree",
+    "authors" : [ "Qi Meng", "Guolin Ke", "Taifeng Wang", "Wei Chen", "Qiwei Ye", "Zhi-Ming Ma", "Tie-Yan Liu" ],
+    "emails" : [ "qimeng13@pku.edu.cn;", "tie-yan.liu}@microsoft.com;", "mazm@amt.ac.cn" ],
+    "sections" : [ {
+      "heading" : "1 Introduction",
+      "text" : "Decision tree [Quinlan (1986)] is a widely used machine learning algorithm, since it is practically effective and the rules it learns are simple and interpretable. Based on decision tree, people have developed other algorithms such as Random Forest (RF) [Breiman (2001)] and Gradient Boosting Decision Trees (GBDT) [Friedman (2001)], which have demonstrated very promising performances in various learning tasks [Burges (2010)].\nIn recent years, with the emergence of very big training data (which cannot be held in one single machine), there has been an increasing need of parallelizing the training process of decision tree. To this end, there have been two major categories of attempts: 2. ∗Denotes equal contribution. This work was done when the first author was visiting Microsoft Research Asia. 2There is another category of works that parallelize the tasks of sub-tree training once a node is split [Pearson (1993)], which require the training data to be moved from machine to machine for many times and are thus inefficient. Moreover, there are also some other works accelerating decision tree construction by using presorting [Mehta, Agrawal, and Rissanen (1996), Shafer, Agrawal, and Mehta (1996) Joshi, Karypis, and Kumar (1998)] and binning [Ranka and Singh (1998), Gehrke et al. (1999), Jin and Agrawal (2003)], or employing a\n30th Conference on Neural Information Processing Systems (NIPS 2016), Barcelona, Spain.\nar X\niv :1\n61 1.\n01 27\n6v 1\n[ cs\n.L G\n] 4\nN ov\nAttribute-parallel: Training data are vertically partitioned according to the attributes and allocated to different machines, and then in each iteration, the machines work on non-overlapping sets of attributes in parallel in order to find the best attribute and its split point (suppose this best attribute locates at the i-th machine) [Shafer, Agrawal, and Mehta (1996), Joshi, Karypis, and Kumar (1998), Svore and Burges (2011)]. This process is communicationally very efficient. However, after that, the re-partition of the data on other machines than the i-th machine will induce very high communication costs (proportional to the number of data samples). This is because those machines have no information about the best attribute at all, and in order to fulfill the re-partitioning, they must retrieve the partition information of every data sample from the i-th machine. Furthermore, as each worker still has full sample set, the partition process is not parallelized, which slows down the algorithm.\nData-parallel: Training data are horizontally partitioned according to the samples and allocated to different machines. Then the machines communicate with each other the local histograms of all attributes (according to their own data samples) in order to obtain the global attribute distributions and identify the best attribute and split point [Kufrin (1997), Panda et al. (2009)]. It is clear that the corresponding communication cost is very high and proportional to the total number of attributes and histogram size. To reduce the cost, in [Ben-Haim and Tom-Tov (2010), Tyree et al. (2011), Jin and Agrawal (2003)], it was proposed to exchange quantized histograms between machines when estimating the global attribute distributions. However, this does not really solve the problem – the communication cost is still proportional to the total number of attributes, not to mentioned that the quantization may hurt the accuracy.\nIn this paper, we proposed a new data-parallel algorithm for decision tree, called Parallel Voting Decision Tree (PV-Tree), which can achieve much better balance between communication efficiency and accuracy. The key difference between conventional data-parallel decision tree algorithm and PV-Tree lies in that the former only trusts the globally aggregated histogram information, while the latter leverages the local statistical information contained in each machine through a two-stage voting process, thus can significantly reduce the communication cost. Specifically, PV-Tree contains the following steps in each iteration. 1) Local voting. On each machine, we select the top-k attributes based on its local data according to the informativeness scores (e.g., risk reduction for regression, and information gain for classification). 2) Global voting. We determine global top-2k attributes by a majority voting among the local candidates selected in the previous step. That is, we rank the attributes according to the number of local machines who select them, and choose the top 2k attributes from the ranked list. 3) Best attribute identification. We collect the full-grained histograms of the globally top-2k attributes from local machines in order to compute their global distributions. Then we identify the best attribute and its split point according to the informativeness scores calculated from the global distributions.\nIt is easy to see that PV-Tree algorithm has a very low communication cost. It does not need to communicate the information of all attributes, instead, it only communicates indices of the locally top-k attributes per machine and the histograms of the globally top-2k attributes. In other words, its communication cost is independent of the total number of attributes. This makes PV-Tree highly scalable. On the other hand, it can be proven that PV-Tree can find the best attribute with a large probability, and the probability will approach 1 regardless of k when the training data become sufficiently large. In contrast, the data-parallel algorithm based on quantized histogram could fail in finding the best attribute, since the bias introduced by histogram quantization cannot be reduced to zero even if the training data are sufficiently large.\nWe have conducted experiments on real-world datasets to evaluate the performance of PV-Tree. The experimental results show that PV-Tree has consistently higher accuracy and training speed than all the baselines we implemented. We further conducted experiments to evaluate the performance of PV-Tree in different settings (e.g., with different numbers of machines, different values of k). The experimental results are in accordance with our theoretical analysis."
+    }, {
+      "heading" : "2 Decision Tree",
+      "text" : "Suppose the training data set Dn = {(xi,j , yi); i = 1, · · · , n, j = 1, · · · , d} are independently sampled from ∏d j=1 Xj × Y according to ( ∏d j=1 PXj )PY |X . The goal is to learn a regression or\nshared-memory-processors approach [Kufrin (1997) Agrawal, Ho, and Zaki (2001)]. However, they are out of our scope.\nclassification model f ∈ F : ∏d\nj=1 Xj → Y by minimizing loss functions on the training data, which hopefully could achieve accurate prediction for the unseen test data.\nDecision tree [Quinlan (1986); Safavian and Landgrebe (1991)] is a widely used model for both regression [Breiman et al. (1984)] and classification [Safavian and Landgrebe (1991)]. A typical decision tree algorithm is described in Alg 1. As can be seen, the tree growth procedure is recursive, and the nodes will not stop growing until they reach the stopping criteria. There are two important functions in the algorithm: FindBestSplit returns the best split point {attribute, threshold} of a node, and Split splits the training data according to the best split point. The details of FindBestSplit is given in Alg 2: first histograms of the attributes are constructed (for continuous attributes, one usually converts their numerical values to finite bins for ease of compuation) by going over all training data on the current node; then all bins (split points) are traversed from left to right, and leftSum and rightSum are used to accumulate sum of left and right parts of the split point respectively. When selecting the best split point, an informativeness measure is adopted. The widely used informative measures are information gain and variance gain for classification and regression, respectively. Algorithm 1 BulidTree Input: Node N, Dateset D if StoppingCirteria(D) then N.output = Prediction(D) else bestSplit = FindBestSplit(D) (DL, DR) = Split(D, N, bestSplit) BuildTree(N.leftChild, DL) BuildTree(N.rightChild, DR) end if\nDefinition 2.1 [Friedman, Hastie, and Tibshirani (2001),Quinlan (1986)] In classification, the information gain (IG) for attribute Xj ∈ [w1, w2] at node O, is defined as the entropy reduction of the output Y after splitting node O by attribute Xj at w, i.e.,\nIGj(w;O) = Hj − (Hlj(w) +Hrj (w)) = P (w1 ≤ Xj ≤ w2)H(Y |w1 ≤ Xj ≤ w2)− P (w1 ≤ Xj < w)H(Y |w1 ≤ Xj < w) − P (w ≤ Xj ≤ w2)H(Y |w ≤ Xj ≤ w2),\nwhere H(·|·) denotes the conditional entropy. In regression, the variance gain (VG) for attribute Xj ∈ [w1, w2] at node O, is defined as variance reduction of the output Y after splitting node O by attribute Xj at w, i.e.,\nV Gj(w;O) = σj − (σlj(w) + σrj (w)) = P (w1 ≤ Xj ≤ w2)V ar[Y |w1 ≤ Xj ≤ w2]− P (w1 ≤ Xj < w)V ar[Y |w1 ≤ Xj < w] − P (w2 ≥ Xj ≥ w)V ar[Y |w2 ≥ Xj ≥ w],\nwhere V ar[·|·] denotes the conditional variance."
+    }, {
+      "heading" : "3 PV-Tree",
+      "text" : "In this section, we describe our proposed PV-Tree algorithm for parallel decision tree learning, which has a very low communication cost, and can achieve a good trade-off between communication efficiency and learning accuracy.\nPV-Tree is a data-parallel algorithm, which also partitions the training data onto M machines just like in [Ben-Haim and Tom-Tov (2010),Tyree et al. (2011)]. However, its design principal is very different. In [Ben-Haim and Tom-Tov (2010),Tyree et al. (2011)], one does not trust the local information about the attributes in each machine, and decides the best attribute and split point only based on the aggregated global histograms of the attributes. In contrast, in PV-Tree, we leverage the meaningful statistical information about the attributes contained in each local machine, and make decisions through a two-stage (local and then global) voting process. In this way, we can significantly reduce the communication cost since we do not need to communicate the histogram information of all the attributes across machines, instead, only the histograms of those attributes that survive in the voting process.\nThe flow of PV-tree algorithm is very similar to the standard decision tree, except function FindBestSplit. So we only give the new implementation of this function in Alg 3, which contains following three steps:\nLocal Voting: We select the top-k attributes for each machine based on its local data set (according to the informativeness scores, e.g., information gain for classification and variance reduction for\nregression), and then exchange indices of the selected attributes among machines. Please note that the communication cost for this step is very low, because only the indices for a small number of (i.e., k ×M ) attributes need to be communicated. Global Voting: We determine the globally top-2k attributes by a majority voting among all locally selected attributes in the previous step. That is, we rank the attributes according to the number of local machines who select them, and choose the top-2k attributes from the ranked list. It can be proven that when the local data are big enough to be statistically representative, there is a very high probability that the top-2k attributes obtained by this majority voting will contain the globally best attribute. Please note that this step does not induce any communication cost.\nBest Attribute Identification: We collect full-grained histograms of the globally top-2k attributes from local machines in order to compute their global distributions. Then we identify the best attribute and its split point according to the informativeness scores calculated from the global distributions. Please note that the communication cost for this step is also low, because we only need to communicate the histograms of 2k pre-selected attributes (but not all attributes).3 As a result, PV-Tree algorithm can scale very well since its communication cost is independent of both the total number of attributes and the total number of samples in the dataset.\nIn next section, we will provide theoretical analysis on accuracy guarantee of PV-Tree algorithm.\nAlgorithm 2 FindBestSplit Input: DataSet D for all X in D.Attribute do . Construct Histogram H = new Histogram() for all x in X do\nH.binAt(x.bin).Put(x.label) end for . Find Best Split leftSum = new HistogramSum() for all bin in H do\nleftSum = leftSum + H.binAt(bin) rightSum = H.AllSum - leftSum split.gain = CalSplitGain(leftSum, rightSum) bestSplit = ChoiceBetterOne(split,bestSplit)\nend for end for return bestSplit\nAlgorithm 3 PV-Tree_FindBestSplit Input: Dataset D localHistograms = ConstructHistograms(D) . Local Voting splits = [] for all H in localHistograms do\nsplits.Push(H.FindBestSplit()) end for localTop = splits.TopKByGain(K) . Gather all candidates allCandidates = AllGather(localTop) . Global Voting globalTop = allCandidates.TopKByMajority(2*K) . Merge global histograms globalHistograms = Gather(globalTop, localHistograms) bestSplit = globalHistograms.FindBestSplit() return bestSplit"
+    }, {
+      "heading" : "4 Theoretical Analysis",
+      "text" : "In this section, we conduct theoretical analysis on proposed PV-Tree algorithm. Specifically, we prove that, PV-Tree can select the best (most informative) attribute in a large probability, for both classification and regression. In order to better present the theorem, we firstly introduce some notations4 In classification, we denote IGj = maxw IGj(w), and rank {IGj ; j ∈ [d]} from large to small as {IG(1), ..., IG(d)}. We call the attribute j(1) the most informative attribute. Then, we denote l(j)(k) = |IG(1)−IG(j)| 2\n, ∀j ≥ k + 1 to indicate the distance between the largest and the k-th largest IG. In regression, l(j)(k) is defined in the same way, except replacing IG with VG.\nTheorem 4.1 Suppose we have M local machines, and each one has n training data. PV-Tree at an arbitrary tree node with local voting size k and global majority voting size 2k will select the most informative attribute with a probability at least\nM∑ m=[M/2+1] CmM 1−  d∑ j=k+1 δ(j)(n, k) m d∑ j=k+1 δ(j)(n, k) M−m , where δ(j)(n, k) = α(j)(n) + 4e−c(j)n(l(j)(k)) 2 with limn→∞ α(j)(n) = 0 and c(j) is constant.\n3As indicated by our theoretical analysis and empirical study (see the next sections), a very small k already leads to good performance in PV-Tree algorithm.\n4Since all analysis are for one arbitrarily fixed node O, we omit the notation O here.\nDue to space restrictions, we briefly illustrate the proof idea here and leave detailed proof to supplementary materials. Our proof contains two parts. (1) For local voting, we find a sufficient condition to guarantee a similar rank of attributes ordered by information gain computed based on local data and full data. Then, we derive a lower bound of probability to make the sufficient condition holds by using concentration inequalities. (2) For global voting, we select top-2k attributes. It’s easy to proof that we can select the most informative attribute if only no less than [M/2 + 1] of all machines select it.5 Therefore, we can calculate the probability in the theorem using binomial distribution.\nRegarding Theorem 4.1, we have following discussions on factors that impact the lower bound for probability of selecting the best attribute.\n1.Size of local training data n: Since δ(j)(n, k) decreased with n, with more and more local training data, the lower bound will increase. That means, if we have sufficiently large data, PV-Tree will select the best attribute with almost probability 1.\n2. Input dimension d: It is clear that for fixed local voting size k and global voting size 2k, with d increasing, the lower bound is decreasing. Consider the case that the number of attributes become 100 times larger. Then the terms in the summation (from ∑d j=k+1 to ∑100d j=k+1) is roughly 100 times larger for a relatively small k. But there must be many attributes away from attribute (1) and l(j)(k) is a large number which results in a small δ(j)(n, k). Thus we can say that the bound in the theorem is not sensitive with d.\n3. Number of machines M : We assume the whole training data size N is fixed and the local data size n = NM . Then on one hand, as M increases, n decreases, and therefore the lower bound will decrease due to larger δj(n, k). On the other hand, because function ∑M m=[M/2+1] C m Mp\nm(1− p)M−m will approach 1 as M increases when p > 0.5 [Zhou (2012)], the lower bound will increase. In other words, the number of machines M has dual effect on the lower bound: with more machines, local data size becomes smaller which reduces the accuracy of local voting, however, it also leads to more copies of local votes and thus increase the reliability of global voting. Therefore, in terms of accuracy, there should be an optimal number of machines given a fixed-size training data.6\n4. Local/Global voting size k/2k: Local/Global voting size k/2k influence l(j)(k) and the terms in the summation in the lower bound . As k increases, l(j)(k) increases and the terms in the summation decreases, and the lower bound increases. But increasing k will bring more communication and calculating time. Therefore, we should better select a moderate k. For some distributions, especially for the distributions over high-dimensional space, l(j)(k) is less sensitive to k, then we can choose a relatively smaller k to save communication time.\nAs a comparison, we also prove a theorem for the data-parallel algorithm based on quantized histogram as follows (please refer to the supplementary material for its proof). The theorem basically tells us that the bias introduced by histogram quantization cannot be reduced to zero even if the training data are sufficiently large, and as a result the corresponding algorithm could fail in finding the best attribute.7 This could be the critical weakness of this algorithm in big data scenario.\nTheorem 4.2 We denote quantized histogram with b bins of the underlying distribution P as P b, that of the empirical distribution Pn as P bn, the information gain ofXj calculated under the distribution P b and P bn as IG b j and IG b n,j respectively, and fj(b) , |IGj − IGbj |. Then, for ≤ minj=1,··· ,d fj(b), with probability at least δj(n, fj(b)− )), we have |IGbn,j − IGj | > ."
+    }, {
+      "heading" : "5 Experiments",
+      "text" : "In this section, we report the experimental comparisons between PV-Tree and baseline algorithms. We used two data sets, one for learning to rank (LTR) and the other for ad click prediction (CTR)8 (see Table 1 for details). For LTR, we extracted about 1200 numerical attributes per data sample, and\n5In fact, the global voting size can be βk with β > 1. Then the sufficient condition becomes that no less than [M/β + 1] of all machines select the most informative attribute.\n6Please note that using more machines will reduce local computing time, thus the optimal value of machine number may be larger in terms of speed-up.\n7The theorem for regression holds in the same way, with replacing IG with VG. 8We use private data in LTR experiments and data of KDD Cup 2012 track 2 in CTR experiments.\nused NDCG [Burges (2010)] as the evaluation measure. For CTR, we extracted about 800 numerical attributes [Jahrer et al. (2012)], and used AUC as the evaluation measure.\nTable 1: Datasets\nTask #Train #Test #Attribute Source\nLTR 11M 1M 1200 Private CTR 235M 31M 800 KDD Cup\nTable 2: Convergence time (seconds)\nTask Sequential Data- Attribute- PV-Tree Parallel Parallel LTR 28690 32260 14660 5825 CTR 154112 9209 26928 5349\nAccording to recent industrial practices, a single decision tree might not be strong enough to learn an effective model for complicated tasks like ranking and click prediction. Therefore, people usually use decision tree based boosting algorithms (e.g., GBDT) to perform tasks. In this paper, we also use GBDT as a platform to examine the efficiency and effectiveness of decision tree parallelization. That is, we used PV-Tree or other baseline algorithms to parallelize the decision tree construction process in each iteration of GBDT, and compare their performance. Our experimental environment is a cluster of servers (each with 12 CPU cores and 32 GB RAM) inter-connected with 1 Gbps Ethernet. For the experiments on LTR, we used 8 machines for parallel training; and for the experiments on CTR, we used 32 machines since the dataset is much larger."
+    }, {
+      "heading" : "5.1 Comparison with Other Parallel Decision Trees",
+      "text" : "For comparison with PV-Tree, we have implemented an attribute-parallel algorithm, in which a binary vector is used to indicate the split information and exchanged across machines. In addition, we implemented a data-parallel algorithm according to [Ben-Haim and Tom-Tov (2010); Tyree et al. (2011)], which can communicate both full-grained histograms and quantized histograms. All parallel algorithms and sequential(single machine) version are compared together.\nThe experimental results can be found in Figure 1a and 1b. From these figures, we have the following observations:\nFor LTR, since the number of data samples is relatively small, the communication of the split information about the samples does not take too much time. As a result, the attribute-parallel algorithm appears to be efficient. Since most attributes take numerical values in this dataset, the fullgrained histogram has quite a lot of bins. Therefore, the data-parallel algorithm which communicates full-grained histogram is quite slow, even slower than the sequential algorithm. When reducing the bins in the histogram to 10%, the data-parallel algorithm becomes much more efficient, however, its convergence point is not good (consistent with our theory – the bias in quantized histograms leads to accuracy drop).\nFor CTR, attribute-parallel algorithm becomes very slow since the number of data samples is very large. In contrast, many attributes in CTR take binary or discrete values, which make the full-grained histogram have limited number of bins. As a result, the data-parallel algorithm with full-grain histogram is faster than the sequential algorithm. The data-parallel algorithm with quantized histograms is even faster, however, its convergence point is once again not very good.\nPV-Tree reaches the best point achieved by sequential algorithm within the shortest time in both LTR and CTR task. For a more quantitative comparison on efficiency, we list the time for each algorithm (8 machines for LTR and 32 machines for CTR) to reach the convergent accuracy of the sequential algorithm in Table 2. From the table, we can see that, for LTR, it costed PV-Tree 5825 seconds, while it costed the data-parallel algorithm (with full-grained histogram9) and attribute-parallel algorithm 32260 and 14660 seconds respectively. As compared with the sequential algorithm (which took 28690 seconds to converge), PV-Tree achieves 4.9x speed up on 8 machines. For CTR, it costed PV-Tree 5349 seconds, while it costed the data-parallel algorithm (with full-grained histogram) and attributeparallel algorithm 9209 and 26928 seconds respectively. As compared with the sequential algorithm (which took 154112 seconds to converge), PV-Tree achieves 28.8x speed up on 32 machines.\nWe also conducted independent experiments to get a clear comparison of communication cost for different parallel algorithms given some typical big data workload setting. The result is listed in\n9The data-parallel algorithm with 10% bins could not achieve the same accuracy with the sequential algorithm and thus we did not put it in the table.\nTable 3: Comparison of communication cost, train one tree with depth=6.\nTable 4: Convergence time and accuracy w.r.t. global voting parameter k for PV-Tree.\nTable 3. We find the cost of attribute-parallel algorithm is relative to the size of training data N , and the cost of data-parallel algorithm is relative to the number of attributes d. In contrast, the cost of PV-Tree is constant."
+    }, {
+      "heading" : "5.2 Tradeoff between Speed-up and Accuracy in PV-Tree",
+      "text" : "In the previous subsection, we have shown that PV-tree is more efficient than other algorithms. Here we make a deep dive into PV-tree to see how its key parameters affect the trade-off between efficiency and accuracy. According to Theorem 4.1, the following two parameters are critical to PV-Tree: the number of machines M and the size of voting k."
+    }, {
+      "heading" : "5.2.1 On Different Numbers of Machines",
+      "text" : "When more machines join the distributed training process, the data throughput will grow larger but the amortized training data on each machine will get smaller. When the data size on each machine becomes too small, there will be no guarantee on the accuracy of the voting procedure, according to our theorem. So it is important to appropriately set the number of machines.\nTo gain more insights on this, we conducted some additional experiments, whose results are shown in Figure 2a and 2b. From these figures, we can see that for LTR, when the number of machines grows from 2 to 8, the training process is significantly accelerated. However, when the number goes up to 16, the convergence speed is even lower than that of using 8 machines. Similar results can be observed for CTR. These observations are consistent with our theoretical findings. Please note that PV-Tree is designed for the big data scenario. Only when the entire training data are huge (and thus distribution of the training data on each local machine can be similar to that of the entire training data), the full power of PV-Tree can be realized. Otherwise, we need to have a reasonable expectation on the speed-up, and should choose to use a smaller number of machines to parallelize the training."
+    }, {
+      "heading" : "5.2.2 On Different Sizes of Voting",
+      "text" : "In PV-Tree, we have a parameter k, which controls the number of top attributes selected during local and global voting. Intuitively, larger k will increase the probability of finding the globally best attribute from the local candidates, however, it also means higher communication cost. According to our theorem, the choice of k should depend on the size of local training data. If the size of local\ntraining data is large, the locally best attributes will be similar to the globally best one. In this case, one can safely choose a small value of k. Otherwise, we should choose a relatively larger k. To gain more insights on this, we conducted some experiments, whose results are shown in Table 4, where M refers to the number of machines. From the table, we have the following observations. First, for both cases, in order to achieve good accuracy, one does not need to choose a large k. When k ≤ 40, the accuracy has been very good. Second, we find that for the cases of using small number of machines, k can be set to an even smaller value, e.g., k = 5. This is because, given a fixed-size training data, when using fewer machines, the size of training data per machine will become larger and thus a smaller k can already guarantee the approximation accuracy."
+    }, {
+      "heading" : "5.3 Comparison with Other Parallel GBDT Algorithms",
+      "text" : "While we mainly focus on how to parallelize the decision tree construction process inside GBDT in the previous subsections, one could also parallelize GBDT in other ways. For example, in [Yu and Skillicorn (2001); Svore and Burges (2011)], each machine learns its own decision tree separately without communication. After that, these decision trees are aggregated by means of winner-takes-all or output ensemble. Although these works are not the focus of our paper, it is still interesting to compare with them.\nFor this purpose, we implemented both the algorithms proposed in [Yu and Skillicorn (2001)] and [Svore and Burges (2011)]. For ease of reference, we denote them as Svore and Yu respectively. Their performances are shown in Figure 3a and 3b. From the figures, we can see that PV-Tree outperforms both Svore and Yu: although these two algorithms converge at a similar speed to PV-Tree, they have much worse converge points. According to our limited understanding, these two algorithms are lacking solid theoretical guarantee. Since the candidate decision trees are trained separately and independently without necessary information exchange, they may have non-negligible bias, which will lead to accuracy drop at the end. In contrast, we can clearly characterize the theoretical properties of PV-tree, and use it in an appropriate setting so as to avoid observable accuracy drop.\nTo sum up all the experiments, we can see that with appropriately-set parameters, PV-Tree can achieve a very good trade-off between efficiency and accuracy, and outperforms both other parallel decision tree algorithms designed specifically for GBDT parallelization."
+    }, {
+      "heading" : "6 Conclusions",
+      "text" : "In this paper, we proposed a novel parallel algorithm for decision tree, called Parallel Voting Decision Tree (PV-Tree), which can achieve high accuracy at a very low communication cost. Experiments on both ranking and ad click prediction indicate that PV-Tree has its advantage over a number of baselines algorithms. As for future work, we plan to generalize the idea of PV-Tree to parallelize other machine learning algorithms. Furthermore, we will open-source PV-Tree algorithm to benefit more researchers and practitioners."
+    }, {
+      "heading" : "7 Appendices",
+      "text" : "First of all, we review the definitions of information gain in classification and variance gain in regression.\nDefinition 2.1 [Friedman, Hastie, and Tibshirani (2001),Quinlan (1986)] In classification, the information gain (IG) for attribute Xj ∈ [w1, w2] at node O, is defined as the entropy reduction of the output Y after splitting node O by attribute Xj at w, i.e.,\nIGj(w;O) = Hj − (Hlj(w) +Hrj (w)) = P (w1 ≤ Xj ≤ w2)H(Y |w1 ≤ Xj ≤ w2)− P (w1 ≤ Xj < w)H(Y |w1 ≤ Xj < w) − P (w ≤ Xj ≤ w2)H(Y |w ≤ Xj ≤ w2),\nwhere H(·|·) denotes the conditional entropy.\nIn regression, the variance gain (VG) for attribute Xj ∈ [w1, w2] at node O, is defined as variance reduction of the output Y after splitting node O by attribute Xj at w, i.e.,\nV Gj(w;O) = σj − (σlj(w) + σrj (w)) = P (w1 ≤ Xj ≤ w2)V ar[Y |w1 ≤ Xj ≤ w2]− P (w1 ≤ Xj < w)V ar[Y |w1 ≤ Xj < w] − P (w2 ≥ Xj ≥ w)V ar[Y |w2 ≥ Xj ≥ w],\nwhere V ar[·|·] denotes the conditional variance.\nThe conditional entropy H(·|·) and the conditional variance V ar(·|·) are calculated according to the conditional distribution P (·|·). For K class classification, we assume Y is a discrete random variable which takes value from the set {1, · · · ,K} and we have\nH(Y |w1 ≤ Xj ≤ w2) = −E(Y |w1≤Xj≤w2) log p(Y |w1 ≤ Xj ≤ w2) (1)\n= − K∑ k=1 p(Y = k|w1 ≤ Xj ≤ w2) log p(Y = k|w1 ≤ Xj ≤ w2). (2)\nFor regression, we assume that Y is a continuous random variable and V ar(Y |w1 ≤ Xj ≤ w2) = E [ (Y − E[Y |w1 ≤ Xj ≤ w2)]2 ∣∣w1 ≤ Xj ≤ w2] (3) = ∫ p(y|w1 ≤ Xj ≤ w2)y2dy − (∫ p(y|w1 ≤ Xj ≤ w2)ydy )2 . (4)"
+    }, {
+      "heading" : "7.1 Theorem 4.1 and its Proof for classification and regression",
+      "text" : "Theorem 4.1: In classification, suppose we have M local machines, and each one has n training data. PV-Tree at an arbitrary tree node with local voting size k and global majority voting size 2k will select the most informative attribute with a probability at least\nM∑ m=[M/2+1] CmM 1−  d∑ j=k+1 δ(j)(n, k) m d∑ j=k+1 δ(j)(n, k) M−m , where δ(j)(n, k) = α(j)(n) + 4e−c(j)n(l(j)(k)) 2 with limn→∞ α(j)(n) = 0 and c(j) is constant.\nProof for classification:\nFirstly we introduce some notations. We use subscript n to denote the corresponding empirical statistics, which is calculated based on the empirical distribution Pn. Let w∗j = argmaxwIGj(w) and w∗n,j = argmaxwIGn,j(w). We denote IGj(w∗j ) as IGj , which is the largest information gain for attribute j. We denote IGn,j(w∗n,j) as IGn,j , which is the largest empirical information gain for attribute j. As we defined in the main paper, we denote the index of attribute with the j-th largest information gain as (j), and its corresponding information gain as IG(j), i.e.,\nIG(1) ≥ · · · ≥ IG(j) ≥ · · · ≥ IG(d). The corresponding empirical information gain for attribute (j) denoted as\nIGn,(1), ..., IGn,(j), ..., IGn,(d).\nNote that IGn,(1), ..., IGn,(j), ..., IGn,(d) may not be in an increasing order. Similarly, we denote the index of attribute with the j-th largest empirical information gain as (j′), and its corresponding empirical information gain as IGn,(j′),i.e.,\nIGn,(1′) ≥ · · · ≥ IGn,(j′) ≥ · · · ≥ IGn,(d′).\nOur proof idea is as follows:\nStep 1: Because IGn,j ∈ d(IGj , lj(k)) is a sufficient condition for (1) ∈ {(1 ′ ), ..., (k ′ )} to be satisfied10, we use concentration inequalities to derive a lower bound of probability for IGn,j ∈ d(IGj , lj(k)),∀j, where d(x, ) denotes the neighborhood of x with radius .\nStep 2: By local top-k and global top-2k voting, the most informative attribute (1) will be contained in the global selected set, i.e., (1) ∈ {(1 ′ ), ..., (k ′ )}, if only no less than [M/2 + 1] local workers select it. We calculate the probability for the case no less than [M/2 + 1] of all machines select attribute (1) using binomial distribution.\nFirstly, we give the probability to ensure (1) ∈ {(1 ′ ), ..., (k ′ )}. We bound the difference between the information gain and the empirical information gain for an arbitrary attribute. To be clear, we will prove, with probability at least δj(n, k), we have |IGn,j − IGj | ≤ lj(k). For simplify the notations, let Hlj(w) = H(Y |w1 ≤ Xj ≤ w), P lj (w) = P (w1 ≤ Xj ≤ w), Hrj (w) = H(Y |w ≤ Xj ≤ w2) and P rj (w) = P (w ≤ Xj ≤ w2). We decomposeHln,j(w∗n,j)−Hlj(w∗j ) as\nHln,j(w∗n,j)−Hlj(w∗j ) (5) = P ln,j(w ∗ n,j)H l n,j(w ∗ n,j)− P lj (w∗j )Hlj(w∗j ) (6) = P ln,j(w ∗ n,j)H l n,j(w ∗ n,j)− P ln,j(w∗j )Hlj(w∗j ) + P ln,j(w∗j )Hlj(w∗j )− P lj (w∗j )Hlj(w∗j ). (7)\nWe decomposeHrn,j(wn,j∗)−Hrj (w∗j ) in a similar way, i.e.,\nHrn,j(w∗n,j)−Hrj (w∗j ) (8) = P rn,j(w ∗ n,j)H r n,j(w ∗ n,j)− P rn,j(w∗j )Hlj(w∗j ) + P rn,j(w∗j )Hrj (w∗j )− P rj (w∗j )Hrj (w∗j ). (9)\nBy adding Ineq.(7) and Ineq.(9), we have the following,\nP (|IGn,j − IGj | > lj(k)) = P (∣∣∣Hln,j(w∗n,j) +Hrn,j(w∗n,j)− (Hlj(w∗j ) +Hrj (w∗j ))∣∣∣ > lj(k))\n≤ P (∣∣∣P ln,j(w∗j )Hlj(w∗j )− P lj (w∗j )Hlj(w∗j )∣∣∣ > lj(k)\n3\n) +\nP (∣∣P rn,j(w∗j )Hrj (w∗j )− P rj (w∗j )Hrj (w∗j )∣∣ > lj(k) 3 ) +\nP (∣∣∣P ln,j(w∗n,j)Hln,j(w∗n,j)− P ln,j(w∗j )Hlj(w∗j ) + P rn,j(w∗n,j)Hrn,j(w∗n,j)− P rn,j(w∗j )Hrj (w∗j )∣∣∣ > lj(k) 3 ) ∆ = I1 + I2 + I3\nFor term I1, by using Hoeffding’s inequality, we have I1 ≤ P ( Hlj(w ∗ j )× ∣∣P lj (w∗j )− P ln,j(w∗j )∣∣ > lj(k) 3 ) (10)\n≤ P (∣∣∣P lj (w∗j )− P ln,j(w∗j )∣∣∣ > lj(k) 3Hlj(w ∗ j ) ) (11)\n≤ 2 exp ( − 2nlj(k) 2\n9(Hlj(w ∗ j )) 2\n) (12)\nSimilarly, for term I2, we have\nI2 ≤ 2 exp ( − 2nlj(k) 2\n9(Hrj (w ∗ j )) 2\n) (13)\nLet cj = min {\n2\n9(Hlj(w ∗ j ))\n2 , 2\n9(Hlj(w ∗ j )) 2\n} , we have\nI1 + I2 ≤ 4 exp ( −cjnlj(k)2 ) . (14)\n10In order to (1) ∈ {(1 ′ ), ..., (k ′ )}, the number of IGn,j which is larger than IGn,(1) is at most k − 1.\nFor the term I3, we have J\n= P ln,j(w ∗ n,j)H l n,j(w ∗ n,j)− P ln,j(w∗j )Hlj(w∗j ) + P rn,j(w∗n,j)Hrn,j(w∗n,j)− P rn,j(w∗j )Hrj (w∗j )\n= 1\nn n∑ i=1 I(w1 ≤ xi,j ≤ w∗n,j)Hln,j(w∗n,j) + 1 n n∑ i=1 I(w∗n,j < xi,j ≤ w2)Hrn,j(w∗n,j)\n− 1 n n∑ i=1 I(w1 ≤ xi,j ≤ w∗j )Hlj(w∗j )− 1 n n∑ i=1 I(w∗j < xi,j ≤ w2)Hrj (w∗j ),\nwhere xi,j is the j-th attribute for the i-th instance in the training set.\nLet Θ denote the set of all possible values of (pl1, pr1, · · · , plK−1, prK−1, wj), where plk = P (Y = k|w1 ≤ Xj ≤ wj) and prk = P (Y = k|wj < Xj ≤ w2). Define the criterion function M(θ) = Pmθ , where mθ(x, y) = − log plkI(w1 ≤ x ≤ wj) − log prkI(w2 ≥ x > wj) if y = k. The vector θ∗ = (pl∗1 , p u∗ 1 , · · · , pl∗K−1, pu∗K−1, w∗j ) maximizes M(θ), while θ∗n = (pl∗n,1, pr∗n,1, · · · , pl∗n,K−1, pr∗n,K−1, w∗n,j) minimizes Mn(θ). Straightforward algebra shows that (mθ −mθ∗)(X,Y ) = I(Y = k)[(log pl∗k − log pr∗k )(I(w1 ≤ X ≤ w∗j,n)− I(w1 ≤ X < d∗j ))(15)\n+(log pl∗n,k − log pl∗k )I(w1 ≤ X ≤ w∗n,j) (16) +(log pu∗n,k − log pr∗k )I(w∗n,j ≤ X ≤ w2)] (17)\nBy following the proof of Theorem 1 in [Banerjee, McKeague, and others (2007)], we can get that n2/3I3 converges to c2 maxtQ(t), where c2 is a constant and Q(t) is composed by the standard two-sided Brownian Motion [Banerjee, McKeague, and others (2007)]. Therefore, we have\nP ( |J | > c2n− 2 3 qα ) < α. (18)\nwhere qα is the upper α-quantile of maxtQ(t). Let c2n− 2 3 qαj(n) = lj(k) 3 . With probability at most αj(n),\nwe have IGn,j(w∗j )− IGn,j > lj(k) 2 , i.e.,\nI2 = P ( |J | > lj(k)\n3\n) < αj(n) (19)\nBy combining Inequalities (14) and (19), we have, with probability at most δj(n, k) = αj(n) + 4 exp (−cjnlj(k)2),\n|IGn,j − IGj | > lj(k). (20) Thus we can get\nP (∣∣IGn,(j) − IG(j)∣∣ ≤ lj(k),∀j ≥ k + 1) ≥ 1− d∑\nj=k+1\nδ(j)(n, k). (21)\nBy binomial distribution, we can derive the results in the theorem.\nProof for regression:\nThe proof is similar to classification. We continue to use notations in the previous section and just substitute IG to V G.\nSimilarly, we will prove, with probability at least δj(n, k), we have |V Gn,j − V Gj | ≤ lj(k).\nBy the definition of variance gain, we have the following, P (|V Gn,j − V Gj | > lj(k))\n≤ P (|σln,j(w∗n,j) + σrn,j(w∗n,j)− σlj(w∗j )− σrj (w∗j )| > lj(k)) ≤ P (∣∣∣P ln,j(w∗j )σlj(w∗j )− P lj (w∗j )σlj(w∗j )∣∣∣ > lj(k)\n3\n) +\nP (∣∣P rn,j(w∗j )σrj (w∗j )− P rj (w∗j )σrj (w∗j )∣∣ > lj(k) 3 ) +\nP (∣∣∣P ln,j(w∗n,j)σln,j(w∗n,j)− P ln,j(w∗j )σlj(w∗j ) + P rn,j(w∗n,j)σrn,j(w∗n,j)− P rn,j(w∗j )σrj (w∗j )∣∣∣ > lj(k) 3 ) , I1 + I2 + I3\nFor term I1, by using Hoeffding’s inequality, we have I1 ≤ P ( σlj(w ∗ j )× ∣∣P lj (w∗j )− P ln,j(w∗j )∣∣ > lj(k) 3 ) ≤ P\n(∣∣∣P lj (w∗j )− P ln,j(w∗j )∣∣∣ > lj(k) 3σlj(w ∗ j ) ) (22)\n≤ 2 exp ( − 2nlj(k) 2\n9(σlj(w ∗ j )) 2\n) (23)\nSimilarly, for term I2, we have\nI2 ≤ 2 exp ( − 2nlj(k) 2\n9(σrj (w ∗ j )) 2\n) (24)\nLet cj = min {\n2\n9(σlj(w ∗ j ))\n2 , 2\n9(σlj(w ∗ j )) 2\n} , we have\nI1 + I2 ≤ 4 exp ( −cjnlj(k)2 ) . (25)\nFor the term I3, let J = P ln,j(w ∗ n,j)σ l n,j(w ∗ n,j) − P ln,j(w∗j )σlj(w∗j ) + P rn,j(w∗n,j)σrn,j(w∗n,j) − P rn,j(w ∗ j )σ r j (w ∗ j ). According to Theorem 2.2 established by [Banerjee, McKeague, and others (2007)], the\nfollowing holds, P ( |J | > c2n− 2 3 qα ) < α. (26)\nwhere c2 is a constant for fixed distribution P and qα is the upper α-quantile of the standard two-sided Brownian Motion [Banerjee, McKeague, and others (2007)]. With probability at most αj(n), we have |J | > lj(k)3 , i.e.,\nI3 = P ( |J | > lj(k)\n3\n) < αj(n) (27)\nBy combining Ineq.(25) and (27), we have, with probability at most δj(n, k) = αj(n) + 4 exp (−cjnlj(k)2),\n|V Gn,j − V Gj | > lj(k). (28)\nThus we can get\nP (∣∣V Gn,(j) − V G(j)∣∣ ≤ h, ∀j ≥ k + 1) ≥ 1− d∑\nj=k+1\nδ(j)(n, k). (29)\nBy binomial distribution, we can derive the results in the theorem."
+    }, {
+      "heading" : "7.2 Theorem 4.2 and its proof",
+      "text" : "Theorem 4.2: We denote quantized histogram with b bins of the underlying distribution P as P b, that of the empirical distribution Pn as P bn, the information gain of Xj calculated under the distribution P\nb and P bn as IGbj and IG b n,j respectively, and fj(b) , |IGj − IGbj |. Then, for ≤ minj=1,··· ,d fj(b), with probability at least δj(n, fj(b)− )), we have |IGbn,j − IGj | > .\nProof: First, |IGbn,j − IGj | = |IGbn,j − IGbj + IGbj − IGj | ≥ ||IGbn,j − IGbj | − |f(b)||. Second, when n is large enough, we have |f(b)| − |IGbn,j − IGbj | > with probability δj(n, fj(b) − )) for ≤ minj=1,··· ,d fj(b). Thus, the proposition is proven."
+    } ],
+    "references" : [ {
+      "title" : "Parallel classification for data mining in a shared-memory multiprocessor system",
+      "author" : [ "R. Agrawal", "C.-T. Ho", "M.J. Zaki" ],
+      "venue" : "US Patent 6,230,151.",
+      "citeRegEx" : "Agrawal et al\\.,? 2001",
+      "shortCiteRegEx" : "Agrawal et al\\.",
+      "year" : 2001
+    }, {
+      "title" : "Confidence sets for split points in decision trees. The Annals of Statistics 35(2):543–574",
+      "author" : [ "M. Banerjee", "I. W McKeague" ],
+      "venue" : null,
+      "citeRegEx" : "Banerjee and McKeague,? \\Q2007\\E",
+      "shortCiteRegEx" : "Banerjee and McKeague",
+      "year" : 2007
+    }, {
+      "title" : "A streaming parallel decision tree algorithm",
+      "author" : [ "Y. Ben-Haim", "E. Tom-Tov" ],
+      "venue" : "The Journal of Machine Learning Research 11:849–872.",
+      "citeRegEx" : "Ben.Haim and Tom.Tov,? 2010",
+      "shortCiteRegEx" : "Ben.Haim and Tom.Tov",
+      "year" : 2010
+    }, {
+      "title" : "Classification and regression trees",
+      "author" : [ "L. Breiman", "J. Friedman", "C.J. Stone", "R.A. Olshen" ],
+      "venue" : "CRC press.",
+      "citeRegEx" : "Breiman et al\\.,? 1984",
+      "shortCiteRegEx" : "Breiman et al\\.",
+      "year" : 1984
+    }, {
+      "title" : "Random forests",
+      "author" : [ "L. Breiman" ],
+      "venue" : "Machine learning, volume 45, 5–32. Springer.",
+      "citeRegEx" : "Breiman,? 2001",
+      "shortCiteRegEx" : "Breiman",
+      "year" : 2001
+    }, {
+      "title" : "From ranknet to lambdarank to lambdamart: An overview",
+      "author" : [ "C.J. Burges" ],
+      "venue" : "Learning, volume 11, 23–581.",
+      "citeRegEx" : "Burges,? 2010",
+      "shortCiteRegEx" : "Burges",
+      "year" : 2010
+    }, {
+      "title" : "The elements of statistical learning, volume 1",
+      "author" : [ "J. Friedman", "T. Hastie", "R. Tibshirani" ],
+      "venue" : "Springer series in statistics Springer, Berlin.",
+      "citeRegEx" : "Friedman et al\\.,? 2001",
+      "shortCiteRegEx" : "Friedman et al\\.",
+      "year" : 2001
+    }, {
+      "title" : "Greedy function approximation: a gradient boosting machine",
+      "author" : [ "J.H. Friedman" ],
+      "venue" : "Annals of statistics, 1189–1232. JSTOR.",
+      "citeRegEx" : "Friedman,? 2001",
+      "shortCiteRegEx" : "Friedman",
+      "year" : 2001
+    }, {
+      "title" : "Boat—optimistic decision tree construction",
+      "author" : [ "J. Gehrke", "V. Ganti", "R. Ramakrishnan", "W.-Y. Loh" ],
+      "venue" : "ACM SIGMOD Record, volume 28, 169–180. ACM.",
+      "citeRegEx" : "Gehrke et al\\.,? 1999",
+      "shortCiteRegEx" : "Gehrke et al\\.",
+      "year" : 1999
+    }, {
+      "title" : "Ensemble of collaborative filtering and feature engineered models for click through rate prediction",
+      "author" : [ "M. Jahrer", "A. Toscher", "J. Lee", "J. Deng", "H. Zhang", "J. Spoelstra" ],
+      "venue" : "KDDCup Workshop.",
+      "citeRegEx" : "Jahrer et al\\.,? 2012",
+      "shortCiteRegEx" : "Jahrer et al\\.",
+      "year" : 2012
+    }, {
+      "title" : "Communication and memory efficient parallel decision tree construction",
+      "author" : [ "R. Jin", "G. Agrawal" ],
+      "venue" : "SDM, 119–129. SIAM.",
+      "citeRegEx" : "Jin and Agrawal,? 2003",
+      "shortCiteRegEx" : "Jin and Agrawal",
+      "year" : 2003
+    }, {
+      "title" : "Scalparc: A new scalable and efficient parallel classification algorithm for mining large datasets",
+      "author" : [ "M.V. Joshi", "G. Karypis", "V. Kumar" ],
+      "venue" : "Parallel processing symposium, 1998. IPPS/SPDP 1998, 573–579. IEEE.",
+      "citeRegEx" : "Joshi et al\\.,? 1998",
+      "shortCiteRegEx" : "Joshi et al\\.",
+      "year" : 1998
+    }, {
+      "title" : "Decision trees on parallel processors",
+      "author" : [ "R. Kufrin" ],
+      "venue" : "Machine Intelligence and Pattern Recognition, volume 20, 279–306. Elsevier.",
+      "citeRegEx" : "Kufrin,? 1997",
+      "shortCiteRegEx" : "Kufrin",
+      "year" : 1997
+    }, {
+      "title" : "Sliq: A fast scalable classifier for data mining",
+      "author" : [ "M. Mehta", "R. Agrawal", "J. Rissanen" ],
+      "venue" : "Advances in Database Technology—EDBT’96. Springer. 18–32.",
+      "citeRegEx" : "Mehta et al\\.,? 1996",
+      "shortCiteRegEx" : "Mehta et al\\.",
+      "year" : 1996
+    }, {
+      "title" : "Planet: massively parallel learning of tree ensembles with mapreduce",
+      "author" : [ "B. Panda", "J.S. Herbach", "S. Basu", "R.J. Bayardo" ],
+      "venue" : "Proceedings of the VLDB Endowment, volume 2, 1426–1437. VLDB Endowment.",
+      "citeRegEx" : "Panda et al\\.,? 2009",
+      "shortCiteRegEx" : "Panda et al\\.",
+      "year" : 2009
+    }, {
+      "title" : "A coarse grained parallel induction heuristic",
+      "author" : [ "R.A. Pearson" ],
+      "venue" : "University College, University of New South Wales, Department of Computer Science, Australian Defence Force Academy.",
+      "citeRegEx" : "Pearson,? 1993",
+      "shortCiteRegEx" : "Pearson",
+      "year" : 1993
+    }, {
+      "title" : "Induction of decision trees",
+      "author" : [ "J.R. Quinlan" ],
+      "venue" : "Machine learning, volume 1, 81–106. Springer.",
+      "citeRegEx" : "Quinlan,? 1986",
+      "shortCiteRegEx" : "Quinlan",
+      "year" : 1986
+    }, {
+      "title" : "Clouds: A decision tree classifier for large datasets",
+      "author" : [ "S. Ranka", "V. Singh" ],
+      "venue" : "Knowledge discovery and data mining, 2–8.",
+      "citeRegEx" : "Ranka and Singh,? 1998",
+      "shortCiteRegEx" : "Ranka and Singh",
+      "year" : 1998
+    }, {
+      "title" : "A survey of decision tree classifier methodology",
+      "author" : [ "S.R. Safavian", "D. Landgrebe" ],
+      "venue" : "IEEE transactions on systems, man, and cybernetics 21(3):660–674.",
+      "citeRegEx" : "Safavian and Landgrebe,? 1991",
+      "shortCiteRegEx" : "Safavian and Landgrebe",
+      "year" : 1991
+    }, {
+      "title" : "Sprint: A scalable parallel classi er for data mining",
+      "author" : [ "J. Shafer", "R. Agrawal", "M. Mehta" ],
+      "venue" : "Proc. 1996 Int. Conf. Very Large Data Bases, 544–555. Citeseer.",
+      "citeRegEx" : "Shafer et al\\.,? 1996",
+      "shortCiteRegEx" : "Shafer et al\\.",
+      "year" : 1996
+    }, {
+      "title" : "Large-scale learning to rank using boosted decision trees",
+      "author" : [ "K.M. Svore", "C. Burges" ],
+      "venue" : "Scaling Up Machine Learning: Parallel and Distributed Approaches 2.",
+      "citeRegEx" : "Svore and Burges,? 2011",
+      "shortCiteRegEx" : "Svore and Burges",
+      "year" : 2011
+    }, {
+      "title" : "Parallel boosted regression trees for web search ranking",
+      "author" : [ "S. Tyree", "K.Q. Weinberger", "K. Agrawal", "J. Paykin" ],
+      "venue" : "Proceedings of the 20th international conference on World wide web, 387–396. ACM.",
+      "citeRegEx" : "Tyree et al\\.,? 2011",
+      "shortCiteRegEx" : "Tyree et al\\.",
+      "year" : 2011
+    }, {
+      "title" : "Parallelizing boosting and bagging",
+      "author" : [ "C. Yu", "D. Skillicorn" ],
+      "venue" : "Queen’s University, Kingston, Canada, Tech. Rep.",
+      "citeRegEx" : "Yu and Skillicorn,? 2001",
+      "shortCiteRegEx" : "Yu and Skillicorn",
+      "year" : 2001
+    }, {
+      "title" : "Ensemble methods: foundations and algorithms",
+      "author" : [ "Zhou", "Z.-H." ],
+      "venue" : "CRC Press.",
+      "citeRegEx" : "Zhou and Z..H.,? 2012",
+      "shortCiteRegEx" : "Zhou and Z..H.",
+      "year" : 2012
+    }, {
+      "title" : "In classification, the information gain (IG) for attribute Xj ∈ [w1, w2] at node O, is defined as the entropy reduction of the output Y after splitting node O by attribute",
+      "author" : [ "Friedman", "Hastie", "Tibshirani" ],
+      "venue" : null,
+      "citeRegEx" : "Friedman et al\\.,? \\Q1986\\E",
+      "shortCiteRegEx" : "Friedman et al\\.",
+      "year" : 1986
+    } ],
+    "referenceMentions" : [ {
+      "referenceID" : 10,
+      "context" : "Decision tree [Quinlan (1986)] is a widely used machine learning algorithm, since it is practically effective and the rules it learns are simple and interpretable.",
+      "startOffset" : 15,
+      "endOffset" : 30
+    }, {
+      "referenceID" : 4,
+      "context" : "Based on decision tree, people have developed other algorithms such as Random Forest (RF) [Breiman (2001)] and Gradient Boosting Decision Trees (GBDT) [Friedman (2001)], which have demonstrated very promising performances in various learning tasks [Burges (2010)].",
+      "startOffset" : 91,
+      "endOffset" : 106
+    }, {
+      "referenceID" : 4,
+      "context" : "Based on decision tree, people have developed other algorithms such as Random Forest (RF) [Breiman (2001)] and Gradient Boosting Decision Trees (GBDT) [Friedman (2001)], which have demonstrated very promising performances in various learning tasks [Burges (2010)].",
+      "startOffset" : 91,
+      "endOffset" : 168
+    }, {
+      "referenceID" : 4,
+      "context" : "Based on decision tree, people have developed other algorithms such as Random Forest (RF) [Breiman (2001)] and Gradient Boosting Decision Trees (GBDT) [Friedman (2001)], which have demonstrated very promising performances in various learning tasks [Burges (2010)].",
+      "startOffset" : 91,
+      "endOffset" : 263
+    }, {
+      "referenceID" : 4,
+      "context" : "Based on decision tree, people have developed other algorithms such as Random Forest (RF) [Breiman (2001)] and Gradient Boosting Decision Trees (GBDT) [Friedman (2001)], which have demonstrated very promising performances in various learning tasks [Burges (2010)]. In recent years, with the emergence of very big training data (which cannot be held in one single machine), there has been an increasing need of parallelizing the training process of decision tree. To this end, there have been two major categories of attempts: 2. ∗Denotes equal contribution. This work was done when the first author was visiting Microsoft Research Asia. There is another category of works that parallelize the tasks of sub-tree training once a node is split [Pearson (1993)], which require the training data to be moved from machine to machine for many times and are thus inefficient.",
+      "startOffset" : 91,
+      "endOffset" : 757
+    }, {
+      "referenceID" : 4,
+      "context" : "Based on decision tree, people have developed other algorithms such as Random Forest (RF) [Breiman (2001)] and Gradient Boosting Decision Trees (GBDT) [Friedman (2001)], which have demonstrated very promising performances in various learning tasks [Burges (2010)]. In recent years, with the emergence of very big training data (which cannot be held in one single machine), there has been an increasing need of parallelizing the training process of decision tree. To this end, there have been two major categories of attempts: 2. ∗Denotes equal contribution. This work was done when the first author was visiting Microsoft Research Asia. There is another category of works that parallelize the tasks of sub-tree training once a node is split [Pearson (1993)], which require the training data to be moved from machine to machine for many times and are thus inefficient. Moreover, there are also some other works accelerating decision tree construction by using presorting [Mehta, Agrawal, and Rissanen (1996), Shafer, Agrawal, and Mehta (1996) Joshi, Karypis, and Kumar (1998)] and binning [Ranka and Singh (1998), Gehrke et al.",
+      "startOffset" : 91,
+      "endOffset" : 1007
+    }, {
+      "referenceID" : 4,
+      "context" : "Based on decision tree, people have developed other algorithms such as Random Forest (RF) [Breiman (2001)] and Gradient Boosting Decision Trees (GBDT) [Friedman (2001)], which have demonstrated very promising performances in various learning tasks [Burges (2010)]. In recent years, with the emergence of very big training data (which cannot be held in one single machine), there has been an increasing need of parallelizing the training process of decision tree. To this end, there have been two major categories of attempts: 2. ∗Denotes equal contribution. This work was done when the first author was visiting Microsoft Research Asia. There is another category of works that parallelize the tasks of sub-tree training once a node is split [Pearson (1993)], which require the training data to be moved from machine to machine for many times and are thus inefficient. Moreover, there are also some other works accelerating decision tree construction by using presorting [Mehta, Agrawal, and Rissanen (1996), Shafer, Agrawal, and Mehta (1996) Joshi, Karypis, and Kumar (1998)] and binning [Ranka and Singh (1998), Gehrke et al.",
+      "startOffset" : 91,
+      "endOffset" : 1042
+    }, {
+      "referenceID" : 4,
+      "context" : "Based on decision tree, people have developed other algorithms such as Random Forest (RF) [Breiman (2001)] and Gradient Boosting Decision Trees (GBDT) [Friedman (2001)], which have demonstrated very promising performances in various learning tasks [Burges (2010)]. In recent years, with the emergence of very big training data (which cannot be held in one single machine), there has been an increasing need of parallelizing the training process of decision tree. To this end, there have been two major categories of attempts: 2. ∗Denotes equal contribution. This work was done when the first author was visiting Microsoft Research Asia. There is another category of works that parallelize the tasks of sub-tree training once a node is split [Pearson (1993)], which require the training data to be moved from machine to machine for many times and are thus inefficient. Moreover, there are also some other works accelerating decision tree construction by using presorting [Mehta, Agrawal, and Rissanen (1996), Shafer, Agrawal, and Mehta (1996) Joshi, Karypis, and Kumar (1998)] and binning [Ranka and Singh (1998), Gehrke et al.",
+      "startOffset" : 91,
+      "endOffset" : 1075
+    }, {
+      "referenceID" : 4,
+      "context" : "Based on decision tree, people have developed other algorithms such as Random Forest (RF) [Breiman (2001)] and Gradient Boosting Decision Trees (GBDT) [Friedman (2001)], which have demonstrated very promising performances in various learning tasks [Burges (2010)]. In recent years, with the emergence of very big training data (which cannot be held in one single machine), there has been an increasing need of parallelizing the training process of decision tree. To this end, there have been two major categories of attempts: 2. ∗Denotes equal contribution. This work was done when the first author was visiting Microsoft Research Asia. There is another category of works that parallelize the tasks of sub-tree training once a node is split [Pearson (1993)], which require the training data to be moved from machine to machine for many times and are thus inefficient. Moreover, there are also some other works accelerating decision tree construction by using presorting [Mehta, Agrawal, and Rissanen (1996), Shafer, Agrawal, and Mehta (1996) Joshi, Karypis, and Kumar (1998)] and binning [Ranka and Singh (1998), Gehrke et al.",
+      "startOffset" : 91,
+      "endOffset" : 1112
+    }, {
+      "referenceID" : 4,
+      "context" : "Based on decision tree, people have developed other algorithms such as Random Forest (RF) [Breiman (2001)] and Gradient Boosting Decision Trees (GBDT) [Friedman (2001)], which have demonstrated very promising performances in various learning tasks [Burges (2010)]. In recent years, with the emergence of very big training data (which cannot be held in one single machine), there has been an increasing need of parallelizing the training process of decision tree. To this end, there have been two major categories of attempts: 2. ∗Denotes equal contribution. This work was done when the first author was visiting Microsoft Research Asia. There is another category of works that parallelize the tasks of sub-tree training once a node is split [Pearson (1993)], which require the training data to be moved from machine to machine for many times and are thus inefficient. Moreover, there are also some other works accelerating decision tree construction by using presorting [Mehta, Agrawal, and Rissanen (1996), Shafer, Agrawal, and Mehta (1996) Joshi, Karypis, and Kumar (1998)] and binning [Ranka and Singh (1998), Gehrke et al. (1999), Jin and Agrawal (2003)], or employing a",
+      "startOffset" : 91,
+      "endOffset" : 1134
+    }, {
+      "referenceID" : 4,
+      "context" : "Based on decision tree, people have developed other algorithms such as Random Forest (RF) [Breiman (2001)] and Gradient Boosting Decision Trees (GBDT) [Friedman (2001)], which have demonstrated very promising performances in various learning tasks [Burges (2010)]. In recent years, with the emergence of very big training data (which cannot be held in one single machine), there has been an increasing need of parallelizing the training process of decision tree. To this end, there have been two major categories of attempts: 2. ∗Denotes equal contribution. This work was done when the first author was visiting Microsoft Research Asia. There is another category of works that parallelize the tasks of sub-tree training once a node is split [Pearson (1993)], which require the training data to be moved from machine to machine for many times and are thus inefficient. Moreover, there are also some other works accelerating decision tree construction by using presorting [Mehta, Agrawal, and Rissanen (1996), Shafer, Agrawal, and Mehta (1996) Joshi, Karypis, and Kumar (1998)] and binning [Ranka and Singh (1998), Gehrke et al. (1999), Jin and Agrawal (2003)], or employing a",
+      "startOffset" : 91,
+      "endOffset" : 1158
+    }, {
+      "referenceID" : 4,
+      "context" : "Attribute-parallel: Training data are vertically partitioned according to the attributes and allocated to different machines, and then in each iteration, the machines work on non-overlapping sets of attributes in parallel in order to find the best attribute and its split point (suppose this best attribute locates at the i-th machine) [Shafer, Agrawal, and Mehta (1996), Joshi, Karypis, and Kumar (1998), Svore and Burges (2011)].",
+      "startOffset" : 416,
+      "endOffset" : 430
+    }, {
+      "referenceID" : 4,
+      "context" : "Attribute-parallel: Training data are vertically partitioned according to the attributes and allocated to different machines, and then in each iteration, the machines work on non-overlapping sets of attributes in parallel in order to find the best attribute and its split point (suppose this best attribute locates at the i-th machine) [Shafer, Agrawal, and Mehta (1996), Joshi, Karypis, and Kumar (1998), Svore and Burges (2011)]. This process is communicationally very efficient. However, after that, the re-partition of the data on other machines than the i-th machine will induce very high communication costs (proportional to the number of data samples). This is because those machines have no information about the best attribute at all, and in order to fulfill the re-partitioning, they must retrieve the partition information of every data sample from the i-th machine. Furthermore, as each worker still has full sample set, the partition process is not parallelized, which slows down the algorithm. Data-parallel: Training data are horizontally partitioned according to the samples and allocated to different machines. Then the machines communicate with each other the local histograms of all attributes (according to their own data samples) in order to obtain the global attribute distributions and identify the best attribute and split point [Kufrin (1997), Panda et al.",
+      "startOffset" : 416,
+      "endOffset" : 1368
+    }, {
+      "referenceID" : 4,
+      "context" : "Attribute-parallel: Training data are vertically partitioned according to the attributes and allocated to different machines, and then in each iteration, the machines work on non-overlapping sets of attributes in parallel in order to find the best attribute and its split point (suppose this best attribute locates at the i-th machine) [Shafer, Agrawal, and Mehta (1996), Joshi, Karypis, and Kumar (1998), Svore and Burges (2011)]. This process is communicationally very efficient. However, after that, the re-partition of the data on other machines than the i-th machine will induce very high communication costs (proportional to the number of data samples). This is because those machines have no information about the best attribute at all, and in order to fulfill the re-partitioning, they must retrieve the partition information of every data sample from the i-th machine. Furthermore, as each worker still has full sample set, the partition process is not parallelized, which slows down the algorithm. Data-parallel: Training data are horizontally partitioned according to the samples and allocated to different machines. Then the machines communicate with each other the local histograms of all attributes (according to their own data samples) in order to obtain the global attribute distributions and identify the best attribute and split point [Kufrin (1997), Panda et al. (2009)].",
+      "startOffset" : 416,
+      "endOffset" : 1389
+    }, {
+      "referenceID" : 2,
+      "context" : "To reduce the cost, in [Ben-Haim and Tom-Tov (2010), Tyree et al.",
+      "startOffset" : 24,
+      "endOffset" : 52
+    }, {
+      "referenceID" : 2,
+      "context" : "To reduce the cost, in [Ben-Haim and Tom-Tov (2010), Tyree et al. (2011), Jin and Agrawal (2003)], it was proposed to exchange quantized histograms between machines when estimating the global attribute distributions.",
+      "startOffset" : 24,
+      "endOffset" : 73
+    }, {
+      "referenceID" : 2,
+      "context" : "To reduce the cost, in [Ben-Haim and Tom-Tov (2010), Tyree et al. (2011), Jin and Agrawal (2003)], it was proposed to exchange quantized histograms between machines when estimating the global attribute distributions.",
+      "startOffset" : 24,
+      "endOffset" : 97
+    }, {
+      "referenceID" : 12,
+      "context" : "The goal is to learn a regression or shared-memory-processors approach [Kufrin (1997) Agrawal, Ho, and Zaki (2001)].",
+      "startOffset" : 72,
+      "endOffset" : 86
+    }, {
+      "referenceID" : 12,
+      "context" : "The goal is to learn a regression or shared-memory-processors approach [Kufrin (1997) Agrawal, Ho, and Zaki (2001)].",
+      "startOffset" : 72,
+      "endOffset" : 115
+    }, {
+      "referenceID" : 14,
+      "context" : "Decision tree [Quinlan (1986); Safavian and Landgrebe (1991)] is a widely used model for both regression [Breiman et al.",
+      "startOffset" : 15,
+      "endOffset" : 30
+    }, {
+      "referenceID" : 14,
+      "context" : "Decision tree [Quinlan (1986); Safavian and Landgrebe (1991)] is a widely used model for both regression [Breiman et al.",
+      "startOffset" : 15,
+      "endOffset" : 61
+    }, {
+      "referenceID" : 3,
+      "context" : "Decision tree [Quinlan (1986); Safavian and Landgrebe (1991)] is a widely used model for both regression [Breiman et al. (1984)] and classification [Safavian and Landgrebe (1991)].",
+      "startOffset" : 106,
+      "endOffset" : 128
+    }, {
+      "referenceID" : 3,
+      "context" : "Decision tree [Quinlan (1986); Safavian and Landgrebe (1991)] is a widely used model for both regression [Breiman et al. (1984)] and classification [Safavian and Landgrebe (1991)].",
+      "startOffset" : 106,
+      "endOffset" : 179
+    }, {
+      "referenceID" : 7,
+      "context" : "1 [Friedman, Hastie, and Tibshirani (2001),Quinlan (1986)] In classification, the information gain (IG) for attribute Xj ∈ [w1, w2] at node O, is defined as the entropy reduction of the output Y after splitting node O by attribute Xj at w, i.",
+      "startOffset" : 3,
+      "endOffset" : 43
+    }, {
+      "referenceID" : 7,
+      "context" : "1 [Friedman, Hastie, and Tibshirani (2001),Quinlan (1986)] In classification, the information gain (IG) for attribute Xj ∈ [w1, w2] at node O, is defined as the entropy reduction of the output Y after splitting node O by attribute Xj at w, i.",
+      "startOffset" : 3,
+      "endOffset" : 58
+    }, {
+      "referenceID" : 2,
+      "context" : "PV-Tree is a data-parallel algorithm, which also partitions the training data onto M machines just like in [Ben-Haim and Tom-Tov (2010),Tyree et al.",
+      "startOffset" : 108,
+      "endOffset" : 136
+    }, {
+      "referenceID" : 2,
+      "context" : "PV-Tree is a data-parallel algorithm, which also partitions the training data onto M machines just like in [Ben-Haim and Tom-Tov (2010),Tyree et al. (2011)].",
+      "startOffset" : 108,
+      "endOffset" : 156
+    }, {
+      "referenceID" : 2,
+      "context" : "PV-Tree is a data-parallel algorithm, which also partitions the training data onto M machines just like in [Ben-Haim and Tom-Tov (2010),Tyree et al. (2011)]. However, its design principal is very different. In [Ben-Haim and Tom-Tov (2010),Tyree et al.",
+      "startOffset" : 108,
+      "endOffset" : 239
+    }, {
+      "referenceID" : 2,
+      "context" : "PV-Tree is a data-parallel algorithm, which also partitions the training data onto M machines just like in [Ben-Haim and Tom-Tov (2010),Tyree et al. (2011)]. However, its design principal is very different. In [Ben-Haim and Tom-Tov (2010),Tyree et al. (2011)], one does not trust the local information about the attributes in each machine, and decides the best attribute and split point only based on the aggregated global histograms of the attributes.",
+      "startOffset" : 108,
+      "endOffset" : 259
+    }, {
+      "referenceID" : 5,
+      "context" : "used NDCG [Burges (2010)] as the evaluation measure.",
+      "startOffset" : 11,
+      "endOffset" : 25
+    }, {
+      "referenceID" : 5,
+      "context" : "used NDCG [Burges (2010)] as the evaluation measure. For CTR, we extracted about 800 numerical attributes [Jahrer et al. (2012)], and used AUC as the evaluation measure.",
+      "startOffset" : 11,
+      "endOffset" : 128
+    }, {
+      "referenceID" : 2,
+      "context" : "In addition, we implemented a data-parallel algorithm according to [Ben-Haim and Tom-Tov (2010); Tyree et al.",
+      "startOffset" : 68,
+      "endOffset" : 96
+    }, {
+      "referenceID" : 2,
+      "context" : "In addition, we implemented a data-parallel algorithm according to [Ben-Haim and Tom-Tov (2010); Tyree et al. (2011)], which can communicate both full-grained histograms and quantized histograms.",
+      "startOffset" : 68,
+      "endOffset" : 117
+    }, {
+      "referenceID" : 20,
+      "context" : "For example, in [Yu and Skillicorn (2001); Svore and Burges (2011)], each machine learns its own decision tree separately without communication.",
+      "startOffset" : 17,
+      "endOffset" : 42
+    }, {
+      "referenceID" : 5,
+      "context" : "For example, in [Yu and Skillicorn (2001); Svore and Burges (2011)], each machine learns its own decision tree separately without communication.",
+      "startOffset" : 53,
+      "endOffset" : 67
+    }, {
+      "referenceID" : 5,
+      "context" : "For example, in [Yu and Skillicorn (2001); Svore and Burges (2011)], each machine learns its own decision tree separately without communication. After that, these decision trees are aggregated by means of winner-takes-all or output ensemble. Although these works are not the focus of our paper, it is still interesting to compare with them. For this purpose, we implemented both the algorithms proposed in [Yu and Skillicorn (2001)] and [Svore and Burges (2011)].",
+      "startOffset" : 53,
+      "endOffset" : 432
+    }, {
+      "referenceID" : 5,
+      "context" : "For example, in [Yu and Skillicorn (2001); Svore and Burges (2011)], each machine learns its own decision tree separately without communication. After that, these decision trees are aggregated by means of winner-takes-all or output ensemble. Although these works are not the focus of our paper, it is still interesting to compare with them. For this purpose, we implemented both the algorithms proposed in [Yu and Skillicorn (2001)] and [Svore and Burges (2011)].",
+      "startOffset" : 53,
+      "endOffset" : 462
+    } ],
+    "year" : 2016,
+    "abstractText" : "Decision tree (and its extensions such as Gradient Boosting Decision Trees and Random Forest) is a widely used machine learning algorithm, due to its practical effectiveness and model interpretability. With the emergence of big data, there is an increasing need to parallelize the training process of decision tree. However, most existing attempts along this line suffer from high communication costs. In this paper, we propose a new algorithm, called Parallel Voting Decision Tree (PV-Tree), to tackle this challenge. After partitioning the training data onto a number of (e.g., M ) machines, this algorithm performs both local voting and global voting in each iteration. For local voting, the top-k attributes are selected from each machine according to its local data. Then, globally top-2k attributes are determined by a majority voting among these local candidates. Finally, the full-grained histograms of the globally top-2k attributes are collected from local machines in order to identify the best (most informative) attribute and its split point. PV-Tree can achieve a very low communication cost (independent of the total number of attributes) and thus can scale out very well. Furthermore, theoretical analysis shows that this algorithm can learn a near optimal decision tree, since it can find the best attribute with a large probability. Our experiments on real-world datasets show that PV-Tree significantly outperforms the existing parallel decision tree algorithms in the trade-off between accuracy and efficiency.",
+    "creator" : "LaTeX with hyperref package"
+  }
+}

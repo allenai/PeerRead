@@ -1,0 +1,630 @@
+{
+  "name" : "1704.03767.pdf",
+  "metadata" : {
+    "source" : "CRF",
+    "title" : "Parallelized Kendall’s Tau Coefficient Computation via SIMD Vectorized Sorting On Many-Integrated-Core Processors",
+    "authors" : [ "Yongchao Liu", "Tony Pan", "Oded Green", "Srinivas Aluru" ],
+    "emails" : [ "yliu@cc.gatech.edu", "tpan7@gatech.edu", "ogreen@gatech.edu", "aluru@cc.gatech.edu" ],
+    "sections" : [ {
+      "heading" : null,
+      "text" : "ar X\niv :1\n70 4.\n03 76\n7v 1\n[ cs\n.D C\n] 1\n2 A\nPairwise association measure is an important operation in data analytics. Kendall’s tau coefficient is one widely used correlation coefficient identifying non-linear relationships between ordinal variables. In this paper, we investigated a parallel algorithm accelerating all-pairs Kendall’s tau coefficient computation via single instruction multiple data (SIMD) vectorized sorting on Intel Xeon Phis by taking advantage of many processing cores and 512-bit SIMD vector instructions. To facilitate workload balancing and overcome on-chip memory limitation, we proposed a generic framework for symmetric all-pairs computation by building provable bijective functions between job identifier and coordinate space. Performance evaluation demonstrated that our algorithm on one 5110P Phi achieves two orders-of-magnitude speedups over 16-threaded MATLAB and three ordersof-magnitude speedups over sequential R, both running on high-end CPUs. Besides, our algorithm exhibited rather good distributed computing scalability with respect to number of Phis. Source code and datasets are publicly available at http://lightpcc.sourceforge.net.\nKeywords: Pairwise correlation; Kendall’s tau coefficient; all-pairs computation; many integrated core; Xeon Phi"
+    }, {
+      "heading" : "1. Introduction",
+      "text" : "Identifying interesting pairwise association between variables is an important operation in data analytics. In bioinformatics and computational biology, one typical application is to mine gene co-expression relationship via gene expression data, which can be realized by query-based gene expression database search [1]\n∗Corresponding author Email addresses: yliu@cc.gatech.edu (Yongchao Liu), tpan7@gatech.edu (Tony Pan),\nogreen@gatech.edu (Oded Green), aluru@cc.gatech.edu (Srinivas Aluru) 1Preliminary work was presented in the 28th International Symposium on Computer Architecture and High Performance Computing, Los Angeles, USA, 2016\nPreprint submitted to Journal of Parallel and Distributed Computing April 13, 2017\nor gene co-expression network analysis [2]. For gene expression database search, it targets to select the subject genes in the database that are co-expressed with the query gene. One approach is to first define some pairwise correlation/dependence measure over gene expression profiles across multiple samples (gene expression profiles for short) and then rank query-subject gene pairs by their scores. For gene co-expression networks, nodes usually correspond to genes and edges represent significant gene interactions inferred from the association of gene expression profiles. To construct a gene co-expression network, allpairs computation over gene expression profiles is frequently conducted based on linear (e.g. [3] [4] [5]) or non-linear (e.g. [6] [7] [8]) co-expression measures. A variety of correlation/dependence measures have been proposed in the literature and among them, Pearson’s product-moment correlation coefficient [9] (or Pearson’s r correlation) is the most widely used correlation measure [10]. However, this correlation coefficient is only applicable to linear correlations. In contrast, Spearman’s rank correlation coefficient [11] (or Spearman’s ρ coefficient) and Kendall’s rank correlation coefficient [12] (or Kendall’s τ coefficient) are two commonly used measures for non-linear correlations [13]. Spearman’s ρ coefficient is based on Pearson’s r coefficient but applies to ranked variables, while Kendall’s τ coefficient tests the association between ordinal variables. These two rank-based coefficients were shown to play complementary roles in the cases when Pearson’s r is not effective [14]. Among other non-linear measures, mutual information [15] [16] [17], Euclidean distance correlation [18] [19], Hilbert-Schmidt information criterion [20], and maximal information criterion [21] are frequently used as well. In addition, some unified frameworks for pairwise dependence assessments were proposed in the literature (e.g. [22]).\nKendall’s τ coefficient (τ coefficient for short) measures the ordinal correlation between two vectors of ordinal variables. Given two ordinal vectors u = {u1, u2, ..., un} and v = {v1, v2, ..., vn}, where variables ui and vi are both ordinal (0 ≤ i < n), the τ coefficient computes the correlation by counting the number of concordant pairs nc and the number of discordant pairs nd by treating ui and vi as a joint ordinal variable (ui, vi). For the τ coefficient, a pair of observations (ui, vi) and (uj , vj), where i 6= j, is deemed as concordant if ui > uj and vi > vj or ui < uj and vi < vj , and discordant if ui > uj and vi < vj or ui < uj and vi > vj . Note that if ui = uj or vi = vj , this pair is considered neither concordant nor discordant.\nIn our study, we will consider two categories of τ coefficient, namely Tau-a (denoted as τA) and Tau-b (denoted as τB). τA does not take into account tied elements in each vector and is defined as\nτA = nc − nd\nn0 (1)\nwhere n0 = n(n − 1)/2. If all elements in each vector are distinct, we have nc + nd = n0 and can therefore re-write Equation (1) as\nτA = n0 − 2nd n0 = 1− 2nd n0 (2)\nAs opposed to τA, τB makes adjustments for ties and is computed as\nτB = nc − nd √\n(n0 − n1)(n0 − n2) (3)\nwhere n1 = ∑ i u ′ i(u ′ i − 1)/2 and n2 = ∑ i v ′ i(v ′ i − 1)/2. u′i (v′i) denotes the cardinality of the i-th group of ties for vector u (v). Within a vector, each distinct value defines one tie group and this value acts as the identifier of the corresponding group. The cardinality of a tie group is equal to the number of elements in the vector whose values are identical to the identifier of the tie group. If all elements in either vector are distinct, τB will equal τA as n1 = n2 = 0. This indicates τA is a special case of τB and an implementation of τB will cover τA inherently. In addition, from the definitions of τA and τB, we can see that the computation of the τ coefficient between u and v is commutable.\nBesides the values of correlation coefficients, some applications need to calculate P -value statistics to infer statistical significance between variables. For this purpose, one approach is permutation test [23]. However, a permutation test may need a substantial number of pairwise τ coefficient computation [24] even for moderately large n, thus resulting in prohibitively long times for sequential execution. In the literature, parallelizing pairwise τ coefficient computation has not yet been intensively explored. One recent work is from Wang et al. [25], which accelerated the sequential τ coefficient computation in R [26] based on Hadoop MapReduce [27] parallel programming model. In [25], the sequential all-pairs τ coefficient implementation in R was shown extremely slow on largescale datasets. In our study, we further confirmed this observation through our performance assessment (refer to section 5.2).\nIn this paper, we parallelized all-pairs τ coefficient computation on Intel Xeon Phis based on Many-Integrated-Core (MIC) architecture, the first work accelerating all-pairs τ coefficient computation on MIC processors to the best of our knowledge. This work is a continuation from our previous parallelization of all-pairs Pearson’s r coefficient on Phi clusters [28] and further enriches our LightPCC library (http://lightpcc.sourceforge.net) targeting parallel pairwise association measures between variables in big data analytics. In this work, we have investigated three variants, namely the näıve variant, the generic sorting-enabled (GSE) variant and the vectorized sorting-enabled (VSE) variant, built upon three pairwise τ coefficient kernels, i.e. the näıve kernel, the GSE kernel and the VSE kernel, respectively. Given two ordinal vectors u and v of n elements each, the näıve kernel enumerates all possible pairs of joint variables (ui, vi) (0 ≤ i < n) to obtain nc and nd, resulting in O(n2) time complexity. In contrast, both the GSE and VSE kernels take sorting as the core and manage to reduce the time complexity to O(n log n).\nGiven m vectors of n elements each, the overall time complexity would be O(m2n2) for the näıve variant and O(m2n logn) for the GSE and VSE variants. The VSE variant enhances the GSE one by exploiting 512-bit wide single instruction multiple data (SIMD) vector instructions in MIC processors to implement fast SIMD vectorized pairwise merge of sorted subarrays. Furthermore,\nto facilitate workload balancing and overcome on-chip memory limitation, we investigated a generic framework for symmetric all-pairs computation by pioneering to build a provable, reversible and bijective relationship between job identifier and coordinate space in a job matrix.\nThe performance of our algorithm was assessed using a collection of real whole human genome gene expression datasets. Our experimental results demonstrates that the VSE variant performs best on both the multi-threaded CPU and Phi systems, compared to the other two variants. We further compared our algorithm with the all-pairs τ coefficient implementations in the widely used MATLAB [29] and R [26], revealing that our algorithm on a single 5110P Phi achieves up to 812 speedups over 16-threaded MATLAB and up to 1,166 speedups over sequential R, both of which were benchmarked on high-end CPUs. In addition, our algorithm exhibited rather good distributed computing scalability with respect to number of Phis."
+    }, {
+      "heading" : "2. Intel Many-Integrated-Core (MIC) Architecture",
+      "text" : "Intel MIC architecture targets to combine many Intel processor cores onto a single chip and has already led to the release of two generations of MIC processors. The first generation is code named as Knights Corner (KNC) and the second generation code named as Knights Landing (KNL) [30]. KNC is a PCI Express (PCIe) connected coprocessor that must be paired with Intel Xeon CPUs. KNC is actually a shared-memory computer [31] with full cache coherency over the entire chip and running a specialized Linux operating system over many cores. Each core adopts an in-order micro-architecture and has four hardware threads offering four-way simultaneous multithreading. Besides scalar processing, each core is capable of vectorized processing from a newly designed vector processing unit (VPU) featuring 512-bit wide SIMD instruction set architecture (ISA). For KNC, each core has only one VPU and this VPU is shared by all active hardware threads running on the same core. Each 512-bit vector register can be split to either 8 lanes with 64 bits each or 16 lanes with 32 bits each. Note that the VPU does not support legacy SIMD ISAs such as the Streaming SIMD extensions (SSE) series. As for caches, each core has separate L1 instruction and data caches of size 32 KB each, and a 512 KB L2 cache interconnected via a bidirectional ring bus with the L2 caches of all other cores to form a unified shared L2 cache over the chip. The cache line size is 64 bytes. In addition, two usage models can be used to invoke KNC: offload model and native model, where the former relies on compiler pragmas/directives to offload highly-parallel parts of an application to KNC, while the latter treats KNC as symmetric multiprocessing computers. While primarily focusing on KNC Phis in this work, we note that our KNC-based implementations can be easily ported onto KNL processors, as KNL implements a superset of KNC instruction sets. We expect that our implementations will be portable to future Phis as well."
+    }, {
+      "heading" : "3. Pairwise Correlation Coefficient Kernels",
+      "text" : "For the τ coefficient, we have investigated three pairwise τ coefficient kernels: the näıve kernel, the GSE kernel and the VSE kernel. From its definition, it can be seen that the Kendall’s τ coefficient only depends on the order of variable pairs. Hence, given two ordinal vectors, we can first order all elements in each vector, then replace the original value of every element with its rank in each vector, and finally conduct the τ coefficient computation on the rank transformed new vectors. This rank transformation does not affect the resulting coefficient value, but could streamline the computation, especially for ordinal variables in complex forms of representation. Moreover, this transformation needs to be done only once beforehand for each vector. Hence, we will assume that all ordinal vectors have already been rank transformed in the following discussions. For the convenience of discussion, Table 1 shows a list of notions used across our study."
+    }, {
+      "heading" : "3.1. Näıve Kernel",
+      "text" : "The näıve kernel enumerates all possible combinations of joint variables (ui, vi) (0 ≤ i < n) and counts the number of concordant pairs nc as well as the number of discordant pairs nd. As mentioned above, given two joint variable pairs (ui, vi) and (uj , vj) (i 6= j), they are considered concordant if ui > uj and vi > vj or ui < uj and vi < vj , discordant if ui > uj and vi < vj or ui < uj and vi > vj , and neither concordant nor discordant if ui = uj or vi = vj . Herein, we can observe that the two joint variables are concordant if and only if the value of (ui − uj) × (vi − vj) is positive; discordant if and only if the value of (ui − uj)× (vi − vj) is negative; and neither concordant nor\ndiscordant if and only if the value of (ui−uj)× (vi−vj) is equal to zero. In this case, in order to avoid branching in execution paths (particularly important for processors without hardware branch prediction units), we compute the value of nc−nd by examining the sign bit of the product of ui− uj and vi − vj (refer to lines 2 and 11 in Algorithm 1).\nAlgorithm 1 Pseudocode of our näıve kernel\n1: function calc sign(v) 2: return (v > 0) − (v < 0); ⊲ return 1 if v > 0, -1 if v < 0 and 0, otherwise 3: end function\n4: function kendall tau a näıve(u, v, n) 5: norminator = 0; ⊲ norminator represents nc − nd 6: for i = 1; i < n; ++i do 7: a = ui; b = vi; 8: #pragma vector aligned 9: #pragma simd reduction(+:nominator) 10: for j = 0; j < i; ++j do 11: nominator += calc sign((a− uj)) × (b − vj)); ⊲ compute nc − nd 12: end for 13: end for 14: return nominator\nn(n−1)/2 ;\n15: end function\nAlgorithm 1 shows the pseudocode of the näıve kernel. From the code, the näıve kernel has a quadratic time complexity in a function of n, but its runtime is independent of the actual content of u and v, due to the use of function calc sign. Meanwhile, the space complexity is O(1). Note that this näıve kernel is only used to compute τA."
+    }, {
+      "heading" : "3.2. Generic Sorting-enabled Kernel",
+      "text" : "Considering the close relationship between calculating τ and ordering a list of variables, Knight [32] proposed a merge-sort-like divide-and-conquer approach with O(n logn) time complexity, based on the assumption that no element tie exists within any vector. As this assumption is not always the case, Knight did mention this drawback and suggested an approximation method by averaging counts, rather than propose an exact solution. In this subsection, we investigate an exact sorting-enabled solution to address both cases: with or without element ties within any vector, together in a unified manner.\nGiven two ordinal vectors u and v, this GSE kernel generally works in the following five steps.\n• Step1 sorts the list of joint variables (ui, vi) (0 ≤ i < n) in ascending order, where the joint variables are sorted first by the first element ui and secondarily by the second element vi. In this step, we used quicksort via the standard qsort library routine, resulting in O(n log n) time complexity.\n• Step2 performs a linear-time scan over the sorted list to compute n1 (refer to Equation (3)) by counting the number of groups consisting of tied values as well as the number of tied values in each group. Meanwhile, we compute a new value n3 for joint ties, with respect to the pair (ui, vi), as\n∑ iwi(wi − 1)/2, where wi represents the number of jointly tied values in the i-th group of joint ties for u and v.\n• Step3 counts the number of discordant pairs nd by re-sorting the sorted list obtained in Step1 in ascending order of all elements in v via a merge sort procedure that can additionally accumulate the number of discordant joint variable pairs each time two adjacent sorted subarrays are merged. The rationale is as follows. Firstly, when merging two adjacent sorted subarrays, we count the number of discordant pairs by only performing pairwise comparison between joint variables from distinct subarrays. In this way, we can ensure that every pair of joint variables will be enumerated once and only once during the whole Step3 execution. Secondly, given two adjacent sorted subarrays to merge, it is guaranteed that the first value (corresponding to u) of every joint variable in the left subarray (with the smaller indices) is absolutely less than or equal to the first value of every joint variable in the right subarray (with the larger indices), due to the sort conducted in Step1. In particular, when the first value is identical for the two joint variables from distinct subarrays, the second value (corresponding to v) of the joint variable from the left subarray is also absolutely less than or equal to the second value of the joint variable from the left subarray. This means that discordance occurs only if the second value of a joint variable from the right subarray is less than the second value of a joint variable from the left subarray. Therefore, the value of nd can be gained by accumulating the number of occurrences of the aforementioned discordance in every pairwise merge of subarrays. Algorithm 2 shows the pseudocode of counting discordant pairs with out-of-place pairwise merge of adjacent sorted subarrays, where the time complexity is O(n log n) and the space complexity is O(n).\n• Step4 performs a linear-time scan over the sorted list obtained in Step3 to compute n2 (see Equation (3)) in a similar way to Step2. This works because the sorted list actually corresponds to a sorted list of all elements in v.\n• Step 5 computes the numerator nc − nd in Equations (1) and (3) as n0 − n1 − n2 + n3 − 2nd. Note that if there is no tie in each vector, n1, n2 and n3 will all be zero. In this case, nc−nd will be equal to n0−2nd as shown in Equation (2).\nFrom the above workflow, we can see that the GSE kernel takes into account tied elements within each vector. Unlike the näıve kernel that computes τA, the GSE kernel targets the computation of τB. As mentioned above, τA is actually a special case of τB and an algorithm for τB will inherently cover τA. Therefore, our GSE kernel is able to calculate both τA and τB in a unified manner. In addition, the GSE kernel has O(n log n) time complexity, since the time complexity is O(n logn) for both Step1 and Step3, O(n) for both Step2 and Step4, and O(1) for Step 5.\nAlgorithm 2 Pseudocode of Step3 of our GSE kernel\n1: function gse merge(in, out, left, mid, right) 2: l = p = left; r = mid; nd = 0; 3: while l < mid && r < right do ⊲ merge two sorted subarrays 4: if in[r].v < in[l].v then 5: nd+ = mid − l; ⊲ count discordant pairs 6: out[p++] = in[r++]; 7: else 8: out[p++] = in[l++]; 9: end if 10: end while 11: return nd; 12: end function\n13: function kendall tau b step3 gse(pairs, buffer, n) 14: nd = 0; in = pairs; out = buffer; 15: for s = 1; s < n; s *= 2 do 16: for l = 0; l < n; l += 2 * s do 17: m = min(l + s, n); 18: r = min(l + 2 ∗ s, n); 19: nd += gse merge(in, out, l, m, r); ⊲ Perform out-of-place merge 20: end for 21: swap(in, out); ⊲ swap in and out 22: end for 23: if pairs != in then 24: memcpy(pairs, in, n * sizeof(*pairs)); 25: end if 26: return nd; 27: end function"
+    }, {
+      "heading" : "3.3. Vectorized Sorting-enabled Kernel",
+      "text" : "The VSE kernel enhances the GSE kernel by employing 512-bit SIMD vector instructions on MIC processors to implement vectorized pairwise merge of sorted subarrays. In contrast with the GSE kernel, the VSE kernel has made the following algorithmic changes. The first is packing a rank variable pair (ui, vi) into a signed 32-bit integer. In this packed format, each variable is represented by 15 bits in the 32-bit integer, with ui taking the most significant 16 bits and vi the least significant 16 bits. In this case, the VSE kernel limits the maximum allowable vector size n to 215 − 1 = 32, 767. The second is that due to packing, we replace the generic variable pair quicksort in Step1 with an integer sorting method, and re-implement the discordant pair counting algorithm in Step3 (see Algorithm 2) based on integer representation. In Step1, sorting packed integers is equivalent to sorting generic variable pairs (ui, vi), since within any packed integer ui sits in higher bits and vi in lower bits. In Step3, an additional preprocessing procedure is needed to reset to zero the most significant 16 bits of each packed integer (corresponding to u). In our implementation, we split a 512-bit SIMD vector into a 16-lane 32-bit-integer vector and then investigated a vectorized merge sort for Step1 and a vectorized discordant pair counting algorithm for Step3, both of which use the same pairwise merge method and also follow a very similar procedure. Algorithm 3 shows the pseudocode of Step3 of our VSE kernel.\nIn the literature, some research has been done to accelerate sorting algorithms by means of SIMD vectorized pairwise merge of sorted subarrays. Hiroshi et al. [33] employed a SSE vectorized odd-even merge network [34] to merge sorted subarrays in an out-of-core way. Chhugan et al. [35] adopted\nAlgorithm 3 Pseudocode of Step3 our VSE kernel\n1: function vse merge(in, out, left, mid, right) 2: l = left; r = mid; p = left;nd = 0; 3: if mid − left < 16||right − mid < 16 then 4: while l < mid && r < right do 5: if input[r] < input[l] then ⊲ correspond to variable v 6: nd+ = mid − l; out[p++] = in[r++]; 7: else 8: out[p + +] = in[l + +]; 9: end if 10: end while 11: else ⊲ count discordant pairs 12: while l < mid && r < right do 13: if in[r] < in[l] then ⊲ correspond to variable v 14: nd+ = mid − 1; r + +; 15: else 16: l + +; 17: end if 18: end while ⊲ merge two sorted subarrays 19: l = left; r = mid; 20: vMin = mm512 load epi32(in + l); vMax = mm512 load epi32(in + r); 21: l+ = 16; r+ = 16; 22: while true do 23: if mm512 reduce min epi32(vMin) ≥ mm512 reduce max epi32(vMax) then 24: mm512 store epi32(out+ p, vMax); p+ = 16; vMax = vMin; 25: else if mm512 reduce min epi32(vMax) ≥ mm512 reduce max epi32(vMin) then 26: mm512 store epi32(out+ p, vMin); p+ = 16; 27: else ⊲ invoke Algorithm 4 28: bitonic merge 16way(vMin, vMax); 29: mm512 store epi32(out+ p, vMin); p+ = 16; 30: end if 31: if l + 16 ≥ mid||r + 16 ≥ right then 32: break; 33: end if 34: A = in[l];B = in[r]; C = mm512 reduce max epi32(vMax); 35: if C ≤ A && C ≤ B then 36: mm512 store epi32(out+ p, vMax); p+ = 16; 37: vMin = mm512 load epi32(in+ l); l+ = 16; 38: vMax = mm512 load epi32(in + r); r+ = 16; 39: else if B < A then 40: vMin = mm512 load epi32(in+ r); r+ = 16; 41: else 42: vMin = mm512 load epi32(in+ l); l+ = 16; 43: end if 44: end while 45: end if ⊲ invoke Algorithm 5 46: bitonic merge 16way leftover(in, out, l, r, p,mid, right, vMax); 47: return nd; 48: end function\n49: function kendall tau b step3 vse(pairs, buffer, n) 50: nd = 0; in = pairs; out = buffer; 51: for s = 1; s < n; s *= 2 do 52: for l = 0; l < n; l += 2 * s do 53: m = min(l + s, n); 54: r = min(l + 2 ∗ s, n); 55: nd += vse merge(in, out, l, m, r); ⊲ Perform out-of-place merge 56: end for 57: swap(in, out); ⊲ swap in and out 58: end for 59: if pairs != in then 60: memcpy(pairs, in, n * sizeof(*pairs)); 61: end if 62: return nd; 63: end function\nsimilar ideas to [33], but combined a SSE vectorized in-register odd-even merge sort [34] with an in-memory bitonic merge network. Chen et al. [36] absorbed the merge-path idea of [37, 38] and extended the SSE vectorized work of [35] to take advantage of 512-bit SIMD VPUs on KNC Phis and used a vectorized in-register bitonic merge sort, instead of the in-register odd-even merge sort. In our VSE kernel, we engineered a 512-bit SIMD vectorized in-register bitonic merge network as the core of our pairwise merge procedure for sorted subarrays, which is similar to [36], and further proposed a predict-and-skip mechanism to reduce the number of comparisons during pairwise merge."
+    }, {
+      "heading" : "3.3.1. In-register bitonic merge network",
+      "text" : "The in-register bitonic merge network is the core of our vectorized pairwise merge of sorted subarrays. In our algorithm, this network has 16 ways and merges two sorted vectors vMin and vMax (Figure 1 shows the computation layout of the network), where all elements in each vector are placed in ascending order from lane 0 to lane 15. In this case, to generate an input bitonic sequence from the two vectors, we need to reverse the order of all elements in one and only one vector (reverse vMax in our case) and this order reversal is realized by one permutation instruction, i.e. mm512 permutevar epi32(·). Having completed the order reversal, we can complete the sorting of vectors vMin and vMax in log2(32) = 5 steps. Algorithm 4 shows the pseudocode for our 16-way in-register bitonic merge network. From the code, the function bitonic merge 16way is\ncomposed of a fixed number of vector instructions and thus has a constant time complexity.\nAlgorithm 4 Pseudocode of our 16-way in-register bitonic merge network\n1: procedure bitonic merge 16way(vMin, vMax) ⊲ constant vector variables and reused 2: //vReverse = mm512 set epi32(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15); 3: //vPermIndex16 = mm512 set epi32(7, 6, 5, 4, 3, 2, 1, 0, 15, 14, 13, 12, 11, 10, 9, 8) 4: //vPermIndex8 = mm512 set epi32(11, 10, 9, 8, 15, 14, 13, 12, 3, 2, 1, 0, 7, 6, 5, 4); 5: //vPermIndex4 = mm512 set epi32(13, 12, 15, 14, 9, 8, 11, 10, 5, 4, 7, 6, 1, 0, 3, 2); 6: //vPermIndex2 = mm512 set epi32(14, 15, 12, 13, 10, 11, 8, 9, 6, 7, 4, 5, 2, 3, 0, 1); ⊲ Reserve vector vMax 7: vMax = mm512 permutevar epi32(vReverse, vMax); ⊲ Level 1 8: vL1 = mm512 min epi32(vMin, vMax); 9: vH1 = mm512 max epi32(vMin, vMax);\n⊲ Level 2 10: vTmp = mm512 permutevar epi32(vPermIndex16, vL1); 11: vTmp2 = mm512 permutevar epi32(vPermIndex16, vH1); 12: vL2 = mm512 mask min epi32(vL2, 0x00ff, vTmp, vL1); 13: vH2 = mm512 mask min epi32(vH2, 0x00ff, vTmp2, vH1); 14: vL2 = mm512 mask max epi32(vL2, 0xff00, vTmp, vL1); 15: vH2 = mm512 mask max epi32(vH2, 0xff00, vTmp2, vH1); ⊲ Level 3 16: vTmp = mm512 permutevar epi32(vPermIndex8, vL2); 17: vTmp2 = mm512 permutevar epi32(vPermIndex8, vH2); 18: vL3 = mm512 mask min epi32(vL3, 0x0f0f, vTmp, vL2); 19: vH3 = mm512 mask min epi32(vH3, 0x0f0f, vTmp2, vH2); 20: vL3 = mm512 mask max epi32(vL3, 0xf0f0, vTmp, vL2); 21: vH3 = mm512 mask max epi32(vH3, 0xf0f0, vTmp2, vH2); ⊲ Level 4 22: vTmp = mm512 permutevar epi32(vPermIndex4, vL3); 23: vTmp2 = mm512 permutevar epi32(vPermIndex4, vH3); 24: vL4 = mm512 mask min epi32(vL4, 0x3333, vTmp, vL3); 25: vH4 = mm512 mask min epi32(vH4, 0x3333, vTmp2, vH3); 26: vL4 = mm512 mask max epi32(vL4, 0xcccc, vTmp, vL3); 27: vH4 = mm512 mask max epi32(vH4, 0xcccc, vTmp2, vH3); ⊲ Level 5: vMin and vMax store the sorted sequence 28: vTmp = mm512 permutevar epi32(vPermIndex2, vL4); 29: vTmp2 = mm512 permutevar epi32(vPermIndex2, vH4); 30: vMin = mm512 mask min epi32(vMin, 0x5555, vTmp, vL4); 31: vMax = mm512 mask min epi32(vMax, 0x5555, vTmp2, vH4); 32: vMin = mm512 mask max epi32(vMin, 0xaaaa, vTmp, vL4); 33: vMax = mm512 mask max epi32(vMax, 0xaaaa, vTmp2, vH4); 34: end procedure"
+    }, {
+      "heading" : "3.3.2. Vectorized pairwise merge of sorted subarrays",
+      "text" : "Our vectorized pairwise merge of sorted subarrays relies on the aforementioned 16-way in-register bitonic merge network and adopted a very similar procedure to [33]. Given two sorted subarrays SA and SB, we assume that they are aligned to 64 bytes and their lengths |SA| and |SB| are multiples of 16, for the convenience of discussion. In this way, the vectorized pairwise merge works as follows.\n1. loads the smallest 16 elements of SA and SB to vMin and vMax, respectively, and advances the pointer of each subarray. 2. invokes bitonic merge 16way(·) to sort vectors vMin and vMax, and then stores the content of vMin, the smallest 16 elements, to the resulting output array.\nAlgorithm 5 Pseudocode of processing the leftovers in both subarrays\n1: procedure bitonic merge 16way leftover(in, out, l, r, p,mid, right, vMax) 2: vIndexInc = mm512 set epi32(15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0); 3: vMaxInt = mm512 set1 epi32(0x7fffffff) ⊲ maximum signed integer value 4: vMid = mm512 set1 epi32(mid); 5: vRight = mm512 set1 epi32(right);\n⊲ initialize the vector mask for vMax 6: maskMax = 0xffff; 7: while l < mid||r < right do 8: if l < mid && r < right then 9: if in[r] < in[l] then 10: vTmp = mm512 add epi32( mm512 set1 epi32(r), vIndexInc) 11: maskMin = mm512 cmplt epi32 mask(vTmp, vRight); 12: vMin = mm512 mask load epi32(vMaxInt, maskMin, in + r); r+ = 16; 13: else 14: vTmp = mm512 add epi32( mm512 set1 epi32(l), vIndexInc) 15: maskMin = mm512 cmplt epi32 mask(vTmp, vMid); 16: vMin = mm512 mask load epi32(vMaxInt, maskMin, in + l); l+ = 16; 17: end if 18: else if l < mid then 19: vTmp = mm512 add epi32( mm512 set1 epi32(l), vIndexInc); 20: maskMin = mm512 cmplt epi32 mask(vTmp, vMid); 21: vMin = mm512 mask load epi32(vMaxInt, maskMin, in + l); 22: tmp = mm512 mask reduce max epi32(maskMax, vMax); 23: if tmp ≤ mm512 reduce min epi32(vMin) then 24: break; 25: end if 26: l+ = 16; 27: else if r < right then 28: vTmp = mm512 add epi32( mm512 set1 epi32(r), vIndexInc); 29: maskMin = mm512 cmplt epi32 mask(vTmp, vRight); 30: vMin = mm512 mask load epi32(vMaxInt,maskMin, in + r); 31: tmp = mm512 mask reduce max epi32(maskMax, vMax); 32: if tmp ≤ mm512 reduce min epi32(vMin) then 33: break; 34: end if 35: r+ = 16; 36: end if ⊲ invoke Algorithm 4 37: bitonic merge 16way(vMin, vMax); ⊲ calculate new vector masks 38: nb = mm countbits 32(maskMin) + mm countbits 32(maskMax); 39: maskMin = nb > 15? 0x0ffff : (1 << nb) − 1; 40: maskMax = nb < 17? 0 : (1 << (nb − 16)) − 1; 41: mm512 mask store epi32(out+ p,maskMin, vMin); 42: p += mm countbits 32(maskMin); 43: end while ⊲ write out vMax 44: mm512 mask packstorelo epi32(out+ p,maskMax, vMax); 45: mm512 mask packstorehi epi32(out + p + 16, maskMax, vMax); 46: p += mm countbits 32(maskMax); ⊲ copy out the rest 47: if l < mid then 48: memcpy(out+ p, in + l, (mid − l)∗ sizeof(int)); 49: else if r < right then 50: memcpy(out+ p, in + r, (right − r)∗ sizeof(int)); 51: end if 52: end procedure\n3. compares the next element of SA and SB and loads 16 elements into vMin from the subarray whose next element is the smaller, followed by pointer advancing for the subarray.\n4. jumps back to the second step and repeats the procedure until all elements in both subarrays have been processed.\n5. completes the merge of SA and SB by writing the content of vMax to the output array.\nNote that if |SA| or |SB| is not a multiple of 16, we will have to implement some special treatment to deal with the leftovers in SA and SB . This special treatment is implemented as Algorithm 5 and invoked by Algorithm 3 (see line 46). From the above procedure, we can see that the time complexity of merging SA and SB is linear and thus the VSE kernel has a time complexity of O(n log n).\nAs assumed that both SA and SB are aligned to 64 bytes, we can therefore use only one mm512 load epi32(·) instruction to load 16 integer elements from memory to a vector and only one mm512 store epi32(·) instruction to store 16 elements in a vector to memory. This is because memory address is guaranteed to keep aligned to 64 bytes during pairwise merge. Defining Trd to denote the latency of memory load (in clock cycles) and Twt to denote the latency of memory store, the number of clock cycles per element load from memory can be estimated as (Trd + 16)/16 = Trd/16 + 1 clock cycles and the number of clocks cycles per element store to memory as (Twt +16)/16 = Twt/16+ 1 clock cycles. Moreover, bitonic merge 16way(·) is composed of 27 vector instructions (see lines 7∼33 in Algorithm 4) and each of its invocations leads to the output of 16 elements. In these regards, the average number of instructions per element can be estimated as 27/16 ≈ 1.69. Considering that we only used simple integer and single-source permutation instructions, each of which has a two clock cycle latency according to the Intel Xeon Phi processor software optimization manual [39], the average computational cost per element can be estimated as ⌈2 × 27/16⌉ = 4 clock cycles in the worst cases where consecutive instructions always have data dependency. In order to reduce inter-instruction latency caused by data dependency, we have manually tuned the order of instructions by means of interleaving. Since each instruction has a latency of two clock cycles, this interleaving could enable to execute one instruction in only one clock cycle, thus further reducing the cost per element to ⌈1 × 27/16⌉ = 2 clock cycles optimistically. In sum, the overall cost per element can be favorably estimated to be (Trd + Twr)/16 + 4 clock cycles.\nWe have proposed a predict-and-skip scheme to determine (i) whether we need to invoke the 16-way bitonic merge network and (ii) whether we should load two vectors of new elements from SA and SB, respectively. For cases (i), the rationale is if the minimum value in vMin (vMax) is ≥ the maximum value in vMax (vMin), every value in vMin (vMax) will be ≥ to all values in vMin (vMax). In this case, there is no need of invoking the bitonic merge network (lines 23∼26 in Algorithm 3), since the order of all elements in both vectors is already deterministic. For cases (ii), we compare the maximum value C in vMax with both the smallest element A in the rest of SA and the one B in\nthe rest of SB (lines 34∼38 in Algorithm 3). If C ≤ A and C ≤ B, none of the elements in vMax will be greater than any element in the rest of SA and SB, indicating that the absolute order of all vMax elements has already been determined. In this case, we write vMax to the resulting output array and load two vectors of new elements from SA and SB to vMin and vMax, respectively. The updates in vMin and vMax will be used for the next iteration of comparison.\nIt is worth mentioning that we also developed a 32-way bitonic merge network to implement the VSE kernel. Unfortunately, this new kernel based on 32-way merge network yielded slightly inferior performance to the kernel with the 16-way network through our tests. In this regard, we adopted the 16-way merge network in our VSE kernel."
+    }, {
+      "heading" : "4. Parallel All-Pairs Computation",
+      "text" : ""
+    }, {
+      "heading" : "4.1. All-Pairs Computation Framework",
+      "text" : "We consider the m ×m job matrix to be a 2-dimensional coordinate space on the Cartesian plane, and define the left-top corner to be the origin, the horizontal x-axis (corresponding to columns) in left-to-right direction and the vertical y-axis (corresponding to rows) in top-to-bottom direction. For nonsymmetric all-pairs computation (non-commutative pairwise computation), the workload distribution over processing elements (PEs), e.g. threads, processes, cores and etc., would be relatively straightforward. This is because coordinates in the 2-dimensional matrix corresponds to distinct jobs. Unlike non-symmetric all-pairs computation, it suffices by only computing the upper-triangle (or lowertriangle) of the job matrix for symmetric all-pairs computation (commutative pairwise computation). In this case, balanced workload distribution could be more complex than non-symmetric all-pairs computation.\nIn this paper, we propose a generic framework for workload balancing in symmetric all-pairs computation, since the computation of the τ coefficient between any u and v is commutable as mentioned above. This framework works by assigning each job a unique identifier and then building a bijective relationship between a job identifier Jm(y, x) and its corresponding coordinate (y, x). We refer to this as direct bijective mapping. While facilitating balanced workload distribution, this mapping merely relies on bijective functions, which is a prominent feature distinguished from existing methods. To the best of our knowledge, in the literature bijective functions have not ever been proposed for workload balancing in symmetric all-pairs computation. In [40], the authors used a very similar job numbering approach to ours (shown in this study), but did not derive a bijective function for symmetric all-pairs computation. Our framework can be applied to cases with identical (e.g. using static workload distribution) or varied workload per job (e.g. using a shared integer counter to realize dynamic workload distribution via remote memory access operations in MPI [41] and Unified Parallel C (UPC) programming models [42] [43]) and is also particularly useful for parallel computing architectures with hardware\nschedulers such as GPUs and FPGAs. In the following, without loss of generality, we will interpret our framework relative to the upper triangle of the job matrix by counting in the major diagonal. Nonetheless, this framework can be easily adapted to the cases excluding the major diagonal.\nDirect bijective mapping. Given a job (y, x) in the upper triangle, we compute its integer job identifier Jm(y, x) as\nJm(y, x) = Fm(y) + x− y, 0 ≤ y ≤ x < m (4)\nfor dimension size m. In this equation, Fm(y) is the total number of cells preceding row y in the upper triangle and is computed as\nFm(y) = y(2m− y + 1)\n2 (5)\nwhere y varies in [0,m]. In this way, we have defined Equation (4) based on our job numbering policy, i.e. all job identifiers vary in [0,m(m+ 1)/2) and jobs are sequentially numbered left-to-right and top-to-bottom in the upper triangle (see Fig. 2a for an example).\nReversely, given a job identifier J = Jm(y, x) (0 ≤ J < m(m+1)/2), we need to compute the coordinate (y, x) in order to locate the corresponding variable pair. As per our definition, we have\n{\nJ ≥ Fm(y) ⇔ y2 − (2m+ 1)y + 2J ≥ 0 J ≤ Fm(y + 1)− 1 ⇔ y2 − (2m− 1)y + 2(J + 1)− 2m ≤ 0 (6)\nBy solving J ≥ Fm(y) (see Figure 2b), we get\ny ≤ m+ 0.5− √ m2 +m+ 0.25− 2J (7)\nwhile getting y ≥ m− 0.5− √ m2 +m+ 0.25− 2(J + 1) (8)\nby solving J ≤ Fm(y + 1) − 1 (see Figure 2c). In this case, by defining ∆ = √\nm2 +m+ 0.25− 2(J + 1), ∆′ = √ m2 +m+ 0.25− 2J and z = m − 0.5 −\n√\nm2 +m+ 0.25− 2(J + 1), we can reformulate Equations (7) and (8) to be z ≤ y ≤ z + 1 + ∆ − ∆′. Because ∆ < ∆′, we know that [z, z + 1 + ∆ −∆′] is a sub-range of [z, z + 1) and thereby have z ≤ y < z + 1. Based on our job numbering policy stated before, as a function of integer y, Equation (6) definitely has y solutions, meaning that at least one integer exists in [z, z + 1 +∆ −∆′], which satisfies Equation (6). Meanwhile, it is known that there always exists one and only one integer in [z, z + 1) (can be easily proved) and this integer equals ⌈z⌉, regardless of the value of z. Since [z, z + 1+∆−∆′] is a sub-range of [z, z + 1), we can conclude that Equation (6) has a unique solution y that is computed as\ny = ⌈z⌉ = ⌈ m− 0.5− √ m2 +m+ 0.25− 2(J + 1) ⌉\n(9)\nHaving got y, we can compute the coordinate x as\nx = J + y − Fm(y) (10)\nbased on Equation (4)."
+    }, {
+      "heading" : "4.2. Tiled Computing",
+      "text" : "Based on the direct bijective mapping, we adopted tiled computing with the intention to benefit from L1/L2 caches. The rationale behind the tiled computing is loading into cache a small subset of the bigger dataset and reusing this block of data in cache for multiple passes. This technique partitions a matrix into a non-overlapping set of equal-sized q × q tiles. In our case, we partition the job matrix and produce a tile matrix of size w × w tiles, where w = ⌈m/q⌉. In this way, all jobs in the upper triangle of the job matrix are still fully covered by the upper triangle of the tile matrix. By treating a tile as a unit, we can assign a unique identifier to each tile in the upper triangle of the tile matrix and then build bijective functions between tile identifiers and tile coordinates in the tile matrix, similarly as we do for the job matrix.\nBecause the tile matrix has an identical structure to the original job matrix, we can directly apply our bijective mapping to the tile matrix. In this case, given a coordinate (yq, xq) (0 ≤ yq ≤ xq < w) in the upper triangle of the tile matrix, we can compute a unique tile identifier Jw(yq, xq) as\nJw(yq, xq) = Fw(yq) + xq − yq, 0 ≤ yq ≤ xq < w (11)\nwhere Fw(yq) is defined similar to Equation (5) as\nFw(yq) = yq(2w − yq + 1)\n2 (12)\nLikewise, given a tile identifier Jw, such that 0 ≤ Jw < w(w + 1)/2, we can\nreversely compute its unique vertical coordinate yq as\nyq = ⌈ w − 0.5− √ w2 + w + 0.25− 2(Jw + 1) ⌉\n(13)\nand subsequently its unique horizontal coordinate xq as\nxq = Jw + yq − Fw(yq) (14)\nAs title size is subject to cache sizes and input data, tuning tile size is believed to be important for gaining high performance. This tuning process, however, is tedious and has to be conducted case-by-case. For convenience, we empirically set q to 8 for CPUs and to 4 for Phis. Nevertheless, users can feel free to tune tile sizes to meet their needs."
+    }, {
+      "heading" : "4.3. Multithreading",
+      "text" : ""
+    }, {
+      "heading" : "4.3.1. Asynchronous kernel execution",
+      "text" : "When m is large, we may not have sufficient memory to reside the resulting m×m correlation matrix Mτ entirely in memory. To overcome memory limitation, we adopted a multi-pass kernel execution model which partitions the tile identifier range [0, w(w+1)/2) into a set of non-overlapping sub-ranges (equalsized in our case) and finishes the computation one sub-range after another. In this way, we do not need to allocate the whole memory for matrix Mτ . Instead, we only need to allocate a small amount of memory to store the computing results of one sub-range, thus considerably reducing memory footprint.\nWhen using the KNC Phi, we need to transfer the newly computed results from the Phi to the host after having completed each pass of kernel execution. If kernel execution and data transfer is conducted in sequential, the Phi will be kept idle during the interim of device-to-host data transfer. In this regard, a more preferable solution would be to employ asynchronous kernel execution by enabling concurrent execution of host-side tasks and accelerator-side kernel execution. Fortunately, KNC Phis enable such a kind of asynchronous data transfer and kernel execution associated with the offload model. This asynchronous execution can be realized by coupling the signal and wait clauses, both of which are associated with each other via a unique identifier. That is, a signal clause initiates an asynchronous operation such as data transfer and kernel execution, while a wait clause blocks the current execution until the associated asynchronous operation is completed. Refer to our previous work [28] for more details about the host-side asynchronous execution workflow proposed."
+    }, {
+      "heading" : "4.3.2. Workload balancing",
+      "text" : "For the variant using the näıve kernel, all jobs have the same amount of computation (refer to Algorithm 1). Thus, given a fixed number of threads, we evenly distribute jobs over the set of threads by assigning a thread to process one tile at a time. In contrast, for the two variants using the sorting-enabled kernels, different jobs may have different amount of computation because of\nthe two rounds of sort used in Step1 and Step3. Typically, an OpenMP dynamic scheduling policy is supposed to be in favor to address workload irregularity, albeit having relatively heavier workload distribution overhead than static scheduling. However, it is observed that dynamic scheduling produces slightly inferior performance to static scheduling through our tests. In this regard, we adopted static scheduling in our two sorting-enabled variants and assigned one thread to process one tile at a time, same as the näıve variant."
+    }, {
+      "heading" : "4.4. Distributed Computing",
+      "text" : "On KNC Phi clusters, we used MPI offload model which launches MPI processes just as an ordinary CPU cluster does. In this model, one or more Phis will be associated to a parental MPI process, which utilizes offload pragmas/directives to interact with the affiliated Phis, and inter-Phi communications need to be explicitly managed by parental processes. In this sense, Phis may not perceive the existence of remote inter-process communications. Our distributed implementations require one-to-one correspondence between MPI processes and Phis, and adopted a static workload distribution scheme based on tiled computation. This static distribution is inspired by our practice in multithreading on single Phis. In our implementation, given p processes, we evenly distribute tiles onto the p processes with the i-th (0 ≤ i < p) process assigned to compute the tiles whose identifiers are in [i×⌈w(w+1)2p ⌉, (i+1)× ⌈ w(w+1) 2p ⌉). Within each process, we adopted asynchronous execution workflow as well."
+    }, {
+      "heading" : "5. Performance Evaluation",
+      "text" : "We assessed the performance of our algorithm from four aspects: (i) comparison between our three variants, (ii) comparison with widely used counterparts: MATLAB (version R2015b) and R (version 3.2.0), (iii) multithreading scalability on a single Phi, and (iv) distributed computing scalability on Phi clusters. In these tests, we used four real whole human genome gene expression datasets (refer to Table 2) produced by Affymetrix Human Genome U133 Plus 2.0 Array. These datasets are publicly available in the GPL570 data collection of SEEK [1], a query-based computational gene co-expression search engine over large transcriptomic databases. In this study, unless otherwise specified, we compute τ coefficients between genes, meaning that m is equal to the number of genes and n equal to the number of samples for each dataset.\nAll tests are conducted on 8 compute nodes in CyEnce HPC Cluster (Iowa State University), where each node has two high-end Intel E5-2650 8-core 2.0 GHz CPUs, two 5110P Phis (each has 60 cores and 8 GB memory) and 128 GB memory. Our algorithm is compiled by Intel C++ compiler v15.0.1 with option -fast enabled. In addition, for distributed computing scalability assessment, when two processes are launched into the same node, we used the environment variable I MPI PIN PROCESSOR LIST to guide Intel MPI runtime system to pin the two processes within the node to distinct CPUs (recall that one node has two CPUs)."
+    }, {
+      "heading" : "5.1. Assessment of Our Three Variants",
+      "text" : "All of the three variants work on CPUs, Phis and their clusters. For the näıve and GSE variants, they both used the same C++ core code for CPUand MIC-oriented instances. For the VSE variant, its 512-bit SIMD vectorization is only applicable to Phis. In this regard, to support CPUs, we further developed a non-vectorized merge sort in Step1 and a non-vectorized discordant pair counting algorithm in Step3 instead, based on the aforementioned packed integer representation. Considering that this non-vectorized version also works on Phis, we have examined how much our 512-bit SIMD vectorization contributes to speed improvement by comparing the vectorized version with the non-vectorized one on the same 5110P Phi. Interestingly, by measuring the correlation between genes using the datasets in Table 2, we observed that the non-vectorized version is on a par with the vectorized one. This may be due to the relatively small value of n, which is only 353 at maximum. Based on this consideration, we further evaluated both versions by measuring the correlation between samples, wherem will be equal to the number of samples and n equal to the number of genes. In this case, n becomes 17,941 for each dataset, more than 50× larger than before. In this context, our performance assessment exposed that the vectorized version is consistently superior to the non-vectorized one, yielding very stable speedups averaged to be 1.87 for all datasets. This result was exciting, proving that our 512-bit SIMD vectorization did boost speed even for moderately large n values. Hence, we have used the vectorized version of the VSE variant for performance measurement all throughout our study."
+    }, {
+      "heading" : "5.1.1. On CPU",
+      "text" : "We first compared the performance of our three variants on multiple CPU cores. Table 3 shows the performance of each variant on 16 CPU cores and Figure 3 shows the speedup of the 16-threaded instance of each variant over its single-threaded one.\nFor the näıve variant, its 16-threaded instance achieves a roughly constant speedup of 13.70 over its single-threaded one. This observation is consistent with our expectation, as the runtime of the näıve kernel is subject to the vector size n but independent of actual vector content (refer to the implementation shown in Algorithm 1). In contrast, the speed of the two sorting-enabled kernels are sensitive to vector content to some degree. This can be explained by the following three factors: variable pair sorting in Step1, discordant pair counting based on pairwise merge of sorted subarrays in Step3, and linear-time scans\nfor determining tie groups in Step2 and Step4. Nevertheless, for both sortingenabled variants, their 16-threaded instances yield relatively consistent speedups over their single-threaded ones, respectively. For the GSE (VSE) variant, its 16- threaded instance runs 13.74× (13.79×) faster than its single-threaded one on average, with a minimum speedup 13.63 (13.69) and a maximum speedup 13.90 (13.97). For each case, the two sorting-enabled variants both yield superior performance to the näıve variant, where the average speedup is 1.60 for the GSE kernel and 2.72 for the VSE kernel."
+    }, {
+      "heading" : "5.1.2. On Xeon Phi",
+      "text" : "Subsequently, we evaluated the three variants on a single 5110P Phi (see Table 4). From Table 4, the VSE variant outperforms the näıve variant for each dataset by yielding an average speedup of 1.60 with the minimum speedup 1.53 and the maximum speedup 1.71. The GSE variant is superior to the näıve one on the DS3526 dataset, but inferior to the latter on the remaining three datasets. Interestingly, by revisiting the CPU results shown in Table 3, we recalled that the former actually performs consistently better than the latter for each dataset on CPU. Since both the näıve and the GSE variants use the same pairwise τ coefficient kernel code for their corresponding CPU- and MIC-oriented implementations, this discordant performance ranking between the two variants could owe to the architectural differences of the two types of processing unit (PU). For instance, by enabling auto-vectorization, the näıve kernel (see Algorithm 1) can concurrently process 16 integer elements by one 512-bit SIMD vector instruction, in contrast with 4 integer elements by one 128-bit SSE instruction on CPU. This fourfold increase in parallelism would enable the näıve kernel to further boost performance.\nFigure 4 shows the speedups of each variant on the Phi over on multiple CPU cores for each dataset. From Figure 4, it is observed that the Phi instance of each variant outperforms its corresponding single-threaded and 16-threaded CPU instances for each dataset. Specifically, the Phi instance of the näıve variant runs 25.34× faster on average than its single-threaded CPU instance, with the maximum speedup 25.67, and 1.85× faster on average than the 16- threaded CPU instance, with the maximum speedup 1.87. Compared to their single-threaded CPU instances, the Phi instances of the GSE and VSE variants produce the average speedups of 15.52 and 14.96 and the maximum speedups of 15.77 and 16.00, respectively. Meanwhile, in comparison to their 16-threaded CPU instances, their Phi instances performs 1.13× and 1.08× better on average and 1.15× and 1.15× better at maximum, respectively."
+    }, {
+      "heading" : "5.2. Comparison With MATLAB and R",
+      "text" : "Secondly, we compared our algorithm with all-pairs τ coefficient implementations in the widely used MATLAB (version R2015b) and R (version 3.2.0). MATLAB and R are executed in one 16-core compute node mentioned above, where MATLAB runs 16 threads as it supports multithreading and R runs in sequential. For fair comparison, both MATLAB and R merely compute all-pairs\nτ coefficient values, without conducting statistical tests, same as our algorithm does. Table 5 shows the runtimes of the 16-threaded MATLAB and sequential R instances as well as their comparison with our three variants that execute on the 5110P Phi. From the table, each variant demonstrates excellent speedups, i.e. two orders-of-magnitude over 16-threaded MATLAB and three orders-ofmagnitude over sequential R. Compared to 16-threaded MATLAB, the average and maximum speedups are 472 and 484 for the näıve variant, 462 and 494 for the GSE variant and 756 and 812 for the VSE variant, respectively. In contrast, the average and maximum speedups over sequential R are 671 and 683 for the näıve variant, 656 and 709 for the GSE variant and 1,074 and 1,166 for the VSE variant, respectively."
+    }, {
+      "heading" : "5.3. Parallel Scalability Assessment",
+      "text" : ""
+    }, {
+      "heading" : "5.3.1. Multithreading",
+      "text" : "Thirdly, we evaluated the multithreading scalability of our variants on the Phi with respect to number of threads. Figure 5 shows the parallel scalability of the three variants. In this test, we used balanced thread affinity to ensure that thread allocation is balanced over the cores and the threads allocated to the same core have consecutive identifiers (i.e. neighbors of each other). This\nthread affinity configuration is attained by setting the environment variable KMP AFFINITY to balanced.\nFrom the figures, it is observed that each variant gets performance improved as the number of active threads per core grows from 1, via 2 and 3, to 4 (corresponding to 59, 118, 177 and 236 threads, respectively). As each core is dual issue and employs in-order execution, at least two threads per core are required in order to saturate the compute capacity of each core. Meanwhile, when moving from one thread per core to two threads per core, we expect that the speedup could be close to 2. In this regard, we investigated the speedup of the instance with two threads per core over the one with one thread per core for each variant, and found that the average speedups are 1.58, 1.61 and 1.56 for the näıve, GSE and VSE variants, respectively. This finding is close to our expectation largely. Furthermore, since all threads per core share the dual in-order execution pipeline, deploying three or four threads per core may further improve performance but normally with decreased parallel efficiency (with respect to threads rather than cores). Note that for the 5110P Phi, only 59 out of 60 cores are used for computing as one core is reserved for the operating system running inside. Since each variant reaches peak performance at 236 threads, we used this number of threads for performance evaluation in all tests, unless otherwise stated."
+    }, {
+      "heading" : "5.3.2. Distributed computing",
+      "text" : "Finally, we measured the parallel scalability of our algorithm by varying the number of Phis used in a distributed environment (see Figure 6). This test is conducted in a cluster that consists of 16 Phis and is constituted by the aforementioned 8 compute nodes. Each variant used 236 threads, since this setting leads to the best performance as mentioned above. From Figure 6, the näıve variant demonstrates nearly constant speedups for all datasets on a specific number of Phis, while the two sorting-enabled variants exposed slight fluctuations under the same hardware configuration. This can be explained by the fact that the runtime of our näıve variant is independent of vector content, whereas that of each sorting-enabled variant is sensitive to actual vector content to some degree. Moreover, for each dataset, it is observed that every variant has demon-\nstrated rather good scalability with respect to number of Phis. Concretely, the näıve variant achieves an average speedup of 2.00, 3.99, 7.96 and 15.81, the GSE one yields an average speedup of 1.93, 3.82, 7.63 and 14.97, and the VSE one produces an average speedup of 1.99, 3.94, 7.86 and 15.23, on 2, 4, 8 and 16 Phis, respectively."
+    }, {
+      "heading" : "6. Conclusion",
+      "text" : "Pairwise association measure is an important operation in searching for meaningful insights within a dataset by examining potentially interesting relationships between data variables of the dataset. However, all-pairs association computation are computationally demanding for a large volume of data and may take a prohibitively long sequential runtime. This computational challenge for big data motivated us to use parallel/high-performance computing architectures to accelerate its execution.\nIn this paper, we have investigated the parallelization of all-pairs Kendall’s τ coefficient computation using MIC processors as the accelerator. To the best of our knowledge, this is for the first time that all-pairs τ coefficient computation\nhas been parallelized on MIC processors. For the τ coefficient, we have developed three variants, namely the näıve variant, the GSE variant and the VSE variant, based on three pairwise τ coefficient kernels, i.e. the näıve kernel, the GSE kernel and the VSE kernel. The three variants all can execute on CPUs, Phis and their clusters. The näıve kernel has a time complexity of O(n2), while the other two sorting-enabled kernels have an improved time complexity of O(n log n). Furthermore, we have proposed a generic framework for workload balancing in symmetric all-pairs computation and overcoming memory limitation on the host or accelerator side. This framework assigns unique identifiers to jobs in the upper triangle of the job matrix and builds provable bijective functions between job identifier and coordinate space.\nThe performance of the three variants was evaluated using a collection of real gene expression datasets produced from whole human genomes. Our experimental results demonstrated that on one 5110P Phi, the näıve variant runs up to 25.67× faster than its execution on a single CPU core, and up to 1.87× faster than on 16 CPU cores. On the same Phi, the GSE and VSE variants run up to 15.77× and 16.00× faster than their executions on a single CPU core, and up to 1.15× and 1.15× faster than on 16 CPU cores, respectively. Meanwhile, on the same CPU/Phi hardware configuration, the VSE variant achieves superior performance to the näıve and GSE variants. Interestingly, the näıve variant was observed to be inferior to the GSE variant on CPUs for both single-threaded and 16-threaded settings, but became superior to the latter on the 5110P Phi for most benchmarking datasets used. As both variants use the same core C++ code for their corresponding CPU- and MIC-oriented implementations as mentioned above, this observation suggests that the architectural differences between different types of PUs may make substantial impact on the resulting performance. Subsequently, we compared our algorithm with the third-party counterparts implemented in the popular MATLAB and R, observing that our algorithm on a single 5110P Phi runs up to 812× faster than 16-threaded MATLAB and up to 1, 166× faster than sequential R, both of which are executed on high-end Intel E5-2650 CPUs. We further assessed the parallel scalability of our algorithm with respect to number of Phis in a distributed environment, exposing that our algorithm demonstrated rather good distributed computing scalability.\nFinally, it is worth mentioning that the current version of our VSE kernel constrains the largest n value to 215 − 1, due to 32-bit integer packing. One solution to overcome this constraint is packing a variable pair (ui, vi) into a 64-bit integer with each variable occupying 32 bits. In this case, we can split a 512-bit vector into 8 lanes with each lane representing a 64-bit integer, and then implement vectorized pairwise merge of sorted subarrays based on 64-bit integers. Nonetheless, it should be noted that this 64-bit solution has twice less parallelism than 32-bit. In the future, we plan to combine this non-linear measure with other linear or non-linear correlation/dependencemeasures to generate fused co-expression networks for genome-wide gene expression data analysis at population level. In addition, since R programming language is frequently used in data analytics and the R implementation of all-pairs τ coefficient computation\nis extremely slow for large-scale datasets, we also plan to release a R package for public use based on our research in this study."
+    }, {
+      "heading" : "Acknowledgment",
+      "text" : "This research is supported in part by US National Science Foundation under IIS-1416259 and an Intel Parallel Computing Center award. Conflict of interest : none declared."
+    } ],
+    "references" : [ {
+      "title" : "V",
+      "author" : [ "Q. Zhu", "A.K. Wong", "A. Krishnan", "M.R. Aure", "A. Tadych", "R. Zhang", "D.C. Corney", "C.S. Greene", "L.A. Bongo" ],
+      "venue" : "N. Kristensen, et al., Targeted exploration and analysis of large cross-platform human transcriptomic compendia, Nature Methods 12 (3) ",
+      "citeRegEx" : "1",
+      "shortCiteRegEx" : null,
+      "year" : 2015
+    }, {
+      "title" : "The mutual information: detecting and evaluating dependencies between variables",
+      "author" : [ "R. Steuer", "J. Kurths", "C.O. Daub", "J. Weise", "J. Selbig" ],
+      "venue" : "Bioinformatics 18 (suppl 2) ",
+      "citeRegEx" : "2",
+      "shortCiteRegEx" : null,
+      "year" : 2002
+    }, {
+      "title" : "I",
+      "author" : [ "A.J. Butte" ],
+      "venue" : "S. Kohane, Unsupervised knowledge discovery in medical databases using relevance networks., in: Proceedings of the AMIA Symposium, American Medical Informatics Association",
+      "citeRegEx" : "3",
+      "shortCiteRegEx" : null,
+      "year" : 1999
+    }, {
+      "title" : "Planet: combined sequence and expression comparisons across plant networks derived from seven species",
+      "author" : [ "M. Mutwil", "S. Klie", "T. Tohge", "F.M. Giorgi", "O. Wilkins", "M.M. Campbell", "A.R. Fernie", "B. Usadel", "Z. Nikoloski", "S. Persson" ],
+      "venue" : "The Plant Cell 23 (3) ",
+      "citeRegEx" : "4",
+      "shortCiteRegEx" : null,
+      "year" : 2011
+    }, {
+      "title" : "A null model for pearson coexpression networks",
+      "author" : [ "A. Gobbi", "G. Jurman" ],
+      "venue" : "PloS One 10 (6) ",
+      "citeRegEx" : "5",
+      "shortCiteRegEx" : null,
+      "year" : 2015
+    }, {
+      "title" : "ARACNE: an algorithm for the reconstruction of gene regulatory networks in a mammalian cellular context",
+      "author" : [ "A.A. Margolin", "I. Nemenman", "K. Basso", "C. Wiggins", "G. Stolovitzky", "R.D. Favera", "A. Califano" ],
+      "venue" : "BMC Bioinformatics 7 (Suppl 1) ",
+      "citeRegEx" : "6",
+      "shortCiteRegEx" : null,
+      "year" : 2006
+    }, {
+      "title" : "Reverse engineering and analysis of large genome-scale gene networks",
+      "author" : [ "M. Aluru", "J. Zola", "D. Nettleton", "S. Aluru" ],
+      "venue" : "Nucleic Acids Research 41 (1) ",
+      "citeRegEx" : "7",
+      "shortCiteRegEx" : null,
+      "year" : 2013
+    }, {
+      "title" : "Aracne-ap: gene network reverse engineering through adaptive partitioning inference of mutual information",
+      "author" : [ "A. Lachmann", "F.M. Giorgi", "G. Lopez", "A. Califano" ],
+      "venue" : "Bioinformatics 32 (14) ",
+      "citeRegEx" : "8",
+      "shortCiteRegEx" : null,
+      "year" : 2016
+    }, {
+      "title" : "Thirteen ways to look at the correlation coefficient",
+      "author" : [ "J. Lee Rodgers", "W.A. Nicewander" ],
+      "venue" : "The American Statistician 42 (1) ",
+      "citeRegEx" : "9",
+      "shortCiteRegEx" : null,
+      "year" : 1988
+    }, {
+      "title" : "Comparison of co-expression measures: mutual information",
+      "author" : [ "L. Song", "P. Langfelder", "S. Horvath" ],
+      "venue" : "correlation, and model based indices, BMC Bioinformatics 13 (1) ",
+      "citeRegEx" : "10",
+      "shortCiteRegEx" : null,
+      "year" : 2012
+    }, {
+      "title" : "Spearmans rank correlation coefficient",
+      "author" : [ "C. Spearman" ],
+      "venue" : "Amer J Psychol 15 ",
+      "citeRegEx" : "11",
+      "shortCiteRegEx" : null,
+      "year" : 1904
+    }, {
+      "title" : "Rank correlation methods",
+      "author" : [ "M.G. Kendall" ],
+      "venue" : "Griffin",
+      "citeRegEx" : "12",
+      "shortCiteRegEx" : null,
+      "year" : 1948
+    }, {
+      "title" : "Efficient test for nonlinear dependence of two continuous variables",
+      "author" : [ "Y. Wang", "Y. Li", "H. Cao", "M. Xiong", "Y.Y. Shugart", "L. Jin" ],
+      "venue" : "BMC Bioinformatics 16 (1) ",
+      "citeRegEx" : "13",
+      "shortCiteRegEx" : null,
+      "year" : 2015
+    }, {
+      "title" : "A comparative analysis of spearman’s rho and kendall’s tau in normal and contaminated normal models",
+      "author" : [ "W. Xu", "Y. Hou", "Y. Hung", "Y. Zou" ],
+      "venue" : "Signal Processing 93 (1) ",
+      "citeRegEx" : "14",
+      "shortCiteRegEx" : null,
+      "year" : 2013
+    }, {
+      "title" : "I",
+      "author" : [ "G.A. Darbellay" ],
+      "venue" : "Vajda, et al., Estimation of the information by an adaptive partitioning of the observation space, IEEE Transactions on Information Theory 45 (4) ",
+      "citeRegEx" : "15",
+      "shortCiteRegEx" : null,
+      "year" : 1999
+    }, {
+      "title" : "Estimating mutual information using b-spline functions–an improved similarity measure for analysing gene expression data",
+      "author" : [ "C.O. Daub", "R. Steuer", "J. Selbig", "S. Kloska" ],
+      "venue" : "BMC Bioinformatics 5 (1) ",
+      "citeRegEx" : "16",
+      "shortCiteRegEx" : null,
+      "year" : 2004
+    }, {
+      "title" : "Gene regulatory network reconstruction using conditional mutual information",
+      "author" : [ "K.-C. Liang", "X. Wang" ],
+      "venue" : "EURASIP Journal on Bioinformatics and Systems Biology 2008 (1) ",
+      "citeRegEx" : "17",
+      "shortCiteRegEx" : null,
+      "year" : 2008
+    }, {
+      "title" : "N",
+      "author" : [ "G.J. Székely", "M.L. Rizzo" ],
+      "venue" : "K. Bakirov, et al., Measuring and testing dependence by correlation of distances, The Annals of Statistics 35 (6) ",
+      "citeRegEx" : "18",
+      "shortCiteRegEx" : null,
+      "year" : 2007
+    }, {
+      "title" : "On brownian distance covariance and high dimensional data",
+      "author" : [ "M.R. Kosorok" ],
+      "venue" : "The Annals of Applied Statistics 3 (4) ",
+      "citeRegEx" : "19",
+      "shortCiteRegEx" : null,
+      "year" : 2009
+    }, {
+      "title" : "Measuring statistical dependence with hilbert-schmidt norms",
+      "author" : [ "A. Gretton", "O. Bousquet", "A. Smola", "B. Schölkopf" ],
+      "venue" : "in: International Conference on Algorithmic Learning Theory, Springer",
+      "citeRegEx" : "20",
+      "shortCiteRegEx" : null,
+      "year" : 2005
+    }, {
+      "title" : "Detecting novel associations in large data sets",
+      "author" : [ "D.N. Reshef", "Y.A. Reshef", "H.K. Finucane", "S.R. Grossman", "G. McVean", "P.J. Turnbaugh", "E.S. Lander", "M. Mitzenmacher", "P.C. Sabeti" ],
+      "venue" : "Science 334 (6062) ",
+      "citeRegEx" : "21",
+      "shortCiteRegEx" : null,
+      "year" : 2011
+    }, {
+      "title" : "Feature selection via dependence maximization",
+      "author" : [ "L. Song", "A. Smola", "A. Gretton", "J. Bedo", "K. Borgwardt" ],
+      "venue" : "Journal of Machine Learning Research 13 (May) ",
+      "citeRegEx" : "22",
+      "shortCiteRegEx" : null,
+      "year" : 2012
+    }, {
+      "title" : "Gsa-lightning: ultra-fast permutation-based gene set analysis",
+      "author" : [ "B.H.W. Chang", "W. Tian" ],
+      "venue" : "Bioinformatics 32 (19) ",
+      "citeRegEx" : "23",
+      "shortCiteRegEx" : null,
+      "year" : 2016
+    }, {
+      "title" : "The kendall rank correlation coefficient",
+      "author" : [ "H. Abdi" ],
+      "venue" : "Encyclopedia of Measurement and Statistics. Sage, Thousand Oaks, CA ",
+      "citeRegEx" : "24",
+      "shortCiteRegEx" : null,
+      "year" : 2007
+    }, {
+      "title" : "Optimising parallel R correlation matrix calculations on gene expression data using mapreduce",
+      "author" : [ "S. Wang", "I. Pandis", "D. Johnson", "I. Emam", "F. Guitton", "A. Oehmichen", "Y. Guo" ],
+      "venue" : "BMC Bioinformatics 15 (1) ",
+      "citeRegEx" : "25",
+      "shortCiteRegEx" : null,
+      "year" : 2014
+    }, {
+      "title" : "A language and environment for statistical computing, R Foundation for",
+      "author" : [ "R.C. Team", "R et al" ],
+      "venue" : "Statistical Computing,",
+      "citeRegEx" : "26",
+      "shortCiteRegEx" : "26",
+      "year" : 2013
+    }, {
+      "title" : "Mapreduce: simplified data processing on large clusters",
+      "author" : [ "J. Dean", "S. Ghemawat" ],
+      "venue" : "Communications of the ACM 51 (1) ",
+      "citeRegEx" : "27",
+      "shortCiteRegEx" : null,
+      "year" : 2008
+    }, {
+      "title" : "Parallel pairwise correlation computation on intel xeon phi clusters",
+      "author" : [ "Y. Liu", "T. Pan", "S. Aluru" ],
+      "venue" : "in: 28th International Symposium on Computer Architecture and High Performance Computing, IEEE",
+      "citeRegEx" : "28",
+      "shortCiteRegEx" : null,
+      "year" : 2016
+    }, {
+      "title" : "Knights landing: Second-generation intel xeon phi product",
+      "author" : [ "A. Sodani", "R. Gramunt", "J. Corbal", "H.-S. Kim", "K. Vinod", "S. Chinthamani", "S. Hutsell", "R. Agarwal", "Y.-C. Liu" ],
+      "venue" : "IEEE Micro 36 (2) ",
+      "citeRegEx" : "30",
+      "shortCiteRegEx" : null,
+      "year" : 2016
+    }, {
+      "title" : "Intel Xeon Phi coprocessor high-performance programming",
+      "author" : [ "J. Jeffers", "J. Reinders" ],
+      "venue" : "Morgan Kaufmann",
+      "citeRegEx" : "31",
+      "shortCiteRegEx" : null,
+      "year" : 2013
+    }, {
+      "title" : "A computer method for calculating kendall’s tau with ungrouped data",
+      "author" : [ "W.R. Knight" ],
+      "venue" : "Journal of the American Statistical Association 61 (314) ",
+      "citeRegEx" : "32",
+      "shortCiteRegEx" : null,
+      "year" : 1966
+    }, {
+      "title" : "Aa-sort: A new parallel sorting algorithm for multi-core simd processors",
+      "author" : [ "H. Inoue", "T. Moriyama", "H. Komatsu", "T. Nakatani" ],
+      "venue" : "in: Proceedings of the 16th International Conference on Parallel Architecture and Compilation Techniques, IEEE Computer Society",
+      "citeRegEx" : "33",
+      "shortCiteRegEx" : null,
+      "year" : 2007
+    }, {
+      "title" : "Sorting networks and their applications",
+      "author" : [ "K.E. Batcher" ],
+      "venue" : "in: Proceedings of the April 30–May 2, 1968, spring joint computer conference, ACM",
+      "citeRegEx" : "34",
+      "shortCiteRegEx" : null,
+      "year" : 1968
+    }, {
+      "title" : "Efficient implementation of sorting on multi-core simd cpu architecture",
+      "author" : [ "J. Chhugani", "A.D. Nguyen", "V.W. Lee", "W. Macy", "M. Hagog", "Y.-K. Chen", "A. Baransi", "S. Kumar", "P. Dubey" ],
+      "venue" : "Proceedings of the VLDB Endowment 1 (2) ",
+      "citeRegEx" : "35",
+      "shortCiteRegEx" : null,
+      "year" : 2008
+    }, {
+      "title" : "Register level sort algorithm on multicore simd processors",
+      "author" : [ "T. Xiaochen", "K. Rocki", "R. Suda" ],
+      "venue" : "in: Proceedings of the 3rd Workshop on Irregular Applications: Architectures and Algorithms, ACM",
+      "citeRegEx" : "36",
+      "shortCiteRegEx" : null,
+      "year" : 2013
+    }, {
+      "title" : "Merge path-cacheefficient parallel merge and sort",
+      "author" : [ "S. Odeh", "O. Green", "Z. Mwassi", "O. Shmueli", "Y. Birk" ],
+      "venue" : "Tech. rep., Technical report, CCIT Report ",
+      "citeRegEx" : "37",
+      "shortCiteRegEx" : null,
+      "year" : 2012
+    }, {
+      "title" : "Gpu merge path: a gpu merging algorithm",
+      "author" : [ "O. Green", "R. McColl", "D.A. Bader" ],
+      "venue" : "in: Proceedings of the 26th ACM international conference on Supercomputing, ACM",
+      "citeRegEx" : "38",
+      "shortCiteRegEx" : null,
+      "year" : 2012
+    }, {
+      "title" : "Pairwise element computation with MapReduce",
+      "author" : [ "T. Kiefer", "P.B. Volk", "W. Lehner" ],
+      "venue" : "in: Proceedings of the 19th ACM International Symposium on High Performance Distributed Computing, ACM",
+      "citeRegEx" : "40",
+      "shortCiteRegEx" : null,
+      "year" : 2010
+    }, {
+      "title" : "Using advanced MPI: Modern features of the message-passing interface",
+      "author" : [ "W. Gropp", "T. Hoefler", "R. Thakur", "E. Lusk" ],
+      "venue" : "MIT Press",
+      "citeRegEx" : "41",
+      "shortCiteRegEx" : null,
+      "year" : 2014
+    }, {
+      "title" : "Upc: unified parallel c",
+      "author" : [ "T. El-Ghazawi", "L. Smith" ],
+      "venue" : "in: Proceedings of the 2006 ACM/IEEE conference on Supercomputing, ACM",
+      "citeRegEx" : "42",
+      "shortCiteRegEx" : null,
+      "year" : 2006
+    }, {
+      "title" : "Parallel and scalable shortread alignment on multi-core clusters using upc++, PLoS ONE",
+      "author" : [ "J. González-Domı́nguez", "Y. Liu", "B. Schmidt" ],
+      "venue" : null,
+      "citeRegEx" : "43",
+      "shortCiteRegEx" : "43",
+      "year" : 2016
+    } ],
+    "referenceMentions" : [ {
+      "referenceID" : 0,
+      "context" : "In bioinformatics and computational biology, one typical application is to mine gene co-expression relationship via gene expression data, which can be realized by query-based gene expression database search [1]",
+      "startOffset" : 207,
+      "endOffset" : 210
+    }, {
+      "referenceID" : 1,
+      "context" : "or gene co-expression network analysis [2].",
+      "startOffset" : 39,
+      "endOffset" : 42
+    }, {
+      "referenceID" : 2,
+      "context" : "[3] [4] [5]) or non-linear (e.",
+      "startOffset" : 0,
+      "endOffset" : 3
+    }, {
+      "referenceID" : 3,
+      "context" : "[3] [4] [5]) or non-linear (e.",
+      "startOffset" : 4,
+      "endOffset" : 7
+    }, {
+      "referenceID" : 4,
+      "context" : "[3] [4] [5]) or non-linear (e.",
+      "startOffset" : 8,
+      "endOffset" : 11
+    }, {
+      "referenceID" : 5,
+      "context" : "[6] [7] [8]) co-expression measures.",
+      "startOffset" : 0,
+      "endOffset" : 3
+    }, {
+      "referenceID" : 6,
+      "context" : "[6] [7] [8]) co-expression measures.",
+      "startOffset" : 4,
+      "endOffset" : 7
+    }, {
+      "referenceID" : 7,
+      "context" : "[6] [7] [8]) co-expression measures.",
+      "startOffset" : 8,
+      "endOffset" : 11
+    }, {
+      "referenceID" : 8,
+      "context" : "A variety of correlation/dependence measures have been proposed in the literature and among them, Pearson’s product-moment correlation coefficient [9] (or Pearson’s r correlation) is the most widely used correlation measure [10].",
+      "startOffset" : 147,
+      "endOffset" : 150
+    }, {
+      "referenceID" : 9,
+      "context" : "A variety of correlation/dependence measures have been proposed in the literature and among them, Pearson’s product-moment correlation coefficient [9] (or Pearson’s r correlation) is the most widely used correlation measure [10].",
+      "startOffset" : 224,
+      "endOffset" : 228
+    }, {
+      "referenceID" : 10,
+      "context" : "In contrast, Spearman’s rank correlation coefficient [11] (or Spearman’s ρ coefficient) and Kendall’s rank correlation coefficient [12] (or Kendall’s τ coefficient) are two commonly used measures for non-linear correlations [13].",
+      "startOffset" : 53,
+      "endOffset" : 57
+    }, {
+      "referenceID" : 11,
+      "context" : "In contrast, Spearman’s rank correlation coefficient [11] (or Spearman’s ρ coefficient) and Kendall’s rank correlation coefficient [12] (or Kendall’s τ coefficient) are two commonly used measures for non-linear correlations [13].",
+      "startOffset" : 131,
+      "endOffset" : 135
+    }, {
+      "referenceID" : 12,
+      "context" : "In contrast, Spearman’s rank correlation coefficient [11] (or Spearman’s ρ coefficient) and Kendall’s rank correlation coefficient [12] (or Kendall’s τ coefficient) are two commonly used measures for non-linear correlations [13].",
+      "startOffset" : 224,
+      "endOffset" : 228
+    }, {
+      "referenceID" : 13,
+      "context" : "These two rank-based coefficients were shown to play complementary roles in the cases when Pearson’s r is not effective [14].",
+      "startOffset" : 120,
+      "endOffset" : 124
+    }, {
+      "referenceID" : 14,
+      "context" : "Among other non-linear measures, mutual information [15] [16] [17], Euclidean distance correlation [18] [19], Hilbert-Schmidt information criterion [20], and maximal information criterion [21] are frequently used as well.",
+      "startOffset" : 52,
+      "endOffset" : 56
+    }, {
+      "referenceID" : 15,
+      "context" : "Among other non-linear measures, mutual information [15] [16] [17], Euclidean distance correlation [18] [19], Hilbert-Schmidt information criterion [20], and maximal information criterion [21] are frequently used as well.",
+      "startOffset" : 57,
+      "endOffset" : 61
+    }, {
+      "referenceID" : 16,
+      "context" : "Among other non-linear measures, mutual information [15] [16] [17], Euclidean distance correlation [18] [19], Hilbert-Schmidt information criterion [20], and maximal information criterion [21] are frequently used as well.",
+      "startOffset" : 62,
+      "endOffset" : 66
+    }, {
+      "referenceID" : 17,
+      "context" : "Among other non-linear measures, mutual information [15] [16] [17], Euclidean distance correlation [18] [19], Hilbert-Schmidt information criterion [20], and maximal information criterion [21] are frequently used as well.",
+      "startOffset" : 99,
+      "endOffset" : 103
+    }, {
+      "referenceID" : 18,
+      "context" : "Among other non-linear measures, mutual information [15] [16] [17], Euclidean distance correlation [18] [19], Hilbert-Schmidt information criterion [20], and maximal information criterion [21] are frequently used as well.",
+      "startOffset" : 104,
+      "endOffset" : 108
+    }, {
+      "referenceID" : 19,
+      "context" : "Among other non-linear measures, mutual information [15] [16] [17], Euclidean distance correlation [18] [19], Hilbert-Schmidt information criterion [20], and maximal information criterion [21] are frequently used as well.",
+      "startOffset" : 148,
+      "endOffset" : 152
+    }, {
+      "referenceID" : 20,
+      "context" : "Among other non-linear measures, mutual information [15] [16] [17], Euclidean distance correlation [18] [19], Hilbert-Schmidt information criterion [20], and maximal information criterion [21] are frequently used as well.",
+      "startOffset" : 188,
+      "endOffset" : 192
+    }, {
+      "referenceID" : 21,
+      "context" : "[22]).",
+      "startOffset" : 0,
+      "endOffset" : 4
+    }, {
+      "referenceID" : 22,
+      "context" : "For this purpose, one approach is permutation test [23].",
+      "startOffset" : 51,
+      "endOffset" : 55
+    }, {
+      "referenceID" : 23,
+      "context" : "However, a permutation test may need a substantial number of pairwise τ coefficient computation [24] even for moderately large n, thus resulting in prohibitively long times for sequential execution.",
+      "startOffset" : 96,
+      "endOffset" : 100
+    }, {
+      "referenceID" : 24,
+      "context" : "[25], which accelerated the sequential τ coefficient computation in R [26] based on Hadoop MapReduce [27] parallel programming model.",
+      "startOffset" : 0,
+      "endOffset" : 4
+    }, {
+      "referenceID" : 25,
+      "context" : "[25], which accelerated the sequential τ coefficient computation in R [26] based on Hadoop MapReduce [27] parallel programming model.",
+      "startOffset" : 70,
+      "endOffset" : 74
+    }, {
+      "referenceID" : 26,
+      "context" : "[25], which accelerated the sequential τ coefficient computation in R [26] based on Hadoop MapReduce [27] parallel programming model.",
+      "startOffset" : 101,
+      "endOffset" : 105
+    }, {
+      "referenceID" : 24,
+      "context" : "In [25], the sequential all-pairs τ coefficient implementation in R was shown extremely slow on largescale datasets.",
+      "startOffset" : 3,
+      "endOffset" : 7
+    }, {
+      "referenceID" : 27,
+      "context" : "This work is a continuation from our previous parallelization of all-pairs Pearson’s r coefficient on Phi clusters [28] and further enriches our LightPCC library (http://lightpcc.",
+      "startOffset" : 115,
+      "endOffset" : 119
+    }, {
+      "referenceID" : 25,
+      "context" : "We further compared our algorithm with the all-pairs τ coefficient implementations in the widely used MATLAB [29] and R [26], revealing that our algorithm on a single 5110P Phi achieves up to 812 speedups over 16-threaded MATLAB and up to 1,166 speedups over sequential R, both of which were benchmarked on high-end CPUs.",
+      "startOffset" : 120,
+      "endOffset" : 124
+    }, {
+      "referenceID" : 28,
+      "context" : "The first generation is code named as Knights Corner (KNC) and the second generation code named as Knights Landing (KNL) [30].",
+      "startOffset" : 121,
+      "endOffset" : 125
+    }, {
+      "referenceID" : 29,
+      "context" : "KNC is actually a shared-memory computer [31] with full cache coherency over the entire chip and running a specialized Linux operating system over many cores.",
+      "startOffset" : 41,
+      "endOffset" : 45
+    }, {
+      "referenceID" : 30,
+      "context" : "Generic Sorting-enabled Kernel Considering the close relationship between calculating τ and ordering a list of variables, Knight [32] proposed a merge-sort-like divide-and-conquer approach with O(n logn) time complexity, based on the assumption that no element tie exists within any vector.",
+      "startOffset" : 129,
+      "endOffset" : 133
+    }, {
+      "referenceID" : 31,
+      "context" : "[33] employed a SSE vectorized odd-even merge network [34] to merge sorted subarrays in an out-of-core way.",
+      "startOffset" : 0,
+      "endOffset" : 4
+    }, {
+      "referenceID" : 32,
+      "context" : "[33] employed a SSE vectorized odd-even merge network [34] to merge sorted subarrays in an out-of-core way.",
+      "startOffset" : 54,
+      "endOffset" : 58
+    }, {
+      "referenceID" : 33,
+      "context" : "[35] adopted",
+      "startOffset" : 0,
+      "endOffset" : 4
+    }, {
+      "referenceID" : 31,
+      "context" : "similar ideas to [33], but combined a SSE vectorized in-register odd-even merge sort [34] with an in-memory bitonic merge network.",
+      "startOffset" : 17,
+      "endOffset" : 21
+    }, {
+      "referenceID" : 32,
+      "context" : "similar ideas to [33], but combined a SSE vectorized in-register odd-even merge sort [34] with an in-memory bitonic merge network.",
+      "startOffset" : 85,
+      "endOffset" : 89
+    }, {
+      "referenceID" : 34,
+      "context" : "[36] absorbed the merge-path idea of [37, 38] and extended the SSE vectorized work of [35] to take advantage of 512-bit SIMD VPUs on KNC Phis and used a vectorized in-register bitonic merge sort, instead of the in-register odd-even merge sort.",
+      "startOffset" : 0,
+      "endOffset" : 4
+    }, {
+      "referenceID" : 35,
+      "context" : "[36] absorbed the merge-path idea of [37, 38] and extended the SSE vectorized work of [35] to take advantage of 512-bit SIMD VPUs on KNC Phis and used a vectorized in-register bitonic merge sort, instead of the in-register odd-even merge sort.",
+      "startOffset" : 37,
+      "endOffset" : 45
+    }, {
+      "referenceID" : 36,
+      "context" : "[36] absorbed the merge-path idea of [37, 38] and extended the SSE vectorized work of [35] to take advantage of 512-bit SIMD VPUs on KNC Phis and used a vectorized in-register bitonic merge sort, instead of the in-register odd-even merge sort.",
+      "startOffset" : 37,
+      "endOffset" : 45
+    }, {
+      "referenceID" : 33,
+      "context" : "[36] absorbed the merge-path idea of [37, 38] and extended the SSE vectorized work of [35] to take advantage of 512-bit SIMD VPUs on KNC Phis and used a vectorized in-register bitonic merge sort, instead of the in-register odd-even merge sort.",
+      "startOffset" : 86,
+      "endOffset" : 90
+    }, {
+      "referenceID" : 34,
+      "context" : "In our VSE kernel, we engineered a 512-bit SIMD vectorized in-register bitonic merge network as the core of our pairwise merge procedure for sorted subarrays, which is similar to [36], and further proposed a predict-and-skip mechanism to reduce the number of comparisons during pairwise merge.",
+      "startOffset" : 179,
+      "endOffset" : 183
+    }, {
+      "referenceID" : 31,
+      "context" : "Vectorized pairwise merge of sorted subarrays Our vectorized pairwise merge of sorted subarrays relies on the aforementioned 16-way in-register bitonic merge network and adopted a very similar procedure to [33].",
+      "startOffset" : 206,
+      "endOffset" : 210
+    }, {
+      "referenceID" : 37,
+      "context" : "In [40], the authors used a very similar job numbering approach to ours (shown in this study), but did not derive a bijective function for symmetric all-pairs computation.",
+      "startOffset" : 3,
+      "endOffset" : 7
+    }, {
+      "referenceID" : 38,
+      "context" : "using a shared integer counter to realize dynamic workload distribution via remote memory access operations in MPI [41] and Unified Parallel C (UPC) programming models [42] [43]) and is also particularly useful for parallel computing architectures with hardware",
+      "startOffset" : 115,
+      "endOffset" : 119
+    }, {
+      "referenceID" : 39,
+      "context" : "using a shared integer counter to realize dynamic workload distribution via remote memory access operations in MPI [41] and Unified Parallel C (UPC) programming models [42] [43]) and is also particularly useful for parallel computing architectures with hardware",
+      "startOffset" : 168,
+      "endOffset" : 172
+    }, {
+      "referenceID" : 40,
+      "context" : "using a shared integer counter to realize dynamic workload distribution via remote memory access operations in MPI [41] and Unified Parallel C (UPC) programming models [42] [43]) and is also particularly useful for parallel computing architectures with hardware",
+      "startOffset" : 173,
+      "endOffset" : 177
+    }, {
+      "referenceID" : 27,
+      "context" : "Refer to our previous work [28] for more details about the host-side asynchronous execution workflow proposed.",
+      "startOffset" : 27,
+      "endOffset" : 31
+    }, {
+      "referenceID" : 0,
+      "context" : "These datasets are publicly available in the GPL570 data collection of SEEK [1], a query-based computational gene co-expression search engine over large transcriptomic databases.",
+      "startOffset" : 76,
+      "endOffset" : 79
+    } ],
+    "year" : 2017,
+    "abstractText" : "Pairwise association measure is an important operation in data analytics. Kendall’s tau coefficient is one widely used correlation coefficient identifying non-linear relationships between ordinal variables. In this paper, we investigated a parallel algorithm accelerating all-pairs Kendall’s tau coefficient computation via single instruction multiple data (SIMD) vectorized sorting on Intel Xeon Phis by taking advantage of many processing cores and 512-bit SIMD vector instructions. To facilitate workload balancing and overcome on-chip memory limitation, we proposed a generic framework for symmetric all-pairs computation by building provable bijective functions between job identifier and coordinate space. Performance evaluation demonstrated that our algorithm on one 5110P Phi achieves two orders-of-magnitude speedups over 16-threaded MATLAB and three ordersof-magnitude speedups over sequential R, both running on high-end CPUs. Besides, our algorithm exhibited rather good distributed computing scalability with respect to number of Phis. Source code and datasets are publicly available at http://lightpcc.sourceforge.net.",
+    "creator" : "LaTeX with hyperref package"
+  }
+}

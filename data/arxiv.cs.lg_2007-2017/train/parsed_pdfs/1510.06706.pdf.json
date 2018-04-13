@@ -1,0 +1,451 @@
+{
+  "name" : "1510.06706.pdf",
+  "metadata" : {
+    "source" : "CRF",
+    "title" : "ZNN – A Fast and Scalable Algorithm for Training 3D Convolutional Networks on Multi-Core and Many-Core Shared Memory Machines",
+    "authors" : [ "Aleksandar Zlateski", "Kisuk Lee", "H. Sebastian Seung" ],
+    "emails" : [ "zlateski@mit.edu,", "kisuklee@mit.edu", "sseung@princeton.edu" ],
+    "sections" : [ {
+      "heading" : null,
+      "text" : "I. INTRODUCTION\nA standard formulation of supervised learning starts with a parametrized class of mappings, a training set of desired input-output pairs, and a loss function measuring deviation of actual output from desired output. The goal of learning is to minimize the average loss over the training set. A popular minimization method is stochastic gradient descent. For each input in sequence, the parameters of the mapping are updated in minus the direction of the gradient of the loss with respect to the parameters. Here we are concerned with a class of mappings known as convolutional networks (ConvNets).\nSignificant effort has been put into parallelizing ConvNet learning on GPUs, as in the popular software packages\nCaffe [1], Torch [2] and Theano[3]. ConvNet learning has also been distributed over multiple machines [4]. However, there has been relatively little work on parallelizing ConvNet learning for single shared memory CPU machines.\nHere we introduce a software package called ZNN, which implements a novel parallel algorithm for ConvNet learning on multi-core and many-core CPU machines. ZNN implements 3D ConvNets, with 2D as a special case. ZNN can employ either direct or FFT convolution, and chooses between the two methods by autotuning each layer of the network. FFT convolution was previously applied to 2D ConvNets running on GPUs [5], [6], and is even more advantageous for 3D ConvNets on CPUs.\nAs far as we know, ZNN is the first publicly available software that supports efficient training of sliding window max-pooling ConvNets, which have been studied by [7], [8], [9].\nThere is related work on using Xeon PhiTMfor supervised deep learning [10]. and unsupervised deep learning [11]."
+    }, {
+      "heading" : "II. COMPUTATION GRAPH",
+      "text" : "We define a ConvNet using a directed acyclic graph (DAG), called the computation graph (Fig. 1). Each node represents a 3D image, and each edge some image filtering operation. (2D images are a special case in which one of the dimensions has size one.) If multiple edges converge on a node, the node sums the outputs of the filtering operations represented by the edges.\nar X\niv :1\n51 0.\n06 70\n6v 1\n[ cs\n.N E\n] 2\n2 O\nFor convenience, the discussion below will assume that images and kernels have isotropic dimensions, though this restriction is not necessary for ZNN. The image filtering operations are of the four following types.\nConvolution A weighted linear combination of voxels within a sliding window is computed for each location of the window in the image. The set of weights of the linear combination is called the kernel. If the input image has size n3 and the kernel has size k3, then the output image has size n′3 = (n − k + 1)3. Image size decreases because an output voxel only exists when the sliding window is fully contained in the input image.1 The convolution is allowed to be sparse, meaning that only every sth image voxel (in every dimension) within the sliding window enters the linear combination.\nMax-pooling divides an image of size n3 into blocks of size p3, where n is divisible by p. The maximum value is computed for each block, yielding an image of size (n/p)3.\nMax-filtering The maximum within a sliding window is computed for each location of the window in the image. For a window of size k3 and an input image of size n3, the output image has size (n−k+1)3. 3D max-filtering can be performed by sequential 1D max-filtering of n2 arrays in each of the three directions. For each array we keep a heap of size k containing the values inside the 1D sliding window. Each element of the array will be inserted and removed at most once, each operation taking log k. For each position of the sliding window the top of the heap will contain the maximum value.\nTransfer function adds a number called the bias to each voxel of the image and then applies a nonlinear function to the result. The nonlinear function is typically nondecreasing. Common choices are the logistic function, the hyperbolic tangent and half-wave rectification.\nThe computational complexities of max-pooling, maxfiltering, and transfer function are shown in Table I.\nFor ConvNets in common use, the computation graph has the following properties:\n• All convergent edges are convolutions; if a node has a sole incoming edge, the edge represents a nonlinear filtering operation. • Nodes with convergent edges are not adjacent in the graph, but are separated from each other by nonlinear filtering edges. This is a reasonable constraint, because a composition of two convolutions can be collapsed into a single convolution, thereby simplifying the graph. • The graph has a layered organization in which all edges in a layer represent operations of the same type.\n1This is known as a valid convolution in MATLAB.\nZNN works for general computation graphs, whether or not they possess the above properties."
+    }, {
+      "heading" : "A. Sliding window max-pooling ConvNet",
+      "text" : "A max-pooling ConvNet in the context of visual object recognition [12] is a special case of the definition given above. No max-filterings are used. The size of the input image (known as the ConvNet field of view) is such that the convolutions and max-poolings reduce the output image(s) to exactly one pixel/voxel. There may be a single output representing whether or not the input image belongs to a given object class, or a set of n outputs representing membership in one of n object classes.\nIf localization and detection are desired as well as recognition, one can slide a window over a large image, and apply the max-pooling ConvNet at each location of the window [9]. For an input image of size n3 and a ConvNet field of view of size v3, the output image is of size (n − v + 1)3. The sliding window max-pooling ConvNet is also useful in the context of boundary detection and image segmentation [13]. However, it is computationally wasteful to literally implement the computation in this way. It is more efficient to use a maxfiltering ConvNet, in which each max-filtering layer increases the sparsity of all subsequent convolutions by a factor equal to the size of the max-filtering window (Fig. 2). This approach has been called skip-kernels [9] or filter rarefaction [14], and is equivalent in its results to max-fragmentation-pooling [8], [7]. ZNN can implement the above, but is more general as the sparsity of convolution need not increase in lock step with max-filtering, but can be controlled independently.\nThis sparsity control capability can confer a great deal of flexibility on ConvNets. It could be useful when implementing a “scale-invariant” ConvNet [15], where convolutions with shared kernel weights are performed at multiple scales to capture scale-invariant features. The scale-invariant convolution can be easily achieved by controlling the sparsity of convolutions. Unlike max-pooling, max-filtering does not decrease the resolution of filtered images. Thus, every image in max-filtering ConvNets keeps the original resolution. This is particularly beneficial to the multi-scale approach [14], [16], where images with multiple resolutions are combined together to construct the representation. In max-pooling ConvNets, upsampling is commonly used to adjust the different resolutions of images at multiple levels. Max-filtering ConvNet, in contrast, removes the need for such upsampling in an elegant and much more efficient way."
+    }, {
+      "heading" : "III. BACKPROPAGATION LEARNING",
+      "text" : "The backpropagation algorithm is a way of calculating the gradient of the loss function with respect to the trainable parameters in a ConvNet, the kernels and biases. For each input, the calculation proceeds in several phases:\n1) Obtain an input and desired output from the training set. 2) Forward pass - compute the actual output of the ConvNet\nfrom the input image.\n3) Compute the gradient of the loss function with respect to the actual output. 4) Backward pass - Compute the gradient of the loss function with respect to the voxels of the output image at each node. 5) Weight update - Compute the gradient of the loss function with respect to the kernels and biases, and update these parameters in the direction of minus the gradient.\nThe forward pass has already been described above. ZNN implements several possibilities for the loss function, such as the Euclidean distance between the actual and desired outputs."
+    }, {
+      "heading" : "A. Backward pass",
+      "text" : "It turns out that the backward pass can be represented by another graph that looks the same as the forward computation graph, except that the direction of every edge is reversed. The output nodes of the forward graph become the input nodes of the backward graph, and are initialized with the gradient of the loss function with respect to the voxels of the output nodes of the forward graph. The nodes of the backward graph are associated with their own images, which are distinct from the ones associated with the nodes of the forward graph.\nEvery edge in the backward graph is multiplication by the transpose of the Jacobian matrix of the operation represented by the corresponding edge in the forward computation graph. The four edge operations in the forward graph become the following four edge operations in the backward graph.\nConvolution Jacobian Convolution in the forward pass becomes convolution in the backward pass. The kernel is the same, except that it is reflected along all three dimensions. If the input image has size n3 and the kernel has size k3, then the output image has size n′3 = (n + k − 1)3. Image size increases because an output voxel exists whenever the sliding window has some overlap with the input image.2\nMax-pooling Jacobian Within each block, all voxels are zeroed out except for the one that was identified as the maximum within that block in the forward pass. An image of size n3 is expanded into an image of size n3p3.\nMax-filtering Jacobian Every element of an image of size n′3 = (n + p − 1)3 is initialized to zero. For each position of the sliding window the appropriate value of the input is accumulated to the position from which the maximum element was selected for that window in the forward pass.\n2This is known as a full convolution in MATLAB.\nTransfer function Jacobian Every voxel of a backward image is multiplied by the derivative of the transfer function for the corresponding voxel in the forward image."
+    }, {
+      "heading" : "B. Weight update",
+      "text" : "After the forward and backward passes are complete, there are “forward images” at the nodes of the forward computation graph, and “backward images” at the nodes of the backward computation graph (except the input nodes). These are used to update the kernels and biases as follows.\nKernel update For a convolution going from node a to node b in the forward graph, the gradient of the loss with respect to the kernel is computed by convolving the reflected forward image at node a with the backward image at node b. A valid convolution is performed, yielding an image the same size as the kernel. This is multiplied by a small “learning rate parameter,” and then subtracted from the kernel.\nBias update For a bias at node a, the gradient of the loss is calculated as the sum of all voxels in the backward image at node a. The scalar result is multiplied by a small “learning rate parameter,” and then subtracted from the bias."
+    }, {
+      "heading" : "IV. DIRECT VS. FFT CONVOLUTION",
+      "text" : "For a single convolution of an image of size n3 with a kernel of size k3, it is well-known that the FFT method (complexity O(n3 log n)), becomes more efficient than the direct method (complexity O(n3k3)), for sufficiently large kernel sizes. The crossover point of equal complexity satisfies k3 ∼ log n. It is less well-known that the FFT-direct crossover occurs at smaller kernel sizes for a ConvNet than for a single convolution [5], [6]. This is because the FFT of an image at a node can be shared by edges at that node (see Table II).3 ZNN performs layerwise auto-tuning to choose between FFT-based or direct convolution for each laeyer.\nComplexity can be further reduced by memoizing the FFTs of images and kernels obtained during the forward pass for reuse during the backward pass and weight update. This possibility was previously noted in passing but not implemented due to limited onboard GPU memory [5], [6]. The reduction in complexity is approximately a third (Table II)."
+    }, {
+      "heading" : "V. TASK DEPENDENCY GRAPH",
+      "text" : "The entire gradient learning calculation can be represented by the task dependency graph (Fig. 3). Each node represents one of the four forward operations (convolution, maxpooling/filtering, transfer function), four backward operations (Jacobians), or two update operations (kernel, bias) described above. Two additional tasks interface with the training set. The data provider obtains a training sample used for a single round of training, and the loss gradient calculates the gradient of the loss with respect to the network output.\nThe edges of the task dependency graph represent dependencies. The forward task of an edge e = (u, v) in the computation graph depends on forward pass tasks of all edges\n3Note that our values differ from the ones in [5] as we take into account the difference in complexity between full and valid convolutions.\n(w, u). The backward task of the same edge depends on the backward tasks of all edges (v, w). Finally the update task of an edge depends on both forward and backward tasks of the same edge.\nAdditionally, if there was a backward pass executed before the current forward pass, the forward task of e also depends on the previous update task of e. This is relevant because gradient learning is iterative, so the gradient is calculated repeatedly by cycling through forward, backward, and update.\nFig. 3 shows the ConvNet learning graph corresponding to the ConvNet computation graph of Fig. 1. For convenience of analysis, steps 3− 5 of one iteration of gradient learning are followed by steps 1 and 2 of the next iteration.\nTherefore forward tasks are at the bottom of the graph, and backward tasks at the top. The topmost dark red circle nodes represent the tasks that calculate the gradient of the loss with respect to the output of the network obtained in the previous forward pass. The yellow circle in the middle represents the task providing the input image for the forward tasks at the bottom. Note that there are no update tasks for pooling/filtering."
+    }, {
+      "heading" : "A. Theoretically achievable speedup",
+      "text" : "Define TP as the time required for P processors to perform one learning iteration. We would like a parallel algorithm that achieves a large speedup SP = T1/TP , and ideally one that approaches linear speedup, SP = P . This should be possible for “wide” ConvNet architectures, which contain many convolutions that can be done in parallel. We formalize this intuition in the following.\nAccording to Brent’s theorem [17], if a computation can be performed in T∞ time with an infinite number of processors, then\nTP ≤ T∞ + T1 − T∞\nP (1)\nThis amounts to a speedup of at least\nSP ≡ T1 TP ≥ S∞ 1 + S∞−1P (2)\nWe will refer to the right hand side as the “theoretically achievable speedup,” because it depends on the idealized assumptions of the PRAM model used to prove Brent’s theorem.\nWe will estimate the theoretically achievable speedup for layered architectures in which every convolutional layer is fully connected. As before, time complexity is measured in number of floating point instructions. We can already estimate T1 by summing the times in Tables I and II for each layer of\nthe network. To estimate T∞, we analyze the following algorithm employing an infinite number of processors. (1) Move sequentially through the layers, and perform all forward tasks in each layer in parallel. (2) Compute the loss gradient for all output nodes in parallel. (3) Move sequentially backward through the layers, and perform all backward tasks in each layer in parallel. (4) Perform the weight updates for all kernels and biases in parallel.\nSince the layers are done sequentially, the total time for the forward pass is the sum of contributions from each layer (convolutional, transfer function, or max pooling/filtering) as specified in Tables III and IV. The time for the backward pass is calculated similarly. Since all kernel and bias updates are done in parallel, the total update time is the maximum of the individual update times, as specified in Tables III and IV. The sum of forward, backward, and update times yields the time complexity of one gradient learning iteration.\nMost of the formulas in the tables do not depend on the widths of the layers, f and f ′. This is because all tasks in a layer are done in parallel. The only exception is that the complexity of a convolutional layer depends logarithmically on width (dlog2 fe), because summing the results of f convergent convolutions requires this amount of time using the binary collapse algorithm described in [17].\nPlots of the theoretically achievable speedup (2) for networks of different width and depth are shown in Fig. 44. In all cases, SP → P in the limit of large network width f . This is because T1 scales like f2 for large f (see terms in Table II), while T∞ scales like log f (see terms in Table III). It follows that S∞ diverges with f , so the bound on SP in Eq. (2) is equal to P in the limit of large f .\nAccording to Fig. 4, the network width at which SP reaches a fixed fraction (say 75%) of its maximal value (P ), increases with P . This behavior is consistent with Eq. (2). We expect SP to approach a fixed fraction of S∞ when S∞ ≈ P . Since S∞ scales like f2 (neglecting the logarithmic factor due to T∞), this should happen when f2 ≈ P . The power of two means that the theoretically achievable speedup approaches its maximum value even for networks with rather modest widths.\n4The constant C for the FFT operations is assumed to be 5."
+    }, {
+      "heading" : "VI. TASK SCHEDULING AND EXECUTION",
+      "text" : "Brent’s theorem guarantees the existence of a parallel algorithm that achieves a large speedup for training wide ConvNets. We now turn to the problem of designing a parallel algorithm that actually achieves large speedup in practice. Since Brent’s theorem assumes no synchronization and communication overhead, we design our algorithm to minimize synchronization overhead and increase temporal locality of computation to reduce cache misses.\nThe central quantity in our algorithm is a global priority queue that contains tasks that are ready to be executed together with their priority. A predetermined number of workers will then execute the tasks from the global queue."
+    }, {
+      "heading" : "A. Priority queue",
+      "text" : "Tasks are placed on a global queue when all non-update dependencies are satisfied (only tasks with update task as requirements are forward tasks). The rationale behind this design choice is that if a forward task is scheduled for execution without the required update task being done, we will force execution of the update task followed by the forward task that requires the result of the update, hence increase the memory locality.\nThe tasks on the queue are sorted by priority. Priorities are chosen to increase temporal locality of the computation and minimize the latency of the computation. We introduce two unique strict orderings of the nodes in the ConvNet’s computation graph based on the longest distance, in decreasing order, to any output and input node respectively. Nodes with the same distance will be ordered in some unique way. The priority of the forward task of an edge e = (u, v) will be equal to position of the output node v in the ordering based on the distance to the output nodes, and similarly the priority of the backward task will be equal to the ordering of u based on the distance to the input nodes. This ensures that we prioritize tasks with the longest path to a sink node in the task dependency, which should intuitively favor lower latency schedules. The strict ordering of the tasks with the same distance increases temporal locality by assuring that when multiple tasks with the same distance are scheduled we prefer to execute ones computing 3D images that have to be accumulated in the same sum, thus increasing the probability\nof the memory accessed being in the cache. The update tasks will have the lowest priority of all tasks. Their execution will be forced when their result is required for the forward pass, which increases cache locality as the result will be used immediately. The only other time the update tasks will be executed is if there’s no other forward or backward tasks ready to be executed."
+    }, {
+      "heading" : "B. Task Execution",
+      "text" : "The tasks are executed by N workers. Each worker picks up and executes a task with the highest priority on the queue.\nForward task algorithm is shown in the Algorithm 1. The main functionality of the forward task is to apply the appropriate FORWARD-TRANSFORM on the given input image I and accumulate the result to the sum stored in the output node. The task that adds the last image to the sum then queues all dependent forward tasks for execution.\nThe main functionality of the forward task is shown in the procedure DO-FORWARD. However such procedure can only be executed when the update task from the previous round has been completed. This is ensured by creating a new subtask containing the main functionality and calling the FORCE method.\nAlgorithm 1 Executing a forward task\nFORWARD-TASK(e, I) 1 t = CREATE-TASK(DO-FORWARD, e, I) 2 FORCE(e.update task , t)\nDO-FORWARD(e = (u, v), I) 1 Iout = e.FORWARD-TRANSFORM(I ) 2 if ADD-TO-SUM(v. fwd sum, Iout) 3 v.If = GET-SUM(v. fwd sum) 4 for e′ ∈ v.out edges 5 t = CREATE-TASK(FORWARD-TASK, e′, v.If ) 6 ENQUEUE(e′.fwd priority , t)\nThe FORCE function receives an update task and a forward subtask as parameters. The goal of the function is to execute the forward subtask but also make sure that the update task has been completed. In order to do that the method first examines the state of the update task which can be one of the following (Note that the FORCE is called from the thread scheduled to execute the appropriate forward task).\n1) Completed - the execution of the update task has been completed; in this case the calling thread just executes the forward subtask. 2) Queued - the update task is on the queue waiting to be scheduled for execution; in this case the update task is removed from the queue, and the calling thread executes both the update task and the forward subtask. 3) Executing - the update task is currently being executed by some other thread; in this case the forward subtask gets attached to the update task. This flags the thread executing the update task to execute the forward subtask as\nsoon as the update task is completed. The calling thread then returns and picks up another task for execution.\nSuch design ensures that no thread is ever waiting for completion of an update task, but rather executes the required update task itself, or delegates the forward subtask to the thread currently executing the update task.\nAlgorithm 2 Executing a backward task\nBACKWARD-TASK(e = (u, v), I) 1 Iout = e.BACKWARD-TRANSFORM(I ) 2 if e. is trainable 3 If = u. fwd image 4 e.update task = CREATE-TASK(UPDATE, e, If , I) 5 ENQUEUE(lowest priority , e.update task) 6 if ADD-TO-SUM(u.bwd sum, Iout) 7 u.Ib = GET-SUM(u.bwd sum) 8 for e′ ∈ u. in edges 9 t = CREATE-TASK(BACKWARD-TASK, e′, u.Ib) 10 ENQUEUE(e′.bwd priority , t)\nBackward task algorithm is shown in Algorithm 2. When scheduled for execution, all the dependencies of the backward task have been satisfied. The backward task then applies the appropriate BACKWARD-TRANSFORM on the given image and then queues an appropriate update task for execution with the lowest common value as priority. Similarly to the forward task, the transformed image is then added to the sum stored in the input node, and the thread to add the last image to the sum queues the dependent tasks for execution.\nUpdate tasks algorithm is shown in Algorithm 3. First the gradient of the loss is calculated, and then is multiplied by a small “learning rate” η and subtracted from the set of the training parameters (weights of the kernel or the bias). Finally, if a forward subtask has been attached it is detached and executed.\nAlgorithm 3 Executing an update task\nUPDATE(e, If , Ib) 1 G = e.COMPUTE-GRADIENT(If , Ib) 2 e.params = e.params − e.η ·G 3 if this. fwd subtask 4 t = this. fwd subtask 5 this. fwd subtask = NIL 6 EXECUTE(t)"
+    }, {
+      "heading" : "VII. SYNCHRONIZATION ISSUES",
+      "text" : "It is important to minimize the amount of time spent in critical sections – parts of the code that can be only executed by a single thread at a time. The main three points in the algorithm that require synchronization are memory management (allocation/deallocation), operations on the global task queue and concurrent summations."
+    }, {
+      "heading" : "A. Queue operations",
+      "text" : "The operations on the global task priority queue have to be synchronized. The queue is implemented as a heap of lists lowering the complexity of insertion and deletion from logN to logK, where N is the total number of tasks in the queue and K is the number of distinct values for the priority of the tasks inside the queue. Depending on the network structure, this number can be much smaller than the total number of tasks in the queue, which is especially true for wide networks."
+    }, {
+      "heading" : "B. Wait-free concurrent summation",
+      "text" : "When multiple edges converge on the same node in the computation graph, it means that multiple convolutions executed in parallel need to add their results to the same accumulated sum. The additions have to be synchronized; only one thread is allowed to change the sum. The naive strategy, waiting until all other threads have finished adding their images to the sum, would lead to critical section time that scales linearly with the image size n3. We propose a novel method that eliminates the dependence on image size by performing only pointer operations inside the critical section, which works as follows.\nSuppose that multiple threads are executing ADD-TO-SUM in Algorithm 4. For each thread, v points to a different 3D image. We would like the pointer to the sum of all these images to be stored in the object S when the computation terminates. This is accomplished by having each thread repeatedly try to reset the pointer to the sum stored in S.sum to point to v instead. If the thread succeeds, it stops working. If the thread fails, it adds the value pointed to by S.sum to the location referenced by v, and sets the pointer to NIL. Every thread continues to work until it succeeds. Once the last thread succeeds, S will contain the correct answer. Note that this algorithm does the time-consuming additions outside the critical section (lines 5-11).\nAlgorithm 4 Wait-free concurrent summation algorithm\nADD-TO-SUM(S, v) 1 v′ = NIL 2 last = FALSE 3 while TRUE 4 ACQUIRE(S. lock ) 5 if S.sum = = NIL 6 S.sum = v 7 v = NIL 8 S. total = S. total + 1 9 last = (S. total = = S.required) 10 else v′ = S.sum 11 S.sum = NIL 12 RELEASE(S. lock ) 13 if v = = NIL 14 return last 15 else ADD-TO(v, v′) // v = v + v′"
+    }, {
+      "heading" : "C. Memory management",
+      "text" : "ZNN implements two custom memory allocators. These are designed to be faster than standard memory management\nroutines, at the cost of using more memory. One custom allocator is dedicated to 3D images, which are usually large, and the other is dedicated to small objects used in auxiliary data structures. Both allocators maintain 32 global pools of memory chunks. Each pool i, i ∈ 0 . . . 31 contains chunks of sizes of 2i. Lock-free queues, as described in [18] and implemented as a part of the boost [19] library are used to implement the pool operations. The only difference between the allocators is the memory alignment—the 3D image memory allocator ensures proper memory alignment for utilizing SIMD instructions. No memory is shared between the two allocators.\nWhen a chunk of memory of size s is requested, first s is rounded up to the nearest power of 2. The appropriate pool is examined for available memory chunks. If there’s an available chunk we return it and remove it from the pool. If no chunks are available we allocate one from the system and return it.\nWhen de-allocating a chunk memory, it is simply added to the appropriate pool, and no memory is ever returned to the system. This means that the memory usage of our program can never decrease. In practice, as the ConvNet training consist of a single loop performing the same work, our memory usage peaks after a few rounds.\nIn the worst case this strategy can lead to near 2× memory usage overhead; however the available memory to the CPU is rarely a limiting factor in training a network. In the future, we might consider implementing more advanced memory allocators, such as ones with thread-local pools in addition to the global pool, or ones with higher granularity of available chunk sizes to reduce the size overhead."
+    }, {
+      "heading" : "VIII. SCALABILITY",
+      "text" : "We performed measurements of the speedup achieved by our proposed parallel algorithm relative to the serial algorithm, using the CPU systems listed in Table V. Amazon EC2 instances with 8 and 18 cores (c4.4xlarge and c4.8xlarge) were chosen for benchmarking, because they are readily available to anyone. A 4-way CPU system was included because it has 40 cores, though this is a relatively specialized piece of hardware. For an even larger number of cores, we also benchmarked the Xeon PhiTMKnights Corner. All measurements used the Intel compiler (version 15.0.2) with Intel MKL (version 11.2) libraries for FFTs and direct convolution.\nThe 3D ConvNets contained four fully-connected convolutional (C) layers with 3 × 3 × 3 kernels, each followed by a transfer function layer (T) with rectified linear function, and two 2 × 2 × 2 max-filtering (M) layers. Each convolutional layer The sequence of layer types was CTMCTMCTCT. The output patch size was 12× 12× 12.\nThe 2D ConvNets contained 6 fully-connected convolutional layers with 11× 11 kernels, each followed by rectified\nlinear transfer function layer (T), and two 2× 2 max-filtering layers (2nd and 4th). The sequence of layer types was CTMCTMCTCTCTCT. The output patch size was 48× 48.\nThe ZNN measurements were performed by first running the gradient learning algorithm for 5 warm-up rounds and then averaging the time required for the next 50 rounds. The GPU measurements were averaged over 100 rounds.\n2D ConvNets were implemented as a special case of 3D ConvNets, by setting one of the dimensions to have size one. The width of the ConvNets was varied as described below. FFT convolution was employed for 2D, and direct convolution for 3D to illustrate the use of both methods; reversing this yields similar results. Other network architectures and kernel sizes also yield similar results.\nFig. 5 shows speedup attained by various CPUs as a function of two parameters, number of worker threads and network width. Each graph shows the result of varying the number of workers while network width is held fixed. To achieve near maximal possible speedup ZNN requires sufficiently wide networks (≥ 30 for multicore CPUs and ≥ 80 for the manycore CPU) and sufficiently many worker threads (number of hyperthreads for multicore and number of hardware threads for manycore) 5. The value of the maximal speedup is equal to the number of cores or a bit larger (maximal height of graphs).\nFor a wide network on multicore CPUs, speedup increases linearly until the number of worker threads equals the number of cores. After that the increase continues at a slower rate. For wide networks on Xeon PhiTM, speedup increases linearly until the number of worker threads equals the number of cores, then more slowly until double that number, and then even slower until the number of hardware threads. The maximal achieved speedups for networks of different widths are shown in Figs. 6 and 7."
+    }, {
+      "heading" : "IX. CPU VS. GPU",
+      "text" : "While the preceding results show that ZNN can efficiently utilize CPUs, it is also important to know how the resulting performance compares to GPU implementations of ConvNet learning. Therefore, we benchmarked ZNN against Caffe [1]\n5Xeon PhiTMhas hardware threads which differ from virtual thread technology of the desktop XeonTMprocessors.\nand Theano [3], two popular GPU implementations. Comparison can be tricky because CPU and GPU implementations by definition cannot be run on the same hardware.\nWe chose to run Caffe and Theano on a Titan X GPU, and ZNN on an 18 core Amazon EC2 instance (c4.8xlarge). We chose this particular comparison, because the alternatives seemed unfair. For example, we could have run ZNN on specialized hardware with more CPU cores than the EC2 instance. This comparison seemed unfair because the specialized hardware would have been much more costly than Titan X and less accessible than Amazon EC2. Also, we could have used GPU instances from Amazon EC2, but these are currently much slower than Titan X (3× or more on our benchmarks) and have half the onboard RAM.\nFor Caffe, both default and cuDNN[20] implementations were used. For 3D ConvNets we only used Theano, as the official release of Caffe still does not support 3D ConvNets. Our Caffe and Theano code is publicly available in the ZNN repository.\nZNN used FFT convolution for both 2D and 3D, as this was found to be optimal by the auto-tuning capability of ZNN. Caffe and Theano used direct convolution.\nOur ConvNets contained 6 fully-connected convolutional (C) layers, each followed by a rectified linear transfer function\nlayer (T), and two max-pooling (P) layers, either 2 × 2 or 2 × 2 × 2. The sequence of the layer types was CTPCTPCTCTCTCT. All networks had width 40, while the sizes of the kernels and the output patch varied.\nAll benchmark times were for “sparse training,” meaning that the ConvNet is used to produce predictions for pixels in the output patch that form a lattice with period 4 in every dimension. The loss of predicted output pixels is due to the two layers of max-pooling.\nAs noted before, ZNN can also perform “dense training,” meaning that the ConvNet is used to produce predictions for every pixel in the output patch by applying the ConvNet to a window that slides across every “valid” location in the input patch. Requiring Caffe or Theano to perform dense training could have been accomplished by computing 16 sparse outputs in 2D and 64 in 3D to assemble a dense output. This method is very inefficient and would have been no contest with ZNN."
+    }, {
+      "heading" : "A. Speed",
+      "text" : "The comparison of 2D ConvNets is shown in Fig. 8. ZNN is faster than Caffe and Theano for sufficiently large kernels (30×30 or larger). This makes sense because FFT convolution (ZNN) is more efficient than direct convolution (Caffe and Theano) for sufficiently large kernels.\nSuch large kernels are not generally used in practice, so ZNN may not be competitive with GPU implementations for 2D networks. On the other hand, ZNN opens up the possibility of efficiently training networks with large kernels, and these might find some practical application in the future.\nThe comparison of 3D ConvNets is shown in Fig. 9. ZNN is comparable to Theano even for modest kernel sizes of 5×5×5 and outperforms Theano for kernel sizes of 7 × 7 × 7 and\ngreater. Such kernel sizes are currently relevant for practical applications [21]. Again the benchmark makes sense, because we expect the crossover point for complexity of FFT vs. direct convolution to occur for smaller (linear) kernel sizes in 3D."
+    }, {
+      "heading" : "B. Memory",
+      "text" : "Working memory is another computational resource that is important for training ConvNets. Given the limited amount of onboard GPU memory, we were unable to use Theano to train 3D networks with kernel sizes larger than 7× 7× 7. We were also unable to use Caffe to train many 2D networks (see missing bars in Fig. 8).\nZNN enables training of larger networks mostly because a typical CPU system has much more RAM than even a top GPU. Titan X, for example, has just 12 GB of onboard RAM. Additionally, ZNN can achieve even higher speed by using extra RAM space, as in the case of FFT memoization. When using FFT-based convolutions, with the memoization disabled, ZNN is more efficient in its usage of RAM than the proposed GPU methods. The memory overhead of the methods proposed\nin [5], [6] could be very high as it is proportional to the number of kernels in a layer. In contrast ZNN’s memory overhead is proportional to the number of workers.\nX. IMPLEMENTATION DETAILS\nZNN is implemented in C++ and is publicly available under the GPL2 license (https://github.com/zlateski/znn-release). It can use either fftw or intel MKL for FFTs and either provided code or intel MKL libraries for direct convolution. Using fftw instead of MKL yields same scalability but lower absolute performances due to the differences in single thread performances of the two libraries. The repository also provides alternative scheduling strategies such as simple FIFO or LIFO as well as some more complex ones based on work stealing [22]. The alternative scheduling strategies achieve noticeably lower scalability than the one proposed in the paper for most networks. However, some very specific networks might benefit from alternative scheduling algorithms. Future work can include automatic detection of the best scheduling strategy."
+    }, {
+      "heading" : "XI. CONCLUSIONS",
+      "text" : "ZNN achieves high performances by efficiently utilizing the available CPUs. We expect an increase in the number of cores per chip (or Xeon PhiTMcard) in the future, making ZNN even more practical. In fact, we have already used ZNN to achieve state of the art results in boundary detection [23] and computation of dendritic arbor densities [24].\nHaving a large amount of RAM available to the CPU, ZNN can efficiently train very large ConvNets with large kernels. ZNN allows for easy extensions and can efficiently train a ConvNet with an arbitrary topology, allowing for new research.\nUnlike the ZNN’s task parallelization model, the current GPU implementations employ SIMD parallelism to perform computation on one whole layer at a time, thus limiting the network structure. Mainly, the computation is parallelized such that a single thread computes the value of a single voxel of an output image. Libraries like cuDNN provide optimized primitives for fully connected convolutional layers by reducing all the required convolutions in the layer to a matrix multiplication, which is then parallelized on the GPU.\nExtending the functionality requires the user to provide a parallelized implementation of the new layer type, which typically requires great knowledge of GPU programming, and might take a long time. Contrary to that, ZNN’s task parallelism allows for easy extensions by simply providing serial functions for the forward and backward pass, as well as the gradient computation, if required. ZNN’s repository contains some sample extensions providing functionality of dropout [25] and multi-scale [14], [16] networks."
+    } ],
+    "references" : [ {
+      "title" : "Caffe: Convolutional architecture for fast feature embedding",
+      "author" : [ "Y. Jia", "E. Shelhamer", "J. Donahue", "S. Karayev", "J. Long", "R. Girshick", "S. Guadarrama", "T. Darrell" ],
+      "venue" : "Proceedings of the ACM International Conference on Multimedia, pp. 675–678, ACM, 2014.",
+      "citeRegEx" : "1",
+      "shortCiteRegEx" : null,
+      "year" : 2014
+    }, {
+      "title" : "Torch7: A matlablike environment for machine learning",
+      "author" : [ "R. Collobert", "K. Kavukcuoglu", "C. Farabet" ],
+      "venue" : "BigLearn, NIPS Workshop, no. EPFL-CONF-192376, 2011.",
+      "citeRegEx" : "2",
+      "shortCiteRegEx" : null,
+      "year" : 1923
+    }, {
+      "title" : "Theano: a cpu and gpu math expression compiler",
+      "author" : [ "J. Bergstra", "O. Breuleux", "F. Bastien", "P. Lamblin", "R. Pascanu", "G. Desjardins", "J. Turian", "D. Warde-Farley", "Y. Bengio" ],
+      "venue" : "Proceedings of the Python for scientific computing conference (SciPy), vol. 4, p. 3, Austin, TX, 2010.",
+      "citeRegEx" : "3",
+      "shortCiteRegEx" : null,
+      "year" : 2010
+    }, {
+      "title" : "Large scale distributed deep networks",
+      "author" : [ "J. Dean", "G. Corrado", "R. Monga", "K. Chen", "M. Devin", "M. Mao", "A. Senior", "P. Tucker", "K. Yang", "Q.V. Le" ],
+      "venue" : "Advances in Neural Information Processing Systems, pp. 1223–1231, 2012.",
+      "citeRegEx" : "4",
+      "shortCiteRegEx" : null,
+      "year" : 2012
+    }, {
+      "title" : "Fast training of convolutional networks through ffts",
+      "author" : [ "M. Mathieu", "M. Henaff", "Y. LeCun" ],
+      "venue" : "International Conference on Learning Representations (ICLR2014), CBLS, April 2014.",
+      "citeRegEx" : "5",
+      "shortCiteRegEx" : null,
+      "year" : 2014
+    }, {
+      "title" : "Fast convolutional nets with fbfft: A gpu performance evaluation",
+      "author" : [ "N. Vasilache", "J. Johnson", "M. Mathieu", "S. Chintala", "S. Piantino", "Y. LeCun" ],
+      "venue" : "arXiv preprint arXiv:1412.7580, 2014.",
+      "citeRegEx" : "6",
+      "shortCiteRegEx" : null,
+      "year" : 2014
+    }, {
+      "title" : "A fast learning algorithm for image segmentation with max-pooling convolutional networks",
+      "author" : [ "J. Masci", "A. Giusti", "D. Ciresan", "G. Fricout", "J. Schmidhuber" ],
+      "venue" : "Image Processing (ICIP), 2013 20th IEEE International Conference on, pp. 2713–2717, IEEE, 2013.",
+      "citeRegEx" : "7",
+      "shortCiteRegEx" : null,
+      "year" : 2013
+    }, {
+      "title" : "Fast image scanning with deep max-pooling convolutional neural networks",
+      "author" : [ "A. Giusti", "D.C. Cireşan", "J. Masci", "L.M. Gambardella", "J. Schmidhuber" ],
+      "venue" : "arXiv preprint arXiv:1302.1700, 2013.",
+      "citeRegEx" : "8",
+      "shortCiteRegEx" : null,
+      "year" : 2013
+    }, {
+      "title" : "Overfeat: Integrated recognition, localization and detection using convolutional networks",
+      "author" : [ "P. Sermanet", "D. Eigen", "X. Zhang", "M. Mathieu", "R. Fergus", "Y. Le- Cun" ],
+      "venue" : "arXiv preprint arXiv:1312.6229, 2013.",
+      "citeRegEx" : "9",
+      "shortCiteRegEx" : null,
+      "year" : 2013
+    }, {
+      "title" : "The potential of the intel xeon phi for supervised deep learning",
+      "author" : [ "A. Viebke", "S. Pllana" ],
+      "venue" : "arXiv preprint arXiv:1506.09067, 2015.",
+      "citeRegEx" : "10",
+      "shortCiteRegEx" : null,
+      "year" : 2015
+    }, {
+      "title" : "Training large scale deep neural networks on the intel xeon phi many-core coprocessor",
+      "author" : [ "L. Jin", "Z. Wang", "R. Gu", "C. Yuan", "Y. Huang" ],
+      "venue" : "Proceedings of the 2014 IEEE International Parallel & Distributed Processing Symposium Workshops, IPDPSW ’14, (Washington, DC, USA), pp. 1622–1630, IEEE Computer Society, 2014.",
+      "citeRegEx" : "11",
+      "shortCiteRegEx" : null,
+      "year" : 2014
+    }, {
+      "title" : "Imagenet classification with deep convolutional neural networks",
+      "author" : [ "A. Krizhevsky", "I. Sutskever", "G.E. Hinton" ],
+      "venue" : "Advances in neural information processing systems, pp. 1097–1105, 2012.",
+      "citeRegEx" : "12",
+      "shortCiteRegEx" : null,
+      "year" : 2012
+    }, {
+      "title" : "Deep neural networks segment neuronal membranes in electron microscopy images",
+      "author" : [ "D. Ciresan", "A. Giusti", "L.M. Gambardella", "J. Schmidhuber" ],
+      "venue" : "Advances in neural information processing systems, pp. 2843–2851, 2012.",
+      "citeRegEx" : "13",
+      "shortCiteRegEx" : null,
+      "year" : 2012
+    }, {
+      "title" : "Fully convolutional networks for semantic segmentation",
+      "author" : [ "J. Long", "E. Shelhamer", "T. Darrell" ],
+      "venue" : "The IEEE Conference on Computer Vision and Pattern Recognition (CVPR), June 2015.",
+      "citeRegEx" : "14",
+      "shortCiteRegEx" : null,
+      "year" : 2015
+    }, {
+      "title" : "Locally scale-invariant convolutional neural networks",
+      "author" : [ "A. Kanazawa", "A. Sharma", "D.W. Jacobs" ],
+      "venue" : "arXiv preprint arXiv:1412.5104, 2014.",
+      "citeRegEx" : "15",
+      "shortCiteRegEx" : null,
+      "year" : 2014
+    }, {
+      "title" : "Traffic sign recognition with multi-scale convolutional networks",
+      "author" : [ "P. Sermanet", "Y. LeCun" ],
+      "venue" : "Neural Networks (IJCNN), The 2011 International Joint Conference on, pp. 2809–2813, IEEE, 2011.",
+      "citeRegEx" : "16",
+      "shortCiteRegEx" : null,
+      "year" : 2011
+    }, {
+      "title" : "Brents theorem",
+      "author" : [ "J. Gustafson" ],
+      "venue" : "Encyclopedia of Parallel Computing (D. Padua, ed.), pp. 182–185, Springer US, 2011.",
+      "citeRegEx" : "17",
+      "shortCiteRegEx" : null,
+      "year" : 2011
+    }, {
+      "title" : "Simple, fast, and practical nonblocking and blocking concurrent queue algorithms",
+      "author" : [ "M.M. Michael", "M.L. Scott" ],
+      "venue" : "Proceedings of the fifteenth annual ACM symposium on Principles of distributed computing, pp. 267–275, ACM, 1996.",
+      "citeRegEx" : "18",
+      "shortCiteRegEx" : null,
+      "year" : 1996
+    }, {
+      "title" : "cudnn: Efficient primitives for deep learning",
+      "author" : [ "S. Chetlur", "C. Woolley", "P. Vandermersch", "J. Cohen", "J. Tran", "B. Catanzaro", "E. Shelhamer" ],
+      "venue" : "arXiv preprint arXiv:1410.0759, 2014.",
+      "citeRegEx" : "20",
+      "shortCiteRegEx" : null,
+      "year" : 2014
+    }, {
+      "title" : "Connectomic reconstruction of the inner plexiform layer in the mouse retina",
+      "author" : [ "M. Helmstaedter", "K.L. Briggman", "S.C. Turaga", "V. Jain", "H.S. Seung", "W. Denk" ],
+      "venue" : "Nature, vol. 500, no. 7461, pp. 168–174, 2013.",
+      "citeRegEx" : "21",
+      "shortCiteRegEx" : null,
+      "year" : 2013
+    }, {
+      "title" : "Scheduling multithreaded computations by work stealing",
+      "author" : [ "R.D. Blumofe", "C.E. Leiserson" ],
+      "venue" : "Journal of the ACM (JACM), vol. 46, no. 5, pp. 720–748, 1999.",
+      "citeRegEx" : "22",
+      "shortCiteRegEx" : null,
+      "year" : 1999
+    }, {
+      "title" : "Recursive training of 2d-3d convolutional networks for neuronal boundary detection",
+      "author" : [ "K. Lee", "A. Zlateski", "A. Vishwanathan", "H.S. Seung" ],
+      "venue" : "arXiv preprint arXiv:1508.04843, 2015.",
+      "citeRegEx" : "23",
+      "shortCiteRegEx" : null,
+      "year" : 2015
+    }, {
+      "title" : "Automated computation of arbor densities: a step toward identifying neuronal cell types",
+      "author" : [ "U. Sümbül", "A. Zlateski", "A. Vishwanathan", "R.H. Masland", "H.S. Seung" ],
+      "venue" : "Frontiers in neuroanatomy, vol. 8, 2014.",
+      "citeRegEx" : "24",
+      "shortCiteRegEx" : null,
+      "year" : 2014
+    }, {
+      "title" : "Dropout: A simple way to prevent neural networks from overfitting",
+      "author" : [ "N. Srivastava", "G. Hinton", "A. Krizhevsky", "I. Sutskever", "R. Salakhutdinov" ],
+      "venue" : "The Journal of Machine Learning Research, vol. 15, no. 1, pp. 1929–1958, 2014.",
+      "citeRegEx" : "25",
+      "shortCiteRegEx" : null,
+      "year" : 1929
+    } ],
+    "referenceMentions" : [ {
+      "referenceID" : 0,
+      "context" : "Caffe [1], Torch [2] and Theano[3].",
+      "startOffset" : 6,
+      "endOffset" : 9
+    }, {
+      "referenceID" : 1,
+      "context" : "Caffe [1], Torch [2] and Theano[3].",
+      "startOffset" : 17,
+      "endOffset" : 20
+    }, {
+      "referenceID" : 2,
+      "context" : "Caffe [1], Torch [2] and Theano[3].",
+      "startOffset" : 31,
+      "endOffset" : 34
+    }, {
+      "referenceID" : 3,
+      "context" : "ConvNet learning has also been distributed over multiple machines [4].",
+      "startOffset" : 66,
+      "endOffset" : 69
+    }, {
+      "referenceID" : 4,
+      "context" : "FFT convolution was previously applied to 2D ConvNets running on GPUs [5], [6], and is even more advantageous for 3D ConvNets on CPUs.",
+      "startOffset" : 70,
+      "endOffset" : 73
+    }, {
+      "referenceID" : 5,
+      "context" : "FFT convolution was previously applied to 2D ConvNets running on GPUs [5], [6], and is even more advantageous for 3D ConvNets on CPUs.",
+      "startOffset" : 75,
+      "endOffset" : 78
+    }, {
+      "referenceID" : 6,
+      "context" : "As far as we know, ZNN is the first publicly available software that supports efficient training of sliding window max-pooling ConvNets, which have been studied by [7], [8], [9].",
+      "startOffset" : 164,
+      "endOffset" : 167
+    }, {
+      "referenceID" : 7,
+      "context" : "As far as we know, ZNN is the first publicly available software that supports efficient training of sliding window max-pooling ConvNets, which have been studied by [7], [8], [9].",
+      "startOffset" : 169,
+      "endOffset" : 172
+    }, {
+      "referenceID" : 8,
+      "context" : "As far as we know, ZNN is the first publicly available software that supports efficient training of sliding window max-pooling ConvNets, which have been studied by [7], [8], [9].",
+      "startOffset" : 174,
+      "endOffset" : 177
+    }, {
+      "referenceID" : 9,
+      "context" : "There is related work on using Xeon PhiTMfor supervised deep learning [10].",
+      "startOffset" : 70,
+      "endOffset" : 74
+    }, {
+      "referenceID" : 10,
+      "context" : "and unsupervised deep learning [11].",
+      "startOffset" : 31,
+      "endOffset" : 35
+    }, {
+      "referenceID" : 11,
+      "context" : "A max-pooling ConvNet in the context of visual object recognition [12] is a special case of the definition given above.",
+      "startOffset" : 66,
+      "endOffset" : 70
+    }, {
+      "referenceID" : 8,
+      "context" : "If localization and detection are desired as well as recognition, one can slide a window over a large image, and apply the max-pooling ConvNet at each location of the window [9].",
+      "startOffset" : 174,
+      "endOffset" : 177
+    }, {
+      "referenceID" : 12,
+      "context" : "The sliding window max-pooling ConvNet is also useful in the context of boundary detection and image segmentation [13].",
+      "startOffset" : 114,
+      "endOffset" : 118
+    }, {
+      "referenceID" : 8,
+      "context" : "This approach has been called skip-kernels [9] or filter rarefaction [14], and is equivalent in its results to max-fragmentation-pooling [8], [7].",
+      "startOffset" : 43,
+      "endOffset" : 46
+    }, {
+      "referenceID" : 13,
+      "context" : "This approach has been called skip-kernels [9] or filter rarefaction [14], and is equivalent in its results to max-fragmentation-pooling [8], [7].",
+      "startOffset" : 69,
+      "endOffset" : 73
+    }, {
+      "referenceID" : 7,
+      "context" : "This approach has been called skip-kernels [9] or filter rarefaction [14], and is equivalent in its results to max-fragmentation-pooling [8], [7].",
+      "startOffset" : 137,
+      "endOffset" : 140
+    }, {
+      "referenceID" : 6,
+      "context" : "This approach has been called skip-kernels [9] or filter rarefaction [14], and is equivalent in its results to max-fragmentation-pooling [8], [7].",
+      "startOffset" : 142,
+      "endOffset" : 145
+    }, {
+      "referenceID" : 14,
+      "context" : "It could be useful when implementing a “scale-invariant” ConvNet [15], where convolutions with shared kernel weights are performed at multiple scales to capture scale-invariant features.",
+      "startOffset" : 65,
+      "endOffset" : 69
+    }, {
+      "referenceID" : 13,
+      "context" : "This is particularly beneficial to the multi-scale approach [14], [16], where images with multiple resolutions are combined together to construct the representation.",
+      "startOffset" : 60,
+      "endOffset" : 64
+    }, {
+      "referenceID" : 15,
+      "context" : "This is particularly beneficial to the multi-scale approach [14], [16], where images with multiple resolutions are combined together to construct the representation.",
+      "startOffset" : 66,
+      "endOffset" : 70
+    }, {
+      "referenceID" : 4,
+      "context" : "It is less well-known that the FFT-direct crossover occurs at smaller kernel sizes for a ConvNet than for a single convolution [5], [6].",
+      "startOffset" : 127,
+      "endOffset" : 130
+    }, {
+      "referenceID" : 5,
+      "context" : "It is less well-known that the FFT-direct crossover occurs at smaller kernel sizes for a ConvNet than for a single convolution [5], [6].",
+      "startOffset" : 132,
+      "endOffset" : 135
+    }, {
+      "referenceID" : 4,
+      "context" : "This possibility was previously noted in passing but not implemented due to limited onboard GPU memory [5], [6].",
+      "startOffset" : 103,
+      "endOffset" : 106
+    }, {
+      "referenceID" : 5,
+      "context" : "This possibility was previously noted in passing but not implemented due to limited onboard GPU memory [5], [6].",
+      "startOffset" : 108,
+      "endOffset" : 111
+    }, {
+      "referenceID" : 4,
+      "context" : "3Note that our values differ from the ones in [5] as we take into account the difference in complexity between full and valid convolutions.",
+      "startOffset" : 46,
+      "endOffset" : 49
+    }, {
+      "referenceID" : 16,
+      "context" : "According to Brent’s theorem [17], if a computation can be performed in T∞ time with an infinite number of processors, then",
+      "startOffset" : 29,
+      "endOffset" : 33
+    }, {
+      "referenceID" : 16,
+      "context" : "The only exception is that the complexity of a convolutional layer depends logarithmically on width (dlog2 fe), because summing the results of f convergent convolutions requires this amount of time using the binary collapse algorithm described in [17].",
+      "startOffset" : 247,
+      "endOffset" : 251
+    }, {
+      "referenceID" : 17,
+      "context" : "Lock-free queues, as described in [18] and implemented as a part of the boost [19] library are used to implement the pool operations.",
+      "startOffset" : 34,
+      "endOffset" : 38
+    }, {
+      "referenceID" : 0,
+      "context" : "Therefore, we benchmarked ZNN against Caffe [1]",
+      "startOffset" : 44,
+      "endOffset" : 47
+    }, {
+      "referenceID" : 2,
+      "context" : "and Theano [3], two popular GPU implementations.",
+      "startOffset" : 11,
+      "endOffset" : 14
+    }, {
+      "referenceID" : 18,
+      "context" : "For Caffe, both default and cuDNN[20] implementations were used.",
+      "startOffset" : 33,
+      "endOffset" : 37
+    }, {
+      "referenceID" : 19,
+      "context" : "Such kernel sizes are currently relevant for practical applications [21].",
+      "startOffset" : 68,
+      "endOffset" : 72
+    }, {
+      "referenceID" : 4,
+      "context" : "in [5], [6] could be very high as it is proportional to the number of kernels in a layer.",
+      "startOffset" : 3,
+      "endOffset" : 6
+    }, {
+      "referenceID" : 5,
+      "context" : "in [5], [6] could be very high as it is proportional to the number of kernels in a layer.",
+      "startOffset" : 8,
+      "endOffset" : 11
+    }, {
+      "referenceID" : 20,
+      "context" : "The repository also provides alternative scheduling strategies such as simple FIFO or LIFO as well as some more complex ones based on work stealing [22].",
+      "startOffset" : 148,
+      "endOffset" : 152
+    }, {
+      "referenceID" : 21,
+      "context" : "In fact, we have already used ZNN to achieve state of the art results in boundary detection [23] and computation of dendritic arbor densities [24].",
+      "startOffset" : 92,
+      "endOffset" : 96
+    }, {
+      "referenceID" : 22,
+      "context" : "In fact, we have already used ZNN to achieve state of the art results in boundary detection [23] and computation of dendritic arbor densities [24].",
+      "startOffset" : 142,
+      "endOffset" : 146
+    }, {
+      "referenceID" : 23,
+      "context" : "ZNN’s repository contains some sample extensions providing functionality of dropout [25] and multi-scale [14], [16] networks.",
+      "startOffset" : 84,
+      "endOffset" : 88
+    }, {
+      "referenceID" : 13,
+      "context" : "ZNN’s repository contains some sample extensions providing functionality of dropout [25] and multi-scale [14], [16] networks.",
+      "startOffset" : 105,
+      "endOffset" : 109
+    }, {
+      "referenceID" : 15,
+      "context" : "ZNN’s repository contains some sample extensions providing functionality of dropout [25] and multi-scale [14], [16] networks.",
+      "startOffset" : 111,
+      "endOffset" : 115
+    } ],
+    "year" : 2015,
+    "abstractText" : "Convolutional networks (ConvNets) have become a popular approach to computer vision. It is important to accelerate ConvNet training, which is computationally costly. We propose a novel parallel algorithm based on decomposition into a set of tasks, most of which are convolutions or FFTs. Applying Brent’s theorem to the task dependency graph implies that linear speedup with the number of processors is attainable within the PRAM model of parallel computation, for wide network architectures. To attain such performance on real shared-memory machines, our algorithm computes convolutions converging on the same node of the network with temporal locality to reduce cache misses, and sums the convergent convolution outputs via an almost wait-free concurrent method to reduce time spent in critical sections. We implement the algorithm with a publicly available software package called ZNN. Benchmarking with multi-core CPUs shows that ZNN can attain speedup roughly equal to the number of physical cores. We also show that ZNN can attain over 90x speedup on a many-core CPU (Xeon PhiTMKnights Corner). These speedups are achieved for network architectures with widths that are in common use. The task parallelism of the ZNN algorithm is suited to CPUs, while the SIMD parallelism of previous algorithms is compatible with GPUs. Through examples, we show that ZNN can be either faster or slower than certain GPU implementations depending on specifics of the network architecture, kernel sizes, and density and size of the output patch. ZNN may be less costly to develop and maintain, due to the relative ease of general-purpose CPU programming.",
+    "creator" : "LaTeX with hyperref package"
+  }
+}

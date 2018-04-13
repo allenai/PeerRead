@@ -1,0 +1,1491 @@
+{
+  "name" : "1610.02527.pdf",
+  "metadata" : {
+    "source" : "CRF",
+    "title" : "Federated Optimization: Distributed Machine Learning for On-Device Intelligence",
+    "authors" : [ "Jakub Konečný", "H. Brendan McMahan" ],
+    "emails" : [ "kubo.konecny@gmail.com", "mcmahan@google.com", "dramage@google.com", "peter.richtarik@ed.ac.uk" ],
+    "sections" : [ {
+      "heading" : null,
+      "text" : "A motivating example arises when we keep the training data locally on users’ mobile devices instead of logging it to a data center for training. In federated optimization, the devices are used as compute nodes performing computation on their local data in order to update a global model. We suppose that we have extremely large number of devices in the network — as many as the number of users of a given service, each of which has only a tiny fraction of the total data available. In particular, we expect the number of data points available locally to be much smaller than the number of devices. Additionally, since different users generate data with different patterns, it is reasonable to assume that no device has a representative sample of the overall distribution.\nWe show that existing algorithms are not suitable for this setting, and propose a new algorithm which shows encouraging experimental results for sparse convex problems. This work also sets a path for future research needed in the context of federated optimization."
+    }, {
+      "heading" : "1 Introduction",
+      "text" : "Mobile phones and tablets are now the primary computing devices for many people. In many cases, these devices are rarely separated from their owners [19], and the combination of rich user interactions and powerful sensors means they have access to an unprecedented amount of data, much of it private in nature. Models learned on such data hold the promise of greatly improving usability by powering more intelligent applications, but the sensitive nature of the data means there are risks and responsibilities to storing it in a centralized location.\nWe advocate an alternative — federated learning — that leaves the training data distributed on the mobile devices, and learns a shared model by aggregating locally computed updates via a\nar X\niv :1\n61 0.\n02 52\n7v 1\n[ cs\n.L G\n] 8\ncentral coordinating server. This is a direct application of the principle of focused collection or data minimization proposed by the 2012 White House report on the privacy of consumer data [98]. Since these updates are specific to improving the current model, they can be purely ephemeral — there is no reason to store them on the server once they have been applied. Further, they will never contain more information than the raw training data (by the data processing inequality), and will generally contain much less. A principal advantage of this approach is the decoupling of model training from the need for direct access to the raw training data. Clearly, some trust of the server coordinating the training is still required, and depending on the details of the model and algorithm, the updates may still contain private information. However, for applications where the training objective can be specified on the basis of data available on each client, federated learning can significantly reduce privacy and security risks by limiting the attack surface to only the device, rather than the device and the cloud.\nIf additional privacy is needed, randomization techniques from differential privacy can be used. The centralized algorithm could be modified to produce a differentially private model [17, 33, 1], which allows the model to be released while protecting the privacy of the individuals contributing updates to the training process. If protection from even a malicious (or compromised) coordinating server is needed, techniques from local differential privacy can be applied to privatize the individual updates [32]. Details of this are beyond the scope of the current work, but it is a promising direction for future research.\nA more complete discussion of applications of federated learning as well as privacy ramifications can be found in [62]. Our focus in this work will be on federated optimization, the optimization problem that must be solved in order to make federated learning a practical alternative to current approaches."
+    }, {
+      "heading" : "1.1 Problem Formulation",
+      "text" : "The optimization community has seen an explosion of interest in solving problems with finite-sum structure in recent years. In general, the objective is formulated as\nmin w∈Rd\nf(w) where f(w) def =\n1\nn n∑ i=1 fi(w). (1)\nThe main source of motivation are problems arising in machine learning. The problem structure (1) covers linear or logistic regressions, support vector machines, but also more complicated models such as conditional random fields or neural networks.\nWe suppose we have a set of input-output pairs {xi, yi}ni=1, and a loss function, giving rise to the functions fi. Typically, xi ∈ Rd and yi ∈ R or yi ∈ {−1, 1}. Simple examples include\n• linear regression: fi(w) = 12(x T i w − yi)2, yi ∈ R\n• logistic regression: fi(w) = − log(1 + exp(−yixTi w)), yi ∈ {−1, 1}\n• support vector machines: fi(w) = max{0, 1− yixTi w}, yi ∈ {−1, 1}\nMore complicated non-convex problems arise in the context of neural networks, where rather than via the linear-in-the-features mapping xTi w, the network makes prediction through a nonconvex function of the feature vector xi. However, the resulting loss can still be written as fi(w), and gradients can be computed efficiently using backpropagation.\nThe amount of data that businesses, governments and academic projects collect is rapidly increasing. Consequently, solving problem (1) arising in practice is often impossible on a single node, as merely storing the whole dataset on a single node becomes infeasible. This necessitates the use of a distributed computational framework, in which the training data describing the problem is stored in a distributed fashion across a number of interconnected nodes and the optimization problem is solved collectively by the cluster of nodes.\nLoosely speaking, one can use any network of nodes to simulate a single powerful node, on which one can run any algorithm. The practical issue is that the time it takes to communicate between a processor and memory on the same node is normally many orders of magnitude smaller than the time needed for two nodes to communicate; similar conclusions hold for the energy required [89]. Further, in order to take advantage of parallel computing power on each node, it is necessary to subdivide the problem into subproblems suitable for independent/parallel computation.\nState-of-the-art optimization algorithms are typically inherently sequential. Moreover, they usually rely on performing a large number of very fast iterations. The problem stems from the fact that if one needs to perform a round of communication after each iteration, practical performance drops down dramatically, as the round of communication is much more time-consuming than a single iteration of the algorithm.\nThese considerations have lead to the development of novel algorithms specialized for distributed optimization (we defer thorough review until Section 2). For now, we note that most of the results in literature work in the setting where the data is evenly distributed, and further suppose that K n/K where K is the number of nodes. This is indeed often close to reality when data is stored in a large data center. Additionally, an important subfield of the field of distributed learning relies on the assumption that each machine has a representative sample of the data available locally. That is, it is assumed that each machine has an IID sample from the underlying distribution. However, this assumption is often too strong; in fact, even in the data center paradigm this is often not the case since the data on a single node can be close to each other on a temporal scale, or clustered by its geographical origin. Since the patterns in the data can change over time, a feature might be present frequently on one node, while not appear on another at all.\nThe federated optimization setting describes a novel optimization scenario where none of the above assumptions hold. We outline this setting in more detail in the following section."
+    }, {
+      "heading" : "1.2 The Setting of Federated Optimization",
+      "text" : "The main purpose of this paper is to bring to the attention of the machine learning and optimization communities a new and increasingly practically relevant setting for distributed optimization, where none of the typical assumptions are satisfied, and communication efficiency is of utmost importance. In particular, algorithms for federated optimization must handle training data with the following characteristics:\n• Massively Distributed: Data points are stored across a large number of nodes K. In particular, the number of nodes can be much bigger than the average number of training examples stored on a given node (n/K).\n• Non-IID: Data on each node may be drawn from a different distribution; that is, the data points available locally are far from being a representative sample of the overall distribution.\n• Unbalanced: Different nodes may vary by orders of magnitude in the number of training examples they hold.\nIn this work, we are particularly concerned with sparse data, where some features occur on a small subset of nodes or data points only. Although this is not necessary characteristic of the setting of federated optimization, we will show that the sparsity structure can be used to develop an effective algorithm for federated optimization. Note that data arising in the largest machine learning problems being solved nowadays, ad click-through rate predictions, are extremely sparse.\nWe are particularly interested in the setting where training data lives on users’ mobile devices (phones and tablets), and the data may be privacy sensitive. The data {xi, yi} is generated through device usage, e.g., via interaction with apps. Examples include predicting the next word a user will type (language modelling for smarter keyboard apps), predicting which photos a user is most likely to share, or predicting which notifications are most important.\nTo train such models using traditional distributed learning algorithms, one would collect the training examples in a centralized location (data center) where it could be shuffled and distributed evenly over proprietary compute nodes. In this paper we propose and study an alternative model: the training examples are not sent to a centralized location, potentially saving significant network bandwidth and providing additional privacy protection. In exchange, users allow some use of their devices’ computing power, which shall be used to train the model.\nIn the communication model of this paper, in each round we send an update δ ∈ Rd to a centralized server, where d is the dimension of the model being computed/improved. The update δ could be a gradient vector, for example. While it is certainly possible that in some applications the δ may encode some private information of the user, it is likely much less sensitive (and orders of magnitude smaller) than the original data itself. For example, consider the case where the raw training data is a large collection of video files on a mobile device. The size of the update δ will be independent of the size of this local training data corpus. We show that a global model can be trained using a small number of communication rounds, and so this also reduces the network bandwidth needed for training by orders of magnitude compared to copying the data to the datacenter.\nFurther, informally, we choose δ to be the minimum piece of information necessary to improve the global model; its utility for other uses is significantly reduced compared to the original data. Thus, it is natural to design a system that does not store these δ’s longer than necessary to update the model, again increasing privacy and reducing liability on the part of the centralized model trainer. This setting, in which a single vector δ ∈ Rd is communicated in each round, covers most existing first-order methods, including dual methods such as CoCoA+ [57].\nCommunication constraints arise naturally in the massively distributed setting, as network connectivity may be limited (e.g., we may wish to deffer all communication until the mobile device is charging and connected to a wi-fi network). Thus, in realistic scenarios we may be limited to only a single round of communication per day. This implies that, within reasonable bounds, we have access to essentially unlimited local computational power. Consequently, the practical objective is solely to minimize the number of communication rounds.\nThe main purpose of this work is initiate research into, and design a first practical implementation of federated optimization. Our results suggest that with suitable optimization algorithms, very little is lost by not having an IID sample of the data available, and that even in the presence of a large number of nodes, we can still achieve convergence in relatively few rounds of communication."
+    }, {
+      "heading" : "2 Related Work",
+      "text" : "In this section we provide a detailed overview of the relevant literature. We particularly focus on algorithms that can be used to solve problem (1) in various contexts. First, in Sections 2.1 and 2.2 we look at algorithms designed to be run on a single computer. In Section 2.3 we follow with a discussion of the distributed setting, where no single node has direct access to all data describing f . We describe a paradigm for measuring the efficiency of distributed methods, followed by overview of existing methods and commentary on whether they were designed with communication efficiency in mind or not."
+    }, {
+      "heading" : "2.1 Baseline Algorithms",
+      "text" : "In this section we shall describe several fundamental baseline algorithms which can be used to solve problems of the form (1).\nGradient Descent. A trivial benchmark for solving problems of structure (1) is Gradient Descent (GD) in the case when functions fi are smooth (or Subgradient Descent for non-smooth functions) [69]. The GD algorithm performs the iteration\nwt+1 = wt − ht∇f(wt),\nwhere ht > 0 is a stepsize parameter. As we mentioned earlier, the number of functions, or equivalently, the number of training data pairs, n, is typically very large. This makes GD impractical, as it needs to process the whole dataset in order to evaluate a single gradient and update the model.\nGradient descent can be substantially accelerated, in theory and practice, via the addition of a momentum term. Acceleration ideas for gradient methods in convex optimization can be traced back to the work of Polyak [73] and Nesterov [68, 69]. While accelerated GD methods have a substantially better convergence rate, in each iteration they still need to do at least one pass over all data. As a result, they are not practical for problems where n very large.\nStochastic Gradient Descent. At present a basic, albeit in practice extremely popular, alternative to GD is Stochastic Gradient Descent (SGD), dating back to the seminal work of Robbins and Monro [82]. In the context of (1), SGD samples a random function (i.e., a random data-label pair) it ∈ {1, 2, . . . , n} in iteration t, and performs the update\nwt+1 = wt − ht∇fit(wt),\nwhere ht > 0 is a stepsize parameter. Intuitively speaking, this method works because if it is sampled uniformly at random from indices 1 to n, the update direction is an unbiased estimate of the gradient — E[∇fit(w)] = ∇f(w). However, noise introduced by sampling slows down the convergence, and a diminsihing sequence of stepsizes hk is necessary for convergence. For a theoretical analysis for convex functions we refer the reader to [66, 64, 65] and [87, 93] for SVM problems. In a recent review [12], the authors outline further research directions. For a more practically-focused discussion, see [11]. In the context of neural networks, computation of stochastic gradients is referred to as backpropagation [49]. Instead of specifying the functions fi and its gradients explicitly, backpropagation is a general way of computing the gradient. Performance of several competitive algorithms for training deep neural networks has been compared in [70].\nOne common trick that has been practically observed to provide superior performance, is to replace random sampling in each iteration by going through all the functions in a random order. This ordering is replaced by another random order after each such cycle [10]. Theoretical understanding of this phenomenon had been a long standing open problem, understood recently in [40].\nThe core differences between GD and SGD can be summarized as follows. GD has a fast convergence rate, but each iteration in the context of (1) is potentially very slow, as it needs to process the entire dataset in each iteration. On the other hand, SGD has slower convergence rate, but each iteration is fast, as the work needed is independent of number of data points n. For the problem structure of (1), SGD is usually better, as for practical purposes relatively low accuracy is required, which SGD can in extreme cases achieve after single pass through data, while GD would make just a single update. However, if a high accuracy was needed, GD or its faster variants would prevail."
+    }, {
+      "heading" : "2.2 A Novel Breed of Randomized Algorithms",
+      "text" : "Recent years have seen an explosion of new randomized methods which, in a first approximation, combine the benefits of cheap iterations of SGD with fast convergence of GD. Most of these methods can be said to belong to one of two classes — dual methods of the randomized coordinate descent variety, and primal methods of the stochastic gradient descent with variance reduction variety.\nRandomized Coordinate Descent. Although the idea of coordinate descent has been around for several decades in various contexts (and for quadratic functions dates back even much further, to works on the Gauss-Seidel methods), it came to prominence in machine learning and optimization with the work of Nesterov [67] which equipped the method with a randomization strategy. Nesterov’s work on Randomized Coordinate Descent (RCD) popularized the method and demonstrated that randomization can be very useful for problems of structure (1).\nThe RCD algorithm in each iteration chooses a random coordinate jt ∈ {1, . . . , d} and performs the update\nwt+1 = wt − hjt∇jtf(wt)ejt ,\nwhere hjt > 0 is a stepsize parameter, ∇jf(w) denotes the jth partial derivative of function f , and ej is the j\nth unit standard basis vector in Rd. For the case of generalized linear models, when the data exhibits certain sparsity structure, it is possible to evaluate the partial derivative ∇jf(w) efficiently, i.e., without need to process the entire dataset, leading to a practically efficient algorithm, see for instance [79, Section 6].\nNumerous follow-up works extended the concept to proximal setting [79], single processor parallelism [15, 80] and develop efficiently implementable acceleration [51]. All of these three properties were connected in a single algorithm in [35], to which we refer the reader for a review of the early developments in the area of RCD, particularly to overview in Table 1 therein.\nStochastic Dual Coordinate Ascent. When an explicit strongly convex, but not necessarily smooth, regularizer is added to the average loss (1), it is possible to write down its (Fenchel) dual and the dual variables live in n-dimensional space. Applying RCD leads to an algorithm for solving (1) known under the name Stochastic Dual Coordinate Ascent [88]. This method has gained broad popularity with practicioners, likely due to the fact that for a number of loss functions, the method comes without the need to tune any hyper-parameters. The work [88] was first to show that by\napplying RCD [79] to the dual problem, one also solves the primal problem (1). For a theoretical and computational comparison of applying RCD to the primal versus the dual problems, see [21].\nA directly primal-dual randomized coordinate descent method called Quartz, was developed in [75]. It has been recently shown in SDNA [74] that incorporating curvature information contained in random low dimensional subspaces spanned by a few coordinates can sometimes lead to dramatic speedups. Recent works [86, 20] interpret the SDCA method in primal-only setting, shedding light onto why this method works as a SGD method with a version of variance reduction property.\nWe now move the the second class of novel randomized algorithms which can be generally interpreted as variants of SGD, with an attempt to reduce variance inherent in the process of gradient estimation.\nStochastic Average Gradient. The first notable algorithm from this class is the Stochastic Average Gradient (SAG) [83, 85]. The SAG algorithm stores an average of n gradients of functions fi evalueated at different points in the history of the algorithm. In each iteration, the algotithm, updates randomly chosen gradient out of this average, and makes a step in the direction of the average. This way, complexity of each iteration is independent of n, and the algorithm enjoys a fast convergence. The drawback of this algorithm is that it needs to store n gradients in memory because of the update operation. In the case of generalized linear models, this memory requirement can be reduced to the need of n scalars, as the gradient is a scalar multiple of the data point. This methods has been recently extended for use in Conditional Random Fields [84]. Nevertheless, the memory requirement makes the algorithm infeasible for application even in relatively small neural networks.\nA followup algorithm SAGA [26] and its simplification [25], modifies the SAG algorithm to achieve unbiased estimate of the gradients. The memory requirement is still present, but the method significantly simplifies theoretical analysis, and yields a slightly stronger convergence guarantee.\nStochastic Variance Reduced Gradient. Another algorithm from the SGD class of methods is Stochastic Variance Reduced Gradient1 (SVRG) [43] and [47, 100, 44]. The SVRG algorithm runs in two nested loops. In the outer loop, it computes full gradient of the whole function, ∇f(wt), the expensive operation one tries to avoid in general. In the inner loop, the update step is iteratively computed as\nw = w − h[∇fi(w)−∇fi(wt) +∇f(wt)].\nThe core idea is that the stochastic gradients are used to estimate the change of the gradient between point wt and w, as opposed to estimating the gradient directly. We return to more detailed description of this algorithm in Section 3.2.\nThe SVRG has the advantage that it does not have the additional memory requirements of SAG/SAGA, but it needs to process the whole dataset every now and then. Indeed, comparing to SGD, which typically makes significant progress in the first pass through data, SVRG does not make any update whatsoever, as it needs to compute the full gradient. This and several other practical issues have been recently addressed in [41], making the algorithm competitive with SGD early on, and superior in later iterations. Although there is nothing that prevents one from applying SVRG and its variants in deep learning, we are not aware of any systematic assessment of\n1The same algorithm was simultaneously introduced as Semi-Stochastic Gradient Descent (S2GD) [47]. Since the former work gained more attention, we will for clarity use the name SVRG throughout this paper.\nits performance in this setting. Vanilla experiments in [43, 77] suggest that SVRG matches basic SGD, and even outperforms in the sense that variance of the iterates seems to be significantly smaller for SVRG. However, in order to draw any meaningful conclusions, one would need to perform extensive experiments and compare with state-of-the-art methods usually equipped with numerous heuristics.\nThere already exist attempts at combining SVRG type algorithms with randomized coordinate descent [46, 97]. Although these works highlight some interesting theoretical properties, the algorithms do not seem to be practical at the moment; more work is needed in this area. The first attempt to unify algorithms such as SVRG and SAG/SAGA already appeared in the SAGA paper [26], where the authors interpret SAGA as a midpoint between SAG and SVRG. Recent work [76] presents a general algorithm, which recovers SVRG, SAGA, SAG and GD as special cases, and obtains an asynchronous variant of these algorithms as a byproduct of the formulation. SVRG can be equipped with momentum (and negative momentum), leading to a new accelerated SVRG method known as Katyusha [3]. SVRG can be further accelerated via a raw clustering mechanism [4].\nStochastic Quasi-Newton Methods. A third class of new algorithms are the Stochastic quasiNewton methods [16, 9]. These algorithms in general try to mimic the limited memory BFGS method (L-BFGS) [54], but model the local curvature information using inexact gradients — coming from the SGD procedure. A recent attempt at combining these methods with SVRG can be found in [63]. In [38], the authors utilize recent progress in the area of stochastic matrix inversion [39] revealing new connections with quasi-Newton methods, and devise a new stochastic limited memory BFGS method working in tandem with SVRG. The fact that the theoretical understanding of this branch of research is the least understood and having several details making the implementation more difficult compared to the methods above may limit its wider use. However, this approach could be most promising for deep learning once understood better.\nOne important aspect of machine learning is that the Empirical Risk Minimization problem (1) we are solving is just a proxy for the Expected Risk we are ultimately interested in. When one can find exact minimum of the empirical risk, everything reduces to balancing approximation– estimation tradeoff that is the object of abundant literature — see for instance [96]. An assessment of asymptotic performance of some optimization algorithms as learning algorithms in large-scale learning problems2 has been introduced in [13]. Recent extension in [41] has shown that the variance reduced algorithms (SAG, SVRG, . . . ) can in certain setting be better learning algorithms than SGD, not just better optimization algorithms.\nFurther Remarks. A general method, referred to as Universal Catalyst [53, 37], effectively enables conversion of a number of the algorithms mentioned in the previous sections to their ‘accelerated’ variants. The resulting convergence guarantees nearly match lower bounds in a number of cases. However, the need to tune additional parameter makes the method rather impractical.\nRecently, lower and upper bounds for complexity of stochastic methods on problems of the form (1) were recently obtained in [99].\n2See [13, Section 2.3] for their definition of large scale learning problem."
+    }, {
+      "heading" : "2.3 Distributed Setting",
+      "text" : "In this section we review the literature concerning algorithms for solving (1) in the distributed setting. When we speak about distributed setting, we refer to the case when the data describing the functions fi are not stored on any single storage device. This can include setting where one’s data just don’t fit into a single RAM/computer/node, but two is enough. This also covers the case where data are distributed across several datacenters around the world, and across many nodes in those datacenters. The point is that in the system, there is no single processing unit that would have direct access to all the data. Thus, the distributed setting does not include single processor parallelism3. Compared with local computation on any single node, the cost of communication between nodes is much higher both in terms of speed and energy consumption [6, 89], introducing new computational challenges, not only for optimization procedures.\nWe first reveiew a theoretical decision rule for determining the practically best algorithm for a given problem in Section 2.3.1, followed by overview of distributed algorithms in Section 2.3.2, and communication efficient algorithms in Section 2.3.3. The following paradigm highlights why the class of communication efficient algorithms are not only preferable choice in the trivial sense. The communication efficient algorithms provide us with much more flexible tools for designing overall optimization procedure, which can make the algorithms inherently adaptive to differences in computing resources and architectures."
+    }, {
+      "heading" : "2.3.1 A Paradigm for Measuring Distributed Optimization Efficiency",
+      "text" : "This section reviews a paradigm for comparing efficency of distributed algorithms. Let us suppose we have many algorithms A readily available to solve the problem (1). The question is: “How do we decide which algorithm is the best for our purpose?” Initial version of this reasoning already appeared in [57], and applies also to [78].\nFirst, consider the basic setting on a single machine. Let us define IA( ) as the number of iterations algorithm A needs to converge to some fixed accuracy. Let TA be the time needed for a single iteration. Then, in practice, the best algorithm is one that minimizes the following quantity.4\nTIME = IA( )× TA. (2)\nThe number of iterations IA( ) is usually given by theoretical guarantees or observed from experience. The TA can be empirically observed, or one can have idea of how the time needed per iteration varies between different algorithms in question. The main point of this simplified setting is to highlight key issue with extending algorithms to the distributed setting.\nThe natural extension to distributed setting is the following. Let c be time needed for communication during a single iteration of the algorithm A. For sake of clarity, we suppose we consider only algorithms that need to communicate a single vector in Rd per round of communication. Note that essentially all first-order algorithms fall into this category, so this is not a restrictive assumption, which effectively sets c to be a constant, given any particular distributed architecture one has at disposal.\nTIME = IA( )× (c+ TA) (3) 3It should be noted that some of the works presented in this section were originally presented as parallel algorithms.\nWe include them anyway as many of the general ideas in carry over to the distributed setting. 4Considering only algorithms that can be run on a given machine.\nThe communication cost c does not only consist of actual exchange of the data, but also many other things like setting up and closing a connection between nodes. Consequently, even if we need to communicate very small amount of information, c always remains above a nontrivial threshold.\nMost, if not all, of the current state-of-the-art algorithms that are the best in setting of (2), are stochastic and rely on doing very large number (big IA( )) of very fast (small TA) iterations. As a result, even relatively small c can cause the practical performance of those algorithms drop down dramatically, because c TA.\nThis has been indeed observed in practice, and motivated development of new methods, designed with this fact in mind from scratch, which we review in Section 2.3.2. Although this is a good development for academia — motivation to explore new setting, it is not necessarily a good news for the industry.\nMany companies have spent significant resources to build excellent algorithms to tackle their problems of form (1), fine tuned to the specific patterns arising in their data and side applications required. When the data companies collect grows too large to be processed on a single machine, it is understandable that they would be reluctant to throw away their fine tuned algorithms. This issue was first time explicitly addressed in CoCoA [57], which is rather framework than a algorithm, which works as follows (more detailed description follows in Section 2.3.3).\nThe CoCoA framework formulates a general way to form a specific subproblem on each node, based on data available locally and a single shared vector that needs to be distributed to all nodes. Within a iteration of the framework, each node uses any optimization algorithm A, to reach a relative Θ accuracy on the local subproblem. Updates from all nodes are then aggregated to form an update to the global model.\nThe efficiency paradigm changes as follows:\nTIME = I( ,Θ)× (c+ TA(Θ)) (4)\nThe number of iterations I( ,Θ) is independent of choice of the algorithm A used as a local solver, because there is theory predicting how many iterations of the CoCoA framework are needed to achieve accuracy, if we solve the local subproblems to relative Θ accuracy. Here, Θ = 0 would mean we require the subproblem to be solved to optimality, and Θ = 1 that we don’t need any progress whatsoever. The general upper bound on number of iterations of the CoCoA framework is I( ,Θ) = O(log(1/ ))1−Θ [42, 58, 57] for strongly convex objectives. From the inverse dependence on 1 − Θ, we can see that there is a fundamental limit to the number of communication rounds needed. Hence, it will probably not be efficient to spend excessive resources to attain very high local accuracy (small Θ). Time per iteration TA(Θ) denotes the time algorithm A needs to reach the relative Θ accuracy on the local subproblem.\nThis efficiency paradigm is more powerful for a number of reasons.\n1. It allows practicioners to continue using their fine-tuned solvers, that can run only on single machine, instead of having to implement completely new algorithms from scratch.\n2. The actual performance in terms of number of rounds of communication is independent from the choice of optimization algorithm, making it much easier to optimize the overall performance.\n3. Since the constant c is architecture dependent, running optimal algorithm on one node network does not have to be optimal on another. In the setting (3), this could mean moving from\none cluster to another, a completely different algorithm is optimal, which is a major change. In the setting (4), this can be improved by simply changing Θ, which is typically implicitly determined by number of iterations algorithm A runs for.\nIn this work we propose a different way to formulate the local subproblems, which does not rely on duality as in the case of CoCoA. We also highlight that some algorithms seem to be particularly suitable to solve those local subproblems, effectively leading to novel algorithms for distributed optimization."
+    }, {
+      "heading" : "2.3.2 Distributed Algorithms",
+      "text" : "As discussed below in Section 2.3.1, this setting creates unique challenges. Distributed optimization algorithms typically require a small number (1–4) of communication rounds per iteration. By communication round we typically understand a single MapReduce operation [24], implemented efficiently for iterative procedures [36], such as optimization algorithms. Spark [102] has been established as a popular open source framework for implementing distributed iterative algorithms, and includes several of the algorithms mentioned in this section.\nOptimization in distributed setting has been studied for decades, tracing back to at least works of Bertsekas and Tsitsiklis [8, 7, 95]. Recent decade has seen an explosion of interest in this area, greatly motivated by rapid increase of data availability in machine learning applications.\nMuch of the recent effort was focused on creating new optimization algorithms, by building variants of popular algorithms suitable for running on a single processor (See Section 2.1). A relatively common feature of many of these efforts is a) The computation overhead in the case of synchronous algorithms, and b) The difficulty of analysing asynchronous algorithms without restrictive assumptions. By computation overhead we mean that if optimization program runs in a compute-communicate-update cycle, the update part cannot start until all nodes finish their computation. This causes some of the nodes be idle, while remaining nodes finish their part of computation, clearly an inefficient use of computational resources. This pattern often diminishes or completely reverts potential speed-ups from distributed computation. In the asynchronous setting in general, an update can be applied to a parameter vector, followed by computation done based on a now-outdated version of that parameter vector. Formally grasping this pattern, while keeping the setting realistic is often quite challenging. Consequently, this is very open area, and optimal choice of algorithm in any particular case is often heavily dependent on the problem size, details in its structure, computing architecture available, and above all, expertise of the practitioner.\nThis general issue is best exhibited with numerous attempts at parallelizing the Stochastic Gradient Descent and its variants. As an example, [27, 29] provide theoretically linear speedup with number of nodes, but are difficult to implement efficiently, as the nodes need to synchronize frequently in order to compute reasonable gradient averages. As an alternative, no synchronization between workers is assumed in [71, 2, 31]. Consequently, each worker reads wt from memory, parameter vector w at time point t, computes a stochastic gradient ∇fi(wt) and applies it to already changed state of the parameter vector wt+τ . The above mentioned methods assume that the delay τ is bounded by a constant, which is not necessarily realistic assumption5. Some of the\n5A bound on the delay τ can be deterministic or probabilistic. However, in practice, the delays are mostly about the number of nodes in the network, and there rare very long delays, when a variety of operating system-related events can temporarily postpone computation of a single node. To the best of our knowledge, no formal assumptions reflect this setting well. In fact, two recent works [60, 48] highlight subtle but important issue with labelling of iterates in the presence of asynchrony, rendering most of the existing analyses of asynchronous optimization algorithms incorrect.\nworks also introduce assumptions on the sparsity structures or conditioning of the Hessian of f . Asymptotically optimal convergent rates were proven in [30] with considerably milder assumptions. Improved analysis of asynchronous SGD was also presented in [22], simultaneously with a version that uses lower-precision arithmetic was introduced without sacrificing performance, which is a trend that might find use in other parts of machine learning in the following years.\nThe negative effect of asynchronous distributed implementations of SGD seem to be negligible, when applied to the task of training very large deep networks — which is the ultimate industrial application of today. The practical usefulness has been demonstrated for instance by Google’s Downpour SGD [23] and Microsoft’s Project Adam [18].\nThe first distributed versions of Coordinate Descent algorithms were the Hydra and its accelerated variant, Hydra2, [81, 34], which has been demonstrated to be very efficient on large sparse problems implemented on a computing cluster. An extended version with description of implementation details is presented in [61]. Effect of asynchrony has been explored and partially theoretically understood in the works of [56, 55]. Another asynchronous, rather framework than an algorithm, for coordinate updates, applicable to wider class of objectives is presented in [72].\nThe data are assumed to be partitioned to nodes by features/coordinates in the above algorithms. This setting can be restrictive if one is not able to distribute the data beforehand, but instead the data are distributed “as is” — in which case the data are most commonly distributed by data points. This does not need to be an issue, if a dual version of coordinate descent is used — in which the distribution is done by data points [94] followed by works on Communication Efficient Dual Cooridante Ascent, described in next section. The use of duality however requires usage of additional explicit strongly convex regularization term, hence can be used to solve smaller class of problems. Despite the apparent practical disadvantages, variants of distributed coordinate descent algorithms are among the most widely used methods in practice.\nMoving to variance reduced methods, distributed versions of SAG/SAGA algorithms have not been proposed yet. However, several distributed versions of the SVRG algorithm already exist. A scheme for replicating data to simulate iid sampling in distributed environment was proposed in [50]. Although the performance is well analysed, the setting requires significantly stronger control of data distribution which is rarely practicaly feasible. A relatively similar method to Algorithm 3 presented here has been proposed in [78], which was analysed, and in [59], a largely experimental work that can be also cast as communication efficient — described in detail in Section 2.3.3.\nAnother class of algorithms relevant for this work is Alternating Direction Method of Multipliers (ADMM) [14, 28]. These algorithms are in general applicable to much broader class of problems, and hasn’t been observed to perform better than other algorithms presented in this section, in the machine learning setting of (1)."
+    }, {
+      "heading" : "2.3.3 Communication-Efficient Algorithms",
+      "text" : "In this Section, we describe algorithms that can be cast as “communication efficient”. The common theme of the algorithms presented here, is that in order to perform better in the sense of (3), one should design algorithms with high TA, in order to make the cost of communcation c negligible.\nBefore moving onto specific methods, it is worth the noting some of the core limits concerning the problem we are trying to solve in distributed setting. Fundamental limitations of stochastic versions of the problem (1) in terms of runtime, communication costs and number of samples used are studied in [90]. Efficient algorithms and lower bounds for distributed statistical estimation are established in [104, 103].\nHowever, these works do not fit into our framework, because they assume that each node has access to data generated IID from a single distribution. In the case of [104, 103] also K n/K, that the number of nodes K is much smaller than the number of data point on each node is also assumed. As we stress in the Introduction, these assumptions are far from being satisfied in our setting. Intuitively, relaxing these assumptions should make the problem harder. However, it is not as straightforward to conclude this, as there are certainly particular non-iid data distributions that simplify the problem — for instance if data are distributed according to separability structure of the objective. Lower bounds on communication complexity of distributed convex optimization of (1) are presented in [5], concluding that for IID data distributions, existing algorithms already achieve optimal complexity in specific settings.\nProbably first, rather extreme, work [107] proposed to parallelize SGD in a single round of communication. Each node simply runs SGD on the data available locally, and their outputs are averaged to form a final result. This approach is however not very robust to differences in data distributions available locally, and it has been shown [91, Appendix A] that in general it cannot perform better than using output of a single machine, ignoring all the other data.\nShamir et al. proposed the DANE algorithm, Distributed Approximate Newton [91], to exactly solve a general subproblem available locally, before averaging their solutions. The method relies on similarity of Hessians of local objectives, representing their iterations as an average of inexact Newton steps. We describe the algorithm in greater detail in Section 3.4 as our proposed work builds on it. A quite similar approach was proposed in [59], with richer class class of subproblems that can be formulated locally, and solved approximately. An analysis of inexact version of DANE and its accelerated variant, AIDE, appeared recently in [78]. Inexact DANE is closely related to the algorithms presented in this paper. We, however, continue in different direction shaped by the setting of federated optimization.\nThe DiSCO algorithm [105] of Zhang and Xiao is based on inexact damped Newton method. The core idea is that the inexact Newton steps are computed by distributed preconditioned conjugate gradient, which can be very fast, if the data are distributed in an IID fashion, enabling a good preconditioner to be computed locally. The theoretical upper bound on number of rounds of communication improves upon DANE and other methods, and in certain settings matches the lower bound presented in [5]. The DiSCO algorithm is related to [52, 106], a distributed truncated Newton method. Although it was reported to perform well in practice, the total number of conjugate gradient iterations may still be high to be considered a communication efficient algorithm.\nCommon to the above algorithms is the assumption that each node has access to data points sampled IID from the same distribution. This assumption is not required only in theory, but can cause the algorithms to converge significantly slower or even diverge (as reported for instance in [91, Table 3]). Thus, these algorithms, at least in their default form, are not suitable for the setting of Federated Optimization presented here.\nAn algorithm that bypasses the need for IID data assumption is CoCoA, which provably converges under any distribution of the data, while the convergence rate does depend on properties of the data distribution. The first version of the algorithm was proposed as DisDCA in [101], without convergence guarantees. First analysis was introduced in [42], with further improvements in [58], and a more general version in [57]. Recently, its variant for L1-regularized objectives was introduced in [92].\nThe CoCoA framework formulates general local subproblems based on the dual form of (1) (See for instance [57, Eq. (2)]). Data points are distributed to nodes, along with corresponding\ndual variables. Arbitrary optimization algorithm is used to attain a relative Θ accuracy on the local subproblem — by changing only local dual variables. These updates have their corresponding updates to primal variable w, which are synchronously aggregated (could be averaging, adding up, or anything in between; depending on the local subproblem formulation).\nFrom the description in this section it appears that the CoCoA framework is the only usable tool for the setting of Federated Optimization. However, the theoretical bound on number of rounds of communications for ill-conditioned problems scales with the number of nodes K. Indeed, as we will show in Section 4 on real data, CoCoA framework does converge very slowly."
+    }, {
+      "heading" : "3 Algorithms for Federated Optimization",
+      "text" : "In this section we introduce the first algorithm that was designed with the unique challenges of federated optimization in mind. Before proceeding with the explanation, we first revisit two important and at first sight unrelated algorithms. The connection between these algorithms helped to motivate our research. Namely, the algorithms are the Stochastic Variance Reduced Gradient (SVRG) [43, 47], a stochastic method with explicit variance reduction, and the Distributed Approximate Newton (DANE) [91] for distributed optimization.\nThe descriptions are followed by their connection, giving rise to a new distributed optimization algorithm, at first sight almost identical to the SVRG algorithm, which we call Federated SVRG (FSVRG).\nAlthough this algorithm seems to work well in practice in simple circumstances, its performance is still unsatisfactory in the general setting we specify in Section 3.3. We proceed by making the FSVRG algorithm adaptive to different local data sizes, general sparsity patterns and significant differences in patterns in data available locally, and those present in the entire data set."
+    }, {
+      "heading" : "3.1 Desirable Algorithmic Properties",
+      "text" : "It is a useful thought experiment to consider the properties one would hope to find in an algorithm for the non-IID, unbalanced, and massively-distributed setting we consider. In particular:\n(A) If the algorithm is initialized to the optimal solution, it stays there.\n(B) If all the data is on a single node, the algorithm should converge in O(1) rounds of communication.\n(C) If each feature occurs on a single node, so the problems are fully decomposable (each machine is essentially learning a disjoint block of parameters), then the algorithm should converge in O(1) rounds of communication6.\n(D) If each node contains an identical dataset, then the algorithm should converge in O(1) rounds of communication.\nFor convex problems, “converges” has the usual technical meaning of finding a solution sufficiently close to the global minimum, but these properties also make sense for non-convex problems where “converge” can be read as “finds a solution of sufficient quality”. In these statements, O(1) round is ideally exactly one round of communication.\n6This is valid only for generalized linear models.\nProperty (A) is valuable in any optimization setting. Properties (B) and (C) are extreme cases of the federated optimization setting (non-IID, unbalanced, and sparse), whereas (D) is an extreme case of the classic distributed optimization setting (large amounts of IID data per machine). Thus, (D) is the least important property for algorithms in the federated optimization setting."
+    }, {
+      "heading" : "3.2 SVRG",
+      "text" : "The SVRG algorithm [43, 47] is a stochastic method designed to solve problem (1) on a single node. We present it as Algorithm 1 in a slightly simplified form.\nAlgorithm 1 SVRG\n1: parameters: m = number of stochastic steps per epoch, h = stepsize 2: for s = 0, 1, 2, . . . do 3: Compute and store ∇f(wt) = 1n ∑n i=1∇fi(wt) . Full pass through data 4: Set w = wt 5: for t = 1 to m do 6: Pick i ∈ {1, 2, . . . , n}, uniformly at random 7: w = w − h ( ∇fi(w)−∇fi(wt) +∇f(wt) ) . Stochastic update 8: end for 9: wt+1 = w\n10: end for\nThe algorithm runs in two nested loops. In the outer loop, it computes gradient of the entire function f (Line 3). This constitutes for a full pass through data — in general expensive operation one tries to avoid unless necessary. This is followed by an inner loop, where m fast stochastic updates are performed. In practice, m is typically set to be a small multiple (1–5) of n. Although the theoretically optimal choice for m is a small multiple of a condition number [47, Theorem 6], this is often of the same order as n in practice.\nThe central idea of the algorithm is to avoid using the stochastic gradients to estimate the entire gradient ∇f(w) directly. Instead, in the stochastic update in Line 7, the algorithm evaluates two stochastic gradients, ∇fi(w) and ∇fi(wt). These gradients are used to estimate the change of the gradient of the entire function between points wt and w, namely ∇f(w) − ∇f(wt). Using this estimate together with ∇f(wt) pre-computed in the outer loop, yields an unbiased estimate of ∇f(w).\nApart from being an unbiased estimate, it could be intuitively clear that if w and wt are close to each other, the variance of the estimate ∇fi(w)−∇fi(wt) should be small, resulting in estimate of ∇f(w) with small variance. As the inner iterate w goes further, variance grows, and the algorithm starts a new outer loop to compute new full gradient ∇f(wt+1) and reset the variance.\nThe performance is well understood in theory. For λ-strongly convex f and L-smooth functions fi, convergence results are in the form\nE[f(wt)− f(w∗)] ≤ ct[f(w0)− f(w∗)], (5)\nwhere w∗ is the optimal solution, and c = Θ (\n1 mh\n) + Θ(h).7\n7See [47, Theorem 4] and [43, Theorem 1] for details.\nIt is possible to show [47, Theorem 6] that for appropriate choice of parameters m and h, the convergence rate (5) translates to the need of\n(n+O(L/λ)) log(1/ )\nevaluations of ∇fi for some i to achieve E[f(w)− f(w∗)] < ."
+    }, {
+      "heading" : "3.3 Distributed Problem Formulation",
+      "text" : "In this section, we introduce notation and specify the structure of the distributed version of the problem we consider (1), focusing on the case where the fi are convex. We assume the data {xi, yi}ni=1, describing functions fi are stored across a large number of nodes.\nLet K be the number of nodes. Let Pk for k ∈ {1, . . . ,K} denote a partition of data point indices {1, . . . , n}, so Pk is the set stored on node k, and define nk = |Pk|. That is, we assume that Pk ∩ Pl = ∅ whenever k 6= l, and ∑K k=1 nk = n. We then define local empirical loss as\nFk(w) def =\n1\nnk ∑ i∈Pk fi(w), (6)\nwhich is the local objective based on the data stored on machine k. We can then rephrase the objective (1) as\nf(w) = K∑ k=1 nk n Fk(w) = K∑ k=1 nk n · 1 nk ∑ i∈Pk fi(w). (7)\nThe way to interpret this structure is to see the empirical loss f(w) = 1n ∑n\ni=1 fi(w) as a convex combination of the local empirical losses Fk(w), available locally to node k. Problem (1) then takes the simplified form\nmin w∈Rd f(w) ≡ K∑ k=1 nk n Fk(w). (8)"
+    }, {
+      "heading" : "3.4 DANE",
+      "text" : "In this section, we introduce a general reasoning providing stronger intuitive support for the DANE algorithm [91], which we describe in detail below. We will follow up on this reasoning in Appendix A and draw a connection between two existing methods that was not known in the literature.\nIf we wanted to design a distributed algorithm for solving the above problem (8), where node k contains the data describing function Fk. The first, and as we shall see, a rather naive idea is to ask each node to minimize their local functions, and average the results (a variant of this idea appeared in [107]):\nwt+1k = arg min w∈Rd Fk(w), w t+1 = K∑ k=1 nk n wt+1k .\nClearly, it does not make sense to run this algorithm for more than one iteration as the output w will always be the same. This is simply because wt+1k does not depend on t. In other words, this method effectively performs just a single round of communication. While the simplicity is appealing, the drawback of this method is that it can’t work. Indeed, there is no reason to expect\nthat in general the solution of (8) will be a weighted average of the local solutions, unless the local functions are all the same — in which case we do not need a distributed algorithm in the first place and can instead solve the much simpler problem minw∈Rd F1(w). This intuitive reasoning can be also formally supported, see for instance [91, Appendix A].\nOne remedy to the above issue is to modify the local problems before each aggregation step. One of the simplest strategies would be to perturb the local function Fk in iteration t by a quadratic term of the form: −(atk)Tw + µ 2‖w − w\nt‖2 and to ask each node to solve the perturbed problem instead. With this change, the improved method then takes the form\nwt+1k = arg min w∈Rd\nFk(w)− (atk)Tw + µ 2 ‖w − wt‖2, wt+1 = 1 K K∑ k=1 wt+1k . (9)\nThe idea behind iterations of this form is the following. We would like each node k ∈ [K] to use as much curvature information stored in Fk as possible. By keeping the function Fk in the subproblem in its entirety, we are keeping the curvature information nearly intact — the Hessian of the subproblem is ∇2Fk + µI, and we can even choose µ = 0.\nAs described, the method is not yet well defined, since we have not described how the vectors atk would change from iteration to iteration, and how one should choose µ. In order to get some insight into how such a method might work, let us examine the optimality conditions. Asymptotically as t → ∞, we would like atk to be such that the minimum of each subproblem is equal to w∗; the minimizer of (8). Hence, we would wish for w∗ to be the solution of\n∇Fk(w)− atk + µ(w − wt) = 0.\nHence, in the limit, we would ideally like to choose atk = ∇Fk(w∗)+µ(w∗−wt) ≈ ∇Fk(w∗), since w∗ ≈ wt. Not knowing w∗ however, we cannot hope to be able to simply set atk to this value. Hence, the second option is to come up with an update rule which would guarantee that atk converges to ∇Fk(w∗) as t→∞. Notice at this point that it has been long known in the optimization community that the gradient of the objective at the optimal point is intimately related to the optimal solution of a dual problem. Here the situation is further complicated by the fact that we need to learn K such gradients. In the following, we show that DANE is in fact a particular instantiation of the scheme above.\nDANE. We present the Distributed Approximate Newton algorithm (DANE) [91], as Algorithm 2. The algorithm was originally analysed for solving the problem of structure (7), with nk being identical for each k — i.e., each computer has the same number of data points. Nothing prevents us from running it in our more general setting though.\nAs alluded to earlier, the main idea of DANE is to form a local subproblem, dependent only on local data, and gradient of the entire function — which can be computed in a single round of communication (Line 3). The subproblem is then solved exactly (Line 4), and updates from individual nodes are averaged to form a new iterate (Line 5). This approach allows any algorithm to be used to solve the local subproblem (10). As a result, it often achieves communication efficiency in the sense of requiring expensive local computation between rounds of communication, hopefully rendering the time needed for communication insignificant (see Section 2.3.1). Further, note that DANE belongs to the family of distributed method that operate via the quadratic perturbation trick (9) with\natk = ∇Fk(wt)− η∇f(wt).\nAlgorithm 2 Distributed Approximate Newton (DANE)\n1: Input: regularizer µ ≥ 0, parameter η (default: µ = 0, η = 1) 2: for s = 0, 1, 2, . . . do 3: Compute ∇f(wt) = 1n ∑n i=1∇fi(wt) and distribute to all machines 4: For each node k ∈ {1, . . . ,K}, solve\nwk = arg min w∈Rd\n{ Fk(w)− ( ∇Fk(wt)− η∇f(wt) )T w + µ\n2 ‖w − wt‖2\n} (10)\n5: Compute wt+1 = 1K ∑K\nk=1wk 6: end for\nIf we assumed that the method works, i.e., that wt → w∗ and hence ∇f(wt)→ ∇f(w∗) = 0, then atk → ∇Fk(w∗), which agrees with the earlier discussion.\nIn the default setting when µ = 0 and η = 1, DANE achieves desirable property (D) (immediate convergence when all local datasets are identical), since in this case ∇Fk(wt)− η∇f(wt) = 0, and so we exactly minimize Fk(w) = f(w) on each machine. For any choice of µ and η, DANE also achieves property (A), since in this case ∇f(wt) = 0, and wt is a minimizer of Fk(w)−∇Fk(wt) ·w as well as of the regularization term. Unfortunately, DANE does not achieve the more federated optimization-specific desirable properties (B) and (C).\nThe convergence analysis for DANE assumes that the functions are twice differentiable, and relies on the assumption that each node has access to IID samples from the same underlying distribution. This implies that that the Hessians of ∇2Fk(w) are similar to each other [91, Lemma 1]. In case of linear regression, with λ = O(1/ √ n)-strongly convex functions, the number of DANE iterations needed to achieve -accuracy is O(K log(1/ )). However, for general L-smooth loss, the theory is significantly worse, and does not match its practical performance.\nThe practical performance also depends on the additional local regularization parameter µ. For small number of nodes K, the algorithm converges quickly with µ = 0. However, as reported [91,\nFigure 3], it can diverge quickly with growing K. Bigger µ makes the algorithm more stable at the cost of slower convergence. Practical choice of µ remains an open question."
+    }, {
+      "heading" : "3.5 SVRG meets DANE",
+      "text" : "As we mentioned above, the DANE algorithm can perform poorly in certain settings, even without the challenging aspects of federated optimization. Another point that is seen as drawback of DANE is the need to find the exact minimum of (10) — this can be feasible for quadratics with relatively small dimension, but infeasible or extremely expensive to achieve for other problems. We adapt the idea from the CoCoA algorithm [57], in which an arbitrary optimization algorithm is used to obtain relative Θ accuracy on a locally defined subproblem. We replace the exact optimization with an approximate solution obtained by using any optimization algorithm.\nConsidering all the algorithms one could use to solve (10), the SVRG algorithm seems to be a particularly good candidate. Starting the local optimization of (10) from point wt, the algorithm automatically has access to the derivative at wt, which is identical for each node — ∇f(wt). Hence, the SVRG algorithm can skip the initial expensive operation, evaluation of the entire gradient (Line 3, Algorithm 1), and proceed only with the stochastic updates in the inner loop.\nIt turns out that this modified version of the DANE algorithm is equivalent to a distributed version of SVRG.\nProposition 1. Consider the following two algorithms.\n1. Run the DANE algorithm (Algorithm 2) with η = 1 and µ = 0, and use SVRG (Algorithm 1) as a local solver for (10), running it for a single iteration, initialized at point wt.\n2. Run a distributed variant of the SVRG algorithm, described in Algorithm 3.\nThe algorithms are equivalent in the following sense. If both start from the same point wt, they generate identical sequence of iterates {wt}.\nProof. We construct the proof by showing that single step of the SVRG algorithm applied to the problem (10) on computer k is identical to the update on Line 8 in Algorithm 3.\nThe way to obtain a stochastic gradient of (10) is to sample one of the functions composing Fk(w) =\n1 nk ∑ i∈Pk fi(w), and add the linear term ∇Fk(w\nt)− ηf(wt), which is known and does not need to be estimated. Upon sampling an index i ∈ Pk, the update direction follows as[ ∇fi(w)−∇Fk(wt)− f(wt) ] − [ ∇fi(wt)−∇Fk(wt)− f(wt) ] +∇f(wt) = ∇fi(w)−∇fi(wt)+∇f(wt),\nwhich is identical to the direction in Line 8 in Algorithm 3. The claim follows by chaining the identical updates to form identical iterate wt+1.\nAlgorithm 3 naive Federated SVRG (FSVRG)\n1: parameters: m = # of stochastic steps per epoch, h = stepsize, data partition {Pk}Kk=1 2: for s = 0, 1, 2, . . . do . Overall iterations 3: Compute ∇f(wt) = 1n ∑n i=1∇fi(wt) 4: for k = 1 to K do in parallel over nodes k . Distributed loop 5: Initialize: wk = w t 6: for t = 1 to m do . Actual update loop 7: Sample i ∈ Pk uniformly at random 8: wk = wk − h ( ∇fi(wk)−∇fi(wt) +∇f(wt)\n) 9: end for\n10: end for 11: wt+1 = wt + 1K ∑K k=1(wk − wt) . Aggregate 12: end for\nRemark 2. The algorithms considered in Proposition 1 are inherently stochastic. The statement of the proposition is valid under the assumption that in both cases, identical sequence of samples i ∈ Pk would be generated by all nodes k ∈ {1, 2, . . . ,K}.\nRemark 3. In the Proposition 1 we consider the DANE algorithm with particular values of η and µ. The Algorithm 3 and the Proposition can be easily gereralized, but we present only the default version for the sake of clarity.\nSince the first version of this paper, this connection has been mentioned in [78], which analyses an inexact version of the DANE algorithm. We proceed by adapting the above algorithm to other challenges arising in the context of federated optimization."
+    }, {
+      "heading" : "3.6 Federated SVRG",
+      "text" : "Empirically, the Algorithm 3 fits in the model of distributed optimization efficiency described in Section 2.3.1, since we can balance how many stochastic iterations should be performed locally against communication costs. However, several modifications are necessary to achieve good performance in the full federated optimization setting (Section 3.3). Very important aspect that needs to be addressed is that the number of data points available to a given node can differ greatly from the average number of data points available to any single node. Furthermore, this setting always comes with the data available locally being clustered around a specific pattern, and thus not being a representative sample of the overall distribution we are trying to learn. In the Experiments section we focus on the case of L2 regularized logistic regression, but the ideas carry over to other generalized linear prediction problems."
+    }, {
+      "heading" : "3.6.1 Notation",
+      "text" : "Note that in large scale generalized linear prediction problems, the data arising are almost always sparse, for example due to bag-of-words style feature representations. This means that only a small subset of d elements of vector xi have nonzero values. In this class of problems, the gradient ∇fi(w) is a multiple of the data vector xi. This creates additional complications, but also potential for exploitation of the problem structure and thus faster algorithms. Before continuing, let us summarize and denote a number of quantities needed to describe the algorithm.\n• n — number of data points / training examples / functions. • Pk — set of indices, corresponding to data points stored on device k. • nk = |Pk| — number of data points stored on device k. • nj =\n∣∣{i ∈ {1, . . . , n} : xTi ej 6= 0}∣∣ — the number of data points with nonzero jth coordinate • njk =\n∣∣{i ∈ Pk : xTi ej 6= 0}∣∣ — the number of data points stored on node k with nonzero jth coordinate • φj = nj/n — frequency of appearance of nonzero elements in jth coordinate • φjk = n j k/nk — frequency of appearance of nonzero elements in j th coordinate on node k • sjk = φ j/φjk — ratio of global and local appearance frequencies on node k in j th coordinate • Sk = Diag(sjk) — diagonal matrix, composed of s j k as j th diagonal element\n• ωj = ∣∣∣{Pk : njk 6= 0}∣∣∣ — Number of nodes that contain data point with nonzero jth coordinate • aj = K/ωj — aggregation parameter for coordinate j • A = Diag(aj) — diagonal matrix composed of aj as jth diagonal element\nWith these quantities defined, we can state our proposed algorithm as Algorithm 4. Our experiments show that this algorithm works very well in practice, but the motivation for the particular scaling of the updates may not be immediately clear. In the following section we provide the intuition that lead to the development of this algorithm."
+    }, {
+      "heading" : "3.6.2 Intuition Behind FSVRG Updates",
+      "text" : "The difference between the Algorithm 4 and Algorithm 3 is in the introduction of the following properties.\n1. Local stepsize — hk = h/nk.\nAlgorithm 4 Federated SVRG (FSVRG)\n1: parameters: h = stepsize, data partition {Pk}Kk=1, diagonal matrices A,Sk ∈ Rd×d for k ∈ {1, . . . ,K} 2: for s = 0, 1, 2, . . . do . Overall iterations 3: Compute ∇f(wt) = 1n ∑n i=1∇fi(wt) 4: for k = 1 to K do in parallel over nodes k . Distributed loop 5: Initialize: wk = w\nt and hk = h/nk 6: Let {it}nkt=1 be random permutation of Pk 7: for t = 1, . . . , nk do . Actual update loop 8: wk = wk − hk ( Sk [ ∇fit(wk)−∇fit(wt) ] +∇f(wt)\n) 9: end for\n10: end for 11: wt = wt +A ∑K k=1 nk n (wk − w\nt) . Aggregate 12: end for\n2. Aggregation of updates proportional to partition sizes — nkn (wk − w t)\n3. Scaling stochastic gradients by diagonal matrix — Sk\n4. Per-coordinate scaling of aggregated updates — A(wk − wt)\nLet us now explain what motivated us to get this particular implementation. As a simplification, assume that at some point in time, we have for some w, wk = w for all k ∈ [K]. In other words, all the nodes have the same local iterate. Although this is not exactly the case in practice, thinking about the issue in this simplified setting will give us insight into what would be meaningful to do if it was true. Further, we can hope that the reality is not too far from the simplification and it will still work in practice. Indeed, all nodes do start from the same point, and adding the linear term ∇Fk(wt)−∇f(wt) to the local objective forces all nodes to move in the same direction, at least initially.\nSuppose the nodes are about to make a single step synchronously. Denote the update direction on node k as Gk = ∇fi(w)−∇fi(wt) +∇f(wt), where i is sampled uniformly at random from Pk.\nIf we had only one node, i.e., K = 1, it is clear that we would have E[G1] = ∇f(wt). If K is more than 1, the values of Gk are in general biased estimates of ∇f(wt). We would like to achieve the following: E [∑K k=1 αkGk ] = ∇f(wt), for some choice of αk. This is motivated by the general desire to make stochastic first-order methods to make a gradient step in expectation. We have\nE [ K∑ k=1 αkGk ] = K∑ k=1 αk 1 nk ∑ i∈Pk [ ∇fi(w)−∇fi(wt) +∇f(wt) ] .\nBy setting αk = nk n , we get\nE [ K∑ k=1 αkGk ] = 1 n K∑ k=1 ∑ i∈Pk [ ∇fi(w)−∇fi(wt) +∇f(wt) ] = ∇f(w).\nThis motivates the aggregation of updates from nodes proportional to nk, the number of data points available locally (Point 2).\nNext, we realize that if the local data sizes, nk, are not identical, we likely don’t want to do the same number of local iterations on each node k. Intuitively, doing one pass through data (or a fixed number of passes) makes sense. As a result, the aggregation motivated above does not make perfect sense anymore. Nevertheless, we can even it out, by setting the stepsize hk inversely proportional to nk, making sure each node makes progress of roughly the same magnitude overall. Hence, hk = h/nk (Point 1).\nTo motivate the Point 3, scaling of stochastic gradients by diagonal matrix Sk, consider the following example. We have 1, 000, 000 data points, distributed across K = 1, 000 nodes. When we look at a particular feature of the data points, we observe it is non-zero only in 1, 000 of them. Moreover, all of them happen to be stored on a single node, that stores only these 1, 000 data points. Sampling a data point from this node and evaluating the corresponding gradient, will clearly yield an estimate of the gradient ∇f(w) with 1000-times larger magnitude. This would not necessarily be a problem if done only once. However, repeatedly sampling and overshooting the magnitude of the gradient will likely cause the iterative process to diverge quickly.\nHence, we scale the stochastic gradients by a diagonal matrix. This can be seen as an attempt to enforce the estimates of the gradient to be of the correct magnitude, conditioned on us, algorithm designers, being aware of the structure of distribution of the sparsity pattern.\nLet us now highlight some properties of the modification in Point 4. Without any extra information, or in the case of fully dense data, averaging the local updates is the only way that actually makes sense — because each node outputs approximate solution of a proxy to the overall objective, and there is no induced separability structure in the outputs such as in CoCoA [57]. However, we could do much more in the other extreme. If the sparsity structure is such that each data point only depends on one of disjoint groups of variables, and the data were distributed according to this structure, we would efficiently have several disjoint problems. Solving each of them locally, and adding up the results would solve the problem in single iteration — desired algorithm property (C).\nWhat we propose is an interpolation between these two settings, on a per-variable basis. If a variable appears in data on each node, we are going to take average. However, the less nodes a particular variable appear on, the more we want to trust those few nodes in informing us about the meaningful update to this variable — or alternatively, take a longer step. Hence the per-variable scaling of aggregated updates."
+    }, {
+      "heading" : "3.7 Further Notes",
+      "text" : "Looking at the Proposition 1, we identify equivalence of two algorithms, take the second one and try modify it to make it suitable for the setting of federated optimization. A question naturally arise: Is it possible to achieve the same by modifying the first algorithm suitable for federated optimization — by only altering the local optimization objective?\nWe indeed tried to experiment with idea, but we don’t report the details for two reasons. First, the requirement of exact solution of the local subproblem is often impractical. Relaxing it gradually moves us to the setting we presented in the previous sections. But more importantly, using this approach we have only managed to get results significantly inferior to those reported later in the Experiments section."
+    }, {
+      "heading" : "4 Experiments",
+      "text" : "In this section we present the first experimental results in the setting of federated optimization. In particular, we provide results on a dataset based on public Google+ posts8, clustered by user — simulating each user as a independent node. This preliminary experiment demonstrates why none of the existing algorithms are suitable for federated optimization, and the robustness of our proposed method to challenges arising there."
+    }, {
+      "heading" : "4.1 Predicting Comments on Public Google+ Posts",
+      "text" : "The dataset presented here was generated based on public Google+ posts. We randomly picked 10, 000 authors that have at least 100 public posts in English, and try to predict whether a post will receive at least one comment (that is, a binary classification task).\nWe split the data chronologically on a per-author basis, taking the earlier 75% for training and the following 25% for testing. The total number of training examples is n = 2, 166, 693. We created a simple bag-of-words language model, based on the 20, 000 most frequent words in dictionary based on all Google+ data. This results in a problem with dimension d = 20, 002. The extra two features represent a bias term and variable for unknown word. We then use a logistic regression model to make a prediction based on these features.\nWe shape the distributed optimization problem as follows. Suppose that each user corresponds to one node, resulting in K = 10, 000. The average nk, number of data points on node k is thus roughly 216. However, the actual numbers nk range from 75 to 9, 000, showing the data is in fact substantially unbalanced.\nIt is natural to expect that different users can exhibit very different patterns in the data generated. This is indeed the case, and hence the distribution to nodes cannot be considered an IID sample from the overall distribution. Since we have a bag-of-words model, our data are very sparse — most posts contain only small fraction of all the words in the dictionary. This, together with the fact that the data are naturally clustered on a per-user basis, creates additional challenge that is not present in the traditional distributed setting.\nFigure 1 shows the frequency of different features across nodes. Some features are present everywhere, such as the bias term, while most features are relatively rare. In particular, over 88% of features are present on fewer than 1, 000 nodes. However, this distribution does not necessarily resemble the overall appearance of the features in data examples. For instance, while an unknown word is present in data of almost every user, it is far from being contained in every data point.\nNaive prediction properties. Before presenting the results, it is useful to look at some of the important basic prediction properties of the data. We use L2-regularized logistic regression, with regularization parameter λ = 1/n. We chose λ to be the best in terms of test error in the optimal solution.\n• If one chooses to predict −1 (no comment), classification error is 33.16%. • The optimal solution of the global logistic regression problem yields 26.27% test set error. • Predicting the per-author majority from the training data yields 17.14% test error. That is,\npredict +1 or −1 for all the posts of an author, based on which label was more common in 8The posts were public at the time the experiment was performed, but since a user may decide to delete the post\nor make it non-public, we cannot release (or even permanently store) any copies of the data.\nthat author’s training data. This indicates that knowing the author is actually more useful than knowing what they said, which is perhaps not surprising.\nIn summary, this data is representative for our motivating application in federated optimization. It is possible to improve upon naive baseline using a fixed global model. Further, the per-author majority result suggests it is possible to improve further by adapting the global model to each user individually. Model personalization is common practice in industrial applications, and the techniques used to do this are orthogonal to the challenges of federated optimization. Exploring its performance is a natural next step, but beyond the scope of this work.\nWhile we do not provide experiments for per user personalized models, we remark that this could be a good descriptor of how far from IID the data is distributed. Indeed, if each node has access to an IID sample, any adaptation to local data is merely over-fitting. However, if we can significantly improve upon the global model by per user/node adaptation, this means that the data available locally exhibit patterns specific to the particular node.\nThe performance of the Algorithm 4 is presented below. The only parameter that remains to be chosen by user is the stepsize h. We tried a set of stepsizes, and retrospectively choose one that works best — a typical practice in machine learning.\nIn Figure 2, we compare the following optimization algorithms9:\n• The blue squares (OPT) represent the best possible offline value (the optimal value of the optimization task in the first plot, and the test error corresponding to the optimum in the second plot). • The teal diamonds (GD) correspond to a simple distributed gradient descent. • The purple triangles (COCOA) are for the CoCoA+ algorithm [57]. • The green circles (FSVRG) give values for our proposed algorithm. • The red stars (FSVRGR) correspond to the same algorithm applied to the same problem with\nrandomly reshuffled data. That is, we keep the unbalanced number of examples per node, but populate each node with randomly selected examples.\n9We thank Mark Schmidt for his prettyPlot function, available on his website.\nThe first thing to notice is that CoCoA+ seems to be worse than trivial benchmark — distributed gradient descent. This behaviour can be predicted from theory, as the overall convergence rate directly depends on the best choice of aggregation parameter σ′. For sparse problems, it is upperbounded by the maximum of the values reported in Figure 1, which is K, and it is close to it also in practice. Althought it is expected that the algorithm could be modified to depend on average of these quantities (which could be orders of magnitude smaller), akin to coordinate descent algorithms [79], it has not been done yet. Note that other communication efficient algorithms fail to converge altogether.\nThe algorithm we propose, FSVRG, converges to optimal test classification accuracy in just 30 iterations. Recall that in the setting of federated optimization we introduced in Section 1.2, minimization of rounds of communication is the principal goal. However, concluding that the approach is stunningly superior to existing methods would not be completely fair nor correct. The conclusion is that the FSVRG is the first algorithm to tackle federated optimization, a problem that existing methods fail to generalize to. It is important to stress that none of the existing methods were designed with these particular challenges in mind, and we formulate the first benchmark.\nSince the core reason other methods fail to converge is the non-IID data distribution, we test our method on the same problem, with data randomly reshuffled among the same number of nodes (FSVRGR; red stars). Since the difference in convergence is subtle, we can conclude that the techniques described in Section 3.6.2 serve its purpose and make the algorithm robust to challenges present in federated optimization.\nThis experiment demonstrates that learning from massively decentralized data, clustered on a per-user basis is indeed problem we can tackle in practice. Since the first version of this paper [45], additional experimental results were presented in [62]. We refer the reader to this paper for experiments in more challenging setting of deep learning, and a further discussion on how such system would be implemented in practice."
+    }, {
+      "heading" : "5 Conclusions and Future Challenges",
+      "text" : "We have introduced a new setting for distributed optimization, which we call federated optimization. This setting is motivated by the outlined vision, in which users do not send the data they generate to companies at all, but rather provide part of their computational power to be used to solve optimization problems. This comes with a unique set of challenges for distributed optimization. In particular, we argue that the massively distributed, non-IID, unbalanced, and sparse properties of federated optimization problems need to be addressed by the optimization community.\nWe explain why existing methods are not applicable or effective in this setting. Even the distributed algorithms that can be applied converge very slowly in the presence of large number of nodes on which the data are stored. We demonstrate that in practice, it is possible to design algorithms that work surprisingly efficiently in the challenging setting of federated optimization, which makes the vision conceptually feasible.\nWe realize that it is important to scale stochastic gradients on a per-coordinate basis, differently on each node to improve performance. To the best of our knowledge, this is the first time such per-node scaling has been used in distributed optimization. Additionally, we use per-coordinate aggregation of updates from each node, based on distribution of the sparsity patterns in the data.\nEven though our results are encouraging, there is a lot of room for future work. One natural direction is to consider fully asynchronous versions of our algorithms, where the updates are applied as soon as they arrive. Another is developing a better theoretical understanding of our algorithm, as we believe that development of a strong understanding of the convergence properties will drive further research in this area.\nStudy of the federated optimization problem for non-convex objectives is another important avenue of research. In particular, neural networks are the most important example of a machine learning tool that yields non-convex functions fi, without any convenient general structure. Consequently, there are no useful results describing convergence guarantees of optimization algorithms. Despite the lack of theoretical understanding, neural networks are now state-of-the-art in many application areas, ranging from natural language understanding to visual object detection. Such applications arise naturally in federated optimization settings, and so extending our work to such problems is an important direction.\nThe non-IID data distribution assumed in federated optimization, and mobile applications in particular, suggest that one should consider the problem of training a personalized model together with that of learning a global model. That is, if there is enough data available on a given node, and we assume that data is drawn from the same distribution as future test examples for that node, it may be preferable to make predictions based on a personalized model that is biased toward good performance on the local data, rather than simply using the global model."
+    }, {
+      "heading" : "A Distributed Optimization via Quadratic Perturbations",
+      "text" : "This appendix follows from the discussion motivating DANE algorithm by a general algorithmic perturbation template (9) for λ-strongly convex objectives. We use this to propose a similar but new method, which unlike DANE converges under arbitrary data partitioning {Pk}Kk=1, and we highlight its relation to the dual CoCoA algorithm for distributed optimization.\nFor simplicity and ease of drawing the above connections we assume that nk is identical for all k ∈ {1, 2, . . . ,K} throughout the appendix. All the arguments can be simply extended, but would unnecessarily complicate the notation for current purpose.\nA.1 New Method\nWe now present a new method (Algorithm 5), which also belongs to the family of quadratic perturbation methods (9). However, the perturbation vectors atk are different from those of DANE. In particular, we set\natk def = ∇Fk(wt)− (η∇Fk(wt) + gtk),\nwhere η > 0 is a parameter, and the vectors gtk are maintained by the method. As we show in Lemma 4, Algorithm 5 satisfies\nK∑ k=1 gtk = 0\nfor all iterations t. This implies that 1K ∑K k=1 a t k = (1 − η)∇f(wt). That is, both DANE and the new method use a linear perturbation which, when averaged over the nodes, involves the gradient of the objective function f at the latest iterate wt. Therefore, the methods have one more property in common beyond both being of the form (9). However, as we shall see in the rest of this section, Algorithm 5 allows an insightful dual interpretation. Moreover, while DANE may not converge for arbitrary problems (even when restricted to ridge regression)—and is only known to converge under the assumption that the data stored on each node are in some precise way similar, Algorithm 5 converges for any ridge regression problem and any data partitioning.\nLet us denote by Xk the matrix obtained by stacking the data points xi as column vectors for all i ∈ Pk. We have the following Lemma.\nLemma 4. For all t ≥ 0 we have ∑K\nk=1 g t k = 0.\nProof. The statement holds for t = 0. Indeed,\nK∑ k=1 gtk = η K∑ k=1 ( K n Xkα 0 k − λw0 ) = 0,\nwhere the last step follows from the definition of w0. Assume now that the statement hold for t. Then\nK∑ k=1 gt+1k = K∑ k=1 ( gtk + ηλ(w t+1 k − w t+1) ) = ηλ K∑ k=1 (wt+1k − w t+1).\nThe first equation follows from the way gk is updated in the algorithm. The second equation follows from the inductive assumption, and the last equation follows from the definition of wt+1 in the algorithm.\nAlgorithm 5 Primal Method\n1: Input: σ ∈ [1,K] 2: Choose: α0k ∈ R|Pk| for k = 1, 2, . . . ,K 3: Set: η = Kσ , µ = λ(η − 1) 4: Set: w0 = 1λn ∑K k=1Xkα 0 k 5: Set: g0k = η( K nXkα 0 k − λw0) for k = 1, 2, . . . ,K 6: for t = 0, 1, 2, . . . do 7: for k = 1 to K do 8: wt+1k = arg minw∈Rd Fk(w)− ( ∇Fk(wt)− (η∇Fk(wt) + gtk) )T w + µ2‖w − w\nt‖2 9: end for\n10: wt+1 = 1K ∑K k=1w t+1 k 11: for k = 1 to K do 12: gt+1k = g t k + λη(w t+1 k − w\nt+1) 13: end for 14: return wt 15: end for\nA.2 L2-Regularized Linear Predictors\nIn the rest of this section we consider the case of L2-regularized linear predictors. That is, we focus on problem (1) with fi of the form\nfi(w) = φi(x T i w) +\nλ 2 ‖w‖2,\nwhere λ > 0 is a regularization parameter. This leads to L2 regularized empirical risk minimization (ERM) problem\nmin w∈Rd\n{ f(w) def = 1\nn n∑ i=1 φi(x T i w) + λ 2 ‖w‖2\n} . (11)\nWe assume that the loss functions φi : R → R are convex and 1/γ-smooth for some γ > 0; these are standard assumptions. As usual, we allow the loss function φi to depend on the label yi. For instance, we may choose the quadratic loss: φi(t) = 1 2(t− yi)\n2 (for which γ = 1). Let X = [x1, . . . , xn] ∈ Rd×n. As described in Section 3.3, we assume that the data (xi, yi)ni=1 is distributed among K nodes of a computer cluster as follows: node k = 1, 2, . . . ,K contains pairs (xi, yi) for i ∈ Pk, where P1, . . . ,PK forms a partition of the set [n] = {1, 2, . . . , n}. Letting X = [X1, . . . , XK ], where Xk ∈ Rd×|Pk| is a submatrix of A corresponding to columns i ∈ Pk, and yk ∈ R|Pk| is the subvector of y corresponding to entries i ∈ Pk. Hence, node k contains the pair (Xk, yk). With this notation, we can write the problem in the form (8), where\nFk(w) = K\nn ∑ i∈Pk φi(x T i w) + λ 2 ‖w‖2. (12)\nA.3 A Dual Method: Dual Block Proximal Gradient Ascent\nThe dual of (11) is the problem\nmax α∈Rn\n{ D(α) def = − 1\n2λn2 ‖Xα‖2 − 1 n n∑ i=1 φ∗i (−αi)\n} , (13)\nwhere φ∗i is the convex conjugate of φi. Since we assume that φi is 1/γ smooth, it follows that φ ∗ i is γ strongly convex. Therefore, D is a strongly concave function.\nFrom dual solution to a primal solution. It is well known that if α∗ is the optimal solution of the dual problem (11), then w∗ def = 1λnXα\n∗ is the optimal solution of the primal problem. Therefore, for any dual algorithm producing a sequence of iterates αt, we can define a corresponding primal algorithm via the linear mapping\nwt def =\n1\nλn Xαt. (14)\nClearly, if αt → α∗, then wt → w∗. We shall now design a method for maximizing the dual function D and then in Theorem 5 we claim that for quadratic loss functions, Algorithm 5 arises as an image, defined via (14), of dual iterations of this dual ascent method.\nDesign of the dual gradient ascent method. Let ξ(α) def = 12‖Xα‖ 2. Since ξ is a convex quadratic, we have\nξ(α+ h) = ξ(α) + 〈∇ξ(α), h〉+ 1 2 hT∇2ξ(α)h, ≤ ξ(α) + 〈∇ξ(α), h〉+ σ 2 ‖h‖2B,\nwhere ∇ξ(α) = XTXα and ∇2ξ(α) = XTX. Further, we define the block-diagonal matrix B def= Diag(XT1 X1, . . . , X T KXK), and a norm associate with this matrix:\n‖h‖2B def = K∑ k=1 ‖Xkhk‖2.\nBy σ we refer to a large enough constant for which XTX σB. In order to avoid unnecessary technicalities, we shall assume that the matrices XTk Xk are positive definite, which implies that ‖ · ‖B is a norm. It can be shown that 1 ≤ σ ≤ K. Clearly, ξ is σ-smooth with respect to the norm ‖ · ‖B. In view of the above, for all h ∈ Rn we can estimate D from below as follows:\nD(αt + h) ≥ − 1 λn2\n( ξ(αt) + 〈∇ξ(αt), h〉+ σ\n2 K∑ k=1 ‖Xkhk‖2 ) − 1 n n∑ i=1 φ∗i (−αti − hi)\n= − 1 λn2 ξ(αt)− K∑ k=1  1 λn2 〈∇kξ(αt), hk〉+ σ 2λn2 ‖Xkhk‖2 + 1 n ∑ i∈Pk φ∗i (−αti − hi)  , where ∇kξ(αt) corresponds to the subvector of ∇ξ(αt) formed by entries i ∈ Pk.\nWe now let ht = (ht1, . . . , h t K) be the maximizer of this lower bound. Since the lower bound is\nseparable in the blocks {htk}k, we can simply set\nhtk := arg min u∈R|Pk| Dtk(u) def= 1λn2 〈∇kξ(αt), u〉+ σ2λn2 ‖Xku‖2 + 1n ∑ i∈Pk φ∗i (−αti − ui)  . (15)\nAlgorithm 6 Dual Method\n1: Input: σ ∈ [1,K] 2: Choose: α0k ∈ R|Pk| for k = 1, 2, . . . ,K 3: for t = 0, 1, 2, . . . do 4: for k = 1 to K do 5: ht+1k = arg minu∈R|Pk| D t k(u) . See (15) 6: end for 7: αt+1 = αt + ht 8: end for 9: return wt\nHaving computed htk for all k, we can set α t+1 k = α t k + h t k for all k, or equivalently, α t+1 = αt + ht. This is formalized as Algorithm 6. Algorithm 6 is a proximal gradient ascent method applied to the dual problem, with smoothness being measured using the block norm ‖h‖B. It is known that gradient ascent converges at a linear rate for smooth and strongly convex (for minimization problems) objectives.\nOne of the main insights of this section is the following equivalence result.\nTheorem 5 (Equivalence of Algorithms 5 and 6 for Quadratic Loss). Consider the ridge regression problem. That is, set φi(t) = 1 2(t − yi) 2 for all i. Assume α01, . . . , α 0 K is chosen in the same way in Algorithms 5 and 6. Then the dual iterates αt and the primal iterates wt produced by the two algorithms are related via (14) for all t ≥ 0.\nSince the dual method converges linearly, in view of the above theorem, so does the primal method. Here we only remark that the popular algorithm CoCoA+ [57] arises if Step 5 in Algorithm 6 is done inexactly. Hence, we show that duality provides a deep relationship between the CoCoA+ and DANE algorithms, which were previously considered completely different.\nA.4 Proof of Theorem 5\nIn this part we prove the theorem.\nPrimal and Dual Problems. Since φi(t) = 1 2(t − yi) 2, the primal problem (11) is a ridge regression problem of the form\nmin w∈Rd\nf(w) = 1 2n ‖XTw − y‖2 + λ 2 ‖w‖2, (16)\nwhere X ∈ Rd×n and y ∈ Rn. In view of (13), the dual of (16) is\nmin α∈Rn\nD(α) = 1 2λn2 ‖Xα‖2 + 1 2n ‖α‖2 − 1 n yTα. (17)\nPrimal Problem: Distributed Setup. The primal objective function is of the form (8), where in view of (12), we have Fk(w) = K 2n‖X T k w − yk‖2 + λ 2‖w‖ 2. Therefore,\n∇Fk(w) = K\nn Xk(X\nT k w − yk) + λw (18)\nand ∇f(w) = 1K ∑ k∇Fk(w) = 1 K ∑ k ( K nXk(X T k w − yk) + λw ) .\nDual Method. Since D is a quadratic, we have\nD(αt + h) = D(αt) +∇D(αt)Th+ 1 2 hT∇2D(αt)h,\nwith\n∇D(αt) = 1 λn2 XTXαt + 1 n (αt − y), ∇2D(αt) = 1 λn2 XTX + 1 n I.\nWe know that XTX σDiag(XT1 X1, . . . , XTKXK). With this approximation, for all h ∈ Rn we can estimate D from above by a node-separable quadratic function as follows:\nD(αt + h) ≤ D(αt) + ( 1\nλn2 XTXαt +\n1 n (αt − y)\n)T h+ 1\n2n ‖h‖2 + σ 2λn2 K∑ k=1 ‖Xkhk‖2\n= D(αt) + 1\nn\n[ 1\nλn (Xαt)TXh+ (αt − y)Th+ 1 2 ‖h‖2 + σ 2λn K∑ k=1\n‖Xkhk‖2 ]\n= D(αt) + 1\nn K∑ k=1 ( (wt)TXkhk + (α t k − yk)Thk + 1 2 ‖hk‖2 + σ 2λn ‖Xkhk‖2 ) .\nNext, we shall define\nhtk def = arg min\nhk∈R|Pk|\nσ\n2λn ‖Xkhk‖2 +\n1 2 ‖hk‖2 − (yk −XTk wt − αtk)Thk (19)\nfor k = 1, 2, . . . ,K and then set αt+1 = αt + ht. (20)\nPrimal Version of the Dual Method. Note that (19) has the same form as (17), with X replaced by Xk, λ replaced by λ/σ and y replaced by ck := yk −XTk wt − αtk. Hence, we know that\nstk def =\n1\n(λ/σ)n Xkh\nt k (21)\nis the optimal solution of the primal problem of (22):\nstk = arg min s∈Rd\n1\n2n ‖XTk s− ck‖2 +\nλ/σ\n2 ‖s‖2. (22)\nHence, the primal version of method (20) is given by\nwt+1 (14) =\n1\nλn Xαt+1\n(20) =\n1\nλn X(αt + ht)\n(14) = wt +\n1\nλn K∑ k=1 Xkh t k\n= 1\nK K∑ k=1 ( wt + K σ σ λn Xkh t k ) (21) = 1 K K∑ k=1 ( wt + K σ stk ) .\nWith the change of variables w := wt + Kσ s (i.e., s = σ K (w − w t)), from (22) we know that wt+1k := w t + Kσ s t k solves\nwt+1k = arg min w∈Rd\n{ Lk(w) def = 1\n2n ∥∥∥XTk σK (w − wt)− ck∥∥∥2 + λ/σ2 ∥∥∥ σK (w − wt)∥∥∥2 }\n(23)\nand wt+1 = 1K ∑K k=1w t+1 k .\nLet us now rewrite the function in (23) so as to connect it to Algorithm 5:\nLk(w) = 1\n2n ∥∥∥XTk σK (w − wt)− ck∥∥∥2 + λ/σ2 ∥∥∥ σK (w − wt)∥∥∥2\n= 1\n2n\nσ2 K2 ∥∥∥∥∥∥∥∥∥(X T k w − yk)− ( XTk w t − yk + K σ ck ) ︸ ︷︷ ︸\ndk\n∥∥∥∥∥∥∥∥∥ 2 + λσ2 2K3 ‖w‖2 − λσ 2 2K3 ‖w‖2 + λ/σ 2 ∥∥∥ σ K (w − wt) ∥∥∥2\n= 1\n2n\nσ2 K2 (∥∥XTk w − yk∥∥2 + ‖dk‖2 − 2(XTk w − yk)Tdk)+ λσ22K3 ‖w‖2 − λσ22K3 ‖w‖2 + λσ2K2 ∥∥w − wt∥∥2 = σ2\nK3\n( K\n2n ∥∥XTk w − yk∥∥2 + K2n‖dk‖2 − Kn (XTk w − yk)Tdk ) + λσ2 2K3 ‖w‖2\n− λσ 2 2K3 ‖w‖2 + λσ 2K2 ∥∥w − wt∥∥2\n= σ2\nK3\n( K\n2n ∥∥XTk w − yk∥∥2 + λ2 ‖w‖2 )\n︸ ︷︷ ︸ Fk(w)\n+ σ2\nK3\n( K\n2n ‖dk‖2 −\nK n (XTk w − yk)Tdk\n)\n− λσ 2 2K3 ‖w‖2 + λσ 2K2 ∥∥w − wt∥∥2\n= σ2\nK3 Fk(w)−\nσ2\nK2n (XTk w − yk)Tdk +\nσ2\n2nK2 ‖dk‖2 −\nλσ2\n2K3 ‖w‖2 + λσ 2K2 ∥∥w − wt∥∥2\n= σ2\nK3 Fk(w)−\nσ2\nK2n (Xkdk)\nTw − λσ 2 2K3 ‖w‖2 + λσ 2K2 ∥∥w − wt∥∥2 + ( σ2 2nK2 ‖dk‖2 + σ2 K2n yTk dk ) ︸ ︷︷ ︸\nβ1\n.\nNext, since ‖w‖2 = ‖w − wt‖2 − ‖wt‖2 + 2(wt)Tw, we can further write\nLk(w) = σ2\nK3 Fk(w)−\nσ2\nK2n (Xkdk)\nTw − λσ 2 2K3 (‖w − wt‖2 − ‖wt‖2 + 2(wt)Tw) + λσ 2K2 ∥∥w − wt∥∥2 + β1\n= σ2\nK3 Fk(w)−\nσ2\nK2n (Xkdk)\nTw − λσ 2\nK3 (wt)Tw +\n( λσ\n2K2 − λσ\n2\n2K3 )∥∥w − wt∥∥2 + λσ2 2K3 ‖wt‖2 + β1︸ ︷︷ ︸ β2\n= σ2\nK3\n( Fk(w)− ( K\nn Xkdk + λw\nt )T w + λ\n2\n( K σ − 1 ) ‖w − wt‖2 ) + β2\n= σ2\nK3\n( Fk(w)− ( ∇Fk(wt)− K2\nσn Xk(X\nT k w t − yk + αtk) )T w + µ\n2 ‖w − wt‖2\n) + β2\n= σ2\nK3 Fk(w)− ∇Fk(wt)− Kσ Kn Xk(XTk wt − yk + αtk)︸ ︷︷ ︸\nztk\n T w + µ 2 ‖w − wt‖2 + β2 = σ2\nK3\n( Fk(w)− ( ∇Fk(wt)− (η∇Fk(wt) + gtk) )T w + µ\n2 ‖w − wt‖2\n) + β2,\nwhere the last step follows from the claim that ηztk = η∇Fk(wt) + gtk. We now prove the claim. First, we have\nηztk = η K\nn Xk(X\nT k w t − yk + αtk)\n= η K\nn Xk(X\nT k w t − yk) + η K\nn Xkα\nt k\n= η\n( K\nn Xk(X\nT k w t − yk) + λwt ) + η ( K\nn Xkα\nt k − λwt ) (18) = η∇Fk(wt) + η ( K\nn Xkα\nt k − λwt\n) .\nDue to the definition of g0k in Step 5 of Algorithm 5 as g 0 k = η( K nXkα 0 k − λw0), we observe that the claim holds for t = 0. If we show that\ngtk = η\n( K\nn Xkα\nt k − λwt ) for all t ≥ 0, then we are done. This can be shown by induction. This finishes the proof of Theorem 5."
+    } ],
+    "references" : [ {
+      "title" : "Deep learning with differential privacy",
+      "author" : [ "Mart́ın Abadi", "Andy Chu", "Ian Goodfellow", "Brendan H McMahan", "Ilya Mironov", "Kunal Talwar", "Li Zhang" ],
+      "venue" : null,
+      "citeRegEx" : "1",
+      "shortCiteRegEx" : "1",
+      "year" : 2016
+    }, {
+      "title" : "Distributed delayed stochastic optimization",
+      "author" : [ "Alekh Agarwal", "John C Duchi" ],
+      "venue" : "In Advances in Neural Information Processing Systems,",
+      "citeRegEx" : "2",
+      "shortCiteRegEx" : "2",
+      "year" : 2011
+    }, {
+      "title" : "Katyusha: The first direct acceleration of stochastic gradient methods",
+      "author" : [ "Zeyuan Allen-Zhu" ],
+      "venue" : null,
+      "citeRegEx" : "3",
+      "shortCiteRegEx" : "3",
+      "year" : 2016
+    }, {
+      "title" : "Exploiting the structure: Stochastic gradient methods using raw clusters",
+      "author" : [ "Zeyuan Allen-Zhu", "Yang Yuan", "Karthik Sridharan" ],
+      "venue" : null,
+      "citeRegEx" : "4",
+      "shortCiteRegEx" : "4",
+      "year" : 2016
+    }, {
+      "title" : "Communication complexity of distributed convex learning and optimization",
+      "author" : [ "Yossi Arjevani", "Ohad Shamir" ],
+      "venue" : "In Advances in Neural Information Processing Systems,",
+      "citeRegEx" : "5",
+      "shortCiteRegEx" : "5",
+      "year" : 2015
+    }, {
+      "title" : "Scaling up machine learning: Parallel and distributed approaches",
+      "author" : [ "Ron Bekkerman", "Mikhail Bilenko", "John Langford" ],
+      "venue" : null,
+      "citeRegEx" : "6",
+      "shortCiteRegEx" : "6",
+      "year" : 2011
+    }, {
+      "title" : "Distributed asynchronous computation of fixed points",
+      "author" : [ "Dimitri P Bertsekas" ],
+      "venue" : "Mathematical Programming,",
+      "citeRegEx" : "7",
+      "shortCiteRegEx" : "7",
+      "year" : 1983
+    }, {
+      "title" : "Parallel and distributed computation: numerical methods",
+      "author" : [ "Dimitri P Bertsekas", "John N Tsitsiklis" ],
+      "venue" : null,
+      "citeRegEx" : "8",
+      "shortCiteRegEx" : "8",
+      "year" : 1989
+    }, {
+      "title" : "Sgd-qn: Careful quasi-Newton stochastic gradient descent",
+      "author" : [ "Antoine Bordes", "Léon Bottou", "Patrick Gallinari" ],
+      "venue" : "The Journal of Machine Learning Research,",
+      "citeRegEx" : "9",
+      "shortCiteRegEx" : "9",
+      "year" : 2009
+    }, {
+      "title" : "Curiously fast convergence of some stochastic gradient descent algorithms",
+      "author" : [ "Léon Bottou" ],
+      "venue" : "In Proceedings of the symposium on learning and data science,",
+      "citeRegEx" : "10",
+      "shortCiteRegEx" : "10",
+      "year" : 2009
+    }, {
+      "title" : "Stochastic gradient descent tricks",
+      "author" : [ "Léon Bottou" ],
+      "venue" : null,
+      "citeRegEx" : "11",
+      "shortCiteRegEx" : "11",
+      "year" : 2012
+    }, {
+      "title" : "Optimization methods for large-scale machine learning",
+      "author" : [ "Léon Bottou", "Frank E Curtis", "Jorge Nocedal" ],
+      "venue" : null,
+      "citeRegEx" : "12",
+      "shortCiteRegEx" : "12",
+      "year" : 2016
+    }, {
+      "title" : "The tradeoffs of large scale learning",
+      "author" : [ "Olivier Bousquet", "Léon Bottou" ],
+      "venue" : "In Advances in Neural Information Processing Systems,",
+      "citeRegEx" : "13",
+      "shortCiteRegEx" : "13",
+      "year" : 2008
+    }, {
+      "title" : "Distributed optimization and statistical learning via the alternating direction method of multipliers",
+      "author" : [ "Stephen Boyd", "Neal Parikh", "Eric Chu", "Borja Peleato", "Jonathan Eckstein" ],
+      "venue" : "Foundations and Trends R  © in Machine Learning,",
+      "citeRegEx" : "14",
+      "shortCiteRegEx" : "14",
+      "year" : 2011
+    }, {
+      "title" : "Parallel coordinate descent for l1regularized loss minimization",
+      "author" : [ "Joseph Bradley", "Aapo Kyrola", "Daniel Bickson", "Carlos Guestrin" ],
+      "venue" : "In Proceedings of the 28th International Conference on Machine Learning,",
+      "citeRegEx" : "15",
+      "shortCiteRegEx" : "15",
+      "year" : 2011
+    }, {
+      "title" : "A stochastic quasi-Newton method for large-scale optimization",
+      "author" : [ "Richard H Byrd", "Samantha L Hansen", "Jorge Nocedal", "Yoram Singer" ],
+      "venue" : "SIAM Journal on Optimization,",
+      "citeRegEx" : "16",
+      "shortCiteRegEx" : "16",
+      "year" : 2016
+    }, {
+      "title" : "Differentially private empirical risk minimization",
+      "author" : [ "Kamalika Chaudhuri", "Claire Monteleoni", "Anand D Sarwate" ],
+      "venue" : "Journal of Machine Learning Research,",
+      "citeRegEx" : "17",
+      "shortCiteRegEx" : "17",
+      "year" : 2011
+    }, {
+      "title" : "Project adam: Building an efficient and scalable deep learning training system",
+      "author" : [ "Trishul Chilimbi", "Yutaka Suzue", "Johnson Apacible", "Karthik Kalyanaraman" ],
+      "venue" : "In 11th USENIX Symposium on Operating Systems Design and Implementation",
+      "citeRegEx" : "18",
+      "shortCiteRegEx" : "18",
+      "year" : 2014
+    }, {
+      "title" : "Primal method for ERM with flexible mini-batching schemes and nonconvex losses",
+      "author" : [ "Dominik Csiba", "Peter Richtárik" ],
+      "venue" : null,
+      "citeRegEx" : "20",
+      "shortCiteRegEx" : "20",
+      "year" : 2015
+    }, {
+      "title" : "Coordinate descent face-off: primal or dual",
+      "author" : [ "Dominik Csiba", "Peter Richtárik" ],
+      "venue" : null,
+      "citeRegEx" : "21",
+      "shortCiteRegEx" : "21",
+      "year" : 2016
+    }, {
+      "title" : "Taming the wild: A unified analysis of hogwild-style algorithms",
+      "author" : [ "Christopher M De Sa", "Ce Zhang", "Kunle Olukotun", "Christopher Ré" ],
+      "venue" : "In Advances in Neural Information Processing Systems,",
+      "citeRegEx" : "22",
+      "shortCiteRegEx" : "22",
+      "year" : 2015
+    }, {
+      "title" : "Large scale distributed deep networks",
+      "author" : [ "Jeffrey Dean", "Greg Corrado", "Rajat Monga", "Kai Chen", "Matthieu Devin", "Mark Mao", "Andrew Senior", "Paul Tucker", "Ke Yang", "Quoc V Le" ],
+      "venue" : "In Advances in Neural Information Processing Systems,",
+      "citeRegEx" : "23",
+      "shortCiteRegEx" : "23",
+      "year" : 2012
+    }, {
+      "title" : "MapReduce: Simplified data processing on large clusters",
+      "author" : [ "Jeffrey Dean", "Sanjay Ghemawat" ],
+      "venue" : "Communications of the ACM,",
+      "citeRegEx" : "24",
+      "shortCiteRegEx" : "24",
+      "year" : 2008
+    }, {
+      "title" : "A simple practical accelerated method for finite sums",
+      "author" : [ "Aaron Defazio" ],
+      "venue" : "arXiv preprint arXiv:1602.02442,",
+      "citeRegEx" : "25",
+      "shortCiteRegEx" : "25",
+      "year" : 2016
+    }, {
+      "title" : "SAGA: A fast incremental gradient method with support for non-strongly convex composite objectives",
+      "author" : [ "Aaron Defazio", "Francis Bach", "Simon Lacoste-Julien" ],
+      "venue" : "In Advances in Neural Information Processing Systems,",
+      "citeRegEx" : "26",
+      "shortCiteRegEx" : "26",
+      "year" : 2014
+    }, {
+      "title" : "Optimal distributed online prediction using mini-batches",
+      "author" : [ "Ofer Dekel", "Ran Gilad-Bachrach", "Ohad Shamir", "Lin Xiao" ],
+      "venue" : "The Journal of Machine Learning Research,",
+      "citeRegEx" : "27",
+      "shortCiteRegEx" : "27",
+      "year" : 2012
+    }, {
+      "title" : "On the global and linear convergence of the generalized alternating direction method of multipliers",
+      "author" : [ "Wei Deng", "Wotao Yin" ],
+      "venue" : "Journal of Scientific Computing,",
+      "citeRegEx" : "28",
+      "shortCiteRegEx" : "28",
+      "year" : 2016
+    }, {
+      "title" : "Dual averaging for distributed optimization: convergence analysis and network scaling",
+      "author" : [ "John C Duchi", "Alekh Agarwal", "Martin J Wainwright" ],
+      "venue" : "Automatic control, IEEE Transactions on,",
+      "citeRegEx" : "29",
+      "shortCiteRegEx" : "29",
+      "year" : 2012
+    }, {
+      "title" : "Asynchronous stochastic convex optimization",
+      "author" : [ "John C Duchi", "Sorathan Chaturapruek", "Christopher Ré" ],
+      "venue" : null,
+      "citeRegEx" : "30",
+      "shortCiteRegEx" : "30",
+      "year" : 2015
+    }, {
+      "title" : "Estimation, optimization, and parallelism when data is sparse",
+      "author" : [ "John C Duchi", "Michael I Jordan", "Brendan H McMahan" ],
+      "venue" : "In Advances in Neural Information Processing Systems,",
+      "citeRegEx" : "31",
+      "shortCiteRegEx" : "31",
+      "year" : 2013
+    }, {
+      "title" : "Privacy aware learning",
+      "author" : [ "John C Duchi", "Michael I Jordan", "Martin J Wainwright" ],
+      "venue" : "Journal of the Association for Computing Machinery,",
+      "citeRegEx" : "32",
+      "shortCiteRegEx" : "32",
+      "year" : 2014
+    }, {
+      "title" : "The Algorithmic Foundations of Differential Privacy",
+      "author" : [ "Cynthia Dwork", "Aaron Roth" ],
+      "venue" : "Foundations and Trends in Theoretical Computer Science. Now Publishers,",
+      "citeRegEx" : "33",
+      "shortCiteRegEx" : "33",
+      "year" : 2014
+    }, {
+      "title" : "Fast distributed coordinate descent for nonstrongly convex losses",
+      "author" : [ "Olivier Fercoq", "Zheng Qu", "Peter Richtárik", "Martin Takáč" ],
+      "venue" : "In Machine Learning for Signal Processing (MLSP),",
+      "citeRegEx" : "34",
+      "shortCiteRegEx" : "34",
+      "year" : 2014
+    }, {
+      "title" : "Accelerated, parallel, and proximal coordinate descent",
+      "author" : [ "Olivier Fercoq", "Peter Richtárik" ],
+      "venue" : "SIAM Journal on Optimization,",
+      "citeRegEx" : "35",
+      "shortCiteRegEx" : "35",
+      "year" : 2015
+    }, {
+      "title" : "Un-regularizing: approximate proximal point and faster stochastic algorithms for empirical risk minimization",
+      "author" : [ "Roy Frostig", "Rong Ge", "Sham M Kakade", "Aaron Sidford" ],
+      "venue" : "In Proceedings of the 32nd International Conference on Machine Learning (ICML),",
+      "citeRegEx" : "37",
+      "shortCiteRegEx" : "37",
+      "year" : 2015
+    }, {
+      "title" : "Stochastic block BFGS: squeezing more curvature out of data",
+      "author" : [ "Robert Mansel Gower", "Donald Goldfarb", "Peter Richtárik" ],
+      "venue" : "In Proceedings of The 33rd International Conference on Machine Learning,",
+      "citeRegEx" : "38",
+      "shortCiteRegEx" : "38",
+      "year" : 2016
+    }, {
+      "title" : "Randomized quasi-Newton updates are linearly convergent matrix inversion algorithms",
+      "author" : [ "Robert Mansel Gower", "Peter Richtárik" ],
+      "venue" : null,
+      "citeRegEx" : "39",
+      "shortCiteRegEx" : "39",
+      "year" : 2016
+    }, {
+      "title" : "Why random reshuffling beats stochastic gradient descent",
+      "author" : [ "Mert Gürbüzbalaban", "Asu Ozdaglar", "Pablo Parrilo" ],
+      "venue" : null,
+      "citeRegEx" : "40",
+      "shortCiteRegEx" : "40",
+      "year" : 2015
+    }, {
+      "title" : "Stop wasting my gradients: Practical SVRG",
+      "author" : [ "Reza Harikandeh", "Mohamed Osama Ahmed", "Alim Virani", "Mark Schmidt", "Jakub Konečný", "Scott Sallinen" ],
+      "venue" : "In Advances in Neural Information Processing Systems,",
+      "citeRegEx" : "41",
+      "shortCiteRegEx" : "41",
+      "year" : 2015
+    }, {
+      "title" : "Communication-efficient distributed dual coordinate ascent",
+      "author" : [ "Martin Jaggi", "Virginia Smith", "Martin Takáč", "Jonathan Terhorst", "Sanjay Krishnan", "Thomas Hofmann", "Michael I Jordan" ],
+      "venue" : "In Advances in Neural Information Processing Systems,",
+      "citeRegEx" : "42",
+      "shortCiteRegEx" : "42",
+      "year" : 2014
+    }, {
+      "title" : "Accelerating stochastic gradient descent using predictive variance reduction",
+      "author" : [ "Rie Johnson", "Tong Zhang" ],
+      "venue" : "In Advances in Neural Information Processing Systems,",
+      "citeRegEx" : "43",
+      "shortCiteRegEx" : "43",
+      "year" : 2013
+    }, {
+      "title" : "Mini-batch semi-stochastic gradient descent in the proximal setting",
+      "author" : [ "Jakub Konečný", "Jie Liu", "Peter Richtárik", "Martin Takáč" ],
+      "venue" : "IEEE Journal of Selected Topics in Signal Processing,",
+      "citeRegEx" : "44",
+      "shortCiteRegEx" : "44",
+      "year" : 2016
+    }, {
+      "title" : "Federated optimization: Distributed optimization beyond the datacenter",
+      "author" : [ "Jakub Konečný", "Brendan H McMahan", "Daniel Ramage" ],
+      "venue" : null,
+      "citeRegEx" : "45",
+      "shortCiteRegEx" : "45",
+      "year" : 2015
+    }, {
+      "title" : "Semi-stochastic gradient descent methods",
+      "author" : [ "Jakub Konečný", "Peter Richtárik" ],
+      "venue" : null,
+      "citeRegEx" : "47",
+      "shortCiteRegEx" : "47",
+      "year" : 2013
+    }, {
+      "title" : "ASAGA: Asynchronous parallel saga",
+      "author" : [ "Rémi Leblond", "Fabian Pedregosa", "Simon Lacoste-Julien" ],
+      "venue" : null,
+      "citeRegEx" : "48",
+      "shortCiteRegEx" : "48",
+      "year" : 2016
+    }, {
+      "title" : "Efficient backprop",
+      "author" : [ "Yann A LeCun", "Léon Bottou", "Genevieve B Orr", "Klaus-Robert Müller" ],
+      "venue" : "In Neural networks: Tricks of the trade,",
+      "citeRegEx" : "49",
+      "shortCiteRegEx" : "49",
+      "year" : 2012
+    }, {
+      "title" : "Distributed stochastic variance reduced gradient methods",
+      "author" : [ "Jason Lee", "Tengyu Ma", "Qihang Lin" ],
+      "venue" : null,
+      "citeRegEx" : "50",
+      "shortCiteRegEx" : "50",
+      "year" : 2015
+    }, {
+      "title" : "Efficient accelerated coordinate descent methods and faster algorithms for solving linear systems",
+      "author" : [ "Yin Tat Lee", "Aaron Sidford" ],
+      "venue" : "In Foundations of Computer Science (FOCS),",
+      "citeRegEx" : "51",
+      "shortCiteRegEx" : "51",
+      "year" : 2013
+    }, {
+      "title" : "Large-scale logistic regression and linear support vector machines using spark",
+      "author" : [ "Chieh-Yen Lin", "Cheng-Hao Tsai", "Ching-Pei Lee", "Chih-Jen Lin" ],
+      "venue" : "In Big Data (Big Data),",
+      "citeRegEx" : "52",
+      "shortCiteRegEx" : "52",
+      "year" : 2014
+    }, {
+      "title" : "A universal catalyst for first-order optimization",
+      "author" : [ "Hongzhou Lin", "Julien Mairal", "Zaid Harchaoui" ],
+      "venue" : "In Advances in Neural Information Processing Systems,",
+      "citeRegEx" : "53",
+      "shortCiteRegEx" : "53",
+      "year" : 2015
+    }, {
+      "title" : "On the limited memory BFGS method for large scale optimization",
+      "author" : [ "Dong C Liu", "Jorge Nocedal" ],
+      "venue" : "Mathematical programming,",
+      "citeRegEx" : "54",
+      "shortCiteRegEx" : "54",
+      "year" : 1989
+    }, {
+      "title" : "Asynchronous stochastic coordinate descent: Parallelism and convergence properties",
+      "author" : [ "Ji Liu", "Stephen J Wright" ],
+      "venue" : "SIAM Journal on Optimization,",
+      "citeRegEx" : "55",
+      "shortCiteRegEx" : "55",
+      "year" : 2015
+    }, {
+      "title" : "An asynchronous parallel stochastic coordinate descent algorithm",
+      "author" : [ "Ji Liu", "Stephen J Wright", "Christopher Ré", "Victor Bittorf", "Srikrishna Sridhar" ],
+      "venue" : "Journal of Machine Learning Research,",
+      "citeRegEx" : "56",
+      "shortCiteRegEx" : "56",
+      "year" : 2015
+    }, {
+      "title" : "Distributed optimization with arbitrary local solvers",
+      "author" : [ "Chenxin Ma", "Jakub Konečný", "Martin Jaggi", "Virginia Smith", "Michael I Jordan", "Peter Richtárik", "Martin Takáč" ],
+      "venue" : null,
+      "citeRegEx" : "57",
+      "shortCiteRegEx" : "57",
+      "year" : 2015
+    }, {
+      "title" : "Adding vs. averaging in distributed primal-dual optimization",
+      "author" : [ "Chenxin Ma", "Virginia Smith", "Martin Jaggi", "Michael Jordan", "Peter Richtárik", "Martin Takáč" ],
+      "venue" : "In Proceedings of The 32nd International Conference on Machine Learning,",
+      "citeRegEx" : "58",
+      "shortCiteRegEx" : "58",
+      "year" : 2015
+    }, {
+      "title" : "An efficient distributed learning algorithm based on effective local functional approximations",
+      "author" : [ "Dhruv Mahajan", "Nikunj Agrawal", "S Sathiya Keerthi", "S Sundararajan", "Leon Bottou" ],
+      "venue" : "arXiv preprint arXiv:1310.8418,",
+      "citeRegEx" : "59",
+      "shortCiteRegEx" : "59",
+      "year" : 2013
+    }, {
+      "title" : "Perturbed iterate analysis for asynchronous stochastic optimization",
+      "author" : [ "Horia Mania", "Xinghao Pan", "Dimitris Papailiopoulos", "Benjamin Recht", "Kannan Ramchandran", "Michael I Jordan" ],
+      "venue" : null,
+      "citeRegEx" : "60",
+      "shortCiteRegEx" : "60",
+      "year" : 2015
+    }, {
+      "title" : "Distributed block coordinate descent for minimizing partially separable functions",
+      "author" : [ "Jakub Mareček", "Peter Richtárik", "Martin Takáč" ],
+      "venue" : "In Numerical Analysis and Optimization,",
+      "citeRegEx" : "61",
+      "shortCiteRegEx" : "61",
+      "year" : 2015
+    }, {
+      "title" : "Federated learning of deep networks using model averaging",
+      "author" : [ "Brendan H McMahan", "Eider Moore", "Daniel Ramage", "Blaise Aguera y Arcas" ],
+      "venue" : null,
+      "citeRegEx" : "62",
+      "shortCiteRegEx" : "62",
+      "year" : 2016
+    }, {
+      "title" : "A linearly-convergent stochastic l-bfgs algorithm",
+      "author" : [ "Philipp Moritz", "Robert Nishihara", "Michael Jordan" ],
+      "venue" : "In Proceedings of the 19th International Conference on Artificial Intelligence and Statistics,",
+      "citeRegEx" : "63",
+      "shortCiteRegEx" : "63",
+      "year" : 2016
+    }, {
+      "title" : "Non-asymptotic analysis of stochastic approximation algorithms for machine learning",
+      "author" : [ "Eric Moulines", "Francis R Bach" ],
+      "venue" : "In Advances in Neural Information Processing Systems,",
+      "citeRegEx" : "64",
+      "shortCiteRegEx" : "64",
+      "year" : 2011
+    }, {
+      "title" : "Stochastic gradient descent, weighted sampling, and the randomized kaczmarz algorithm",
+      "author" : [ "Deanna Needell", "Rachel Ward", "Nati Srebro" ],
+      "venue" : "In Advances in Neural Information Processing Systems,",
+      "citeRegEx" : "65",
+      "shortCiteRegEx" : "65",
+      "year" : 2014
+    }, {
+      "title" : "Robust stochastic approximation approach to stochastic programming",
+      "author" : [ "Arkadi Nemirovski", "Anatoli Juditsky", "Guanghui Lan", "Alexander Shapiro" ],
+      "venue" : "SIAM Journal on Optimization,",
+      "citeRegEx" : "66",
+      "shortCiteRegEx" : "66",
+      "year" : 2009
+    }, {
+      "title" : "Efficiency of coordinate descent methods on huge-scale optimization problems",
+      "author" : [ "Yu Nesterov" ],
+      "venue" : "SIAM Journal on Optimization,",
+      "citeRegEx" : "67",
+      "shortCiteRegEx" : "67",
+      "year" : 2012
+    }, {
+      "title" : "A method of solving a convex programming problem with convergence rate o(1/k)",
+      "author" : [ "Yurii Nesterov" ],
+      "venue" : "Soviet Mathematics Doklady,",
+      "citeRegEx" : "68",
+      "shortCiteRegEx" : "68",
+      "year" : 1983
+    }, {
+      "title" : "Introductory Lectures on Convex Optimization",
+      "author" : [ "Yurii Nesterov" ],
+      "venue" : "A Basic Course. Kluwer,",
+      "citeRegEx" : "69",
+      "shortCiteRegEx" : "69",
+      "year" : 2004
+    }, {
+      "title" : "On optimization methods for deep learning",
+      "author" : [ "Jiquan Ngiam", "Adam Coates", "Ahbik Lahiri", "Bobby Prochnow", "Quoc V Le", "Andrew Y Ng" ],
+      "venue" : "In Proceedings of the 28th International Conference on Machine Learning,",
+      "citeRegEx" : "70",
+      "shortCiteRegEx" : "70",
+      "year" : 2011
+    }, {
+      "title" : "Hogwild: A lock-free approach to parallelizing stochastic gradient descent",
+      "author" : [ "Feng Niu", "Benjamin Recht", "Christopher Re", "Stephen Wright" ],
+      "venue" : "In Advances in Neural Information Processing Systems,",
+      "citeRegEx" : "71",
+      "shortCiteRegEx" : "71",
+      "year" : 2011
+    }, {
+      "title" : "Arock: an algorithmic framework for asynchronous parallel coordinate updates",
+      "author" : [ "Zhimin Peng", "Yangyang Xu", "Ming Yan", "Wotao Yin" ],
+      "venue" : null,
+      "citeRegEx" : "72",
+      "shortCiteRegEx" : "72",
+      "year" : 2015
+    }, {
+      "title" : "Some methods of speeding up the convergence of iteration methods",
+      "author" : [ "B.T. Polyak" ],
+      "venue" : "USSR Computational Mathematics and Mathematical Physics,",
+      "citeRegEx" : "73",
+      "shortCiteRegEx" : "73",
+      "year" : 1964
+    }, {
+      "title" : "SDNA: Stochastic dual newton ascent for empirical risk minimization",
+      "author" : [ "Zheng Qu", "Peter Richtárik", "Martin Takáč", "Olivier Fercoq" ],
+      "venue" : "In Proceedings of The 33rd International Conference on Machine Learning,",
+      "citeRegEx" : "74",
+      "shortCiteRegEx" : "74",
+      "year" : 2016
+    }, {
+      "title" : "Quartz: Randomized dual coordinate ascent with arbitrary sampling",
+      "author" : [ "Zheng Qu", "Peter Richtárik", "Tong Zhang" ],
+      "venue" : "In Advances in Neural Information Processing Systems,",
+      "citeRegEx" : "75",
+      "shortCiteRegEx" : "75",
+      "year" : 2015
+    }, {
+      "title" : "On variance reduction in stochastic gradient descent and its asynchronous variants",
+      "author" : [ "Sashank J Reddi", "Ahmed Hefny", "Suvrit Sra", "Barnabás Póczós", "Alex Smola" ],
+      "venue" : "In Advances in Neural Information Processing Systems,",
+      "citeRegEx" : "76",
+      "shortCiteRegEx" : "76",
+      "year" : 2015
+    }, {
+      "title" : "Stochastic variance reduction for nonconvex optimization",
+      "author" : [ "Sashank J Reddi", "Ahmed Hefny", "Suvrit Sra", "Barnabás Póczós", "Alex Smola" ],
+      "venue" : null,
+      "citeRegEx" : "77",
+      "shortCiteRegEx" : "77",
+      "year" : 2016
+    }, {
+      "title" : "AIDE: Fast and communication efficient distributed optimization",
+      "author" : [ "Sashank J Reddi", "Jakub Konečný", "Peter Richtárik", "Barnabás Póczós", "Alex Smola" ],
+      "venue" : null,
+      "citeRegEx" : "78",
+      "shortCiteRegEx" : "78",
+      "year" : 2016
+    }, {
+      "title" : "Iteration complexity of randomized block-coordinate descent methods for minimizing a composite function",
+      "author" : [ "Peter Richtárik", "Martin Takáč" ],
+      "venue" : "Mathematical Programming,",
+      "citeRegEx" : "79",
+      "shortCiteRegEx" : "79",
+      "year" : 2014
+    }, {
+      "title" : "Parallel coordinate descent methods for big data optimization",
+      "author" : [ "Peter Richtárik", "Martin Takáč" ],
+      "venue" : "Mathematical Programming,",
+      "citeRegEx" : "80",
+      "shortCiteRegEx" : "80",
+      "year" : 2016
+    }, {
+      "title" : "Distributed coordinate descent method for learning with big data",
+      "author" : [ "Peter Richtárik", "Martin Takáč" ],
+      "venue" : "Journal of Machine Learning Research,",
+      "citeRegEx" : "81",
+      "shortCiteRegEx" : "81",
+      "year" : 2016
+    }, {
+      "title" : "A stochastic approximation method",
+      "author" : [ "Herbert Robbins", "Sutton Monro" ],
+      "venue" : "The Annals of Mathematical Statistics,",
+      "citeRegEx" : "82",
+      "shortCiteRegEx" : "82",
+      "year" : 1951
+    }, {
+      "title" : "A stochastic gradient method with an exponential convergence rate for finite training sets",
+      "author" : [ "Nicolas Le Roux", "Mark Schmidt", "Francis Bach" ],
+      "venue" : "In Advances in Neural Information Processing Systems,",
+      "citeRegEx" : "83",
+      "shortCiteRegEx" : "83",
+      "year" : 2012
+    }, {
+      "title" : "Nonuniform stochastic average gradient method for training conditional random fields",
+      "author" : [ "Mark Schmidt", "Reza Babanezhad", "Mohamed Ahmed", "Aaron Defazio", "Ann Clifton", "Anoop Sarkar" ],
+      "venue" : "In Proceedings of the Eighteenth International Conference on Artificial Intelligence and Statistics,",
+      "citeRegEx" : "84",
+      "shortCiteRegEx" : "84",
+      "year" : 2015
+    }, {
+      "title" : "Minimizing finite sums with the stochastic average gradient",
+      "author" : [ "Mark Schmidt", "Nicolas Le Roux", "Francis Bach" ],
+      "venue" : null,
+      "citeRegEx" : "85",
+      "shortCiteRegEx" : "85",
+      "year" : 2013
+    }, {
+      "title" : "SDCA without duality, regularization, and individual convexity",
+      "author" : [ "Shai Shalev-Shwartz" ],
+      "venue" : null,
+      "citeRegEx" : "86",
+      "shortCiteRegEx" : "86",
+      "year" : 2016
+    }, {
+      "title" : "Pegasos: Primal estimated subgradient solver for svm",
+      "author" : [ "Shai Shalev-Shwartz", "Yoram Singer", "Nathan Srebro", "Andrew Cotter" ],
+      "venue" : "Mathematical programming,",
+      "citeRegEx" : "87",
+      "shortCiteRegEx" : "87",
+      "year" : 2011
+    }, {
+      "title" : "Stochastic dual coordinate ascent methods for regularized loss",
+      "author" : [ "Shai Shalev-Shwartz", "Tong Zhang" ],
+      "venue" : "The Journal of Machine Learning Research,",
+      "citeRegEx" : "88",
+      "shortCiteRegEx" : "88",
+      "year" : 2013
+    }, {
+      "title" : "Exascale computing technology challenges",
+      "author" : [ "John Shalf", "Sudip Dosanjh", "John Morrison" ],
+      "venue" : "In High Performance Computing for Computational Science–VECPAR",
+      "citeRegEx" : "89",
+      "shortCiteRegEx" : "89",
+      "year" : 2010
+    }, {
+      "title" : "Distributed stochastic optimization and learning",
+      "author" : [ "Ohad Shamir", "Nathan Srebro" ],
+      "venue" : "In Communication, Control and Computing (Allerton),",
+      "citeRegEx" : "90",
+      "shortCiteRegEx" : "90",
+      "year" : 2014
+    }, {
+      "title" : "Communication-efficient distributed optimization using an approximate newton-type method",
+      "author" : [ "Ohad Shamir", "Nati Srebro", "Tong Zhang" ],
+      "venue" : "In Proceedings of the 31st International Conference on Machine Learning,",
+      "citeRegEx" : "91",
+      "shortCiteRegEx" : "91",
+      "year" : 2014
+    }, {
+      "title" : "L1-regularized distributed optimization: A communication-efficient primal-dual framework",
+      "author" : [ "Virginia Smith", "Simone Forte", "Michael I Jordan", "Martin Jaggi" ],
+      "venue" : null,
+      "citeRegEx" : "92",
+      "shortCiteRegEx" : "92",
+      "year" : 2015
+    }, {
+      "title" : "Mini-batch primal and dual methods for SVMs",
+      "author" : [ "Martin Takáč", "Avleen Bijral", "Peter Richtárik", "Nathan Srebro" ],
+      "venue" : "In Proceedings of the 30th International Conference on Machine Learning,",
+      "citeRegEx" : "93",
+      "shortCiteRegEx" : "93",
+      "year" : 2013
+    }, {
+      "title" : "Distributed mini-batch SDCA",
+      "author" : [ "Martin Takáč", "Peter Richtárik", "Nathan Srebro" ],
+      "venue" : null,
+      "citeRegEx" : "94",
+      "shortCiteRegEx" : "94",
+      "year" : 2015
+    }, {
+      "title" : "Problems in decentralized decision making and computation",
+      "author" : [ "John Nikolas Tsitsiklis" ],
+      "venue" : "Technical report, DTIC Document,",
+      "citeRegEx" : "95",
+      "shortCiteRegEx" : "95",
+      "year" : 1984
+    }, {
+      "title" : "An overview of statistical learning theory",
+      "author" : [ "Vladimir N Vapnik" ],
+      "venue" : "Neural Networks, IEEE Transactions on,",
+      "citeRegEx" : "96",
+      "shortCiteRegEx" : "96",
+      "year" : 1999
+    }, {
+      "title" : "Randomized block coordinate descent for online and stochastic optimization",
+      "author" : [ "Huahua Wang", "Arindam Banerjee" ],
+      "venue" : null,
+      "citeRegEx" : "97",
+      "shortCiteRegEx" : "97",
+      "year" : 2014
+    }, {
+      "title" : "Consumer data privacy in a networked world: A framework for protecting privacy and promoting innovation in the global digital economy",
+      "author" : [ "White House Report" ],
+      "venue" : "Journal of Privacy and Confidentiality,",
+      "citeRegEx" : "98",
+      "shortCiteRegEx" : "98",
+      "year" : 2013
+    }, {
+      "title" : "Tight complexity bounds for optimizing composite objectives",
+      "author" : [ "Blake Woodworth", "Nathan Srebro" ],
+      "venue" : null,
+      "citeRegEx" : "99",
+      "shortCiteRegEx" : "99",
+      "year" : 2016
+    }, {
+      "title" : "A proximal stochastic gradient method with progressive variance reduction",
+      "author" : [ "Lin Xiao", "Tong Zhang" ],
+      "venue" : "SIAM Journal on Optimization,",
+      "citeRegEx" : "100",
+      "shortCiteRegEx" : "100",
+      "year" : 2014
+    }, {
+      "title" : "Trading computation for communication: Distributed stochastic dual coordinate ascent",
+      "author" : [ "Tianbao Yang" ],
+      "venue" : "In Advances in Neural Information Processing Systems,",
+      "citeRegEx" : "101",
+      "shortCiteRegEx" : "101",
+      "year" : 2013
+    }, {
+      "title" : "Spark: cluster computing with working sets",
+      "author" : [ "Matei Zaharia", "Mosharaf Chowdhury", "Michael J Franklin", "Scott Shenker", "Ion Stoica" ],
+      "venue" : "In Proceedings of the 2nd USENIX conference on Hot topics in cloud computing,",
+      "citeRegEx" : "102",
+      "shortCiteRegEx" : "102",
+      "year" : 2010
+    }, {
+      "title" : "Information-theoretic lower bounds for distributed statistical estimation with communication constraints",
+      "author" : [ "Yuchen Zhang", "John Duchi", "Michael I Jordan", "Martin J Wainwright" ],
+      "venue" : "In Advances in Neural Information Processing Systems,",
+      "citeRegEx" : "103",
+      "shortCiteRegEx" : "103",
+      "year" : 2013
+    }, {
+      "title" : "Communication-efficient algorithms for statistical optimization",
+      "author" : [ "Yuchen Zhang", "John C Duchi", "Martin J Wainwright" ],
+      "venue" : "Journal of Machine Learning Research,",
+      "citeRegEx" : "104",
+      "shortCiteRegEx" : "104",
+      "year" : 2013
+    }, {
+      "title" : "DiSCO: Distributed optimization for self-concordant empirical loss",
+      "author" : [ "Yuchen Zhang", "Xiao Lin" ],
+      "venue" : "In Proceedings of The 32th International Conference on Machine Learning,",
+      "citeRegEx" : "105",
+      "shortCiteRegEx" : "105",
+      "year" : 2015
+    }, {
+      "title" : "Distributed newton methods for regularized logistic regression",
+      "author" : [ "Yong Zhuang", "Wei-Sheng Chin", "Yu-Chin Juan", "Chih-Jen Lin" ],
+      "venue" : "In Advances in Knowledge Discovery and Data Mining,",
+      "citeRegEx" : "106",
+      "shortCiteRegEx" : "106",
+      "year" : 2015
+    } ],
+    "referenceMentions" : [ {
+      "referenceID" : 94,
+      "context" : "This is a direct application of the principle of focused collection or data minimization proposed by the 2012 White House report on the privacy of consumer data [98].",
+      "startOffset" : 161,
+      "endOffset" : 165
+    }, {
+      "referenceID" : 16,
+      "context" : "The centralized algorithm could be modified to produce a differentially private model [17, 33, 1], which allows the model to be released while protecting the privacy of the individuals contributing updates to the training process.",
+      "startOffset" : 86,
+      "endOffset" : 97
+    }, {
+      "referenceID" : 31,
+      "context" : "The centralized algorithm could be modified to produce a differentially private model [17, 33, 1], which allows the model to be released while protecting the privacy of the individuals contributing updates to the training process.",
+      "startOffset" : 86,
+      "endOffset" : 97
+    }, {
+      "referenceID" : 0,
+      "context" : "The centralized algorithm could be modified to produce a differentially private model [17, 33, 1], which allows the model to be released while protecting the privacy of the individuals contributing updates to the training process.",
+      "startOffset" : 86,
+      "endOffset" : 97
+    }, {
+      "referenceID" : 30,
+      "context" : "If protection from even a malicious (or compromised) coordinating server is needed, techniques from local differential privacy can be applied to privatize the individual updates [32].",
+      "startOffset" : 178,
+      "endOffset" : 182
+    }, {
+      "referenceID" : 58,
+      "context" : "A more complete discussion of applications of federated learning as well as privacy ramifications can be found in [62].",
+      "startOffset" : 114,
+      "endOffset" : 118
+    }, {
+      "referenceID" : 85,
+      "context" : "The practical issue is that the time it takes to communicate between a processor and memory on the same node is normally many orders of magnitude smaller than the time needed for two nodes to communicate; similar conclusions hold for the energy required [89].",
+      "startOffset" : 254,
+      "endOffset" : 258
+    }, {
+      "referenceID" : 53,
+      "context" : "This setting, in which a single vector δ ∈ Rd is communicated in each round, covers most existing first-order methods, including dual methods such as CoCoA+ [57].",
+      "startOffset" : 157,
+      "endOffset" : 161
+    }, {
+      "referenceID" : 65,
+      "context" : "A trivial benchmark for solving problems of structure (1) is Gradient Descent (GD) in the case when functions fi are smooth (or Subgradient Descent for non-smooth functions) [69].",
+      "startOffset" : 174,
+      "endOffset" : 178
+    }, {
+      "referenceID" : 69,
+      "context" : "Acceleration ideas for gradient methods in convex optimization can be traced back to the work of Polyak [73] and Nesterov [68, 69].",
+      "startOffset" : 104,
+      "endOffset" : 108
+    }, {
+      "referenceID" : 64,
+      "context" : "Acceleration ideas for gradient methods in convex optimization can be traced back to the work of Polyak [73] and Nesterov [68, 69].",
+      "startOffset" : 122,
+      "endOffset" : 130
+    }, {
+      "referenceID" : 65,
+      "context" : "Acceleration ideas for gradient methods in convex optimization can be traced back to the work of Polyak [73] and Nesterov [68, 69].",
+      "startOffset" : 122,
+      "endOffset" : 130
+    }, {
+      "referenceID" : 78,
+      "context" : "At present a basic, albeit in practice extremely popular, alternative to GD is Stochastic Gradient Descent (SGD), dating back to the seminal work of Robbins and Monro [82].",
+      "startOffset" : 167,
+      "endOffset" : 171
+    }, {
+      "referenceID" : 62,
+      "context" : "For a theoretical analysis for convex functions we refer the reader to [66, 64, 65] and [87, 93] for SVM problems.",
+      "startOffset" : 71,
+      "endOffset" : 83
+    }, {
+      "referenceID" : 60,
+      "context" : "For a theoretical analysis for convex functions we refer the reader to [66, 64, 65] and [87, 93] for SVM problems.",
+      "startOffset" : 71,
+      "endOffset" : 83
+    }, {
+      "referenceID" : 61,
+      "context" : "For a theoretical analysis for convex functions we refer the reader to [66, 64, 65] and [87, 93] for SVM problems.",
+      "startOffset" : 71,
+      "endOffset" : 83
+    }, {
+      "referenceID" : 83,
+      "context" : "For a theoretical analysis for convex functions we refer the reader to [66, 64, 65] and [87, 93] for SVM problems.",
+      "startOffset" : 88,
+      "endOffset" : 96
+    }, {
+      "referenceID" : 89,
+      "context" : "For a theoretical analysis for convex functions we refer the reader to [66, 64, 65] and [87, 93] for SVM problems.",
+      "startOffset" : 88,
+      "endOffset" : 96
+    }, {
+      "referenceID" : 11,
+      "context" : "In a recent review [12], the authors outline further research directions.",
+      "startOffset" : 19,
+      "endOffset" : 23
+    }, {
+      "referenceID" : 10,
+      "context" : "For a more practically-focused discussion, see [11].",
+      "startOffset" : 47,
+      "endOffset" : 51
+    }, {
+      "referenceID" : 45,
+      "context" : "In the context of neural networks, computation of stochastic gradients is referred to as backpropagation [49].",
+      "startOffset" : 105,
+      "endOffset" : 109
+    }, {
+      "referenceID" : 66,
+      "context" : "Performance of several competitive algorithms for training deep neural networks has been compared in [70].",
+      "startOffset" : 101,
+      "endOffset" : 105
+    }, {
+      "referenceID" : 9,
+      "context" : "This ordering is replaced by another random order after each such cycle [10].",
+      "startOffset" : 72,
+      "endOffset" : 76
+    }, {
+      "referenceID" : 37,
+      "context" : "Theoretical understanding of this phenomenon had been a long standing open problem, understood recently in [40].",
+      "startOffset" : 107,
+      "endOffset" : 111
+    }, {
+      "referenceID" : 63,
+      "context" : "Although the idea of coordinate descent has been around for several decades in various contexts (and for quadratic functions dates back even much further, to works on the Gauss-Seidel methods), it came to prominence in machine learning and optimization with the work of Nesterov [67] which equipped the method with a randomization strategy.",
+      "startOffset" : 279,
+      "endOffset" : 283
+    }, {
+      "referenceID" : 75,
+      "context" : "Numerous follow-up works extended the concept to proximal setting [79], single processor parallelism [15, 80] and develop efficiently implementable acceleration [51].",
+      "startOffset" : 66,
+      "endOffset" : 70
+    }, {
+      "referenceID" : 14,
+      "context" : "Numerous follow-up works extended the concept to proximal setting [79], single processor parallelism [15, 80] and develop efficiently implementable acceleration [51].",
+      "startOffset" : 101,
+      "endOffset" : 109
+    }, {
+      "referenceID" : 76,
+      "context" : "Numerous follow-up works extended the concept to proximal setting [79], single processor parallelism [15, 80] and develop efficiently implementable acceleration [51].",
+      "startOffset" : 101,
+      "endOffset" : 109
+    }, {
+      "referenceID" : 47,
+      "context" : "Numerous follow-up works extended the concept to proximal setting [79], single processor parallelism [15, 80] and develop efficiently implementable acceleration [51].",
+      "startOffset" : 161,
+      "endOffset" : 165
+    }, {
+      "referenceID" : 33,
+      "context" : "All of these three properties were connected in a single algorithm in [35], to which we refer the reader for a review of the early developments in the area of RCD, particularly to overview in Table 1 therein.",
+      "startOffset" : 70,
+      "endOffset" : 74
+    }, {
+      "referenceID" : 84,
+      "context" : "Applying RCD leads to an algorithm for solving (1) known under the name Stochastic Dual Coordinate Ascent [88].",
+      "startOffset" : 106,
+      "endOffset" : 110
+    }, {
+      "referenceID" : 84,
+      "context" : "The work [88] was first to show that by",
+      "startOffset" : 9,
+      "endOffset" : 13
+    }, {
+      "referenceID" : 75,
+      "context" : "applying RCD [79] to the dual problem, one also solves the primal problem (1).",
+      "startOffset" : 13,
+      "endOffset" : 17
+    }, {
+      "referenceID" : 19,
+      "context" : "For a theoretical and computational comparison of applying RCD to the primal versus the dual problems, see [21].",
+      "startOffset" : 107,
+      "endOffset" : 111
+    }, {
+      "referenceID" : 71,
+      "context" : "A directly primal-dual randomized coordinate descent method called Quartz, was developed in [75].",
+      "startOffset" : 92,
+      "endOffset" : 96
+    }, {
+      "referenceID" : 70,
+      "context" : "It has been recently shown in SDNA [74] that incorporating curvature information contained in random low dimensional subspaces spanned by a few coordinates can sometimes lead to dramatic speedups.",
+      "startOffset" : 35,
+      "endOffset" : 39
+    }, {
+      "referenceID" : 82,
+      "context" : "Recent works [86, 20] interpret the SDCA method in primal-only setting, shedding light onto why this method works as a SGD method with a version of variance reduction property.",
+      "startOffset" : 13,
+      "endOffset" : 21
+    }, {
+      "referenceID" : 18,
+      "context" : "Recent works [86, 20] interpret the SDCA method in primal-only setting, shedding light onto why this method works as a SGD method with a version of variance reduction property.",
+      "startOffset" : 13,
+      "endOffset" : 21
+    }, {
+      "referenceID" : 79,
+      "context" : "The first notable algorithm from this class is the Stochastic Average Gradient (SAG) [83, 85].",
+      "startOffset" : 85,
+      "endOffset" : 93
+    }, {
+      "referenceID" : 81,
+      "context" : "The first notable algorithm from this class is the Stochastic Average Gradient (SAG) [83, 85].",
+      "startOffset" : 85,
+      "endOffset" : 93
+    }, {
+      "referenceID" : 80,
+      "context" : "This methods has been recently extended for use in Conditional Random Fields [84].",
+      "startOffset" : 77,
+      "endOffset" : 81
+    }, {
+      "referenceID" : 24,
+      "context" : "A followup algorithm SAGA [26] and its simplification [25], modifies the SAG algorithm to achieve unbiased estimate of the gradients.",
+      "startOffset" : 26,
+      "endOffset" : 30
+    }, {
+      "referenceID" : 23,
+      "context" : "A followup algorithm SAGA [26] and its simplification [25], modifies the SAG algorithm to achieve unbiased estimate of the gradients.",
+      "startOffset" : 54,
+      "endOffset" : 58
+    }, {
+      "referenceID" : 40,
+      "context" : "Another algorithm from the SGD class of methods is Stochastic Variance Reduced Gradient1 (SVRG) [43] and [47, 100, 44].",
+      "startOffset" : 96,
+      "endOffset" : 100
+    }, {
+      "referenceID" : 43,
+      "context" : "Another algorithm from the SGD class of methods is Stochastic Variance Reduced Gradient1 (SVRG) [43] and [47, 100, 44].",
+      "startOffset" : 105,
+      "endOffset" : 118
+    }, {
+      "referenceID" : 96,
+      "context" : "Another algorithm from the SGD class of methods is Stochastic Variance Reduced Gradient1 (SVRG) [43] and [47, 100, 44].",
+      "startOffset" : 105,
+      "endOffset" : 118
+    }, {
+      "referenceID" : 41,
+      "context" : "Another algorithm from the SGD class of methods is Stochastic Variance Reduced Gradient1 (SVRG) [43] and [47, 100, 44].",
+      "startOffset" : 105,
+      "endOffset" : 118
+    }, {
+      "referenceID" : 38,
+      "context" : "This and several other practical issues have been recently addressed in [41], making the algorithm competitive with SGD early on, and superior in later iterations.",
+      "startOffset" : 72,
+      "endOffset" : 76
+    }, {
+      "referenceID" : 43,
+      "context" : "The same algorithm was simultaneously introduced as Semi-Stochastic Gradient Descent (S2GD) [47].",
+      "startOffset" : 92,
+      "endOffset" : 96
+    }, {
+      "referenceID" : 40,
+      "context" : "Vanilla experiments in [43, 77] suggest that SVRG matches basic SGD, and even outperforms in the sense that variance of the iterates seems to be significantly smaller for SVRG.",
+      "startOffset" : 23,
+      "endOffset" : 31
+    }, {
+      "referenceID" : 73,
+      "context" : "Vanilla experiments in [43, 77] suggest that SVRG matches basic SGD, and even outperforms in the sense that variance of the iterates seems to be significantly smaller for SVRG.",
+      "startOffset" : 23,
+      "endOffset" : 31
+    }, {
+      "referenceID" : 93,
+      "context" : "There already exist attempts at combining SVRG type algorithms with randomized coordinate descent [46, 97].",
+      "startOffset" : 98,
+      "endOffset" : 106
+    }, {
+      "referenceID" : 24,
+      "context" : "The first attempt to unify algorithms such as SVRG and SAG/SAGA already appeared in the SAGA paper [26], where the authors interpret SAGA as a midpoint between SAG and SVRG.",
+      "startOffset" : 99,
+      "endOffset" : 103
+    }, {
+      "referenceID" : 72,
+      "context" : "Recent work [76] presents a general algorithm, which recovers SVRG, SAGA, SAG and GD as special cases, and obtains an asynchronous variant of these algorithms as a byproduct of the formulation.",
+      "startOffset" : 12,
+      "endOffset" : 16
+    }, {
+      "referenceID" : 2,
+      "context" : "SVRG can be equipped with momentum (and negative momentum), leading to a new accelerated SVRG method known as Katyusha [3].",
+      "startOffset" : 119,
+      "endOffset" : 122
+    }, {
+      "referenceID" : 3,
+      "context" : "SVRG can be further accelerated via a raw clustering mechanism [4].",
+      "startOffset" : 63,
+      "endOffset" : 66
+    }, {
+      "referenceID" : 15,
+      "context" : "A third class of new algorithms are the Stochastic quasiNewton methods [16, 9].",
+      "startOffset" : 71,
+      "endOffset" : 78
+    }, {
+      "referenceID" : 8,
+      "context" : "A third class of new algorithms are the Stochastic quasiNewton methods [16, 9].",
+      "startOffset" : 71,
+      "endOffset" : 78
+    }, {
+      "referenceID" : 50,
+      "context" : "These algorithms in general try to mimic the limited memory BFGS method (L-BFGS) [54], but model the local curvature information using inexact gradients — coming from the SGD procedure.",
+      "startOffset" : 81,
+      "endOffset" : 85
+    }, {
+      "referenceID" : 59,
+      "context" : "A recent attempt at combining these methods with SVRG can be found in [63].",
+      "startOffset" : 70,
+      "endOffset" : 74
+    }, {
+      "referenceID" : 35,
+      "context" : "In [38], the authors utilize recent progress in the area of stochastic matrix inversion [39] revealing new connections with quasi-Newton methods, and devise a new stochastic limited memory BFGS method working in tandem with SVRG.",
+      "startOffset" : 3,
+      "endOffset" : 7
+    }, {
+      "referenceID" : 36,
+      "context" : "In [38], the authors utilize recent progress in the area of stochastic matrix inversion [39] revealing new connections with quasi-Newton methods, and devise a new stochastic limited memory BFGS method working in tandem with SVRG.",
+      "startOffset" : 88,
+      "endOffset" : 92
+    }, {
+      "referenceID" : 92,
+      "context" : "When one can find exact minimum of the empirical risk, everything reduces to balancing approximation– estimation tradeoff that is the object of abundant literature — see for instance [96].",
+      "startOffset" : 183,
+      "endOffset" : 187
+    }, {
+      "referenceID" : 12,
+      "context" : "An assessment of asymptotic performance of some optimization algorithms as learning algorithms in large-scale learning problems2 has been introduced in [13].",
+      "startOffset" : 152,
+      "endOffset" : 156
+    }, {
+      "referenceID" : 38,
+      "context" : "Recent extension in [41] has shown that the variance reduced algorithms (SAG, SVRG, .",
+      "startOffset" : 20,
+      "endOffset" : 24
+    }, {
+      "referenceID" : 49,
+      "context" : "A general method, referred to as Universal Catalyst [53, 37], effectively enables conversion of a number of the algorithms mentioned in the previous sections to their ‘accelerated’ variants.",
+      "startOffset" : 52,
+      "endOffset" : 60
+    }, {
+      "referenceID" : 34,
+      "context" : "A general method, referred to as Universal Catalyst [53, 37], effectively enables conversion of a number of the algorithms mentioned in the previous sections to their ‘accelerated’ variants.",
+      "startOffset" : 52,
+      "endOffset" : 60
+    }, {
+      "referenceID" : 95,
+      "context" : "Recently, lower and upper bounds for complexity of stochastic methods on problems of the form (1) were recently obtained in [99].",
+      "startOffset" : 124,
+      "endOffset" : 128
+    }, {
+      "referenceID" : 5,
+      "context" : "Compared with local computation on any single node, the cost of communication between nodes is much higher both in terms of speed and energy consumption [6, 89], introducing new computational challenges, not only for optimization procedures.",
+      "startOffset" : 153,
+      "endOffset" : 160
+    }, {
+      "referenceID" : 85,
+      "context" : "Compared with local computation on any single node, the cost of communication between nodes is much higher both in terms of speed and energy consumption [6, 89], introducing new computational challenges, not only for optimization procedures.",
+      "startOffset" : 153,
+      "endOffset" : 160
+    }, {
+      "referenceID" : 53,
+      "context" : "The question is: “How do we decide which algorithm is the best for our purpose?” Initial version of this reasoning already appeared in [57], and applies also to [78].",
+      "startOffset" : 135,
+      "endOffset" : 139
+    }, {
+      "referenceID" : 74,
+      "context" : "The question is: “How do we decide which algorithm is the best for our purpose?” Initial version of this reasoning already appeared in [57], and applies also to [78].",
+      "startOffset" : 161,
+      "endOffset" : 165
+    }, {
+      "referenceID" : 53,
+      "context" : "This issue was first time explicitly addressed in CoCoA [57], which is rather framework than a algorithm, which works as follows (more detailed description follows in Section 2.",
+      "startOffset" : 56,
+      "endOffset" : 60
+    }, {
+      "referenceID" : 39,
+      "context" : "The general upper bound on number of iterations of the CoCoA framework is I( ,Θ) = O(log(1/ )) 1−Θ [42, 58, 57] for strongly convex objectives.",
+      "startOffset" : 99,
+      "endOffset" : 111
+    }, {
+      "referenceID" : 54,
+      "context" : "The general upper bound on number of iterations of the CoCoA framework is I( ,Θ) = O(log(1/ )) 1−Θ [42, 58, 57] for strongly convex objectives.",
+      "startOffset" : 99,
+      "endOffset" : 111
+    }, {
+      "referenceID" : 53,
+      "context" : "The general upper bound on number of iterations of the CoCoA framework is I( ,Θ) = O(log(1/ )) 1−Θ [42, 58, 57] for strongly convex objectives.",
+      "startOffset" : 99,
+      "endOffset" : 111
+    }, {
+      "referenceID" : 22,
+      "context" : "By communication round we typically understand a single MapReduce operation [24], implemented efficiently for iterative procedures [36], such as optimization algorithms.",
+      "startOffset" : 76,
+      "endOffset" : 80
+    }, {
+      "referenceID" : 98,
+      "context" : "Spark [102] has been established as a popular open source framework for implementing distributed iterative algorithms, and includes several of the algorithms mentioned in this section.",
+      "startOffset" : 6,
+      "endOffset" : 11
+    }, {
+      "referenceID" : 7,
+      "context" : "Optimization in distributed setting has been studied for decades, tracing back to at least works of Bertsekas and Tsitsiklis [8, 7, 95].",
+      "startOffset" : 125,
+      "endOffset" : 135
+    }, {
+      "referenceID" : 6,
+      "context" : "Optimization in distributed setting has been studied for decades, tracing back to at least works of Bertsekas and Tsitsiklis [8, 7, 95].",
+      "startOffset" : 125,
+      "endOffset" : 135
+    }, {
+      "referenceID" : 91,
+      "context" : "Optimization in distributed setting has been studied for decades, tracing back to at least works of Bertsekas and Tsitsiklis [8, 7, 95].",
+      "startOffset" : 125,
+      "endOffset" : 135
+    }, {
+      "referenceID" : 25,
+      "context" : "As an example, [27, 29] provide theoretically linear speedup with number of nodes, but are difficult to implement efficiently, as the nodes need to synchronize frequently in order to compute reasonable gradient averages.",
+      "startOffset" : 15,
+      "endOffset" : 23
+    }, {
+      "referenceID" : 27,
+      "context" : "As an example, [27, 29] provide theoretically linear speedup with number of nodes, but are difficult to implement efficiently, as the nodes need to synchronize frequently in order to compute reasonable gradient averages.",
+      "startOffset" : 15,
+      "endOffset" : 23
+    }, {
+      "referenceID" : 67,
+      "context" : "As an alternative, no synchronization between workers is assumed in [71, 2, 31].",
+      "startOffset" : 68,
+      "endOffset" : 79
+    }, {
+      "referenceID" : 1,
+      "context" : "As an alternative, no synchronization between workers is assumed in [71, 2, 31].",
+      "startOffset" : 68,
+      "endOffset" : 79
+    }, {
+      "referenceID" : 29,
+      "context" : "As an alternative, no synchronization between workers is assumed in [71, 2, 31].",
+      "startOffset" : 68,
+      "endOffset" : 79
+    }, {
+      "referenceID" : 56,
+      "context" : "In fact, two recent works [60, 48] highlight subtle but important issue with labelling of iterates in the presence of asynchrony, rendering most of the existing analyses of asynchronous optimization algorithms incorrect.",
+      "startOffset" : 26,
+      "endOffset" : 34
+    }, {
+      "referenceID" : 44,
+      "context" : "In fact, two recent works [60, 48] highlight subtle but important issue with labelling of iterates in the presence of asynchrony, rendering most of the existing analyses of asynchronous optimization algorithms incorrect.",
+      "startOffset" : 26,
+      "endOffset" : 34
+    }, {
+      "referenceID" : 28,
+      "context" : "Asymptotically optimal convergent rates were proven in [30] with considerably milder assumptions.",
+      "startOffset" : 55,
+      "endOffset" : 59
+    }, {
+      "referenceID" : 20,
+      "context" : "Improved analysis of asynchronous SGD was also presented in [22], simultaneously with a version that uses lower-precision arithmetic was introduced without sacrificing performance, which is a trend that might find use in other parts of machine learning in the following years.",
+      "startOffset" : 60,
+      "endOffset" : 64
+    }, {
+      "referenceID" : 21,
+      "context" : "The practical usefulness has been demonstrated for instance by Google’s Downpour SGD [23] and Microsoft’s Project Adam [18].",
+      "startOffset" : 85,
+      "endOffset" : 89
+    }, {
+      "referenceID" : 17,
+      "context" : "The practical usefulness has been demonstrated for instance by Google’s Downpour SGD [23] and Microsoft’s Project Adam [18].",
+      "startOffset" : 119,
+      "endOffset" : 123
+    }, {
+      "referenceID" : 77,
+      "context" : "The first distributed versions of Coordinate Descent algorithms were the Hydra and its accelerated variant, Hydra2, [81, 34], which has been demonstrated to be very efficient on large sparse problems implemented on a computing cluster.",
+      "startOffset" : 116,
+      "endOffset" : 124
+    }, {
+      "referenceID" : 32,
+      "context" : "The first distributed versions of Coordinate Descent algorithms were the Hydra and its accelerated variant, Hydra2, [81, 34], which has been demonstrated to be very efficient on large sparse problems implemented on a computing cluster.",
+      "startOffset" : 116,
+      "endOffset" : 124
+    }, {
+      "referenceID" : 57,
+      "context" : "An extended version with description of implementation details is presented in [61].",
+      "startOffset" : 79,
+      "endOffset" : 83
+    }, {
+      "referenceID" : 52,
+      "context" : "Effect of asynchrony has been explored and partially theoretically understood in the works of [56, 55].",
+      "startOffset" : 94,
+      "endOffset" : 102
+    }, {
+      "referenceID" : 51,
+      "context" : "Effect of asynchrony has been explored and partially theoretically understood in the works of [56, 55].",
+      "startOffset" : 94,
+      "endOffset" : 102
+    }, {
+      "referenceID" : 68,
+      "context" : "Another asynchronous, rather framework than an algorithm, for coordinate updates, applicable to wider class of objectives is presented in [72].",
+      "startOffset" : 138,
+      "endOffset" : 142
+    }, {
+      "referenceID" : 90,
+      "context" : "This does not need to be an issue, if a dual version of coordinate descent is used — in which the distribution is done by data points [94] followed by works on Communication Efficient Dual Cooridante Ascent, described in next section.",
+      "startOffset" : 134,
+      "endOffset" : 138
+    }, {
+      "referenceID" : 46,
+      "context" : "A scheme for replicating data to simulate iid sampling in distributed environment was proposed in [50].",
+      "startOffset" : 98,
+      "endOffset" : 102
+    }, {
+      "referenceID" : 74,
+      "context" : "A relatively similar method to Algorithm 3 presented here has been proposed in [78], which was analysed, and in [59], a largely experimental work that can be also cast as communication efficient — described in detail in Section 2.",
+      "startOffset" : 79,
+      "endOffset" : 83
+    }, {
+      "referenceID" : 55,
+      "context" : "A relatively similar method to Algorithm 3 presented here has been proposed in [78], which was analysed, and in [59], a largely experimental work that can be also cast as communication efficient — described in detail in Section 2.",
+      "startOffset" : 112,
+      "endOffset" : 116
+    }, {
+      "referenceID" : 13,
+      "context" : "Another class of algorithms relevant for this work is Alternating Direction Method of Multipliers (ADMM) [14, 28].",
+      "startOffset" : 105,
+      "endOffset" : 113
+    }, {
+      "referenceID" : 26,
+      "context" : "Another class of algorithms relevant for this work is Alternating Direction Method of Multipliers (ADMM) [14, 28].",
+      "startOffset" : 105,
+      "endOffset" : 113
+    }, {
+      "referenceID" : 86,
+      "context" : "Fundamental limitations of stochastic versions of the problem (1) in terms of runtime, communication costs and number of samples used are studied in [90].",
+      "startOffset" : 149,
+      "endOffset" : 153
+    }, {
+      "referenceID" : 100,
+      "context" : "Efficient algorithms and lower bounds for distributed statistical estimation are established in [104, 103].",
+      "startOffset" : 96,
+      "endOffset" : 106
+    }, {
+      "referenceID" : 99,
+      "context" : "Efficient algorithms and lower bounds for distributed statistical estimation are established in [104, 103].",
+      "startOffset" : 96,
+      "endOffset" : 106
+    }, {
+      "referenceID" : 100,
+      "context" : "In the case of [104, 103] also K n/K, that the number of nodes K is much smaller than the number of data point on each node is also assumed.",
+      "startOffset" : 15,
+      "endOffset" : 25
+    }, {
+      "referenceID" : 99,
+      "context" : "In the case of [104, 103] also K n/K, that the number of nodes K is much smaller than the number of data point on each node is also assumed.",
+      "startOffset" : 15,
+      "endOffset" : 25
+    }, {
+      "referenceID" : 4,
+      "context" : "Lower bounds on communication complexity of distributed convex optimization of (1) are presented in [5], concluding that for IID data distributions, existing algorithms already achieve optimal complexity in specific settings.",
+      "startOffset" : 100,
+      "endOffset" : 103
+    }, {
+      "referenceID" : 87,
+      "context" : "proposed the DANE algorithm, Distributed Approximate Newton [91], to exactly solve a general subproblem available locally, before averaging their solutions.",
+      "startOffset" : 60,
+      "endOffset" : 64
+    }, {
+      "referenceID" : 55,
+      "context" : "A quite similar approach was proposed in [59], with richer class class of subproblems that can be formulated locally, and solved approximately.",
+      "startOffset" : 41,
+      "endOffset" : 45
+    }, {
+      "referenceID" : 74,
+      "context" : "An analysis of inexact version of DANE and its accelerated variant, AIDE, appeared recently in [78].",
+      "startOffset" : 95,
+      "endOffset" : 99
+    }, {
+      "referenceID" : 101,
+      "context" : "The DiSCO algorithm [105] of Zhang and Xiao is based on inexact damped Newton method.",
+      "startOffset" : 20,
+      "endOffset" : 25
+    }, {
+      "referenceID" : 4,
+      "context" : "The theoretical upper bound on number of rounds of communication improves upon DANE and other methods, and in certain settings matches the lower bound presented in [5].",
+      "startOffset" : 164,
+      "endOffset" : 167
+    }, {
+      "referenceID" : 48,
+      "context" : "The DiSCO algorithm is related to [52, 106], a distributed truncated Newton method.",
+      "startOffset" : 34,
+      "endOffset" : 43
+    }, {
+      "referenceID" : 102,
+      "context" : "The DiSCO algorithm is related to [52, 106], a distributed truncated Newton method.",
+      "startOffset" : 34,
+      "endOffset" : 43
+    }, {
+      "referenceID" : 97,
+      "context" : "The first version of the algorithm was proposed as DisDCA in [101], without convergence guarantees.",
+      "startOffset" : 61,
+      "endOffset" : 66
+    }, {
+      "referenceID" : 39,
+      "context" : "First analysis was introduced in [42], with further improvements in [58], and a more general version in [57].",
+      "startOffset" : 33,
+      "endOffset" : 37
+    }, {
+      "referenceID" : 54,
+      "context" : "First analysis was introduced in [42], with further improvements in [58], and a more general version in [57].",
+      "startOffset" : 68,
+      "endOffset" : 72
+    }, {
+      "referenceID" : 53,
+      "context" : "First analysis was introduced in [42], with further improvements in [58], and a more general version in [57].",
+      "startOffset" : 104,
+      "endOffset" : 108
+    }, {
+      "referenceID" : 88,
+      "context" : "Recently, its variant for L1-regularized objectives was introduced in [92].",
+      "startOffset" : 70,
+      "endOffset" : 74
+    }, {
+      "referenceID" : 40,
+      "context" : "Namely, the algorithms are the Stochastic Variance Reduced Gradient (SVRG) [43, 47], a stochastic method with explicit variance reduction, and the Distributed Approximate Newton (DANE) [91] for distributed optimization.",
+      "startOffset" : 75,
+      "endOffset" : 83
+    }, {
+      "referenceID" : 43,
+      "context" : "Namely, the algorithms are the Stochastic Variance Reduced Gradient (SVRG) [43, 47], a stochastic method with explicit variance reduction, and the Distributed Approximate Newton (DANE) [91] for distributed optimization.",
+      "startOffset" : 75,
+      "endOffset" : 83
+    }, {
+      "referenceID" : 87,
+      "context" : "Namely, the algorithms are the Stochastic Variance Reduced Gradient (SVRG) [43, 47], a stochastic method with explicit variance reduction, and the Distributed Approximate Newton (DANE) [91] for distributed optimization.",
+      "startOffset" : 185,
+      "endOffset" : 189
+    }, {
+      "referenceID" : 40,
+      "context" : "The SVRG algorithm [43, 47] is a stochastic method designed to solve problem (1) on a single node.",
+      "startOffset" : 19,
+      "endOffset" : 27
+    }, {
+      "referenceID" : 43,
+      "context" : "The SVRG algorithm [43, 47] is a stochastic method designed to solve problem (1) on a single node.",
+      "startOffset" : 19,
+      "endOffset" : 27
+    }, {
+      "referenceID" : 87,
+      "context" : "In this section, we introduce a general reasoning providing stronger intuitive support for the DANE algorithm [91], which we describe in detail below.",
+      "startOffset" : 110,
+      "endOffset" : 114
+    }, {
+      "referenceID" : 87,
+      "context" : "We present the Distributed Approximate Newton algorithm (DANE) [91], as Algorithm 2.",
+      "startOffset" : 63,
+      "endOffset" : 67
+    }, {
+      "referenceID" : 53,
+      "context" : "We adapt the idea from the CoCoA algorithm [57], in which an arbitrary optimization algorithm is used to obtain relative Θ accuracy on a locally defined subproblem.",
+      "startOffset" : 43,
+      "endOffset" : 47
+    }, {
+      "referenceID" : 74,
+      "context" : "Since the first version of this paper, this connection has been mentioned in [78], which analyses an inexact version of the DANE algorithm.",
+      "startOffset" : 77,
+      "endOffset" : 81
+    }, {
+      "referenceID" : 53,
+      "context" : "Without any extra information, or in the case of fully dense data, averaging the local updates is the only way that actually makes sense — because each node outputs approximate solution of a proxy to the overall objective, and there is no induced separability structure in the outputs such as in CoCoA [57].",
+      "startOffset" : 302,
+      "endOffset" : 306
+    }, {
+      "referenceID" : 53,
+      "context" : "• The purple triangles (COCOA) are for the CoCoA+ algorithm [57].",
+      "startOffset" : 60,
+      "endOffset" : 64
+    }, {
+      "referenceID" : 75,
+      "context" : "Althought it is expected that the algorithm could be modified to depend on average of these quantities (which could be orders of magnitude smaller), akin to coordinate descent algorithms [79], it has not been done yet.",
+      "startOffset" : 187,
+      "endOffset" : 191
+    }, {
+      "referenceID" : 42,
+      "context" : "Since the first version of this paper [45], additional experimental results were presented in [62].",
+      "startOffset" : 38,
+      "endOffset" : 42
+    }, {
+      "referenceID" : 58,
+      "context" : "Since the first version of this paper [45], additional experimental results were presented in [62].",
+      "startOffset" : 94,
+      "endOffset" : 98
+    } ],
+    "year" : 2016,
+    "abstractText" : "We introduce a new and increasingly relevant setting for distributed optimization in machine learning, where the data defining the optimization are unevenly distributed over an extremely large number of nodes. The goal is to train a high-quality centralized model. We refer to this setting as Federated Optimization. In this setting, communication efficiency is of the utmost importance and minimizing the number of rounds of communication is the principal goal. A motivating example arises when we keep the training data locally on users’ mobile devices instead of logging it to a data center for training. In federated optimization, the devices are used as compute nodes performing computation on their local data in order to update a global model. We suppose that we have extremely large number of devices in the network — as many as the number of users of a given service, each of which has only a tiny fraction of the total data available. In particular, we expect the number of data points available locally to be much smaller than the number of devices. Additionally, since different users generate data with different patterns, it is reasonable to assume that no device has a representative sample of the overall distribution. We show that existing algorithms are not suitable for this setting, and propose a new algorithm which shows encouraging experimental results for sparse convex problems. This work also sets a path for future research needed in the context of federated optimization.",
+    "creator" : "LaTeX with hyperref package"
+  }
+}

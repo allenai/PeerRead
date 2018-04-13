@@ -1,0 +1,286 @@
+{
+  "name" : "1705.01991.pdf",
+  "metadata" : {
+    "source" : "CRF",
+    "title" : "Sharp Models on Dull Hardware: Fast and Accurate Neural Machine Translation Decoding on the CPU",
+    "authors" : [ "Jacob Devlin" ],
+    "emails" : [ "jdevlin@microsoft.com" ],
+    "sections" : [ {
+      "heading" : null,
+      "text" : "We approach this problem from two angles: First, we describe several techniques for speeding up an NMT beam search decoder, which obtain a 4.4x speedup over a very efficient baseline decoder without changing the decoder output. Second, we propose a simple but powerful network architecture which uses an RNN (GRU/LSTM) layer at bottom, followed by a series of stacked fully-connected layers applied at every timestep. This architecture achieves similar accuracy to a deep recurrent model, at a small fraction of the training and decoding cost. By combining these techniques, our best system achieves a very competitive accuracy of 38.3 BLEU on WMT EnglishFrench NewsTest2014, while decoding at 100 words/sec on single-threaded CPU. We believe this is the best published accuracy/speed trade-off of an NMT system."
+    }, {
+      "heading" : "1 Introduction",
+      "text" : "Attentional sequence-to-sequence models have become the new standard for machine translation over the last two years, and with the unprecedented improvements in translation accuracy\ncomes a new set of technical challenges. One of the biggest challenges is the high training and decoding costs of these neural machine translation (NMT) system, which is often at least an order of magnitude higher than a phrase-based system trained on the same data. For instance, phrasal MT systems were able achieve single-threaded decoding speeds of 100-500 words/sec on decade-old CPUs (Quirk and Moore, 2007), while Jean et al. (2015) reported single-threaded decoding speeds of 8-10 words/sec on a shallow NMT system. Wu et al. (2016) was able to reach CPU decoding speeds of 100 words/sec for a deep model, but used 44 CPU cores to do so. There has been recent work in speeding up decoding by reducing the search space (Kim and Rush, 2016), but little in computational improvements.\nIn this work, we consider a production scenario which requires low-latency, high-throughput NMT decoding. We focus on CPU-based decoders, since GPU/FPGA/ASIC-based decoders require specialized hardware deployment and logistical constraints such as batch processing. Efficient CPU decoders can also be used for ondevice mobile translation. We focus on singlethreaded decoding and single-sentence processing, since multiple threads can be used to reduce latency but not total throughput.\nWe approach this problem from two angles: In Section 4, we describe a number of techniques for improving the speed of the decoder, and obtain a 4.4x speedup over a highly efficient baseline. These speedups do not affect decoding results, so they can be applied universally. In Section 5, we describe a simple but powerful network architecture which uses a single RNN (GRU/LSTM) layer at the bottom with a large number of fully-connected (FC) layers on top, and obtains improvements similar to a deep RNN model at a fraction of the training and decoding cost.\nar X\niv :1\n70 5.\n01 99\n1v 1\n[ cs\n.C L\n] 4\nM ay\n2 01\n7"
+    }, {
+      "heading" : "2 Data Set",
+      "text" : "The data set we evaluate on in this work is WMT English-French NewsTest2014, which has 380M words of parallel training data and a 3003 sentence test set. The NewsTest2013 set is used for validation. In order to compare our architecture to past work, we train a word-based system without any data augmentation techniques. The network architecture is very similar to Bahdanau et al. (2014), and specific details of layer size/depth are provided in subsequent sections. We use an 80k source/target vocab and perform standard unk-replacement (Jean et al., 2015) on out-of-vocabulary words. Training is performed using an in-house toolkit."
+    }, {
+      "heading" : "3 Baseline Decoder",
+      "text" : "Our baseline decoder is a standard beam search decoder (Sutskever et al., 2014) with several straightforward performance optimizations:\n• It is written in pure C++, with no heap allocation done during the core search. • A candidate list is used to reduce the output softmax from 80k to ~500. We run word alignment (Brown et al., 1993) on the training and keep the top 20 context-free translations for each source word in the test sentence. • The Intel MKL library is used for matrix multiplication, as it is the fastest floating point matrix multiplication library for CPUs. • Early stopping is performed when the top partial hypothesis has a log-score of δ = 3.0 worse than the best completed hypothesis. • Batching of matrix multiplication is applied when possible. Since each sentence is decoded separately, we can only batch over the hypotheses in the beam as well as the input vectors on the source side."
+    }, {
+      "heading" : "4 Decoder Speed Improvements",
+      "text" : "This section describes a number of speedups that can be made to a CPU-based attentional sequenceto-sequence beam decoder. Crucially, none of these speedups affect the actual mathematical computation of the decoder, so they can be applied to any network architecture with a guarantee that they will not affect the results.1\n1Some speedups apply quantization which leads to small random perturbations, but these change the BLEU score by less than 0.02.\nThe model used here is similar to the original implementation of Bahdanau et al. (2014). The exact target GRU equation is:\ndij = tanh(Wahi−1 + Vaxi)·tanh(Uasj) αij = edij∑ j′ e dij′\nci = ∑ j αijsj\nui = σ(Wuhi−1 + Vuxi + Uuci + bu) ri = σ(Wrhi−1 + Vrxi + Urci + br)\nĥi = σ(ri (Whhi−1) + Vhxi + Uhci + bh) hi = uihi−1 + (1− ui)ĥi\nWhere W∗, V∗, U∗, b∗ are learned parameters, sj is the hidden vector of the jth source word, hi−1 is the previous target recurrent vector, xi is the target input (e.g., embedding of previous word).\nWe also denote the various hyperparameters: b for the beam size, r for the recurrent hidden size, e is the embedding size, |S| for the source sentence length, and |T | for the target sentence length, |E| is the vocab size."
+    }, {
+      "heading" : "4.1 16-Bit Matrix Multiplication",
+      "text" : "Although CPU-based matrix multiplication libraries are highly optimized, they typically only operate on 32/64-bit floats, even though DNNs can almost always operate on much lower precision without degredation of accuracy (Han et al., 2016). However, low-precision math (1-bit to 7-bit) is difficult to implement efficiently on the CPU, and even 8-bit math has limited support in terms of vectorized (SIMD) instruction sets. Here, we use 16-bit fixed-point integer math, since it has firstclass SIMD support and requires minimal changes to training. Training is still performed with 32-bit floats, but we clip the weights to the range [-1.0, 1.0] the relu activation to [0.0, 10.0] to ensure that all values fit into 16-bits with high precision. A reference implementation of 16-bit multiplication in C++/SSE2 is provided in the supplementary material, with a thorough description of lowlevel details.2\nA comparison between our 16-bit integer implementation and Intel MKL’s 32-bit floating point multiplication is given in Figure 1. We can see that 16-bit multiplication is 2x-3x faster than 32- bit multiplication for batch sizes between 2 and 8, which is the typical range of the beam size b. We\n2Included as ancillary file in Arxiv submission, on right side of submission page.\nare able to achieve greater than a 2x speedup in certain cases because we pre-process the weight matrix offline to have optimal memory layout, which is a capability BLAS libraries do not have."
+    }, {
+      "heading" : "4.2 Pre-Compute Embeddings",
+      "text" : "In the first hidden layer on the source and target sides, xi corresponds to word embeddings. Since this is a closed set of values that are fixed after training, the vectors V xi can be pre-computed (Devlin et al., 2014) for each word in the vocabulary and stored in a lookup table. This can only be applied to the first hidden layer.\nPre-computation does increase the memory cost of the model, since we must store r × 3 floats per word instead of e. However, if we only compute the k most frequently words (e.g., k = 8, 000), this reduces the pre-computation memory by 90% but still results in 95%+ token coverage due to the Zipfian distribution of language."
+    }, {
+      "heading" : "4.3 Pre-Compute Attention",
+      "text" : "The attention context computation in the GRU can be re-factored as follows:\nUci = U( ∑ j αijsj) = ∑ j αij(Usj)\nCrucially, the hidden vector representation sj is only dependent on the source sentence, while aij is dependent on the target hypothesis. Therefore, the original computation Uci requires total |T |× b multiplications per sentence, but the re-factored versionUsj only requires total |S|multiplications. The expectation over α must still be computed at each target timestep, but this is much less expensive than the multiplication by U ."
+    }, {
+      "heading" : "4.4 SSE & Lookup Tables",
+      "text" : "For the element-wise vector functions use in the GRU, we can use vectorized instructions (SSE/AVX) for the add and multiply functions, and lookup tables for sigmoid and tanh.\nReference implementations in C++ are provided in the supplementary material."
+    }, {
+      "heading" : "4.5 Merge Recurrent States",
+      "text" : "In the GRU equation, for the first target hidden layer, xi represents the previously generated word, and hi−1 encodes the hypothesis up to two words before the current word. Therefore, if two partial hypotheses in the beam only differ by the last emitted word, their hi−1 vectors will be identical. Thus, we can perform matrix multiplication Whi−1 only on the unique hi−1 vectors in the beam at each target timestep. For a beam size of b = 6, we measured that the ratio of unique hi−1 compared to total hi−1 is approximately 70%, averaged over several language pairs. This can only be applied to the first target hidden layer."
+    }, {
+      "heading" : "4.6 Speedup Results",
+      "text" : "Cumulative results from each of the preceding speedups are presented in Table 1, measured on WMT English-French NewsTest2014. The NMT architecture evaluated here uses 3-layer 512- dimensional bidirectional GRU for the source, and a 1-layer 1024-dimensional attentional GRU for the target. Each sentence is decoded independently with a beam of 6. Since these speedups are all mathematical identities excluding quantization noise, all outputs achieve 36.2 BLEU and are 99.9%+ identical.\nThe largest improvement is from 16-bit matrix multiplication, but all speedups contribute a significant amount. Overall, we are able to achieve a 4.4x speedup over a fast baseline decoder. Although the absolute speed is impressive, the model only uses one target layer and is several BLEU behind the SOTA, so the next goal is to maximize model accuracy while still achieving speeds greater than some target, such as 100 words/sec."
+    }, {
+      "heading" : "5 Model Improvements",
+      "text" : "In NMT, like in many other deep learning tasks, accuracy can be greatly improved by adding more hidden layers, but training and decoding time increase significantly (Luong et al., 2014; Zhou et al., 2016; Wu et al., 2016). Several past works have noted that convolutional neural networks (CNNs) are significantly less expensive than RNNs, and replaced the source and/or target side with a CNN-based architecture (Gehring et al., 2016; Kalchbrenner et al., 2016). However, these works have found it is difficult to replace the target side of the model with CNN layers while maintaining high accuracy. The use of a recurrent target is especially important to track attentional coverage and ensure fluency.\nHere, we propose a mixed model which uses an RNN layer at the bottom to both capture fullsentence context and perform attention, followed by a series of fully-connected (FC) layers applied on top at each timestep. The FC layers can be interpreted as a CNN without overlapping stride. Since each FC layer consists of a single matrix multiplication, it is 1/6th the cost of a GRU (or 1/8th an LSTM). Additionally, several of the speedups from Section 4 can only be applied to the first layer, so there is strong incentive to only use a single target RNN.\nTo avoid vanishing gradients, we use ResNetstyle skip connections (He et al., 2016). These allow very deep models to be trained from scratch and do not require any additional matrix multiplications, unlike highway networks (Srivastava et al., 2015). With 5 intermediate FC layers, target timestep i is computed as:\nhBi = AttGRU(h B i−1, xi, S)\nh1i = relu(W 1hBi ) h2i = relu(W 2h1i ) h3i = relu(W 3h2i + h 1 i ) h4i = relu(W 4h3i ) h5i = relu(W 5h4i + h 3 i ) hTi = tanh(W Th5i ) or GRU(h T i−1, h 5 i )\nyi = softmax(V h T i )\nWe follow He et al. (2016) and only use skip connections on every other FC layer, but do not use batch normalization. The same pattern can be used for more FC layers, and the FC layers can be a different size than the bottom or top hidden layers. The top hidden layer can be an RNN or an FC layer. It is important to use relu activations (opposed to tanh) for ResNet-style skip connections. The GRUs still use tanh."
+    }, {
+      "heading" : "5.1 Model Results",
+      "text" : "Results using the mixed RNN+FC architecture are shown in Table 2, using all speedups. We have\nfound that the benefit of using RNN+FC layers on the source is minimal, so we only perform ablation on the target. For the source, we use a 3-layer 512- dim bidi GRU in all models (S1)-(S6).\nModel (S1) and (S2) are one and two layer baselines. Model (S4), which uses 7 intermediate FC layers, has similar decoding cost to (S2) while doubling the improvement over (S1) to 1.2 BLEU. We see minimal benefit from using a GRU on the top layer (S5) or using more FC layers (S6). In (E1) and (E2) we present 2 and 3 model ensembles of (S4), trained from scratch with different random seeds. We can see that the 2-model ensemble improves results by 0.9 BLEU, but the 3-model ensemble has little additional improvment. Although not presented here, we have found these improvement from decoder speedups and RNN+FC to be consistent across many language pairs.\nAll together, we were able to achieve a BLEU score of 38.3 while decoding at 100 words/sec on a single CPU core. As a point of comparison, Wu et al. (2016) achieves similar BLEU scores on this test set (37.9 to 38.9) and reports a CPU decoding speed of ~100 words/sec (0.2226 sents/sec), but parallelizes this decoding across 44 CPU cores. System (S7), which is our re-implementation of Wu et al. (2016), decodes at 28 words/sec on one CPU core, using all of the speedups described in Section 4. Zhou et al. (2016) has a similar computational cost to (S7), but we were not able to replicate those results in terms of accuracy.\nAlthough we are comparing an ensemble to a single model, we can see ensemble (E1) is over 3x faster to decode than the single model (S7). Additionally, we have found that model (S4) is roughly 3x faster to train than (S7) using the same GPU resources, so (E1) is also 1.5x faster to train than a single model (S7)."
+    } ],
+    "references" : [ {
+      "title" : "Neural machine translation by jointly learning to align and translate",
+      "author" : [ "Dzmitry Bahdanau", "Kyunghyun Cho", "Yoshua Bengio." ],
+      "venue" : "arXiv preprint arXiv:1409.0473 .",
+      "citeRegEx" : "Bahdanau et al\\.,? 2014",
+      "shortCiteRegEx" : "Bahdanau et al\\.",
+      "year" : 2014
+    }, {
+      "title" : "The mathematics of statistical machine translation: Parameter estimation",
+      "author" : [ "Peter F Brown", "Vincent J Della Pietra", "Stephen A Della Pietra", "Robert L Mercer." ],
+      "venue" : "Computational linguistics 19(2):263–311.",
+      "citeRegEx" : "Brown et al\\.,? 1993",
+      "shortCiteRegEx" : "Brown et al\\.",
+      "year" : 1993
+    }, {
+      "title" : "Fast and robust neural network joint models",
+      "author" : [ "Jacob Devlin", "Rabih Zbib", "Zhongqiang Huang", "Thomas Lamar", "Richard M Schwartz", "John Makhoul" ],
+      "venue" : null,
+      "citeRegEx" : "Devlin et al\\.,? \\Q2014\\E",
+      "shortCiteRegEx" : "Devlin et al\\.",
+      "year" : 2014
+    }, {
+      "title" : "Edinburgh’s phrase-based machine translation systems for wmt-14",
+      "author" : [ "Nadir Durrani", "Barry Haddow", "Philipp Koehn", "Kenneth Heafield." ],
+      "venue" : "Proceedings of the Ninth Workshop on Statistical Machine Translation. pages 97–104.",
+      "citeRegEx" : "Durrani et al\\.,? 2014",
+      "shortCiteRegEx" : "Durrani et al\\.",
+      "year" : 2014
+    }, {
+      "title" : "A convolutional encoder model for neural machine translation",
+      "author" : [ "Jonas Gehring", "Michael Auli", "David Grangier", "Yann N Dauphin." ],
+      "venue" : "arXiv preprint arXiv:1611.02344 .",
+      "citeRegEx" : "Gehring et al\\.,? 2016",
+      "shortCiteRegEx" : "Gehring et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Deep compression: Compressing deep neural network with pruning, trained quantization and huffman coding",
+      "author" : [ "Song Han", "Huizi Mao", "William J. Dally." ],
+      "venue" : "ICLR .",
+      "citeRegEx" : "Han et al\\.,? 2016",
+      "shortCiteRegEx" : "Han et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Deep residual learning for image recognition",
+      "author" : [ "Kaiming He", "Xiangyu Zhang", "Shaoqing Ren", "Jian Sun." ],
+      "venue" : "Proceedings of the IEEE Conference on Computer Vision and Pattern Recognition. pages 770–778.",
+      "citeRegEx" : "He et al\\.,? 2016",
+      "shortCiteRegEx" : "He et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "On using very large target vocabulary for neural machine translation",
+      "author" : [ "Sébastien Jean", "Kyunghyun Cho", "Roland Memisevic", "Yoshua Bengio." ],
+      "venue" : "CoRR .",
+      "citeRegEx" : "Jean et al\\.,? 2015",
+      "shortCiteRegEx" : "Jean et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "Neural machine translation in linear time",
+      "author" : [ "Nal Kalchbrenner", "Lasse Espeholt", "Karen Simonyan", "Aaron van den Oord", "Alex Graves", "Koray Kavukcuoglu." ],
+      "venue" : "arXiv preprint arXiv:1610.10099 .",
+      "citeRegEx" : "Kalchbrenner et al\\.,? 2016",
+      "shortCiteRegEx" : "Kalchbrenner et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Sequencelevel knowledge distillation",
+      "author" : [ "Yoon Kim", "Alexander M Rush." ],
+      "venue" : "arXiv preprint arXiv:1606.07947 .",
+      "citeRegEx" : "Kim and Rush.,? 2016",
+      "shortCiteRegEx" : "Kim and Rush.",
+      "year" : 2016
+    }, {
+      "title" : "Addressing the rare word problem in neural machine translation",
+      "author" : [ "Minh-Thang Luong", "Ilya Sutskever", "Quoc V Le", "Oriol Vinyals", "Wojciech Zaremba." ],
+      "venue" : "ACL 2015 .",
+      "citeRegEx" : "Luong et al\\.,? 2014",
+      "shortCiteRegEx" : "Luong et al\\.",
+      "year" : 2014
+    }, {
+      "title" : "Faster beamsearch decoding for phrasal statistical machine translation",
+      "author" : [ "Chris Quirk", "Robert Moore." ],
+      "venue" : "Machine Translation Summit XI .",
+      "citeRegEx" : "Quirk and Moore.,? 2007",
+      "shortCiteRegEx" : "Quirk and Moore.",
+      "year" : 2007
+    }, {
+      "title" : "http://www-lium",
+      "author" : [ "Holger Schwenk." ],
+      "venue" : "univ-lemans.fr/schwenk/cslm_joint_ paper. [Online; accessed 03-September-2014].",
+      "citeRegEx" : "Schwenk.,? 2014",
+      "shortCiteRegEx" : "Schwenk.",
+      "year" : 2014
+    }, {
+      "title" : "Highway networks",
+      "author" : [ "Rupesh Kumar Srivastava", "Klaus Greff", "Jürgen Schmidhuber." ],
+      "venue" : "arXiv preprint arXiv:1505.00387 .",
+      "citeRegEx" : "Srivastava et al\\.,? 2015",
+      "shortCiteRegEx" : "Srivastava et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "Sequence to sequence learning with neural networks",
+      "author" : [ "Ilya Sutskever", "Oriol Vinyals", "Quoc V. Le." ],
+      "venue" : "NIPS .",
+      "citeRegEx" : "Sutskever et al\\.,? 2014",
+      "shortCiteRegEx" : "Sutskever et al\\.",
+      "year" : 2014
+    }, {
+      "title" : "Deep recurrent models with fast-forward connections for neural machine translation",
+      "author" : [ "Jie Zhou", "Ying Cao", "Xuguang Wang", "Peng Li", "Wei Xu." ],
+      "venue" : "arXiv preprint arXiv:1606.04199 .",
+      "citeRegEx" : "Zhou et al\\.,? 2016",
+      "shortCiteRegEx" : "Zhou et al\\.",
+      "year" : 2016
+    } ],
+    "referenceMentions" : [ {
+      "referenceID" : 11,
+      "context" : "For instance, phrasal MT systems were able achieve single-threaded decoding speeds of 100-500 words/sec on decade-old CPUs (Quirk and Moore, 2007), while Jean et al.",
+      "startOffset" : 123,
+      "endOffset" : 146
+    }, {
+      "referenceID" : 9,
+      "context" : "There has been recent work in speeding up decoding by reducing the search space (Kim and Rush, 2016), but little in computational improvements.",
+      "startOffset" : 80,
+      "endOffset" : 100
+    }, {
+      "referenceID" : 7,
+      "context" : "For instance, phrasal MT systems were able achieve single-threaded decoding speeds of 100-500 words/sec on decade-old CPUs (Quirk and Moore, 2007), while Jean et al. (2015) reported single-threaded decoding speeds of 8-10 words/sec on a shallow NMT system.",
+      "startOffset" : 154,
+      "endOffset" : 173
+    }, {
+      "referenceID" : 7,
+      "context" : "For instance, phrasal MT systems were able achieve single-threaded decoding speeds of 100-500 words/sec on decade-old CPUs (Quirk and Moore, 2007), while Jean et al. (2015) reported single-threaded decoding speeds of 8-10 words/sec on a shallow NMT system. Wu et al. (2016) was able to reach CPU decoding speeds of 100 words/sec for a deep model, but used 44 CPU cores to do so.",
+      "startOffset" : 154,
+      "endOffset" : 274
+    }, {
+      "referenceID" : 7,
+      "context" : "We use an 80k source/target vocab and perform standard unk-replacement (Jean et al., 2015) on out-of-vocabulary words.",
+      "startOffset" : 71,
+      "endOffset" : 90
+    }, {
+      "referenceID" : 0,
+      "context" : "The network architecture is very similar to Bahdanau et al. (2014), and specific details of layer size/depth are provided in subsequent sections.",
+      "startOffset" : 44,
+      "endOffset" : 67
+    }, {
+      "referenceID" : 14,
+      "context" : "Our baseline decoder is a standard beam search decoder (Sutskever et al., 2014) with several straightforward performance optimizations:",
+      "startOffset" : 55,
+      "endOffset" : 79
+    }, {
+      "referenceID" : 1,
+      "context" : "We run word alignment (Brown et al., 1993) on the training and keep the top 20 context-free translations for each source word in the test sentence.",
+      "startOffset" : 22,
+      "endOffset" : 42
+    }, {
+      "referenceID" : 0,
+      "context" : "The model used here is similar to the original implementation of Bahdanau et al. (2014). The exact target GRU equation is:",
+      "startOffset" : 65,
+      "endOffset" : 88
+    }, {
+      "referenceID" : 5,
+      "context" : "Although CPU-based matrix multiplication libraries are highly optimized, they typically only operate on 32/64-bit floats, even though DNNs can almost always operate on much lower precision without degredation of accuracy (Han et al., 2016).",
+      "startOffset" : 221,
+      "endOffset" : 239
+    }, {
+      "referenceID" : 2,
+      "context" : "Since this is a closed set of values that are fixed after training, the vectors V xi can be pre-computed (Devlin et al., 2014) for each word in the vocabulary and stored in a lookup table.",
+      "startOffset" : 105,
+      "endOffset" : 126
+    }, {
+      "referenceID" : 12,
+      "context" : "Basic Phrase-Based MT (Schwenk, 2014) 33.",
+      "startOffset" : 22,
+      "endOffset" : 37
+    }, {
+      "referenceID" : 3,
+      "context" : "1 SOTA Phrase-Based MT (Durrani et al., 2014) 37.",
+      "startOffset" : 23,
+      "endOffset" : 45
+    }, {
+      "referenceID" : 10,
+      "context" : "0 6-Layer Non-Attentional Seq-to-Seq LSTM (Luong et al., 2014) 33.",
+      "startOffset" : 42,
+      "endOffset" : 62
+    }, {
+      "referenceID" : 7,
+      "context" : "GRU, w/ Large Vocab (Jean et al., 2015) 34.",
+      "startOffset" : 20,
+      "endOffset" : 39
+    }, {
+      "referenceID" : 15,
+      "context" : "LSTM (Zhou et al., 2016) 39.",
+      "startOffset" : 5,
+      "endOffset" : 24
+    }, {
+      "referenceID" : 10,
+      "context" : "In NMT, like in many other deep learning tasks, accuracy can be greatly improved by adding more hidden layers, but training and decoding time increase significantly (Luong et al., 2014; Zhou et al., 2016; Wu et al., 2016).",
+      "startOffset" : 165,
+      "endOffset" : 221
+    }, {
+      "referenceID" : 15,
+      "context" : "In NMT, like in many other deep learning tasks, accuracy can be greatly improved by adding more hidden layers, but training and decoding time increase significantly (Luong et al., 2014; Zhou et al., 2016; Wu et al., 2016).",
+      "startOffset" : 165,
+      "endOffset" : 221
+    }, {
+      "referenceID" : 4,
+      "context" : "Several past works have noted that convolutional neural networks (CNNs) are significantly less expensive than RNNs, and replaced the source and/or target side with a CNN-based architecture (Gehring et al., 2016; Kalchbrenner et al., 2016).",
+      "startOffset" : 189,
+      "endOffset" : 238
+    }, {
+      "referenceID" : 8,
+      "context" : "Several past works have noted that convolutional neural networks (CNNs) are significantly less expensive than RNNs, and replaced the source and/or target side with a CNN-based architecture (Gehring et al., 2016; Kalchbrenner et al., 2016).",
+      "startOffset" : 189,
+      "endOffset" : 238
+    }, {
+      "referenceID" : 6,
+      "context" : "To avoid vanishing gradients, we use ResNetstyle skip connections (He et al., 2016).",
+      "startOffset" : 66,
+      "endOffset" : 83
+    }, {
+      "referenceID" : 13,
+      "context" : "These allow very deep models to be trained from scratch and do not require any additional matrix multiplications, unlike highway networks (Srivastava et al., 2015).",
+      "startOffset" : 138,
+      "endOffset" : 163
+    }, {
+      "referenceID" : 6,
+      "context" : "hi = AttGRU(h B i−1, xi, S) hi = relu(W hi ) hi = relu(W hi ) hi = relu(W hi + h 1 i ) hi = relu(W hi ) hi = relu(W hi + h 3 i ) hi = tanh(W hi ) or GRU(h T i−1, h 5 i ) yi = softmax(V h T i ) We follow He et al. (2016) and only use skip connections on every other FC layer, but do not use batch normalization.",
+      "startOffset" : 203,
+      "endOffset" : 220
+    }, {
+      "referenceID" : 15,
+      "context" : "Zhou et al. (2016) has a similar computational cost to (S7), but we were not able to replicate those results in terms of accuracy.",
+      "startOffset" : 0,
+      "endOffset" : 19
+    } ],
+    "year" : 2017,
+    "abstractText" : "Attentional sequence-to-sequence models have become the new standard for machine translation, but one challenge of such models is a significant increase in training and decoding cost compared to phrase-based systems. Here, we focus on efficient decoding, with a goal of achieving accuracy close the state-of-the-art in neural machine translation (NMT), while achieving CPU decoding speed/throughput close to that of a phrasal decoder. We approach this problem from two angles: First, we describe several techniques for speeding up an NMT beam search decoder, which obtain a 4.4x speedup over a very efficient baseline decoder without changing the decoder output. Second, we propose a simple but powerful network architecture which uses an RNN (GRU/LSTM) layer at bottom, followed by a series of stacked fully-connected layers applied at every timestep. This architecture achieves similar accuracy to a deep recurrent model, at a small fraction of the training and decoding cost. By combining these techniques, our best system achieves a very competitive accuracy of 38.3 BLEU on WMT EnglishFrench NewsTest2014, while decoding at 100 words/sec on single-threaded CPU. We believe this is the best published accuracy/speed trade-off of an NMT system.",
+    "creator" : "LaTeX with hyperref package"
+  }
+}

@@ -1,0 +1,434 @@
+{
+  "name" : "1506.03140.pdf",
+  "metadata" : {
+    "source" : "CRF",
+    "title" : "On-the-Job Learning with Bayesian Decision Theory",
+    "authors" : [ "Keenon Werling", "Arun Chaganty", "Christopher D. Manning" ],
+    "emails" : [ "keenon@cs.stanford.edu", "chaganty@cs.stanford.edu", "pliang@cs.stanford.edu", "manning@cs.stanford.edu" ],
+    "sections" : [ {
+      "heading" : null,
+      "text" : "Our goal is to deploy a high-accuracy system starting with zero training examples. We consider an on-the-job setting, where as inputs arrive, we use real-time crowdsourcing to resolve uncertainty where needed and output our prediction when confident. As the model improves over time, the reliance on crowdsourcing queries decreases. We cast our setting as a stochastic game based on Bayesian decision theory, which allows us to balance latency, cost, and accuracy objectives in a principled way. Computing the optimal policy is intractable, so we develop an approximation based on Monte Carlo Tree Search. We tested our approach on three datasets—named-entity recognition, sentiment classification, and image classification. On the NER task we obtained more than an order of magnitude reduction in cost compared to full human annotation, while boosting performance relative to the expert provided labels. We also achieve a 8% F1 improvement over having a single human label the whole set, and a 28% F1 improvement over online learning.\n“Poor is the pupil who does not surpass his master.” – Leonardo da Vinci"
+    }, {
+      "heading" : "1 Introduction",
+      "text" : "There are two roads to an accurate AI system today: (i) gather a huge amount of labeled training data [1] and do supervised learning [2]; or (ii) use crowdsourcing to directly perform the task [3, 4]. However, both solutions require non-trivial amounts of time and money. In many situations, one wishes to build a new system — e.g., to do Twitter information extraction [5] to aid in disaster relief efforts or monitor public opinion — but one simply lacks the resources to follow either the pure ML or pure crowdsourcing road.\nIn this paper, we propose a framework called on-the-job learning (formalizing and extending ideas first implemented in [6]), in which we produce high quality results from the start without requiring a trained model. When a new input arrives, the system can choose to asynchronously query the crowd on parts of the input it is uncertain about (e.g. query about the label of a single token in a sentence). After collecting enough evidence the system makes a prediction. The goal is to maintain high accuracy by initially using the crowd as a crutch, but gradually becoming more self-sufficient as the model improves. Online learning [7] and online active learning [8, 9, 10] are different in that they do not actively seek new information prior to making a prediction, and cannot maintain high accuracy independent of the number of data instances seen so far. Active classification [11], like us,\nar X\niv :1\n50 6.\n03 14\n0v 2\n[ cs\n.A I]\n7 D\nstrategically seeks information (by querying a subset of labels) prior to prediction, but it is based on a static policy, whereas we improve the model during test time based on observed data.\nTo determine which queries to make, we model on-the-job learning as a stochastic game based on a CRF prediction model. We use Bayesian decision theory to tradeoff latency, cost, and accuracy in a principled manner. Our framework naturally gives rise to intuitive strategies: To achieve high accuracy, we should ask for redundant labels to offset the noisy responses. To achieve low latency, we should issue queries in parallel, whereas if latency is unimportant, we should issue queries sequentially in order to be more adaptive. Computing the optimal policy is intractable, so we develop an approximation based on Monte Carlo tree search [12] and progressive widening to reason about continuous time [?].\nWe implemented and evaluated our system on three different tasks: named-entity recognition, sentiment classification, and image classification. On the NER task we obtained more than an order of magnitude reduction in cost compared to full human annotation, while boosting performance relative to the expert provided labels. We also achieve a 8% F1 improvement over having a single human label the whole set, and a 28% F1 improvement over online learning. An open-source implementation of our system, dubbed LENSE for “Learning from Expensive Noisy Slow Experts” is available at http://www.github.com/keenon/lense."
+    }, {
+      "heading" : "2 Problem formulation",
+      "text" : "Consider a structured prediction problem from input x = (x1, . . . , xn) to output y = (y1, . . . , yn). For example, for named-entity recognition (NER) on tweets, x is a sequence of words in the tweet (e.g., “on George str.”) and y is the corresponding sequence of labels (e.g., NONE LOCATION LOCATION). The full set of labels of PERSON, LOCATION, RESOURCE, and NONE.\nIn the on-the-job learning setting, inputs arrive in a stream. On each input x, we make zero or more queries q1, q2, . . . on the crowd to obtain labels (potentially more than once) for any positions in x. The responses r1, r2, . . . come back asynchronously, which are incorporated into our current prediction model pθ. Figure 2 (left) shows one possible outcome: We query positions q1 = 2 (“George”) and q2 = 3 (“str.”). The first query returns r1 = LOCATION, upon which we make another query on the the same position q3 = 3 (“George”), and so on. When we have sufficient confidence about the entire output, we return the most likely prediction ŷ under the model. Each query qi is issued at time si and the response comes back at time ti. Assume that each query costs m cents. Our goal is to choose queries to maximize accuracy, minimize latency and cost.\nWe make several remarks about this setting: First, we must make a prediction ŷ on each input x in the stream, unlike in active learning, where we are only interested in the pool or stream of examples for the purposes of building a good model. Second, we evaluate on accuracy(y, ŷ) against the true label sequence y (on named-entity recognition, this is the F1 metric), but y is never actually\nobserved—the only feedback is via the responses, like in partial monitoring games [13]. Therefore, we must make enough queries to garner sufficient confidence (something we can’t do in partial monitoring games) on each example from the beginning. Finally, the responses are used to update the prediction model, like in online learning. This allows the number of queries needed (and thus cost and latency) to decrease over time without compromising accuracy."
+    }, {
+      "heading" : "3 Model",
+      "text" : "We model on-the-job learning as a stochastic game with two players: the system and the crowd. The game starts with the system receiving input x and ends when the system turns in a set of labels y = (y1, . . . , yn). During the system’s turn, the system may choose a query action q ∈ {1, . . . , n} to ask the crowd to label yq . The system may also choose the wait action (q = ∅W ) to wait for the crowd to respond to a pending query or the return action (q = ∅R) to terminate the game and return its prediction given responses received thus far. The system can make as many queries in a row (i.e. simultaneously) as it wants, before deciding to wait or turn in.1 When the wait action is chosen, the turn switches to the crowd, which provides a response r to one pending query, and advances the game clock by the time taken for the crowd to respond. The turn then immediately reverts back to the system. When the game ends (the system chooses the return action), the system evaluates a utility that depends on the accuracy of its prediction, the number of queries issued and the total time taken. The system should choose query and wait actions to maximize the utility of the prediction eventually returned.\nIn the rest of this section, we describe the details of the game tree, our choice of utility and specify models for crowd responses, followed by a brief exploration of behavior admitted by our model.\nGame tree. Let us now formalize the game tree in terms of its states, actions, transitions and rewards; see Figure 2b for an example. The game state σ = (tnow,q, s, r, t) consists of the current time tnow, the actions q = (q1, . . . , qk−1) that have been issued at times s = (s1, . . . , sk−1) and the responses r = (r1, . . . , rk−1) that have been received at times t = (t1, . . . , tk−1). Let rj = ∅ and tj = ∅ iff qj is not a query action or its responses have not been received by time tnow. During the system’s turn, when the system chooses an action qk, the state is updated to σ′ = (tnow,q ′, s′, r′, t′), where q′ = (q1, . . . , qk), s′ = (s1, . . . , sk−1, tnow), r′ = (r1, . . . , rk−1, ∅) and\n1 This rules out the possibility of launching a query midway through waiting for the next response. However, we feel like this is a reasonable limitation that significantly simplifies the search space.\nt′ = (t1, . . . , tk−1, ∅). If qk ∈ {1, . . . n}, then the system chooses another action from the new state σ′. If qk = ∅W , the crowd makes a stochastic move from σ′. Finally, if qk = ∅R, the game ends, and the system returns its best estimate of the labels using the responses it has received and obtains a utility U(σ) (defined later).\nLet F = {1 ≤ j ≤ k − 1 | qj 6= ∅W ∧ rj = ∅} be the set of in-flight requests. During the crowd’s turn (i.e. after the system chooses ∅W ), the next response from the crowd, j∗ ∈ F , is chosen: j∗ = arg minj∈F t ′ j where t ′ j is sampled from the response-time model, t ′ j ∼ pT(t′j | sj , t′j > tnow), for each j ∈ F . Finally, a response is sampled using a response model, r′j∗ ∼ p(r′j∗ | x, r), and the state is updated to σ′ = (tj∗ ,q, s, r′, t′), where r′ = (r1, . . . , r′j∗ , . . . , rk) and t ′ = (t1, . . . , t ′ j∗ , . . . , tk).\nUtility. Under Bayesian decision theory, the optimal choice for an action in state σ = (tnow,q, r, s, t) is the one that attains the maximum expected utility (i.e. value) for the game starting at σ. Recall that the system can return at any time, at which point it receives a utility that trades off two things: The first is the accuracy of the MAP estimate according to the model’s best guess of y incorporating all responses received by time τ . The second is the cost of making queries: a (monetary) cost wM per query made and penalty of wT per unit of time taken. Formally, we define the utility to be:\nU(σ) , ExpAcc(p(y | x,q, s, r, t))− (nQwM + tnowwT), (1) ExpAcc(p) = Ep(y)[Accuracy(argmax\ny′ p(y′))], (2)\nwhere nQ = |{j | qj ∈ {1, . . . , n}| is the number of queries made, p(y | x,q, s, r, t) is a prediction model that incorporates the crowd’s responses.\nThe utility of wait and return actions is computed by taking expectations over subsequent trajectories in the game tree. This is intractable to compute exactly, so we propose an approximate algorithm in Section 4.\nEnvironment model. The final component is a model of the environment (crowd). Given input x and queries q = (q1, . . . , qk) issued at times s = (s1, . . . , sk), we define a distribution over the output y, responses r = (r1, . . . , rk) and response times t = (t1, . . . , tk) as follows:\np(y, r, t | x,q, s) , pθ(y | x) k∏ i=1 pR(ri | yqi)pT(ti | si). (3)\nThe three components are as follows: pθ(y | x) is the prediction model (e.g. a standard linear-chain CRF); pR(r | yq) is the response model which describes the distribution of the crowd’s response r for a given a query q when the true answer is yq; and pT(ti | si) specifies the latency of query qi. The CRF model pθ(y | x) is learned based on all actual responses (not simulated ones) using AdaGrad. To model annotation errors, we set pR(r | yq) = 0.7 iff r = yq ,2 and distribute the remaining probability for r uniformly. Given this full model, we can compute p(r′ | x, r, q) simply by marginalizing out y and t from Equation 3. When conditioning on r, we ignore responses that have not yet been received (i.e. when rj = ∅ for some j).\nBehavior. Let’s look at typical behavior that we expect the model and utility to capture. Figure 2a shows how the marginals over the labels change as the crowd provides responses for our running example, i.e. named entity recognition for the sentence “Soup on George str.”. In the both timelines, the system issues queries on “Soup” and “George” because it is not confident about its predictions for these tokens. In the first timeline, the crowd correctly responds that “Soup” is a resource and that “George” is a location. Integrating these responses, the system is also more confident about its prediction on “str.”, and turns in the correct sequence of labels. In the second timeline, a crowd worker makes an error and labels “George” to be a person. The system still has uncertainty on “George” and issues an additional query which receives a correct response, following which the system turns in the correct sequence of labels. While the answer is still correct, the system could have taken less time to respond by making an additional query on “George” at the very beginning.\n2We found the humans we hired were roughly 70% accurate in our experiments"
+    }, {
+      "heading" : "4 Game playing",
+      "text" : "In Section 3 we modeled on-the-job learning as a stochastic game played between the system and the crowd. We now turn to the problem of actually finding a policy that maximizes the expected utility, which is, of course, intractable because of the large state space.\nOur algorithm (Algorithm 1) combines ideas from Monte Carlo tree search [12] to systematically explore the state space and progressive widening [?] to deal with the challenge of continuous variables (time). Some intuition about the algorithm is provided below. When simulating the system’s turn, the next state (and hence action) is chosen using the upper confidence tree (UCT) decision rule that trades off maximizing the value of the next state (exploitation) with the number of visits (exploration). The crowd’s turn is simulated based on transitions defined in Section 3. To handle the unbounded fanout during the crowd’s turn, we use progressive widening that maintains a current set of “active” or “explored” states, which is gradually grown with time. Let N(σ) be the number of times a state has been visited, and C(σ) be all successor states that the algorithm has sampled.\nAlgorithm 1 Approximating expected utility with MCTS and progressive widening 1: For all σ, N(σ)← 0, V (σ)← 0, C(σ)← [ ] . Initialize visits, utility sum, and children 2: function MONTECARLOVALUE(state σ) 3: increment N(σ) 4: if system’s turn then 5: σ′ ← arg maxσ′ { V (σ′) N(σ′) + c √ logN(σ) N(σ′) } . Choose next state σ′ using UCT\n6: v ←MONTECARLOVALUE(σ′) 7: V (σ)← V (σ) + v . Record observed utility 8: return v 9: else if crowd’s turn then\n10: if max(1, √ N(σ)) ≤ |C(σ)| then . Restrict continuous samples using PW 11: σ′ is sampled from set of already visited C(σ) based on (3) 12: else 13: σ′ is drawn based on (3) 14: C(σ)← C(σ) ∪ {[σ′]} 15: end if 16: return MONTECARLOVALUE(σ′) 17: else if game terminated then 18: return utility U of σ according to (1) 19: end if 20: end function"
+    }, {
+      "heading" : "5 Experiments",
+      "text" : "In this section, we empirically evaluate our approach on three tasks. While the on-the-job setting we propose is targeted at scenarios where there is no data to begin with, we use existing labeled datasets (Table 1) to have a gold standard.\nBaselines. We evaluated the following four methods on each dataset:\n1. Human n-query: The majority vote of n human crowd workers was used as a prediction. 2. Online learning: Uses a classifier that trains on the gold output for all examples seen so\nfar and then returns the MLE as a prediction. This is the best possible offline system: it sees perfect information about all the data seen so far, but can not query the crowd while making a prediction.\n3. Threshold baseline: Uses the following heuristic: For each label, yi, we ask for m queries such that (1−pθ(yi | x))×0.3m ≥ 0.98. Instead of computing the expected marginals over the responses to queries in flight, we simply count the in-flight requests for a given variable, and reduces the uncertainty on that variable by a factor of 0.3. The system continues launching requests until the threshold (adjusted by number of queries in flight) is crossed.\nPredictions are made using MLE on the model given responses. The baseline does not reason about time and makes all its queries at the very beginning.\n4. LENSE: Our full system as described in Section 3.\nImplementation and crowdsourcing setup. We implemented the retainer model of [18] on Amazon Mechanical Turk to create a “pool” of crowd workers that could respond to queries in real-time. The workers were given a short tutorial on each task before joining the pool to minimize systematic errors caused by misunderstanding the task. We paid workers $1.00 to join the retainer pool and an additional $0.01 per query (for NER, since response times were much faster, we paid $0.005 per query). Worker response times were generally in the range of 0.5–2 seconds for NER, 10–15 seconds for Sentiment, and 1–4 seconds for Faces.\nWhen running experiments, we found that the results varied based on the current worker quality. To control for variance in worker quality across our evaluations of the different methods, we collected 5 worker responses and their delays on each label ahead of time5. During simulation we sample the worker responses and delays without replacement from this frozen pool of worker responses.\nSummary of results. Table 2 and Table 3 summarize the performance of the methods on the three tasks. On all three datasets, we found that on-the-job learning outperforms machine and human-only\n3http://www.cnts.ua.ac.be/conll2003/ner/ 4 The original also includes a fifth tag for miscellaneous, however the definition for miscellaneos is complex,\nmaking it very difficult for non-expert crowd workers to provide accurate labels. 5These datasets are available in the code repository for this paper\ncomparisons on both quality and cost. On NER, we achieve an F1 of 88.4% at more than an order of magnitude reduction on the cost of achieving comporable quality result using the 5-vote approach. On Sentiment and Faces, we reduce costs for a comparable accuracy by a factor of around 2. For the latter two tasks, both on-the-job learning methods perform less well than in NER. We suspect this is due to the presence of a dominant class (“none”) in NER that the model can very quickly learn to expend almost no effort on. LENSE outperforms the threshold baseline, supporting the importance of Bayesian decision theory.\nFigure 4 tracks the performance and cost of LENSE over time on the NER task. LENSE is not only able to consistently outperform other baselines, but the cost of the system steadily reduces over time. On the NER task, we find that LENSE is able to trade off time to produce more accurate results than the 1-vote baseline with fewer queries by waiting for responses before making another query.\nWhile on-the-job learning allows us to deploy quickly and ensure good results, we would like to eventually operate without crowd supervision. Figure 3, we show the number of queries per example on Sentiment with two different features sets, UNIGRAMS and RNN (as described in Table 1). With simpler features (UNIGRAMS), the model saturates early and we will continue to need to query to the crowd to achieve our accuracy target (as specified by the loss function). On the other hand, using richer features (RNN) the model is able to learn from the crowd and the amount of supervision needed reduces over time. Note that even when the model capacity is limited, LENSE is able to guarantee a consistent, high level of performance."
+    }, {
+      "heading" : "6 Related Work",
+      "text" : "On-the-job learning draws ideas from many areas: online learning, active learning, active classification, crowdsourcing, and structured prediction.\nOnline learning. The fundamental premise of online learning is that algorithms should improve with time, and there is a rich body of work in this area [7]. In our setting, algorithms not only improve over time, but maintain high accuracy from the beginning, whereas regret bounds only achieve this asymptotically.\nActive learning. Active learning (see [19] for a survey) algorithms strategically select most informative examples to build a classifier. Online active learning [8, 9, 10] performs active learning in the online setting. Several authors have also considered using crowd workers as a noisy oracle [20, 21, 22, 23]. It differs from our setup in that it assumes that labels can only be observed after classification, which makes it nearly impossible to maintain high accuracy in the beginning.\nActive classification. Active classification [24, 25, 26] asks what are the most informative features to measure at test time. Existing active classification algorithms rely on having a fully labeled dataset which is used to learn a static policy for when certain features should be queried, which does not change at test time. On-the-job learning differs from active classification in two respects: true labels are never observed, and our system improves itself at test time by learning a stronger model. A notable exception is Legion:AR [6], which like us operates in on-the-job learning setting to for real-time activity classification. However, they do not explore the machine learning foundations associated with operating in this setting, which is the aim of this paper.\nCrowdsourcing. A burgenoning subset of the crowdsourcing community overlaps with machine learning. One example is Flock [27], which first crowdsources the identification of features for an image classification task, and then asks the crowd to annotate these features so it can learn a decision tree. In another line of work, TurKontrol [28] models individual crowd worker reliability to optimize the number of human votes needed to achieve confident consensus using a POMDP.\nStructured prediction. An important aspect our prediction tasks is that the output is structured, which leads to a much richer setting for one-the-job learning. Since tags are correlated, the importance of a coherent framework for optimizing querying resources is increased. Making active partial observations on structures and has been explored in the measurements framework of [29] and in the distant supervision setting [30]."
+    }, {
+      "heading" : "7 Conclusion",
+      "text" : "We have introduced a new framework that learns from (noisy) crowds on-the-job to maintain high accuracy, and reducing cost significantly over time. The technical core of our approach is modeling the on-the-job setting as a stochastic game and using ideas from game playing to approximate the optimal policy. We have built a system, LENSE, which obtains significant cost reductions over a pure crowd approach and significant accuracy improvements over a pure ML approach."
+    } ],
+    "references" : [ {
+      "title" : "ImageNet: A large-scale hierarchical image database",
+      "author" : [ "J. Deng", "W. Dong", "R. Socher", "L. Li", "K. Li", "L. Fei-Fei" ],
+      "venue" : "In Computer Vision and Pattern Recognition (CVPR),",
+      "citeRegEx" : "1",
+      "shortCiteRegEx" : "1",
+      "year" : 2009
+    }, {
+      "title" : "Imagenet classification with deep convolutional neural networks",
+      "author" : [ "A. Krizhevsky", "I. Sutskever", "G.E. Hinton" ],
+      "venue" : "In Advances in Neural Information Processing Systems (NIPS),",
+      "citeRegEx" : "2",
+      "shortCiteRegEx" : "2",
+      "year" : 2012
+    }, {
+      "title" : "Soylent: a word processor with a crowd inside",
+      "author" : [ "M.S. Bernstein", "G. Little", "R.C. Miller", "B. Hartmann", "M.S. Ackerman", "D.R. Karger", "D. Crowell", "K. Panovich" ],
+      "venue" : "In Symposium on User Interface Software and Technology,",
+      "citeRegEx" : "3",
+      "shortCiteRegEx" : "3",
+      "year" : 2010
+    }, {
+      "title" : "Emailvalet: Managing email overload through private, accountable crowdsourcing",
+      "author" : [ "N. Kokkalis", "T. Köhn", "C. Pfeiffer", "D. Chornyi", "M.S. Bernstein", "S.R. Klemmer" ],
+      "venue" : "In Conference on Computer Supported Cooperative Work,",
+      "citeRegEx" : "4",
+      "shortCiteRegEx" : "4",
+      "year" : 2013
+    }, {
+      "title" : "Twiner: named entity recognition in targeted twitter stream",
+      "author" : [ "C. Li", "J. Weng", "Q. He", "Y. Yao", "A. Datta", "A. Sun", "B. Lee" ],
+      "venue" : "In ACM Special Interest Group on Information Retreival (SIGIR),",
+      "citeRegEx" : "5",
+      "shortCiteRegEx" : "5",
+      "year" : 2012
+    }, {
+      "title" : "Real-time crowd labeling for deployable activity recognition",
+      "author" : [ "Walter S Lasecki", "Young Chol Song", "Henry Kautz", "Jeffrey P Bigham" ],
+      "venue" : "In Proceedings of the 2013 conference on Computer supported cooperative work,",
+      "citeRegEx" : "6",
+      "shortCiteRegEx" : "6",
+      "year" : 2013
+    }, {
+      "title" : "Prediction, learning, and games",
+      "author" : [ "N. Cesa-Bianchi", "G. Lugosi" ],
+      "venue" : null,
+      "citeRegEx" : "7",
+      "shortCiteRegEx" : "7",
+      "year" : 2006
+    }, {
+      "title" : "Some label efficient learning results",
+      "author" : [ "D. Helmbold", "S. Panizza" ],
+      "venue" : "In Conference on Learning Theory (COLT),",
+      "citeRegEx" : "8",
+      "shortCiteRegEx" : "8",
+      "year" : 1997
+    }, {
+      "title" : "Online active learning methods for fast label-efficient spam filtering",
+      "author" : [ "D. Sculley" ],
+      "venue" : "In Conference on Email and Anti-spam (CEAS),",
+      "citeRegEx" : "9",
+      "shortCiteRegEx" : "9",
+      "year" : 2007
+    }, {
+      "title" : "Unbiased online active learning in data streams",
+      "author" : [ "W. Chu", "M. Zinkevich", "L. Li", "A. Thomas", "B. Tseng" ],
+      "venue" : "In International Conference on Knowledge Discovery and Data Mining (KDD),",
+      "citeRegEx" : "10",
+      "shortCiteRegEx" : "10",
+      "year" : 2011
+    }, {
+      "title" : "Active classification based on value of classifier",
+      "author" : [ "T. Gao", "D. Koller" ],
+      "venue" : "In Advances in Neural Information Processing Systems (NIPS),",
+      "citeRegEx" : "11",
+      "shortCiteRegEx" : "11",
+      "year" : 2011
+    }, {
+      "title" : "Bandit based Monte-Carlo planning",
+      "author" : [ "L. Kocsis", "C. Szepesvári" ],
+      "venue" : "In European Conference on Machine Learning (ECML),",
+      "citeRegEx" : "12",
+      "shortCiteRegEx" : "12",
+      "year" : 2006
+    }, {
+      "title" : "Regret minimization under partial monitoring",
+      "author" : [ "N. Cesa-Bianchi", "G. Lugosi", "G. Stoltz" ],
+      "venue" : "Mathematics of Operations Research,",
+      "citeRegEx" : "13",
+      "shortCiteRegEx" : "13",
+      "year" : 2006
+    }, {
+      "title" : "Incorporating non-local information into information extraction systems by Gibbs sampling",
+      "author" : [ "J.R. Finkel", "T. Grenager", "C. Manning" ],
+      "venue" : "In Association for Computational Linguistics (ACL),",
+      "citeRegEx" : "14",
+      "shortCiteRegEx" : "14",
+      "year" : 2005
+    }, {
+      "title" : "Learning word vectors for sentiment analysis",
+      "author" : [ "Andrew L. Maas", "Raymond E. Daly", "Peter T. Pham", "Dan Huang", "Andrew Y. Ng", "Christopher Potts" ],
+      "venue" : "In Proceedings of the 49th Annual Meeting of the Association for Computational Linguistics: Human Language Technologies,",
+      "citeRegEx" : "15",
+      "shortCiteRegEx" : "15",
+      "year" : 2011
+    }, {
+      "title" : "Recursive deep models for semantic compositionality over a sentiment treebank",
+      "author" : [ "R. Socher", "A. Perelygin", "J.Y. Wu", "J. Chuang", "C.D. Manning", "A.Y. Ng", "C. Potts" ],
+      "venue" : "In Empirical Methods in Natural Language Processing (EMNLP),",
+      "citeRegEx" : "16",
+      "shortCiteRegEx" : "16",
+      "year" : 2013
+    }, {
+      "title" : "Attribute and Simile Classifiers for Face Verification",
+      "author" : [ "N. Kumar", "A.C. Berg", "P.N. Belhumeur", "S.K. Nayar" ],
+      "venue" : "In IEEE International Conference on Computer Vision (ICCV),",
+      "citeRegEx" : "17",
+      "shortCiteRegEx" : "17",
+      "year" : 2009
+    }, {
+      "title" : "Crowds in two seconds: Enabling realtime crowd-powered interfaces",
+      "author" : [ "M.S. Bernstein", "J. Brandt", "R.C. Miller", "D.R. Karger" ],
+      "venue" : "In User Interface Software and Technology,",
+      "citeRegEx" : "18",
+      "shortCiteRegEx" : "18",
+      "year" : 2011
+    }, {
+      "title" : "Active learning literature survey",
+      "author" : [ "B. Settles" ],
+      "venue" : "Technical report, University of Wisconsin,",
+      "citeRegEx" : "19",
+      "shortCiteRegEx" : "19",
+      "year" : 2010
+    }, {
+      "title" : "Proactive learning: cost-sensitive active learning with multiple imperfect oracles",
+      "author" : [ "P. Donmez", "J.G. Carbonell" ],
+      "venue" : "In Conference on Information and Knowledge Management (CIKM),",
+      "citeRegEx" : "20",
+      "shortCiteRegEx" : "20",
+      "year" : 2008
+    }, {
+      "title" : "Near-optimal Bayesian active learning with noisy observations",
+      "author" : [ "D. Golovin", "A. Krause", "D. Ray" ],
+      "venue" : "In Advances in Neural Information Processing Systems (NIPS),",
+      "citeRegEx" : "21",
+      "shortCiteRegEx" : "21",
+      "year" : 2010
+    }, {
+      "title" : "Active learning from crowds",
+      "author" : [ "Y. Yan", "G.M. Fung", "R. Rosales", "J.G. Dy" ],
+      "venue" : "In International Conference on Machine Learning (ICML),",
+      "citeRegEx" : "22",
+      "shortCiteRegEx" : "22",
+      "year" : 2011
+    }, {
+      "title" : "Large-scale live active learning: Training object detectors with crawled data and crowds",
+      "author" : [ "Sudheendra Vijayanarasimhan", "Kristen Grauman" ],
+      "venue" : "International Journal of Computer Vision,",
+      "citeRegEx" : "23",
+      "shortCiteRegEx" : "23",
+      "year" : 2014
+    }, {
+      "title" : "Learning cost-sensitive active classifiers",
+      "author" : [ "R. Greiner", "A.J. Grove", "D. Roth" ],
+      "venue" : "Artificial Intelligence,",
+      "citeRegEx" : "24",
+      "shortCiteRegEx" : "24",
+      "year" : 2002
+    }, {
+      "title" : "Test-cost sensitive naive Bayes classification",
+      "author" : [ "X. Chai", "L. Deng", "Q. Yang", "C.X. Ling" ],
+      "venue" : "In International Conference on Data Mining,",
+      "citeRegEx" : "25",
+      "shortCiteRegEx" : "25",
+      "year" : 2004
+    }, {
+      "title" : "Anytime induction of cost-sensitive trees",
+      "author" : [ "S. Esmeir", "S. Markovitch" ],
+      "venue" : "In Advances in Neural Information Processing Systems (NIPS),",
+      "citeRegEx" : "26",
+      "shortCiteRegEx" : "26",
+      "year" : 2007
+    }, {
+      "title" : "Flock: Hybrid Crowd-Machine learning classifiers",
+      "author" : [ "J. Cheng", "M.S. Bernstein" ],
+      "venue" : "In Proceedings of the 18th ACM Conference on Computer Supported Cooperative Work & Social Computing,",
+      "citeRegEx" : "27",
+      "shortCiteRegEx" : "27",
+      "year" : 2015
+    }, {
+      "title" : "Decision-theoretic control of crowd-sourced workflows",
+      "author" : [ "P. Dai", "Mausam", "D.S. Weld" ],
+      "venue" : "In Association for the Advancement of Artificial Intelligence (AAAI),",
+      "citeRegEx" : "28",
+      "shortCiteRegEx" : "28",
+      "year" : 2010
+    }, {
+      "title" : "Learning from measurements in exponential families",
+      "author" : [ "P. Liang", "M.I. Jordan", "D. Klein" ],
+      "venue" : "In International Conference on Machine Learning (ICML),",
+      "citeRegEx" : "29",
+      "shortCiteRegEx" : "29",
+      "year" : 2009
+    }, {
+      "title" : "Combining distant and partial supervision for relation extraction",
+      "author" : [ "G. Angeli", "J. Tibshirani", "J.Y. Wu", "C.D. Manning" ],
+      "venue" : "In Empirical Methods in Natural Language Processing (EMNLP),",
+      "citeRegEx" : "30",
+      "shortCiteRegEx" : "30",
+      "year" : 2014
+    } ],
+    "referenceMentions" : [ {
+      "referenceID" : 0,
+      "context" : "There are two roads to an accurate AI system today: (i) gather a huge amount of labeled training data [1] and do supervised learning [2]; or (ii) use crowdsourcing to directly perform the task [3, 4].",
+      "startOffset" : 102,
+      "endOffset" : 105
+    }, {
+      "referenceID" : 1,
+      "context" : "There are two roads to an accurate AI system today: (i) gather a huge amount of labeled training data [1] and do supervised learning [2]; or (ii) use crowdsourcing to directly perform the task [3, 4].",
+      "startOffset" : 133,
+      "endOffset" : 136
+    }, {
+      "referenceID" : 2,
+      "context" : "There are two roads to an accurate AI system today: (i) gather a huge amount of labeled training data [1] and do supervised learning [2]; or (ii) use crowdsourcing to directly perform the task [3, 4].",
+      "startOffset" : 193,
+      "endOffset" : 199
+    }, {
+      "referenceID" : 3,
+      "context" : "There are two roads to an accurate AI system today: (i) gather a huge amount of labeled training data [1] and do supervised learning [2]; or (ii) use crowdsourcing to directly perform the task [3, 4].",
+      "startOffset" : 193,
+      "endOffset" : 199
+    }, {
+      "referenceID" : 4,
+      "context" : ", to do Twitter information extraction [5] to aid in disaster relief efforts or monitor public opinion — but one simply lacks the resources to follow either the pure ML or pure crowdsourcing road.",
+      "startOffset" : 39,
+      "endOffset" : 42
+    }, {
+      "referenceID" : 5,
+      "context" : "In this paper, we propose a framework called on-the-job learning (formalizing and extending ideas first implemented in [6]), in which we produce high quality results from the start without requiring a trained model.",
+      "startOffset" : 119,
+      "endOffset" : 122
+    }, {
+      "referenceID" : 6,
+      "context" : "Online learning [7] and online active learning [8, 9, 10] are different in that they do not actively seek new information prior to making a prediction, and cannot maintain high accuracy independent of the number of data instances seen so far.",
+      "startOffset" : 16,
+      "endOffset" : 19
+    }, {
+      "referenceID" : 7,
+      "context" : "Online learning [7] and online active learning [8, 9, 10] are different in that they do not actively seek new information prior to making a prediction, and cannot maintain high accuracy independent of the number of data instances seen so far.",
+      "startOffset" : 47,
+      "endOffset" : 57
+    }, {
+      "referenceID" : 8,
+      "context" : "Online learning [7] and online active learning [8, 9, 10] are different in that they do not actively seek new information prior to making a prediction, and cannot maintain high accuracy independent of the number of data instances seen so far.",
+      "startOffset" : 47,
+      "endOffset" : 57
+    }, {
+      "referenceID" : 9,
+      "context" : "Online learning [7] and online active learning [8, 9, 10] are different in that they do not actively seek new information prior to making a prediction, and cannot maintain high accuracy independent of the number of data instances seen so far.",
+      "startOffset" : 47,
+      "endOffset" : 57
+    }, {
+      "referenceID" : 10,
+      "context" : "Active classification [11], like us,",
+      "startOffset" : 22,
+      "endOffset" : 26
+    }, {
+      "referenceID" : 11,
+      "context" : "Computing the optimal policy is intractable, so we develop an approximation based on Monte Carlo tree search [12] and progressive widening to reason about continuous time [?].",
+      "startOffset" : 109,
+      "endOffset" : 113
+    }, {
+      "referenceID" : 12,
+      "context" : "observed—the only feedback is via the responses, like in partial monitoring games [13].",
+      "startOffset" : 82,
+      "endOffset" : 86
+    }, {
+      "referenceID" : 11,
+      "context" : "Our algorithm (Algorithm 1) combines ideas from Monte Carlo tree search [12] to systematically explore the state space and progressive widening [?] to deal with the challenge of continuous variables (time).",
+      "startOffset" : 72,
+      "endOffset" : 76
+    }, {
+      "referenceID" : 13,
+      "context" : "We used standard features [14]: the current word, current lemma, previous and next lemmas, lemmas in a window of size three to the left and right, word shape and word prefix and suffixes, as well as word embeddings.",
+      "startOffset" : 26,
+      "endOffset" : 30
+    }, {
+      "referenceID" : 14,
+      "context" : "Sentiment (1800) We evaluate on a subset of the IMDB sentiment dataset [15] that consists of 2000 polar movie reviews; the goal is binary classification of documents into classes POS and NEG.",
+      "startOffset" : 71,
+      "endOffset" : 75
+    }, {
+      "referenceID" : 15,
+      "context" : "We used two feature sets, the first (UNIGRAMS) containing only word unigrams, and the second (RNN) that also contains sentence vector embeddings from [16].",
+      "startOffset" : 150,
+      "endOffset" : 154
+    }, {
+      "referenceID" : 16,
+      "context" : "Face (1784) We evaluate on a celebrity face classification task [17].",
+      "startOffset" : 64,
+      "endOffset" : 68
+    }, {
+      "referenceID" : 1,
+      "context" : "We used the last layer of a 11layer AlexNet [2] trained on ImageNet as input feature embeddings, though we leave back-propagating into the net to future work.",
+      "startOffset" : 44,
+      "endOffset" : 47
+    }, {
+      "referenceID" : 17,
+      "context" : "We implemented the retainer model of [18] on Amazon Mechanical Turk to create a “pool” of crowd workers that could respond to queries in real-time.",
+      "startOffset" : 37,
+      "endOffset" : 41
+    }, {
+      "referenceID" : 6,
+      "context" : "The fundamental premise of online learning is that algorithms should improve with time, and there is a rich body of work in this area [7].",
+      "startOffset" : 134,
+      "endOffset" : 137
+    }, {
+      "referenceID" : 18,
+      "context" : "Active learning (see [19] for a survey) algorithms strategically select most informative examples to build a classifier.",
+      "startOffset" : 21,
+      "endOffset" : 25
+    }, {
+      "referenceID" : 7,
+      "context" : "Online active learning [8, 9, 10] performs active learning in the online setting.",
+      "startOffset" : 23,
+      "endOffset" : 33
+    }, {
+      "referenceID" : 8,
+      "context" : "Online active learning [8, 9, 10] performs active learning in the online setting.",
+      "startOffset" : 23,
+      "endOffset" : 33
+    }, {
+      "referenceID" : 9,
+      "context" : "Online active learning [8, 9, 10] performs active learning in the online setting.",
+      "startOffset" : 23,
+      "endOffset" : 33
+    }, {
+      "referenceID" : 19,
+      "context" : "Several authors have also considered using crowd workers as a noisy oracle [20, 21, 22, 23].",
+      "startOffset" : 75,
+      "endOffset" : 91
+    }, {
+      "referenceID" : 20,
+      "context" : "Several authors have also considered using crowd workers as a noisy oracle [20, 21, 22, 23].",
+      "startOffset" : 75,
+      "endOffset" : 91
+    }, {
+      "referenceID" : 21,
+      "context" : "Several authors have also considered using crowd workers as a noisy oracle [20, 21, 22, 23].",
+      "startOffset" : 75,
+      "endOffset" : 91
+    }, {
+      "referenceID" : 22,
+      "context" : "Several authors have also considered using crowd workers as a noisy oracle [20, 21, 22, 23].",
+      "startOffset" : 75,
+      "endOffset" : 91
+    }, {
+      "referenceID" : 23,
+      "context" : "Active classification [24, 25, 26] asks what are the most informative features to measure at test time.",
+      "startOffset" : 22,
+      "endOffset" : 34
+    }, {
+      "referenceID" : 24,
+      "context" : "Active classification [24, 25, 26] asks what are the most informative features to measure at test time.",
+      "startOffset" : 22,
+      "endOffset" : 34
+    }, {
+      "referenceID" : 25,
+      "context" : "Active classification [24, 25, 26] asks what are the most informative features to measure at test time.",
+      "startOffset" : 22,
+      "endOffset" : 34
+    }, {
+      "referenceID" : 5,
+      "context" : "A notable exception is Legion:AR [6], which like us operates in on-the-job learning setting to for real-time activity classification.",
+      "startOffset" : 33,
+      "endOffset" : 36
+    }, {
+      "referenceID" : 26,
+      "context" : "One example is Flock [27], which first crowdsources the identification of features for an image classification task, and then asks the crowd to annotate these features so it can learn a decision tree.",
+      "startOffset" : 21,
+      "endOffset" : 25
+    }, {
+      "referenceID" : 27,
+      "context" : "In another line of work, TurKontrol [28] models individual crowd worker reliability to optimize the number of human votes needed to achieve confident consensus using a POMDP.",
+      "startOffset" : 36,
+      "endOffset" : 40
+    }, {
+      "referenceID" : 28,
+      "context" : "Making active partial observations on structures and has been explored in the measurements framework of [29] and in the distant supervision setting [30].",
+      "startOffset" : 104,
+      "endOffset" : 108
+    }, {
+      "referenceID" : 29,
+      "context" : "Making active partial observations on structures and has been explored in the measurements framework of [29] and in the distant supervision setting [30].",
+      "startOffset" : 148,
+      "endOffset" : 152
+    } ],
+    "year" : 2015,
+    "abstractText" : "Our goal is to deploy a high-accuracy system starting with zero training examples. We consider an on-the-job setting, where as inputs arrive, we use real-time crowdsourcing to resolve uncertainty where needed and output our prediction when confident. As the model improves over time, the reliance on crowdsourcing queries decreases. We cast our setting as a stochastic game based on Bayesian decision theory, which allows us to balance latency, cost, and accuracy objectives in a principled way. Computing the optimal policy is intractable, so we develop an approximation based on Monte Carlo Tree Search. We tested our approach on three datasets—named-entity recognition, sentiment classification, and image classification. On the NER task we obtained more than an order of magnitude reduction in cost compared to full human annotation, while boosting performance relative to the expert provided labels. We also achieve a 8% F1 improvement over having a single human label the whole set, and a 28% F1 improvement over online learning. “Poor is the pupil who does not surpass his master.” – Leonardo da Vinci",
+    "creator" : "LaTeX with hyperref package"
+  }
+}

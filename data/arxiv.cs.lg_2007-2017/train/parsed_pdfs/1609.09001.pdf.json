@@ -1,0 +1,642 @@
+{
+  "name" : "1609.09001.pdf",
+  "metadata" : {
+    "source" : "CRF",
+    "title" : "Learning from the Hindsight Plan – Episodic MPC Improvement",
+    "authors" : [ "Aviv Tamar", "Garrett Thomas", "Tianhao Zhang", "Sergey Levine", "Pieter Abbeel" ],
+    "emails" : [ ],
+    "sections" : [ {
+      "heading" : null,
+      "text" : "I. INTRODUCTION\nModel predictive control (MPC), also known as receding horizon control, is an effective model-based control method that is well-suited for complex dynamical systems, with a wide range of applications in robotics (see, e.g., [1], [2]) among other domains. In MPC, a model of system dynamics, either learned or known, is used to plan a locally optimal control policy for a limited horizon, starting from the current state of the system. The first control in the plan is executed, and then re-planning is performed from the new state.\nWhen the system dynamics are not known exactly, as is often the case in practice, MPC can be integrated with online system identification to simultaneously learn dynamics and plan controls. This approach has been successfully applied in various robotic tasks, from aerial vehicle flight [3], [4], to contact-rich object manipulation [5], [6]. In these applications, the limited horizon of MPC serves a dual purpose: maintaining tractability of the planning problem and mitigating error propagation during planning as a result of inaccurate models [7]. Indeed, MPC has been successfully applied to problems with challenging dynamics, such as cutting vegetables [5] and object manipulation [6].\nOne drawback of MPC is that planning with a limited horizon can lead to suboptimal policies. For example, consider a task of navigating an environment with an obstacle. The MPC policy can only maneuver around the obstacle when it is within the planning horizon. If the robot were to encounter the same task several times, we should naturally expect it to learn to maneuver around the obstacle even before it enters the planning horizon. However, state-of-theart MPC methods that only learn dynamics, such as [5] and\n1EECS Department, UC Berkeley, 2ICSI, UC Berkeley, 3OpenAI\n[6], are prone to repeatedly produce suboptimal behavior in each episode of the task due to the limited horizon.\nIn this work, we propose a method that improves the MPC policies in episodic tasks. Our main insight is that, between episodes, we can revisit the MPC planning computations that were performed online, and recompute them offline with a longer horizon, and with potentially better dynamics. The difference between this hindsight plan and the actions that were actually performed can be used to drive a policy improvement between episodes. In particular, we learn a neural network cost shaping for MPC using supervised learning, by minimizing this difference. The result is a method that incorporates long-term reasoning into MPC, while maintaining the benefits of short-horizon planning.\nIn comparison to previous policy improvement methods, which are typically based on value functions or policy gradients [8], our approach exploits the predictive nature of MPC to drive policy improvement, by contrasting the predicted actions with actions calculated in hindsight. This allows us to circumvent the difficulties of value function approximation and the sample inefficiency of policy gradients.\nWe show that our method effectively improves MPC policies for contact-rich manipulation tasks, such as peg insertion, in both simulated and real environments."
+    }, {
+      "heading" : "II. RELATED WORK",
+      "text" : "A standard approach for mitigating the limited planning horizon in MPC is to introduce a value function as the terminal cost, also known as infinite horizon MPC [9], [10]. When the model is not fully known, or too large to calculate the value function, approximation techniques must be employed. However, it has been observed that standard value function approximation methods perform poorly when combined with MPC [11]. Zhong et el. [11] also proposed\nar X\niv :1\n60 9.\n09 00\n1v 2\n[ cs\n.R O\n] 2\n0 M\nar 2\n01 7\nan improved approximation based on state discretization. However, that method does not scale to high-dimensional systems such as the 7 DoF robot arm considered in our experiments. We note that the cost shaping in our method can be set to have the form of a terminal value function. However, instead of learning directly from observed scalar costs, as typical for value function approximation [8], our method learns the cost shaping from the hindsight plan, which contains desired controls and hence is much more informative.\nOur episodic formulation of improving the MPC controller is similar to the setting of iterative learning control (ILC) [12], [13], [14], [15]. However, in ILC, the goal is typically to follow a reference trajectory, which is not suitable for the manipulation tasks we consider here. Our formulation allows the goal to be specified as a general optimal control problem. We note that a very recent work [16] proposed an extension of ILC that does not require a reference trajectory, and also uses a form of learning MPC, based on adding a value function to the MPC cost, which is calculated for all previously visited states. That approach, however, requires on a controller that can deterministically drive the system to any previously visited state, which does not hold for the real-world manipulation tasks we consider here.\nReinforcement planning [17] considers a discrete highlevel planner for a continuous low-level control algorithm, and learns cost parameters of the planner using reinforcement learning methods. Our approach, in comparison, exploits the fact that our controller is based on MPC to learn from the hindsight plan, and is not limited to discrete planning. We also note that our method is different from hindsight optimization [18], in which simulation is used to calculate a value function online.\nLearning a cost function from observed controls is a form of inverse optimal control (IOC) [19], [20]. While in IOC, the actions are assumed to be generated by an expert demonstrator, our method does not require such demonstrations, and the actions used for learning the cost shaping are generated by a planning algorithm which learns the model from interaction, as in model-based reinforcement learning (RL) [21], [22] and adaptive control [23]. Model-based RL is a standard approach in robotic control [8], achieving state-of-the-art results in various domains, from helicopter flight [24] to contact-rich manipulation [25]. The use of MPC in RL allows for extremely data-efficient learning [6], which is especially important in robotics, where robot interaction time is often costly. In this work we improve the MPC controllers of [6] for contact-rich manipulation tasks. However, our method is general, and can be applied to any adaptive MPC algorithm, and any domain for which MPC is suitable."
+    }, {
+      "heading" : "III. PRELIMINARIES",
+      "text" : "In this work, we consider the standard episodic reinforcement learning or optimal control setting in discrete time with episode length T . We denote by xt the state at time t, and ut the control. The goal is to generate a control sequence U0:T = (u0, . . . ,uT ) that minimizes the total cost ∑T t=0 `t(xt,ut) given an initial state x0, where\n`t is a predefined task-specific scalar cost function, under dynamics given by xt+1 = f(xt,ut). At time step t, adaptive MPC methods calculate the control ut by first estimating the dynamics model and then approximately solving for the optimal action.\nConcretely, let Dt = {(xs,us,xs+1)}t−1s=0 denote a dataset of the observed interaction with the system up to time t. Let H ≤ T denote the MPC horizon, which is a parameter of the algorithm. At time t, MPC1 first uses Dt to predict system dynamics f̂ ts for the next H time steps, i.e. for t ≤ s ≤ t+H . Using the predicted dynamics, MPC then calculates the H-horizon optimal actions U∗t:t+H = (u ∗ t , . . . ,u ∗ t+H), by solving\narg min ut,...,ut+H t+H∑ s=t `s(xs,us), s.t. xs+1 = f̂ ts(xs,us), ∀s= t, . . . , t+H. (1)\nThe action ut = u∗t is then taken, and the system transitions to a new state xt+1 = f(xt,ut), from which the MPC optimization is repeated. When the episode ends, at t = T , the system is reset to the initial condition x0 and the process iterates. To reduce clutter, we omit the episode index from the notation."
+    }, {
+      "heading" : "IV. THE HINDSIGHT PLAN",
+      "text" : "In principle, if we know the true system dynamics f , and set H equal to the episode length T , the solution of Eq. (1) would lead to an optimal policy. However, in practice, both the computational burden of solving Eq. (1), and the error in dynamics prediction, necessitate the use of a shorter horizon H < T (and often much shorter H T ) for online MPC optimization, which results in a suboptimal policy. To mitigate this sub-optimality, we propose to revisit the planning computation after an episode has ended, using a longer horizon, and potentially better dynamics, as we describe in this section. This additional planning computation, which we term the hindsight plan, will allow us to improve our MPC policy, as we shall later describe.\nLet H̄ denote the horizon of the hindsight plan, where typically2 H̄ ≥ H . The hindsight action ūt at time t is defined as ūt = ū∗t , where Ū ∗ t:t+H̄ = (ū∗t , . . . , ū ∗ t+H̄\n) is the solution to the following hindsight planning problem:\narg min ut,...,ut+H̄ t+H̄∑ s=t `s(xs,us), s.t. xs+1 = f̂ss (xs,us), ∀s = t, . . . , t+H̄, (2)\nwhere the initial state xt is the state observed at time t during the original MPC execution, and the terms f̂ss are the same terms that were already calculated for the original MPC planning problem (1). Henceforth, we collectively term xt and f̂ss as the MPC trajectory information I . = {xt, f̂ss }.\nLet us emphasize the differences between the hindsight planning problem (2) and the original MPC planning problem (1). First, we plan with a longer horizon H̄ . Second, at each time step t, we use the dynamics predictions f̂ tt , . . . , f̂ t+H̄ t+H̄\n1Note that this slightly non-standard notation of the MPC algorithm makes explicit the online dynamics learning.\n2With perfect dynamics, setting H̄ = T would be optimal. However, with an inaccurate dynamics model, setting H̄ < T may be preferred.\nthat were calculated at times t, . . . , t+H̄ of the online MPC execution, as opposed to the predictions that were calculated at time t, f̂ tt , . . . , f̂ t t+H̄\nin Eq. (1). These predictions were not available at time t during the online MPC execution, as they use observations from later time steps in the episode3.\nThe main assumption underlying our approach is that the hindsight plan produces improved actions compared to the original MPC execution. This assumption is motivated by the improved dynamics prediction in (2), which is based on future data and, more importantly, the much longer planning horizon. Thus, in the hindsight plan, the two main sources of MPC sub-optimality are removed. We also note that calculating the hindsight plan typically requires more computation than the original MPC planning during the episode execution. However, the real-time requirement of MPC can be relaxed, because it can be computed offline, and the calculation can be performed concurrently and in parallel for all t."
+    }, {
+      "heading" : "V. MPC POLICY IMPROVEMENT",
+      "text" : "In this section, we show how the hindsight plan can be used to drive a policy improvement algorithm, by using it for learning a cost shaping for MPC. The idea is to learn a cost shaping that encourages the online MPC solution to be more similar to the solution in hindsight.\nLet us revisit the MPC optimization problem, and add to the original cost a cost shaping term, δs(xs,us, θ), parametrized by some vector θ,\narg min ut,...,ut+H t+H∑ s=t `s(xs,us)+δs(xs,us, θ),\ns.t. xs+1 = f̂ ts(xs,us), ∀s= t, . . . , t+H\n(3)\nwhere, similarly to Eq. (2), the trajectory information I = {xt, f̂ ts} contains the terms that were calculated for the original MPC planning problem (1). The cost-shaping term δs(xs,us, θ) can be represented, for example, by a neural network parametrized by θ. We denote by ut(θ) the first action in the solution of (3) for time t. That is, ut(θ) denotes the action MPC would have taken during the episode, had the cost-shaping parameter been θ. We also denote by u0t the first action in the solution of (3) with δs(xs,us, θ) ≡ 0, that is, the solution with no cost shaping applied.\nWe aim to learn a parameter θ that encourages the MPC solution of Eq. (3) to be similar to the the hindsight plan (2). We therefore propose to learn θ by minimizing the similarity loss L, defined as\nL(θ) = T∑\nt=0\n‖ut(θ)− ūt‖2 + λ‖ut(θ)− u0t‖2, (4)\nwhere λ ≥ 0 acts as a regularization term that controls the change from the online MPC policy. Note that the dependence of ut(θ) on θ can be quite complex, as it encapsulates the solution of the planning problem (3). A similar problem is encountered in IOC [19], [20], and indeed, our approach can be seen as performing IOC with the hindsight plan replacing\n3Potentially, we can use the data set at the end of the episode DT to reestimate the dynamics at every time step, and obtain even better dynamics predictions. However, we found it sufficient to use the dynamics that were already calculated during the online MPC execution.\nthe expert demonstration. For planning algorithms that can be represented as a computation graph [26], such as linear quadratic regulator (LQR) and value iteration [27], the loss L can be minimized efficiently using gradient based methods, such as L-BFGS [28]. We also note that our method can be used to learn additional parameters of the planning algorithm, such as the dynamics and discount factor, by simply adding them to the parameter vector θ. In this work, however, we focus on learning cost shaping.\nFurthermore, if δs(xs,us, θ) is set to 0 for all s < t+H , the cost shaping becomes a terminal value function, which is exactly the infinite horizon MPC formulation [9], [10]. A crucial difference in our approach, however, is that we learn the parameters θ by minimizing the similarity loss L, which directly measures the difference between the online and hindsight actions. Standard value function methods first approximate a value function, and then approximately solve the planning problem with that value function, resulting in two sources of approximation error, possibly explaining their poor performance observed in previous work [11].\nThe solution to Eq. (4) provides us with the parameters of a shaping cost that causes the MPC controller to mimic the hindsight controller, and results in a single step of policy improvement. However, once we run the MPC with the shaped cost in the system, we obtain a new trajectory, which we can perform hindsight planning on. This results in an iterative policy improvement algorithm, which we term hindsight iterative MPC (HIMPC). Let i ≥ 0 denote an iteration of the algorithm, and let θi denote the cost-shaping parameters used for the MPC execution at iteration i, where we assume that the first iteration i = 0 is executed without any cost shaping. We denote by Li(θ) the similarity loss optimization problem (4), where the trajectory information Ii is calculated from execution of the MPC controller at iteration i, with cost-shaping parameter θi. We calculate θi+1 by minimizing ∑i k=0 Lk(θ), which assures that we aggregate the hindsight information obtained at previous iterations. The general HIMPC algorithm is summarized in Algorithm 1. So far, we have not discussed the specific algorithms used for dynamics predictions and planning in MPC (1), nor the functional form of the cost shaping, and in principle, HIMPC can be combined with any adaptive MPC method such as [5] and [6]. However, the specific choice of algorithm and cost shaping will determine the computational complexity of solving the cost-shaped MPC planning (3) in real time. In addition, the tractability of minimizing the similarity loss (4) depends on the specific algorithm and cost shaping structure. In the next section, we describe a particular implementation of HIMPC based on LQR planning and Gaussian Mixture Model (GMM) dynamics. We also propose a neural-network (NN) cost shaping form that is both efficient to optimize and interpretable."
+    }, {
+      "heading" : "VI. AN LQR IMPLEMENTATION OF HIMPC",
+      "text" : "In this section we describe a particular implementation of the HIMPC algorithm, based on LQR planning and GMM dynamics learning. We are inspired by the work of [6], in which similar methods were used within MPC for effectively performing contact-rich manipulation tasks. In addition, we\nAlgorithm 1: HIMPC Algorithm 1 Run original MPC controller (1), and collect trajectory\ninformation I0 2 Calculate hindsight plan (2) with I0 3 Find cost-shaping that mimics hindsight controller\nθ0 = arg minθ L0(θ) 4 for i=1,2,. . . do 5 Run MPC controller with cost-shaping parameter θi−1, and collect trajectory information Ii 6 Calculate hindsight plan (2) with Ii 7 Solve θi = arg minθ ∑i k=0 Lk(θ) 8 end\npropose a novel cost shaping structure, that is both efficient to optimize, and has an intuitive interpretation as learning ‘way points’.\nThe online dynamics adaptation algorithm of [6] is based on a Bayesian approach for estimation, where the recent observations within an episode are used to estimate a linear dynamics model, using observations from previous episodes as a Bayesian prior. This produces, for every time step t, a time-varying linear dynamics model of the form xs+1 = f̂ ts(xs,us) = A t sxs+B t sus, for s = t, . . . , t+H . The method is further described in Appendix I. As the loss function `s, we use a quadratic loss of the form `s(xs,us) = (xs−x∗)>Qs(xs−x∗)+u>s Rsus, where x∗ is some goal state of the system, and Qs and Rs are a positive semi-definite and positive definite matrices, respectively4. Such a cost function is standard for many control tasks [29], and is particularly suitable for the manipulation experiments we consider, where the task is specified as moving the robot end-effector to some goal position, such as pushing a peg into a hole.\nWith linear dynamics and a quadratic loss, the MPC planning problem (1) becomes a standard LQR problem [29], for which a solution can be calculated efficiently by dynamic programming, as described Appendix II. The mapping from the trajectory information {xt, f̂ ts} to the action ut in this case can be written as the sequence of matrix multiplications and inversions in the LQR solution. This mapping can be represented as a computation graph, and the gradient ∂ut/∂x\n∗ can be easily calculated using modern automatic differentiation packages such as Theano [30].\nWe are now ready to introduce our cost shaping formulation. At time t, for s = t, . . . , t + H , we consider a cost shaping of the form:\nδs(xs,us, θ) = g(xt, θ) >Qsxs, (5)\nwhere g(xt, θ) is a neural network that has the current state xt as its input, θ as its weights, and a vector-valued output with the same dimensionality as xt. Note that adding a linear term to a quadratic form is equivalent to changing the center of the quadratic, up to a constant. Therefore, the shaped cost can be written as: `s(xs,us) + δs(xs,us, θ) =\n(xs − x̂∗(xt, θ))>Qs (xs − x̂∗(xt, θ)) + u>s Rsus+const, (6)\n4Extending our approach to non-quadratic loss functions is straightforward, by using a second-order Taylor expansion. See, e.g., [2] for details.\nwhere x̂∗(xt, θ) = x∗+ g(xt, θ) is a modified goal position. Thus, our cost shaping has the intuitive interpretation of modifying the goal position, which can be thought of as learning state-dependent way points. Note that g depends on the current state observation xt, and not on xs, therefore solving LQR with the cost in (6) is equivalent to solving the original LQR, just with a different x∗, making the solution similarly tractable.\nIn addition, calculating the gradient ∂ut/∂θ = ∂ut/∂x̂∗ · ∂x̂∗/∂θ is also tractable. This gradient can be used for minimizing the similarity loss (4) with standard optimization algorithms such as L-BFGS [28]. Note that the gradient ∂g/∂x is not required since g depends on xt, which is part of the trajectory information I .\nAn Illustrative Example\nIn this section we discuss an application of HIMPC to a simple 2D navigation task with obstacles. The goal of this example is to illustrate the function of the hindsight plan, and the learned cost shaping. Further quantitative analysis of this experiment is presented in Section VIII.\nConsider the 2D navigation task depicted in Figure 2. A particle with mass needs to navigate to a goal position by using vertical and horizontal forces. The particle may collide with the impenetrable gray colored obstacles, which when in contact, apply normal and frictional forces to the particle.\nIdeally, when starting from the initial position shown in Figure 2, the particle should navigate to the opening between the obstacles and from there continue to the goal. Such a plan would minimize the total cost in this domain. However, when a MPC policy is applied, the controller first navigates to the obstacle location which is closest to the goal, as shown in the dashed-red line in Figure 2, since its limited horizon planning (here H = 10) and imperfect dynamics model fail to take into account the future obstacle collision. Only after experiencing the obstacle, the controller navigates alongside it towards the goal. While the initial MPC policy is able to solve the task, its solution is clearly sub-optimal.\nThe wide red and black arrows in Figure 2 show the action that MPC selected, ut, and the action that the hindsight plan (with H̄ = 30 in this case) has chosen, ūt, at a particular time step. Due to the better dynamics prediction and longer horizon, the hindsight plan correctly predicts the future collision, and takes an appropriate action.\nThe solid-black line in Figure 2 shows the trajectory performed by the HIMPC algorithm, after 5 episodes of learning. The controller learned to first navigate to the opening, as desired. In addition, we visualize the cost shaping by plotting a black quiver plot of the direction to the modified goal position x̂∗(x, θ) − x. Note how the modified goal position at the beginning of the trajectory orients towards the opening, and note the difference with the red quiver plot, which shows the direction to the original goal x∗ − x."
+    }, {
+      "heading" : "VII. PRACTICAL IMPROVEMENTS OF HIMPC",
+      "text" : "As with most machine learning algorithms, and neural networks in particular, a successful application of the method requires some technical know-how [31], [32]. In this section\nwe report several technical procedures that we found to improve the performance of HIMPC in our experiments.\na) Add control noise to the MPC: This helps the MPC controller get around ‘local minima’ in the trajectory by random exploration, and the HIMPC then learns a cost shaping that consolidates this trajectory improvement. In particular, we used the exploration scheme of [6] in our experiments.\nb) Collect several trajectories in each iteration: We found that collecting several roll-outs of the same shaped MPC controller at each iteration (lines 1 and 5 in Algorithm 1) stabilizes the neural network training.\nc) Wait for successful MPC runs before initiating costshaping: When the standard MPC fails in the task due to a bad initial dynamics model, its trajectories do not contain enough useful knowledge for the hindsight planning. We therefore wait until several successful trajectories occur before starting HIMPC. We found measuring success by a threshold on the final distance to the target to perform well. While this condition is task dependent, in our experiments we did not find it to be sensitive to the threshold magnitude.\nd) Early stopping of cost-shaping The learned cost shaping can potentially direct the controller to a different goal position than x∗. This often happens in early iterations, when not enough successful trajectories have been observed, and can cause the algorithm to destabilize, as it no longer receives successful trajectories. A solution to this problem is to turn off the cost shaping (during the run) if the shaped cost has converged, while the original cost has not. Such a fix guarantees that HIMPC is as stable as the original MPC."
+    }, {
+      "heading" : "VIII. EXPERIMENTS",
+      "text" : "In this section, we experimentally evaluate the HIMPC algorithm in simulated and real robot experiments. In this work, we focus on contact-rich manipulation, following the work of Fu et al. [6], though our method can be applied to\nother tasks where MPC is applicable. In particular, we focus on various insertion tasks, which are important for assembly, and for which the improvement of HIMPC over standard MPC can be easily visualized.\nIn our evaluation, we aim to answer the following two questions:\n1) Can HIMPC improve upon standard MPC? 2) Can HIMPC improve upon a standard episodic model-\nbased RL approach (i.e., without MPC)? For our simulations, in addition to the 2D navigation task discussed in Section VI, we consider two variants of a peg insertion task. All our simulations were performed using the MuJoCo physics engine [33], and our code, which is based on the guided policy search repository [34], will be made available. Additionally we experiment on a peg insertion task with a real PR2 robot. In both simulated and real experiments, we apply direct torque control at 20Hz. For the simulated experiments, the state space is 26-dimensional, consisting of the positions and angular velocities of the 7 joints, and positions and velocities of 2 points on the endeffector. For the real robot experiment, an additional endeffector point was added, resulting in 32 state dimensions.\nIn our evaluation, we compare HIMPC to the MPC method of [6], and, as a baseline, to iLQG – a state-of-the-art modelbased RL method [22]. Our dynamics model uses a GMM prior, combined with online dynamics adaptation [6], as further described in Appendix I. The iLQG method of [22] uses a similar GMM for a dynamics prior, but combines with time-varying linear dynamics, and therefore constitutes a fair comparison. The same quadratic cost function was used for all algorithms. We note that the optimization in iLQG is performed over the full episode, and should in principal converge to a (locally) optimal solution. However, MPC is expected to be much more sample-efficient, as was demonstrated in [6].\nIn terms of computation time, hindsight planning demands were comparable to system reset times between episodes, and had negligible effect. However, solving the optimization problem in (4) was much slower, requiring several minutes of computation, since our Theano-based implementation [30] cannot differentiate a matrix inverse for multiple samples in parallel. We expect future automatic differentiation packages to substantially reduce the computation time."
+    }, {
+      "heading" : "A. Simulated 2D Navigation",
+      "text" : "This task, as depicted in Figure 2, requires moving a particle through an opening towards a goal position in 2D space. The available controls apply horizontal and vertical forces to the particle, and obstacles effect friction and normal forces. Episodes are 200 time-steps long, and three trajectories are executed at each iteration. The horizon H and hindsight horizon H̄ were chosen as 10 and 30, respectively. The costshaping neural network g consists of two fully connected hidden layers, each with 25 units and tanh activations. The inputs to g are the particle position and velocity.\nThe dynamics GMM prior was initialized from a single episode with a random initial policy. In addition, after each episode we update the prior with the samples from the most\nrecent episode, to potentially improve the baseline MPC algorithm between iterations.\nOur performance evaluation is the cumulative distance to the goal over the entire episode, which measures the speed of reaching the goal. In Figure 3a, we plot the averaged performance over four runs using different random seeds. As may be observed, HIMPC significantly improves over standard MPC. Interestingly, updating the dynamics prior did not significantly improve the original MPC (as can be seen by relatively similar performance across episodes). This is since in this simple domain, the dynamics prior of the first episode is already good enough. Note that the baseline iLQG reaches a better solution than MPC. This is expected, as iLQG solves the problem with the full horizon and therefore requires more samples than MPC.\nGeneralization and the effect of H̄ . The HIMPC algorithm learns to improve performance when iteratively starting the task from the same initial position. An important consideration, however, is its sensitivity to the change of initial position. In this experiment we demonstrate that the neural network cost shaping can generalize to initial positions that were not trained on.\nUsing the simulated 2D domain described in section VIII-A, we ran HIMPC using samples collected from five different initial positions. We then evaluated performance when starting from 16 different test positions, arranged in a 4 × 4 grid. We evaluated HIMPC for various values of H̄ , as well as standard MPC, on the test positions, and present the results (averaged across 10 test trials) in Figure 5. Observe that as H̄ increases, the performance of HIMPC improves consistently for all test positions. Furthermore, when H̄ > H , HIMPC outperforms standard MPC, even when run from initial positions that were not seen during training. This result shows that the benefit of planning with a longer horizon is indeed captured by the learned cost shaping, and also demonstrates the generalization capability of the neural network."
+    }, {
+      "heading" : "B. Simulated 3D Peg Insertion",
+      "text" : "In this task, a 7-Dof robot arm must insert a cylindrical peg into a tight-fitting rectangular hole, as depicted in Figure 4a & 4b. The controls are the torques applied to the 7 joints, and\nthe state space consists of the positions and angular velocities of these joints and the 3D positions and velocities of 2 points on the end-effector, which are hereafter referred to as the EE points. The goal is specified by the coordinates of the EE points (but not the joints), when the peg is fully inserted in the hole. Thus, there is a rotational degree of freedom in the goal position, since there are only 2 EE points. This nontrivial task requires solving both a kinematic problem, and a control problem with complex contact dynamics, and has been used as a benchmark in previous studies [35].\nEpisodes are 400 time-steps long, and 3 trajectories are executed at each iteration. The horizon H is 10, while the hindsight horizon H̄ was chosen as 60. The NN g had 2 fully connected hidden layers of sizes [100, 25] with tanh activations, and its inputs were the positions of the EE points. The dynamics GMM prior was initialized from a single episode with a random policy. In this experiment we did not update the prior after the first episode, as we observed it to decrease performance. We attribute this to the GMM method, which is sensitive to the choice of clusters and the input distribution, and can degrade performance when additional samples are added. Using dynamics models such as neural networks [6] or Gaussian processes [36] could potentially improve the dynamics learning, as we plan to investigate in future work. We emphasize, however, that improving MPC dynamics should also improve the performance of HIMPC.\nTo make a fair comparison with iLQG, which learns timedependent linear dynamics models, we executed 6 trajectories of 200 time-steps at each iLQG iteration. This results in a better performance of iLQG, while the number of samples (total time steps) at each iteration is the same as HIMPC.\nOur performance evaluation is the minimal distance to the goal over the episode, which measures the success of inserting the peg. In Figure 3b, we plot our results, averaged over the trajectories in the episode. As may be observed, HIMPC significantly improves over the standard MPC, which is equivalent to the performance of HIMPC in the first episode. In this domain, HIMPC solves the task with significantly fewer samples than iLQG."
+    }, {
+      "heading" : "C. Simulated 3D Oblong Peg Insertion",
+      "text" : "In this experiment, we demonstrate how HIMPC with random exploration noise in the control, can learn additional structure in the task, and represent it in the shaped cost.\nThis task is similar to the previous peg insertion task, with a difference that the peg and hole have an oblong shape, requiring a particular orientation of the peg for a successful insertion. As before, the goal is specified by the coordinates of the 2 EE points, when the peg is fully inserted in the hole. Thus, the cost function does not contain information about the correct orientation for solving the task. With sufficient exploration noise, standard MPC can sometimes solve this task. Our goal is to show that HIMPC can consolidate the information from these ‘lucky’ runs, and learn a cost shaping that guides the peg into the correct orientation.\nAs before, episodes are 400 time-steps long, and 3 trajectories are executed at each iteration. The horizon H is 10, while the hindsight horizon H̄ was chosen as 60, and the NN g had 2 fully connected hidden layers of sizes [100, 25] with tanh activations. In this case, however, we added to the NN\nshaping-cost an additional EE point, which was not used for the original cost specification. Thus, the cost-shaping has the capacity to represent an orientation of the peg. We emphasize that this additional EE point was not part of the MPC cost, and the orientation can only be learned from the hindsight plan on ‘lucky’ trajectories.\nIn Table I we report the success rate of peg insertion for MPC, and HIMPC after 6 episodes of learning. We also report on success or failure when no control noise is added. After 6 episodes, HIMPC has learned a cost shaping that orients the peg correctly, and succeeds in the task, even without control noise. MPC on the other hand, cannot solve the task without exploration noise. This behavior can be further visualized in the supplemental video5."
+    }, {
+      "heading" : "D. Real PR2 Experiments",
+      "text" : "We evaluated our method on a peg insertion task with the PR2 robot. The robot is tasked with inserting a small wooden peg into a hole in a wooden plate. The task specification is similar to the simulated peg insertion of Section VIII-B, and the goal position is specified by the position of 3 EE points, when the peg is fully inserted in the hole.\nWe constructed a GMM dynamics prior from 40, 000 samples of actions in free space, collected by running the iLQG algorithm for 30 minutes, reaching random goal positions. Such a large data set was required for a stable MPC control. In addition, we used a shorter hindsight horizon than in simulation H̄=30, to account for the less accurate dynamics.\n5https://sites.google.com/site/ himpchindsightplan/\nIn Figure 3c, we plot the distance of the EE points from their goal position, for the original MPC controller, and for HIMPC after 3 episodes of learning, averaged over 5 executions of the controller. Similarly to the 2D task described above, the MPC controller in this task tries to approach the goal position in a straight line, and bumps into the wooden plate. It then glides into the opening to insert the peg. HIMPC, on the other hand, learns to directly insert the peg into the opening, and therefore reaches the goal faster. This behavior can be visualized in the supplemental video5."
+    }, {
+      "heading" : "IX. CONCLUSION",
+      "text" : "In this work we introduced a new approach for policy improvement in repeated tasks. Rather than using value functions or policy gradients – the traditional drivers of policy improvement in RL – our method employs an online MPC policy, and suggests improved actions based on an offline hindsight calculation once an episode has ended.\nWe demonstrated a significant improvement over standard MPC on several complex manipulation tasks with contacts, and a notable improvement in sample efficiency over stateof-the-art model based RL.\nIn future work we intend to investigate the use of different dynamics prediction models in our method, and applications in different robotics domains such as quadrotors. In addition, the explicit use of the prediction error as a driver for policy improvement could potentially be used in different RL algorithms.\nAPPENDIX I Dynamics Prediction: We used the dynamics prediction method of [6]. An exponential moving average of the observations is maintained throughout the episode µ̂t ← βµ̂t−1 + (1−β)pt, where pt = [xt−1;ut−1;xt] is the tth observation and β is a discounting factor that causes the model to forget old data. A similar exponential moving covariance is maintained by Σ̂t ← βΣ̂t−1 + (1 − β)ptp>t . These withinepisode dynamics are mixed with a prior model of dynamics (µp,Σp), by µ = α1µ̂ + (1 − α1)µp, and Σ = α2Σp + α3Σ̂+α4(µp−µ̂)(µp−µ̂)>, where the prior is a GMM fit to samples from previous episodes, and the mixing coefficients α1, α2, α3, α4 are described in [6]. A linear dynamics model xt+1 = Atxt +Btut is obtained by assuming a multivariate Gaussian distribution for [xt;ut;xt+1] with mean µ and covariance Σ, and conditioning xt+1 on [xt,ut], producing a Gaussian distribution with mean [At, Bt]. We refer to [6] for the full details and theoretical motivation of this algorithm. To predict the dynamics for time s = t+1, the previous MPC policy (for time t−1) is used to predict the current action ût, and the predicted next state is x̂t+1 = Atxt+Btût. The prior is queried for the dynamics of state x̂t+1, and mixed with the current dynamics estimate as described above, to produce a linear dynamics model xs+1 = Atsxs + B t sus. This process can be repeated iteratively for s = t+2, . . . , t+H , producing a time-varying linear dynamics model for the horizon H .\nAPPENDIX II LQR: Consider a linear dynamics system xt+1 = ft(xt,ut) . = Atxt + Btut, and a quadratic loss function\n`t(xt,ut) = (xt − x∗)>Dt(xt − x∗) + u>t Rtut. The Qfunction and value function are both quadratic, given by\nV (xt) = 1\n2 x>t Vx,xtxt + x > t Vxt + const\nQ(xt,ut)= 1\n2 [xt;ut]\n>Qxu,xut[xt;ut]+[xt;ut] >Qxut+const,\nUsing dynamics programming [29]: Qxu,xut = `xu,xut + f > xutVx,xt+1fxut\nQxut = `xut + f > xutVxt+1 Vx,xt = Qx,xt −Q>u,xtQ −1 u,utQu,xt\nVxt = Qxt −Q>u,xtQ −1 u,utQut.\nThe optimal control law is linear, and given by ut = kt + Ktxt, where Kt = −Q−1u,utQu,xt and kt = −Q−1u,utQut.\nACKNOWLEDGMENT This work was supported in part by Siemens, the DARPA SIMPLEX program, an NSF CAREER Award, and an ONR Young Investigator Award. Aviv Tamar was partially funded by the Viterbi Scholarship, Technion. Tianhao Zhang was supported by a UC Berkeley EECS Departmental Fellowship. The authors thank Ramu Chandra, Karthik Kappaganthu, and Juan L. Aparicio for fruitful discussions, and Justin Fu for useful advice, and for sharing his adaptive MPC code.\nREFERENCES [1] E. F. Camacho and C. B. Alba, Model predictive control. Springer\nScience & Business Media, 2013. [2] T. Erez, K. Lowrey, Y. Tassa, V. Kumar, S. Kolev, and E. Todorov, “An\nintegrated system for real-time model predictive control of humanoid robots,” in Humanoids, 2013. [3] A. Aswani, P. Bouffard, and C. Tomlin, “Extensions of learningbased model predictive control for real-time application to a quadrotor helicopter,” in ACC, 2012, pp. 4661–4666. [4] G. Chowdhary, M. Mühlegg, J. P. How, and F. Holzapfel, “Concurrent learning adaptive model predictive control,” in Advances in Aerospace Guidance, Navigation and Control. Springer, 2013, pp. 29–47. [5] I. Lenz, R. Knepper, and A. Saxena, “Deepmpc: Learning deep latent features for model predictive control,” in Robotics Science and Systems, 2015. [6] J. Fu, S. Levine, and P. Abbeel, “One-shot learning of manipulation skills with online dynamics adaptation and neural network priors,” IROS, 2016. [7] N. Jiang, A. Kulesza, S. Singh, and R. Lewis, “The dependence of effective planning horizon on model accuracy,” in AAMAS. International Foundation for Autonomous Agents and Multiagent Systems, 2015, pp. 1181–1189. [8] J. Kober, J. A. Bagnell, and J. Peters, “Reinforcement learning in robotics: A survey,” International Journal of Robotics Research, 2013. [9] H. Chen and F. ALLGoWER, “A quasi-infinite horizon nonlinear model predictive control scheme with guaranteed stability,” Automatica, vol. 34, no. 10, pp. 1205–1217, 1998. [10] T. Erez, Y. Tassa, and E. Todorov, “Infinite-horizon model predictive control for periodic tasks with contacts,” Robotics: Science and systems, p. 73, 2012. [11] M. Zhong, M. Johnson, Y. Tassa, T. Erez, and E. Todorov, “Value function approximation and model predictive control,” in 2013 IEEE Symposium on Adaptive Dynamic Programming and Reinforcement Learning (ADPRL). IEEE, 2013, pp. 100–107. [12] K. L. Moore and J.-X. Xu, Iterative learning control. Taylor & Francis, 2000. [13] R. W. Longman, “Iterative learning control and repetitive control for engineering practice,” International journal of control, vol. 73, no. 10, pp. 930–954, 2000. [14] D. A. Bristow, M. Tharayil, and A. G. Alleyne, “A survey of iterative learning control,” IEEE Control Systems, 2006. [15] Y. Wang, F. Gao, and F. J. Doyle, “Survey on iterative learning control, repetitive control, and run-to-run control,” Journal of Process Control, vol. 19, no. 10, pp. 1589–1600, 2009. [16] U. Rosolia and F. Borrelli, “Learning model predictive control for iterative tasks,” arXiv preprint arXiv:1609.01387, 2016.\n[17] M. Zucker and J. A. Bagnell, “Reinforcement planning: RL for optimal planners,” in ICRA. IEEE, 2012, pp. 1850–1855. [18] E. K. Chong, R. L. Givan, and H. S. Chang, “A framework for simulation-based network control via hindsight optimization,” in CDC, 2000. [19] J. Rust, “Maximum likelihood estimation of discrete control processes,” SIAM Journal on Control and Optimization, vol. 26, no. 5, pp. 1006–1024, 1988. [20] P. Abbeel and A. Y. Ng, “Apprenticeship learning via inverse reinforcement learning,” in ICML. ACM, 2004, p. 1. [21] M. Deisenroth and C. E. Rasmussen, “PILCO: A model-based and data-efficient approach to policy search,” in ICML, 2011, pp. 465– 472. [22] S. Levine and P. Abbeel, “Learning neural network policies with guided policy search under unknown dynamics,” in NIPS, 2014. [23] K. J. Åström and B. Wittenmark, Adaptive control. Courier Corporation, 2013. [24] P. Abbeel, A. Coates, M. Quigley, and A. Y. Ng, “An application of reinforcement learning to aerobatic helicopter flight,” NIPS, 2007. [25] S. Levine, N. Wagener, and P. Abbeel, “Learning contact-rich manipulation skills with guided policy search,” in ICRA, 2015. [26] J. Schulman, N. Heess, T. Weber, and P. Abbeel, “Gradient estimation using stochastic computation graphs,” in NIPS, 2015, pp. 3528–3536. [27] A. Tamar, Y. Wu, G. Thomas, S. Levine, and P. Abbeel, “Value iteration networks,” CoRR, vol. abs/1602.02867, 2016. [28] D. C. Liu and J. Nocedal, “On the limited memory BFGS method for large scale optimization,” Mathematical programming, 1989. [29] B. D. Anderson and J. B. Moore, Optimal control: linear quadratic methods. Courier Corporation, 2007. [30] Theano Development Team, “Theano: A Python framework for fast computation of mathematical expressions,” arXiv e-prints, vol. abs/1605.02688. [31] Y. A. LeCun, L. Bottou, G. B. Orr, and K.-R. Müller, “Efficient backprop,” in Neural networks: Tricks of the trade. Springer, 2012. [32] X. Glorot and Y. Bengio, “Understanding the difficulty of training deep feedforward neural networks.” in Aistats, vol. 9, 2010, pp. 249–256. [33] E. Todorov, T. Erez, and Y. Tassa, “Mujoco: A physics engine for model-based control,” in 2012 IEEE/RSJ International Conference on Intelligent Robots and Systems. IEEE, 2012, pp. 5026–5033. [34] C. Finn, M. Zhang, J. Fu, X. Tan, Z. McCarthy, E. Scharff, and S. Levine, “Guided policy search code implementation,” 2016. [Online]. Available: http://rll.berkeley.edu/gps [35] M. Zhang, Z. McCarthy, C. Finn, S. Levine, and P. Abbeel, “Learning deep neural network policies with continuous memory states,” in ICRA. IEEE, 2016, pp. 520–527. [36] Y. Pan, X. Yan, E. Theodorou, and B. Boots, “Adaptive probabilistic trajectory optimization via efficient approximate inference,” arXiv preprint arXiv:1608.06235, 2016."
+    } ],
+    "references" : [ {
+      "title" : "An integrated system for real-time model predictive control of humanoid robots",
+      "author" : [ "T. Erez", "K. Lowrey", "Y. Tassa", "V. Kumar", "S. Kolev", "E. Todorov" ],
+      "venue" : "Humanoids, 2013.",
+      "citeRegEx" : "2",
+      "shortCiteRegEx" : null,
+      "year" : 2013
+    }, {
+      "title" : "Extensions of learningbased model predictive control for real-time application to a quadrotor helicopter",
+      "author" : [ "A. Aswani", "P. Bouffard", "C. Tomlin" ],
+      "venue" : "ACC, 2012, pp. 4661–4666.",
+      "citeRegEx" : "3",
+      "shortCiteRegEx" : null,
+      "year" : 2012
+    }, {
+      "title" : "Concurrent learning adaptive model predictive control",
+      "author" : [ "G. Chowdhary", "M. Mühlegg", "J.P. How", "F. Holzapfel" ],
+      "venue" : "Advances in Aerospace Guidance, Navigation and Control. Springer, 2013, pp. 29–47.",
+      "citeRegEx" : "4",
+      "shortCiteRegEx" : null,
+      "year" : 2013
+    }, {
+      "title" : "Deepmpc: Learning deep latent features for model predictive control",
+      "author" : [ "I. Lenz", "R. Knepper", "A. Saxena" ],
+      "venue" : "Robotics Science and Systems, 2015.",
+      "citeRegEx" : "5",
+      "shortCiteRegEx" : null,
+      "year" : 2015
+    }, {
+      "title" : "One-shot learning of manipulation skills with online dynamics adaptation and neural network priors",
+      "author" : [ "J. Fu", "S. Levine", "P. Abbeel" ],
+      "venue" : "IROS, 2016.",
+      "citeRegEx" : "6",
+      "shortCiteRegEx" : null,
+      "year" : 2016
+    }, {
+      "title" : "The dependence of effective planning horizon on model accuracy",
+      "author" : [ "N. Jiang", "A. Kulesza", "S. Singh", "R. Lewis" ],
+      "venue" : "AAMAS. International Foundation for Autonomous Agents and Multiagent Systems, 2015, pp. 1181–1189.",
+      "citeRegEx" : "7",
+      "shortCiteRegEx" : null,
+      "year" : 2015
+    }, {
+      "title" : "Reinforcement learning in robotics: A survey",
+      "author" : [ "J. Kober", "J.A. Bagnell", "J. Peters" ],
+      "venue" : "International Journal of Robotics Research, 2013.",
+      "citeRegEx" : "8",
+      "shortCiteRegEx" : null,
+      "year" : 2013
+    }, {
+      "title" : "A quasi-infinite horizon nonlinear model predictive control scheme with guaranteed stability",
+      "author" : [ "H. Chen", "F. ALLGoWER" ],
+      "venue" : "Automatica, vol. 34, no. 10, pp. 1205–1217, 1998.",
+      "citeRegEx" : "9",
+      "shortCiteRegEx" : null,
+      "year" : 1998
+    }, {
+      "title" : "Infinite-horizon model predictive control for periodic tasks with contacts",
+      "author" : [ "T. Erez", "Y. Tassa", "E. Todorov" ],
+      "venue" : "Robotics: Science and systems, p. 73, 2012.",
+      "citeRegEx" : "10",
+      "shortCiteRegEx" : null,
+      "year" : 2012
+    }, {
+      "title" : "Value function approximation and model predictive control",
+      "author" : [ "M. Zhong", "M. Johnson", "Y. Tassa", "T. Erez", "E. Todorov" ],
+      "venue" : "2013 IEEE Symposium on Adaptive Dynamic Programming and Reinforcement Learning (ADPRL). IEEE, 2013, pp. 100–107.",
+      "citeRegEx" : "11",
+      "shortCiteRegEx" : null,
+      "year" : 2013
+    }, {
+      "title" : "Iterative learning control",
+      "author" : [ "K.L. Moore", "J.-X. Xu" ],
+      "venue" : "Taylor & Francis,",
+      "citeRegEx" : "12",
+      "shortCiteRegEx" : "12",
+      "year" : 2000
+    }, {
+      "title" : "Iterative learning control and repetitive control for engineering practice",
+      "author" : [ "R.W. Longman" ],
+      "venue" : "International journal of control, vol. 73, no. 10, pp. 930–954, 2000.",
+      "citeRegEx" : "13",
+      "shortCiteRegEx" : null,
+      "year" : 2000
+    }, {
+      "title" : "A survey of iterative learning control",
+      "author" : [ "D.A. Bristow", "M. Tharayil", "A.G. Alleyne" ],
+      "venue" : "IEEE Control Systems, 2006.",
+      "citeRegEx" : "14",
+      "shortCiteRegEx" : null,
+      "year" : 2006
+    }, {
+      "title" : "Survey on iterative learning control, repetitive control, and run-to-run control",
+      "author" : [ "Y. Wang", "F. Gao", "F.J. Doyle" ],
+      "venue" : "Journal of Process Control, vol. 19, no. 10, pp. 1589–1600, 2009.",
+      "citeRegEx" : "15",
+      "shortCiteRegEx" : null,
+      "year" : 2009
+    }, {
+      "title" : "Learning model predictive control for iterative tasks",
+      "author" : [ "U. Rosolia", "F. Borrelli" ],
+      "venue" : "arXiv preprint arXiv:1609.01387, 2016.",
+      "citeRegEx" : "16",
+      "shortCiteRegEx" : null,
+      "year" : 2016
+    }, {
+      "title" : "Reinforcement planning: RL for optimal planners",
+      "author" : [ "M. Zucker", "J.A. Bagnell" ],
+      "venue" : "ICRA. IEEE, 2012, pp. 1850–1855.",
+      "citeRegEx" : "17",
+      "shortCiteRegEx" : null,
+      "year" : 2012
+    }, {
+      "title" : "A framework for simulation-based network control via hindsight optimization",
+      "author" : [ "E.K. Chong", "R.L. Givan", "H.S. Chang" ],
+      "venue" : "CDC, 2000.",
+      "citeRegEx" : "18",
+      "shortCiteRegEx" : null,
+      "year" : 2000
+    }, {
+      "title" : "Maximum likelihood estimation of discrete control processes",
+      "author" : [ "J. Rust" ],
+      "venue" : "SIAM Journal on Control and Optimization, vol. 26, no. 5, pp. 1006–1024, 1988.",
+      "citeRegEx" : "19",
+      "shortCiteRegEx" : null,
+      "year" : 1988
+    }, {
+      "title" : "Apprenticeship learning via inverse reinforcement learning",
+      "author" : [ "P. Abbeel", "A.Y. Ng" ],
+      "venue" : "ICML. ACM, 2004, p. 1.",
+      "citeRegEx" : "20",
+      "shortCiteRegEx" : null,
+      "year" : 2004
+    }, {
+      "title" : "PILCO: A model-based and data-efficient approach to policy search",
+      "author" : [ "M. Deisenroth", "C.E. Rasmussen" ],
+      "venue" : "ICML, 2011, pp. 465– 472.",
+      "citeRegEx" : "21",
+      "shortCiteRegEx" : null,
+      "year" : 2011
+    }, {
+      "title" : "Learning neural network policies with guided policy search under unknown dynamics",
+      "author" : [ "S. Levine", "P. Abbeel" ],
+      "venue" : "NIPS, 2014.",
+      "citeRegEx" : "22",
+      "shortCiteRegEx" : null,
+      "year" : 2014
+    }, {
+      "title" : "An application of reinforcement learning to aerobatic helicopter flight",
+      "author" : [ "P. Abbeel", "A. Coates", "M. Quigley", "A.Y. Ng" ],
+      "venue" : "NIPS, 2007.",
+      "citeRegEx" : "24",
+      "shortCiteRegEx" : null,
+      "year" : 2007
+    }, {
+      "title" : "Learning contact-rich manipulation skills with guided policy search",
+      "author" : [ "S. Levine", "N. Wagener", "P. Abbeel" ],
+      "venue" : "ICRA, 2015.",
+      "citeRegEx" : "25",
+      "shortCiteRegEx" : null,
+      "year" : 2015
+    }, {
+      "title" : "Gradient estimation using stochastic computation graphs",
+      "author" : [ "J. Schulman", "N. Heess", "T. Weber", "P. Abbeel" ],
+      "venue" : "NIPS, 2015, pp. 3528–3536.",
+      "citeRegEx" : "26",
+      "shortCiteRegEx" : null,
+      "year" : 2015
+    }, {
+      "title" : "Value iteration networks",
+      "author" : [ "A. Tamar", "Y. Wu", "G. Thomas", "S. Levine", "P. Abbeel" ],
+      "venue" : "CoRR, vol. abs/1602.02867, 2016.",
+      "citeRegEx" : "27",
+      "shortCiteRegEx" : null,
+      "year" : 2016
+    }, {
+      "title" : "On the limited memory BFGS method for large scale optimization",
+      "author" : [ "D.C. Liu", "J. Nocedal" ],
+      "venue" : "Mathematical programming, 1989.",
+      "citeRegEx" : "28",
+      "shortCiteRegEx" : null,
+      "year" : 1989
+    }, {
+      "title" : "Optimal control: linear quadratic methods",
+      "author" : [ "B.D. Anderson", "J.B. Moore" ],
+      "venue" : "Courier Corporation,",
+      "citeRegEx" : "29",
+      "shortCiteRegEx" : "29",
+      "year" : 2007
+    }, {
+      "title" : "Theano: A Python framework for fast computation of mathematical expressions",
+      "author" : [ "Theano Development Team" ],
+      "venue" : "arXiv e-prints, vol. abs/1605.02688.",
+      "citeRegEx" : "30",
+      "shortCiteRegEx" : null,
+      "year" : 2688
+    }, {
+      "title" : "Efficient backprop",
+      "author" : [ "Y.A. LeCun", "L. Bottou", "G.B. Orr", "K.-R. Müller" ],
+      "venue" : "Neural networks: Tricks of the trade. Springer, 2012.",
+      "citeRegEx" : "31",
+      "shortCiteRegEx" : null,
+      "year" : 2012
+    }, {
+      "title" : "Understanding the difficulty of training deep feedforward neural networks.",
+      "author" : [ "X. Glorot", "Y. Bengio" ],
+      "venue" : "in Aistats, vol",
+      "citeRegEx" : "32",
+      "shortCiteRegEx" : "32",
+      "year" : 2010
+    }, {
+      "title" : "Mujoco: A physics engine for model-based control",
+      "author" : [ "E. Todorov", "T. Erez", "Y. Tassa" ],
+      "venue" : "2012 IEEE/RSJ International Conference on Intelligent Robots and Systems. IEEE, 2012, pp. 5026–5033.",
+      "citeRegEx" : "33",
+      "shortCiteRegEx" : null,
+      "year" : 2012
+    }, {
+      "title" : "Guided policy search code implementation",
+      "author" : [ "C. Finn", "M. Zhang", "J. Fu", "X. Tan", "Z. McCarthy", "E. Scharff", "S. Levine" ],
+      "venue" : "2016. [Online]. Available: http://rll.berkeley.edu/gps",
+      "citeRegEx" : "34",
+      "shortCiteRegEx" : null,
+      "year" : 2016
+    }, {
+      "title" : "Learning deep neural network policies with continuous memory states",
+      "author" : [ "M. Zhang", "Z. McCarthy", "C. Finn", "S. Levine", "P. Abbeel" ],
+      "venue" : "ICRA. IEEE, 2016, pp. 520–527.",
+      "citeRegEx" : "35",
+      "shortCiteRegEx" : null,
+      "year" : 2016
+    }, {
+      "title" : "Adaptive probabilistic trajectory optimization via efficient approximate inference",
+      "author" : [ "Y. Pan", "X. Yan", "E. Theodorou", "B. Boots" ],
+      "venue" : "arXiv preprint arXiv:1608.06235, 2016.",
+      "citeRegEx" : "36",
+      "shortCiteRegEx" : null,
+      "year" : 2016
+    } ],
+    "referenceMentions" : [ {
+      "referenceID" : 0,
+      "context" : ", [1], [2]) among other domains.",
+      "startOffset" : 7,
+      "endOffset" : 10
+    }, {
+      "referenceID" : 1,
+      "context" : "This approach has been successfully applied in various robotic tasks, from aerial vehicle flight [3], [4], to contact-rich object manipulation [5], [6].",
+      "startOffset" : 97,
+      "endOffset" : 100
+    }, {
+      "referenceID" : 2,
+      "context" : "This approach has been successfully applied in various robotic tasks, from aerial vehicle flight [3], [4], to contact-rich object manipulation [5], [6].",
+      "startOffset" : 102,
+      "endOffset" : 105
+    }, {
+      "referenceID" : 3,
+      "context" : "This approach has been successfully applied in various robotic tasks, from aerial vehicle flight [3], [4], to contact-rich object manipulation [5], [6].",
+      "startOffset" : 143,
+      "endOffset" : 146
+    }, {
+      "referenceID" : 4,
+      "context" : "This approach has been successfully applied in various robotic tasks, from aerial vehicle flight [3], [4], to contact-rich object manipulation [5], [6].",
+      "startOffset" : 148,
+      "endOffset" : 151
+    }, {
+      "referenceID" : 5,
+      "context" : "In these applications, the limited horizon of MPC serves a dual purpose: maintaining tractability of the planning problem and mitigating error propagation during planning as a result of inaccurate models [7].",
+      "startOffset" : 204,
+      "endOffset" : 207
+    }, {
+      "referenceID" : 3,
+      "context" : "cutting vegetables [5] and object manipulation [6].",
+      "startOffset" : 19,
+      "endOffset" : 22
+    }, {
+      "referenceID" : 4,
+      "context" : "cutting vegetables [5] and object manipulation [6].",
+      "startOffset" : 47,
+      "endOffset" : 50
+    }, {
+      "referenceID" : 3,
+      "context" : "However, state-of-theart MPC methods that only learn dynamics, such as [5] and",
+      "startOffset" : 71,
+      "endOffset" : 74
+    }, {
+      "referenceID" : 4,
+      "context" : "[6], are prone to repeatedly produce suboptimal behavior in each episode of the task due to the limited horizon.",
+      "startOffset" : 0,
+      "endOffset" : 3
+    }, {
+      "referenceID" : 6,
+      "context" : "which are typically based on value functions or policy gradients [8], our approach exploits the predictive nature of MPC to drive policy improvement, by contrasting the predicted actions with actions calculated in hindsight.",
+      "startOffset" : 65,
+      "endOffset" : 68
+    }, {
+      "referenceID" : 7,
+      "context" : "A standard approach for mitigating the limited planning horizon in MPC is to introduce a value function as the terminal cost, also known as infinite horizon MPC [9], [10].",
+      "startOffset" : 161,
+      "endOffset" : 164
+    }, {
+      "referenceID" : 8,
+      "context" : "A standard approach for mitigating the limited planning horizon in MPC is to introduce a value function as the terminal cost, also known as infinite horizon MPC [9], [10].",
+      "startOffset" : 166,
+      "endOffset" : 170
+    }, {
+      "referenceID" : 9,
+      "context" : "However, it has been observed that standard value function approximation methods perform poorly when combined with MPC [11].",
+      "startOffset" : 119,
+      "endOffset" : 123
+    }, {
+      "referenceID" : 9,
+      "context" : "[11] also proposed ar X iv :1 60 9.",
+      "startOffset" : 0,
+      "endOffset" : 4
+    }, {
+      "referenceID" : 6,
+      "context" : "However, instead of learning directly from observed scalar costs, as typical for value function approximation [8], our method learns the cost shaping from the hindsight plan, which contains desired controls and hence is much more informative.",
+      "startOffset" : 110,
+      "endOffset" : 113
+    }, {
+      "referenceID" : 10,
+      "context" : "Our episodic formulation of improving the MPC controller is similar to the setting of iterative learning control (ILC) [12], [13], [14], [15].",
+      "startOffset" : 119,
+      "endOffset" : 123
+    }, {
+      "referenceID" : 11,
+      "context" : "Our episodic formulation of improving the MPC controller is similar to the setting of iterative learning control (ILC) [12], [13], [14], [15].",
+      "startOffset" : 125,
+      "endOffset" : 129
+    }, {
+      "referenceID" : 12,
+      "context" : "Our episodic formulation of improving the MPC controller is similar to the setting of iterative learning control (ILC) [12], [13], [14], [15].",
+      "startOffset" : 131,
+      "endOffset" : 135
+    }, {
+      "referenceID" : 13,
+      "context" : "Our episodic formulation of improving the MPC controller is similar to the setting of iterative learning control (ILC) [12], [13], [14], [15].",
+      "startOffset" : 137,
+      "endOffset" : 141
+    }, {
+      "referenceID" : 14,
+      "context" : "We note that a very recent work [16] proposed an extension of ILC that does not require a reference trajectory, and also uses a form of learning MPC, based on adding a value function to the MPC cost, which is calculated for all previously visited states.",
+      "startOffset" : 32,
+      "endOffset" : 36
+    }, {
+      "referenceID" : 15,
+      "context" : "Reinforcement planning [17] considers a discrete highlevel planner for a continuous low-level control algorithm, and learns cost parameters of the planner using reinforcement learning methods.",
+      "startOffset" : 23,
+      "endOffset" : 27
+    }, {
+      "referenceID" : 16,
+      "context" : "We also note that our method is different from hindsight optimization [18], in which simulation is used to calculate a value function online.",
+      "startOffset" : 70,
+      "endOffset" : 74
+    }, {
+      "referenceID" : 17,
+      "context" : "Learning a cost function from observed controls is a form of inverse optimal control (IOC) [19], [20].",
+      "startOffset" : 91,
+      "endOffset" : 95
+    }, {
+      "referenceID" : 18,
+      "context" : "Learning a cost function from observed controls is a form of inverse optimal control (IOC) [19], [20].",
+      "startOffset" : 97,
+      "endOffset" : 101
+    }, {
+      "referenceID" : 19,
+      "context" : "While in IOC, the actions are assumed to be generated by an expert demonstrator, our method does not require such demonstrations, and the actions used for learning the cost shaping are generated by a planning algorithm which learns the model from interaction, as in model-based reinforcement learning (RL) [21], [22] and adaptive control [23].",
+      "startOffset" : 306,
+      "endOffset" : 310
+    }, {
+      "referenceID" : 20,
+      "context" : "While in IOC, the actions are assumed to be generated by an expert demonstrator, our method does not require such demonstrations, and the actions used for learning the cost shaping are generated by a planning algorithm which learns the model from interaction, as in model-based reinforcement learning (RL) [21], [22] and adaptive control [23].",
+      "startOffset" : 312,
+      "endOffset" : 316
+    }, {
+      "referenceID" : 6,
+      "context" : "Model-based RL is a standard approach in robotic control [8], achieving state-of-the-art results in various domains, from helicopter flight [24] to contact-rich manipulation [25].",
+      "startOffset" : 57,
+      "endOffset" : 60
+    }, {
+      "referenceID" : 21,
+      "context" : "Model-based RL is a standard approach in robotic control [8], achieving state-of-the-art results in various domains, from helicopter flight [24] to contact-rich manipulation [25].",
+      "startOffset" : 140,
+      "endOffset" : 144
+    }, {
+      "referenceID" : 22,
+      "context" : "Model-based RL is a standard approach in robotic control [8], achieving state-of-the-art results in various domains, from helicopter flight [24] to contact-rich manipulation [25].",
+      "startOffset" : 174,
+      "endOffset" : 178
+    }, {
+      "referenceID" : 4,
+      "context" : "The use of MPC in RL allows for extremely data-efficient learning [6], which is especially important in robotics, where robot interaction time is often costly.",
+      "startOffset" : 66,
+      "endOffset" : 69
+    }, {
+      "referenceID" : 4,
+      "context" : "In this work we improve the MPC controllers of [6] for contact-rich manipulation tasks.",
+      "startOffset" : 47,
+      "endOffset" : 50
+    }, {
+      "referenceID" : 17,
+      "context" : "A similar problem is encountered in IOC [19], [20], and indeed, our approach can be seen as performing IOC with the hindsight plan replacing",
+      "startOffset" : 40,
+      "endOffset" : 44
+    }, {
+      "referenceID" : 18,
+      "context" : "A similar problem is encountered in IOC [19], [20], and indeed, our approach can be seen as performing IOC with the hindsight plan replacing",
+      "startOffset" : 46,
+      "endOffset" : 50
+    }, {
+      "referenceID" : 23,
+      "context" : "For planning algorithms that can be represented as a computation graph [26], such as linear quadratic regulator (LQR) and value iteration [27], the loss L can be minimized efficiently using gradient based methods, such as L-BFGS [28].",
+      "startOffset" : 71,
+      "endOffset" : 75
+    }, {
+      "referenceID" : 24,
+      "context" : "For planning algorithms that can be represented as a computation graph [26], such as linear quadratic regulator (LQR) and value iteration [27], the loss L can be minimized efficiently using gradient based methods, such as L-BFGS [28].",
+      "startOffset" : 138,
+      "endOffset" : 142
+    }, {
+      "referenceID" : 25,
+      "context" : "For planning algorithms that can be represented as a computation graph [26], such as linear quadratic regulator (LQR) and value iteration [27], the loss L can be minimized efficiently using gradient based methods, such as L-BFGS [28].",
+      "startOffset" : 229,
+      "endOffset" : 233
+    }, {
+      "referenceID" : 7,
+      "context" : "Furthermore, if δs(xs,us, θ) is set to 0 for all s < t+H , the cost shaping becomes a terminal value function, which is exactly the infinite horizon MPC formulation [9], [10].",
+      "startOffset" : 165,
+      "endOffset" : 168
+    }, {
+      "referenceID" : 8,
+      "context" : "Furthermore, if δs(xs,us, θ) is set to 0 for all s < t+H , the cost shaping becomes a terminal value function, which is exactly the infinite horizon MPC formulation [9], [10].",
+      "startOffset" : 170,
+      "endOffset" : 174
+    }, {
+      "referenceID" : 9,
+      "context" : "Standard value function methods first approximate a value function, and then approximately solve the planning problem with that value function, resulting in two sources of approximation error, possibly explaining their poor performance observed in previous work [11].",
+      "startOffset" : 262,
+      "endOffset" : 266
+    }, {
+      "referenceID" : 3,
+      "context" : "So far, we have not discussed the specific algorithms used for dynamics predictions and planning in MPC (1), nor the functional form of the cost shaping, and in principle, HIMPC can be combined with any adaptive MPC method such as [5] and [6].",
+      "startOffset" : 231,
+      "endOffset" : 234
+    }, {
+      "referenceID" : 4,
+      "context" : "So far, we have not discussed the specific algorithms used for dynamics predictions and planning in MPC (1), nor the functional form of the cost shaping, and in principle, HIMPC can be combined with any adaptive MPC method such as [5] and [6].",
+      "startOffset" : 239,
+      "endOffset" : 242
+    }, {
+      "referenceID" : 4,
+      "context" : "We are inspired by the work of [6], in which similar methods were used within MPC for effectively performing contact-rich manipulation tasks.",
+      "startOffset" : 31,
+      "endOffset" : 34
+    }, {
+      "referenceID" : 4,
+      "context" : "The online dynamics adaptation algorithm of [6] is based on a Bayesian approach for estimation, where the recent observations within an episode are used to estimate a linear dynamics model, using observations from previous episodes as a Bayesian prior.",
+      "startOffset" : 44,
+      "endOffset" : 47
+    }, {
+      "referenceID" : 26,
+      "context" : "Such a cost function is standard for many control tasks [29], and is particularly suitable for the manipulation experiments we consider, where the task is specified as moving the robot end-effector to some goal position, such as pushing a peg into a hole.",
+      "startOffset" : 56,
+      "endOffset" : 60
+    }, {
+      "referenceID" : 26,
+      "context" : "With linear dynamics and a quadratic loss, the MPC planning problem (1) becomes a standard LQR problem [29], for which a solution can be calculated efficiently by dynamic programming, as described Appendix II.",
+      "startOffset" : 103,
+      "endOffset" : 107
+    }, {
+      "referenceID" : 27,
+      "context" : "This mapping can be represented as a computation graph, and the gradient ∂ut/∂x ∗ can be easily calculated using modern automatic differentiation packages such as Theano [30].",
+      "startOffset" : 170,
+      "endOffset" : 174
+    }, {
+      "referenceID" : 0,
+      "context" : ", [2] for details.",
+      "startOffset" : 2,
+      "endOffset" : 5
+    }, {
+      "referenceID" : 25,
+      "context" : "This gradient can be used for minimizing the similarity loss (4) with standard optimization algorithms such as L-BFGS [28].",
+      "startOffset" : 118,
+      "endOffset" : 122
+    }, {
+      "referenceID" : 28,
+      "context" : "As with most machine learning algorithms, and neural networks in particular, a successful application of the method requires some technical know-how [31], [32].",
+      "startOffset" : 149,
+      "endOffset" : 153
+    }, {
+      "referenceID" : 29,
+      "context" : "As with most machine learning algorithms, and neural networks in particular, a successful application of the method requires some technical know-how [31], [32].",
+      "startOffset" : 155,
+      "endOffset" : 159
+    }, {
+      "referenceID" : 4,
+      "context" : "In particular, we used the exploration scheme of [6] in our experiments.",
+      "startOffset" : 49,
+      "endOffset" : 52
+    }, {
+      "referenceID" : 4,
+      "context" : "[6], though our method can be applied to other tasks where MPC is applicable.",
+      "startOffset" : 0,
+      "endOffset" : 3
+    }, {
+      "referenceID" : 30,
+      "context" : "All our simulations were performed using the MuJoCo physics engine [33], and our code, which is based on the guided policy search repository [34], will be made available.",
+      "startOffset" : 67,
+      "endOffset" : 71
+    }, {
+      "referenceID" : 31,
+      "context" : "All our simulations were performed using the MuJoCo physics engine [33], and our code, which is based on the guided policy search repository [34], will be made available.",
+      "startOffset" : 141,
+      "endOffset" : 145
+    }, {
+      "referenceID" : 4,
+      "context" : "In our evaluation, we compare HIMPC to the MPC method of [6], and, as a baseline, to iLQG – a state-of-the-art modelbased RL method [22].",
+      "startOffset" : 57,
+      "endOffset" : 60
+    }, {
+      "referenceID" : 20,
+      "context" : "In our evaluation, we compare HIMPC to the MPC method of [6], and, as a baseline, to iLQG – a state-of-the-art modelbased RL method [22].",
+      "startOffset" : 132,
+      "endOffset" : 136
+    }, {
+      "referenceID" : 4,
+      "context" : "Our dynamics model uses a GMM prior, combined with online dynamics adaptation [6], as further described in Appendix I.",
+      "startOffset" : 78,
+      "endOffset" : 81
+    }, {
+      "referenceID" : 20,
+      "context" : "The iLQG method of [22] uses a similar GMM for a dynamics prior, but combines with time-varying linear dynamics, and therefore constitutes a fair comparison.",
+      "startOffset" : 19,
+      "endOffset" : 23
+    }, {
+      "referenceID" : 4,
+      "context" : "However, MPC is expected to be much more sample-efficient, as was demonstrated in [6].",
+      "startOffset" : 82,
+      "endOffset" : 85
+    }, {
+      "referenceID" : 27,
+      "context" : "However, solving the optimization problem in (4) was much slower, requiring several minutes of computation, since our Theano-based implementation [30] cannot differentiate a matrix inverse for multiple samples in parallel.",
+      "startOffset" : 146,
+      "endOffset" : 150
+    }, {
+      "referenceID" : 32,
+      "context" : "This nontrivial task requires solving both a kinematic problem, and a control problem with complex contact dynamics, and has been used as a benchmark in previous studies [35].",
+      "startOffset" : 170,
+      "endOffset" : 174
+    }, {
+      "referenceID" : 22,
+      "context" : "The NN g had 2 fully connected hidden layers of sizes [100, 25] with tanh activations, and its inputs were the positions of the EE points.",
+      "startOffset" : 54,
+      "endOffset" : 63
+    }, {
+      "referenceID" : 4,
+      "context" : "Using dynamics models such as neural networks [6] or Gaussian processes [36] could potentially improve the dynamics learning, as we plan to investigate in future work.",
+      "startOffset" : 46,
+      "endOffset" : 49
+    }, {
+      "referenceID" : 33,
+      "context" : "Using dynamics models such as neural networks [6] or Gaussian processes [36] could potentially improve the dynamics learning, as we plan to investigate in future work.",
+      "startOffset" : 72,
+      "endOffset" : 76
+    }, {
+      "referenceID" : 22,
+      "context" : "The horizon H is 10, while the hindsight horizon H̄ was chosen as 60, and the NN g had 2 fully connected hidden layers of sizes [100, 25] with tanh activations.",
+      "startOffset" : 128,
+      "endOffset" : 137
+    }, {
+      "referenceID" : 4,
+      "context" : "APPENDIX I Dynamics Prediction: We used the dynamics prediction method of [6].",
+      "startOffset" : 74,
+      "endOffset" : 77
+    }, {
+      "referenceID" : 4,
+      "context" : "These withinepisode dynamics are mixed with a prior model of dynamics (μp,Σp), by μ = α1μ̂ + (1 − α1)μp, and Σ = α2Σp + α3Σ̂+α4(μp−μ̂)(μp−μ̂), where the prior is a GMM fit to samples from previous episodes, and the mixing coefficients α1, α2, α3, α4 are described in [6].",
+      "startOffset" : 267,
+      "endOffset" : 270
+    }, {
+      "referenceID" : 4,
+      "context" : "We refer to [6] for the full details and theoretical motivation of this algorithm.",
+      "startOffset" : 12,
+      "endOffset" : 15
+    }, {
+      "referenceID" : 26,
+      "context" : "Using dynamics programming [29]: Qxu,xut = `xu,xut + f > xutVx,xt+1fxut Qxut = `xut + f > xutVxt+1",
+      "startOffset" : 27,
+      "endOffset" : 31
+    } ],
+    "year" : 2017,
+    "abstractText" : "Model predictive control (MPC) is a popular control method that has proved effective for robotics, among other fields. MPC performs re-planning at every time step. Replanning is done with a limited horizon per computational and real-time constraints and often also for robustness to potential model errors. However, the limited horizon leads to suboptimal performance. In this work, we consider the iterative learning setting, where the same task can be repeated several times, and propose a policy improvement scheme for MPC. The main idea is that between executions we can, offline, run MPC with a longer horizon, resulting in a hindsight plan. To bring the next real-world execution closer to the hindsight plan, our approach learns to re-shape the original cost function with the goal of satisfying the following property: short horizon planning (as realistic during real executions) with respect to the shaped cost should result in mimicking the hindsight plan. This effectively consolidates long-term reasoning into the shorthorizon planning. We empirically evaluate our approach in contact-rich manipulation tasks both in simulated and real environments, such as peg insertion by a real PR2 robot.",
+    "creator" : "LaTeX with hyperref package"
+  }
+}

@@ -1,0 +1,268 @@
+{
+  "name" : "1410.0759.pdf",
+  "metadata" : {
+    "source" : "CRF",
+    "title" : "cuDNN: Efficient Primitives for Deep Learning",
+    "authors" : [ "Sharan Chetlur", "Cliff Woolley", "Philippe Vandermersch", "Jonathan Cohen", "John Tran", "Evan Shelhamer" ],
+    "emails" : [ "johntran}@nvidia.com", "bcatanzaro@baidu.com", "shelhamer@eecs.berkeley.edu" ],
+    "sections" : [ {
+      "heading" : "1 Introduction",
+      "text" : "Deep neural networks have been successful at solving many kinds of tasks [4]. Parallel processors such as GPUs have played a significant role in the practical implementation of deep neural networks. The computations that arise when training and using deep neural networks lend themselves naturally to efficient parallel implementations. The efficiency provided by these implementations allows researchers to explore significantly higher capacity networks, training them on larger datasets [7]. This has led to greatly improved accuracy on tasks such as speech recognition and image classification, among other tasks. For example, the majority of entries in the 2014 ILSVRC challenge [17] use GPUs to implement deep neural networks, as pioneered by [13], and improved by many others, including [18] [19]. Deep neural networks for speech recognition have also benefited from parallel implementations on GPUs [10] [9] [15].\nConvolutional Neural Networks (CNNs) [14] are an important class of deep networks, and have proven successful at many tasks, including image recognition. Convolutional neural networks are computed using dense kernels that differ from traditional dense linear algebra routines. Accordingly, modern deep learning frameworks, such as Torch7 [8], Theano [5], and Caffe [11] feature suites of\nar X\niv :1\n41 0.\n07 59\nv1 [\ncs .N\nE ]\n3 O\ncustom kernels that implement basic operations such as tensor convolutions, activation functions and pooling. These routines represent the bulk of the computation when training a CNN, and thus account for the majority of its execution time. The deep learning community has been successful in finding optimized implementations of these kernels, but as the underlying architectures evolve, these kernels must be re-optimized, which is a significant investment. Optimizing these kernels requires a deep understanding of the underlying processor architecture, with careful scheduling of data movement, on-chip memory placement, register blocking, and other optimizations in order to get acceptable performance.\nWe believe that providing a library of optimized routines for these computations will provide several important benefits. Firstly, deep learning frameworks can focus on higher-level issues rather than close optimization of parallel kernels to specific hardware platforms. Secondly, as parallel architectures evolve, library providers can provide performance portability, in much the same way as the BLAS routines provide performance portability to diverse applications on diverse hardware. Thirdly, a clearer separation of concerns allows specialization: library providers can take advantage of their deep understanding of parallel architectures to provide optimal efficiency. Our goal is to make it much easier for deep learning frameworks to take advantage of parallel hardware.\nOur library addresses this goal by providing a flexible, easy-to-use C-language API for deep learning workloads that integrates neatly into existing frameworks. It can provide immediate efficiency gains, and it is rigorously tested and maintained in order to be reliable and performant across a range of different processor architectures. Importantly, our library is designed to use the minimum possible amount of auxiliary memory, which frees up scarce GPU memory for larger models and datasets. We also optimize performance across a wide range of potential use cases, including small mini-batch sizes."
+    }, {
+      "heading" : "2 Library",
+      "text" : "One of the primary goals of cuDNN is to enable the community of neural network frameworks to benefit equally from its APIs. This led us to a framework agnostic design in the sense that users of cuDNN are not required to adopt any particular software framework, paradigm, or even data layout.\nWe initially considered designing a library where a neural net layer would be the primary abstraction, with a persistent layer object to carry around the state information used in the forward and backward passes. However, integration with this kind of library would basically look like bolting one framework on to another, an operation that would be at odds with the design of some software packages. Theano, for instance, uses a tensor as the primary level of abstraction, not a neural net layer. It would also involve our redundantly storing the state of each layer - information the client application would presumably have to maintain as well. This duplication seemed to be both inefficient as well as cumbersome for the developer to deal with.\ncuDNN’s interface is designed to be independent of the neural network topology. We maintain a small amount of global state information, primarily related to threads and CUDA run-time management. We also have opaque structures representing datatypes like filters and tensors, described below. But these objects are lightweight and are merely descriptors of data which is owned by the client application, not by the cuDNN library itself. The bulk of the API is dedicated to defining functions which perform primitive operations on data stored in user-controlled buffers. By keeping the API state-free and with only a minimal object model, the library integrates nicely into other frameworks.\ncuDNN supports forward and backward propagation variants of all its routines in single and double precision. These include convolution, pooling and neuron activation functions. The library allows variable data layout and strides, as well as indexing of sub-sections of input images. It also includes a set of auxiliary tensor transformation routines that allow for the easy manipulation of 4d-tensors."
+    }, {
+      "heading" : "2.1 Overview and Handles",
+      "text" : "The library exposes a host-callable C language API, but requires that input and output data be resident on the GPU. The library is thread-safe and its routines can be called from different host threads. Convolutional routines for the forward and backward passes use a common descriptor that encapsu-\nlates the attributes of the layer (such as number of feature maps, dimensions of the image, striding etc.). Tensors and Filters are represented in opaque descriptors, with the flexibility to specify the tensor layout using arbitrary strides along each dimension."
+    }, {
+      "heading" : "2.1.1 Spatial Convolutions",
+      "text" : "The most important computational primitive in convolutional neural networks is a special form of batched convolution. The parameters governing this convolution are listed in table 1. In this section, we describe the forward form of this convolution - the other forms necessary for backpropagation are closely related.\nThere are two inputs to the convolution: D ∈ RNCHW , which forms the input data, and F ∈ RKCRS , which forms the convolutional filters. The input data ranges over N images in a minibatch, C input feature maps, H rows per image, and W columns per image. The filters range over K output feature maps, C input feature maps, R rows per filter, and S columns per filter. The output is also a four-dimensional tensor O ∈ RNKPQ, where N and K were as defined previously, and P = f(H,R, u, pad h), Q = f(W,S, v, pad w), meaning that the height and width of the output images depends on the image and filter height and width, along with padding and striding choices. The striding parameters u and v allow the user to reduce the computational load by computing only a subset of the output pixels. The padding parameters allow users to specify how many rows or columns of 0 entries are appended to each image. MATLAB’s “valid” convolution mode corresponds to setting pad h = 0, pad w = 0, while MATLAB’s “same” convolution mode corresponds to pad h = ⌊ R 2 ⌋ , pad w = ⌊ S 2 ⌋ , and MATLAB’s “full” convolution mode corresponds to pad h = R− 1, pad w = S − 1. More specifically,\nf(H,R, u, pad h) =\n⌈ H −R+ 1 + 2pad h\nu\n⌉ (1)\nDefine an accessing function to account for striding, padding, and inverting for the convolution:\ng(p, u,R, r, pad h) = p · u+R− r − 1− pad h (2)\nThen, the forward convolution evaluates O[n, k, p, q] ∀n ∈ [0, N),∀k ∈ [0,K),∀p ∈ [0, P ),∀q ∈ [0, Q). For convenience, define D0 as a zero-extended version of D.\nO[n, k, p, q] = C−1∑ c=0 R−1∑ r=0 S−1∑ s=0 D0[n, c, g(p, u,R, r, pad h), g(q, v, S, s, pad w)] · F [k, c, r, s] (3)\nAs can be seen from Equation 3, computing the convolution involves a seven-way nested loop, with four independent loops and three accumulation loops. There are many ways of implementing this computation, which we will discuss in the next section.\ncuDNN’s convolutional routines incorporate implementations of both the convolution as well as the cross-correlation variants of these functions. These functions all support user-defined strides along\neach dimension of the input and output tensors. This is important because different frameworks store tensors using different memory layouts; for example, some frameworks interleave feature maps, while others keep them separate. cuDNN allows the user to specify memory layout, which makes it much simpler to integrate into deep learning frameworks. cuDNN’s routines also have a mode to either return the raw gradients or to accumulate them in a buffer as needed for models with shared parameters or directed acyclic graph (DAG) structure."
+    }, {
+      "heading" : "2.2 Other functions",
+      "text" : "cuDNN also provides other commonly used functions for deep learning. For example, it provides three commonly used neuron activation functions; Sigmoid, Rectified Linear and Hyperbolic Tangent. It provides a softmax routine, which by default uses the numerically stable approach of scaling each element in the exponent by the maximum value, to avoid overflow in intermediate results. Optionally, this scaling can be disabled to evaluate a faster but less accurate version of the function. Softmax may be computed per image across the feature map, height and width dimensions or per spatial location, per image across the feature map dimension. cuDNN provides average and max pooling operations, as well as a set of tensor transformation routines, such as those that add tensors, with optional broadcasting. The goal of providing these functions is to reduce the amount of parallel code that is required for deep learning frameworks, by providing flexible, well-optimized versions of these commonly used functions. With cuDNN, it is possible to write programs that train standard convolutional neural networks without writing any parallel code, but simply using libraries."
+    }, {
+      "heading" : "3 Implementation",
+      "text" : "The majority of functions that cuDNN provides have straightforward implementations. The convolution implementation is not as obvious, so we will outline the motivation and reasoning behind our design choices.\nThere are many ways to implement convolutions efficiently. Our goal is to provide performance as close as possible to matrix multiplication, while using no auxiliary memory. GPU memory is high bandwidth, but low capacity, and is therefore a scarce resource. When training deep networks, ideally the GPU memory should be filled with data, parameters, and neuron responses, not auxiliary data structures needed by the convolution algorithm. Several approaches to computing convolutions require large auxiliary data structures, and therefore we do not consider these approaches for cuDNN.\nOne approach is to lower the convolutions into a matrix multiplication, following [6]. This can be done by reshaping the filter tensor F into a matrix Fm with dimensions K × CRS, and gathering a data matrix by duplicating the original input data into a matrix Dm with dimensions CRS×NPQ. The computation can then be performed with a single matrix multiply to form an output matrix Om with dimension K ×NPQ. Figure 1 illustrates how a simple convolution can be lowered to a matrix multiplication. The colors in this illustration represent the input feature maps, and elements of D and F are uniquely labeled in the illustration so as to show how each participates in forming Dm and Fm. The filter matrix Fm has dimensions K×CRS = 2×12, while the data matrix Dm has dimensions CRS×NPQ = 12×4. Note that each element of D is duplicated up to RS = 4 times in Dm. The output matrix Om has dimensions K ×NPQ = 2× 4. Lowering convolutions to matrix multiplication can be efficient, since matrix multiplication is highly optimized. Matrix multiplication is fast because it has a high ratio of floating-point operations per byte of data transferred. This ratio increases as the matrices get larger, meaning that matrix multiplication is less efficient on small matrices. Accordingly, this approach to convolution is most effective when it creates large matrices for multiplication. As we mentioned earlier, the sizes of Dm and Fm depend on products of the parameters to the convolution, not the parameters themselves. This means that performance using this approach can be very consistent, since the algorithm does not care if one of the parameters is small, as long as the product is large enough. For example, it is often true that in early layers of a convolutional network, C is small, but R and S are large, while at the end of the network, C is large, but R and S are small. However, the product CRS is usually fairly large for all layers, so performance can be consistently good. The disadvantage of this approach is\nthat forming Dm involves duplicating the input data up to RS times, depending on striding choices, which can require a prohibitively large temporary allocation. To work around this, implementations sometimes materialize Dm piece by piece, for example, by calling matrix multiplication iteratively for each element of the mini-batch. However, this limits the parallelism in the implementation, and can lead to cases where the matrix multiplications are too small to effectively utilize the GPU. This approach also lowers the computational intensity of the convolutions, because Dm must be written and read, in addition to reading D itself, requiring significantly more memory traffic as a more direct approach. Accordingly, we opt not to use this implementation directly, although as we will explain, our implementation is related.\nAnother approach is to use the Fast Fourier Transform to compute the convolution. The FFT can significantly lower the work complexity of the convolutions, and with clever engineering can be used effectively for deep neural networks [16]. However, the FFT based approach uses a significant amount of temporary memory, since the filters must be padded to be the same size as the inputs. This is especially costly when the filters are small compared to the images, which often happens in the first few layers of a convolutional network. Additionally, the FFT based approach does not perform efficiently when the striding parameters u and v are greater than 1, which is common in many state-of-the art networks, such as the early layers in [18] and [19]. Striding reduces the computational work of the convolutions by a factor of uv, by computing only a sparse subset of the output. However, the nature of the FFT algorithm is such that computing pruned FFTs is a non-trivial task, and often is slower than computing the dense FFT, followed by an additional subsampling step. Due to these drawbacks, we opted to forgo the FFT approach, although we can see that in some cases it is useful.\nAnother common approach is to compute the convolutions directly. This can be very efficient, but requires a large number of specialized implementations to handle the many corner cases implicit in the 11-dimensional parameter space of the convolutions. Implementations following this approach are often well-optimized for convolutions in certain parts of the parameter space, but perform poorly for others. For example, cuda-convnet2 [12] performs well when batch sizes are large, but poorly once batch size falls to 64 or below. Optimizing and maintaining all these specializations is a difficult task. As we envision this library being maintained for some time, and being ported to yet-to-beconceived future architectures, we searched for something simpler that would perform more robustly across the parameter space and be easier to port to new architectures."
+    }, {
+      "heading" : "3.1 Our approach",
+      "text" : "NVIDIA provides a matrix multiplication routine that achieves a substantial fraction of floatingpoint throughput on GPUs. The algorithm for this routine is similar to the algorithm described in [20]. Fixed sized submatrices of the input matrices A and B are successively read into on-chip memory and are then used to compute a submatrix of the output matrix C. We compute on tiles of A and B while fetching the next tiles of A and B from off-chip memory into on-chip caches and other memories. This technique hides the memory latency associated with the data transfer, allowing the matrix multiplication computation to be limited only by the time it takes to perform the arithmetic.\nAs we discussed earlier, convolutions can be lowered onto matrix multiplication. This approach provides simplicity of implementation as well as consistency of performance across the parameter space, although materializing the lowered matrix in memory can be costly. Our solution follows this approach, but we avoid the problems with materializing the lowered matrix in memory by lazily materializing Dm in on-chip memory only, rather than by materializing it in off-chip memory before calling a matrix multiplication routine. Since the tiling required for the matrix multiplication routine is independent of any parameters from the convolution, the mapping between the tile boundaries of Dm and the convolution problem is not trivial. Accordingly, our approach entails computing this mapping and using it to load the correct elements of A and B into on-chip memories. This happens dynamically as the computation proceeds, which allows our convolution algorithm to exploit optimized infrastructure for matrix multiplication. We require additional indexing arithmetic compared to a matrix multiplication, but fully leverage the computational engine of matrix multiplication to perform the work. After the computation is complete, we perform the required tensor transposition to store the result in the user’s desired data layout.\nComputing the additional indexing requires repeated calculations of integer division and modulus operations by launch-time constant divisors. We make use of the algorithm for integer division and modulus presented in [21] to transform these costly operations into integer multiplies and shifts, and thus reduce the indexing overhead required by our approach."
+    }, {
+      "heading" : "3.2 Performance",
+      "text" : "The convolution routines in cuDNN provide competitive performance with zero auxiliary memory required.\nFigure 2 shows the performance on an NVIDIA Tesla K40 of three convolution implementations: cuDNN, Caffe, and cuda-convnet2. We evaluated these implementations using the layer configurations shown in table 2, which are commonly used for benchmarking convolution performance [1], and quote average throughput for all these layers. cuDNN performance ranges from 0.8× to 2.25× that of cuda-convnet2, with an advantage at smaller batch sizes. Compared to Caffe, cuDNN per-\nformance ranges from 1.0× to 1.41×. Importantly, even with a small mini-batch size of only 16, cuDNN performance is still 86% of maximum performance, which shows that our implementation performs well across the convolution parameter space.\nTable 3 illustrates cuDNN’s performance portability across GPU architectures. The Tesla K40 is built using the Kepler architecture, and has a peak single-precision throughput of 4.29 TFlops. The Geforce GTX 980 is built using the newer Maxwell architecture, and has a peak single-precision throughput of 4.95 TFlops. cuDNN performance ranges from 23-35% of peak on the Tesla K40, and from 30-51% of peak on the GTX 980. This data illustrates how cuDNN provides performance portability across GPU architectures, with no need for users to retune their code as GPU architectures evolve."
+    }, {
+      "heading" : "4 Caffe Integration",
+      "text" : "Caffe is a deep learning framework developed with expression, speed, and modularity in mind. Its architecture mirrors the natural modularity of deep networks as compositional models made from a collection of inter-connected layers. A deep network is defined layer-by-layer in a plaintext schema. Each layer type is implemented according to a simple protocol of setup, forward, and backward steps to encapsulate engineering details. Data and derivatives flow through layers and between the host and device according to the framework’s unified memory interface that handles allocation and communication. cuDNN integration raises the speed and memory efficiency of the framework without sacrificing expression or modularity."
+    }, {
+      "heading" : "4.1 Development",
+      "text" : "Integration is made simple by the self-contained design of the cuDNN handles, descriptors, and function calls together with the modularity of the framework. The core Caffe framework is unaltered, preserving the network, layer, and memory interfaces. Changes were isolated to new layer definitions and implementations, helper functions for descriptors, and the corresponding tests. The patch is almost purely additive.\nIn Caffe each type of model operation is encapsulated in a layer. Layer development comprises declaring and implementing a layer class, defining the layer in the protocol buffer model schema, extending the layer factory, and including tests. Computations are carried out through the layer protocol of setup, forward, and backward steps. cuDNN layers fit this same scheme. Library handles and descriptors are configured in setup while forward and backward calls are made in the respective layer methods. The cuDNN primitives yield concise layer implementations. To accomodate multiple implementations layer classes follow the strategy pattern. The layer factory returns the needed class according to the model configuration, and falls back to standard Caffe for special cases not yet covered by cuDNN or for CPU mode computation. The test suite for a cuDNN layer mir-\nrors the standard layer tests. The cuDNN layers are drop-in replacements to their standard Caffe counterparts.\nCaffe has a standard array and memory interface, called a blob, for storing and communicating data on the host and device. Blobs hold data, gradients, and parameters. In particular, layer inputs and outputs are held in N × C ×H ×W dimensional blobs. cuDNN tensor and filter descriptors are trivially constructed from blob arrays through its flexible support for dimension and stride. By coordinating memory solely at the descriptor, Caffe retains control over memory and communication for efficiency.\nThe Caffe+cuDNN convolution layer exploits the reduced memory consumption of cuDNN to speed up execution. The forward pass parallelizes the computation of group convolution (filtering with sets of filters with restricted channel connectivity). The backward pass parallelizes the computation of the gradients with respect to the bias, filter weights, and bottom data.\nTable 4 illustrates the performance improvements gained from integrating cuDNN into Caffe. Overall, training time for 200 iterations improved by 36%, when training the bvlc reference caffenet model, using cuDNN R1 on an NVIDIA Tesla K40."
+    }, {
+      "heading" : "4.2 User Experience",
+      "text" : "cuDNN computation is transparent to the user through drop-in integration. The model schema and framework interfaces are completely unchanged. Setting a single compilation flag during installation equips Caffe with cuDNN layer implementations and sets cuDNN as the default computation engine. Layers automatically fall back to the standard Caffe functionality in all cases outside of the current scope of cuDNN. Model execution can be tuned through per-layer ENGINE parameters that select the implementation. The workflow for the user is virtually identical.\nFuture cuDNN releases will be integrated in like fashion."
+    }, {
+      "heading" : "5 Future Work",
+      "text" : "We are considering several avenues for expanding the performance and functionality of cuDNN. Firstly, although our convolution routines are competitive with other available implementations, more work remains to bring performance up to that attained by matrix multiplication. Over time, we hope to shrink this gap. Secondly, we envision adding support for other primitives; for example: 1D and 3D convolutions would be useful for speech, language processing, and video applications, among others. Local Receptive Field computations, which are similar to convolutions, but with untied weights, are also useful and could be added to cuDNN. Finally, we would like this library to help people use multiple GPUs to accelerate training."
+    }, {
+      "heading" : "6 Conclusion",
+      "text" : "This paper presents cuDNN, a library for deep learning primitives. We presented a novel implementation of convolutions that provides reliable performance across a wide range of input sizes, and takes advantage of highly-optimized matrix multiplication routines to provide high performance, without requiring any auxiliary memory. We also provide a set of routines that allow users to train and evaluate complete deep neural networks without the need to write parallel code manually. As parallel architectures continue to evolve, such libraries will provide increasing value to the machine learning community. The library is available at [3], and we welcome feedback at cuDNN@nvidia.com.\nReferences [1] convnet-benchmarks. https://github.com/soumith/convnet-benchmarks,\n2014. [2] Netlib BLAS. http://www.netlib.org/blas/, 2014. [3] NVIDIA cuDNN - GPU accelerated deep learning. https://developer.nvidia.\ncom/cuDNN, 2014. [4] Yoshua Bengio, Aaron C. Courville, and Pascal Vincent. Unsupervised feature learning and\ndeep learning: A review and new perspectives. CoRR, abs/1206.5538, 2012. [5] James Bergstra, Olivier Breuleux, Frédéric Bastien, Pascal Lamblin, Razvan Pascanu, Guil-\nlaume Desjardins, Joseph Turian, David Warde-Farley, and Yoshua Bengio. Theano: a cpu and gpu math expression compiler. In SciPy, volume 4, page 3, 2010.\n[6] Kumar Chellapilla, Sidd Puri, Patrice Simard, et al. High performance convolutional neural networks for document processing. In Workshop on Frontiers in Handwriting Recognition, 2006.\n[7] Adam Coates, Brody Huval, Tao Wang, David Wu, Bryan Catanzaro, and Andrew Ng. Deep learning with COTS HPC systems. In ICML, pages 1337–1345, 2013.\n[8] Ronan Collobert, Koray Kavukcuoglu, and Clément Farabet. Torch7: A matlab-like environment for machine learning. In BigLearn, NIPS Workshop, 2011.\n[9] George E Dahl, Dong Yu, Li Deng, and Alex Acero. Context-dependent pre-trained deep neural networks for large-vocabulary speech recognition. Audio, Speech, and Language Processing, IEEE Transactions on, 20(1):30–42, 2012.\n[10] Geoffrey Hinton, Li Deng, Dong Yu, George E Dahl, Abdel-rahman Mohamed, Navdeep Jaitly, Andrew Senior, Vincent Vanhoucke, Patrick Nguyen, Tara N Sainath, et al. Deep neural networks for acoustic modeling in speech recognition: The shared views of four research groups. Signal Processing Magazine, IEEE, 29(6):82–97, 2012.\n[11] Yangqing Jia, Evan Shelhamer, Jeff Donahue, Sergey Karayev, Jonathan Long, Ross Girshick, Sergio Guadarrama, and Trevor Darrell. Caffe: Convolutional architecture for fast feature embedding. arXiv preprint arXiv:1408.5093, 2014.\n[12] Alex Krizhevsky. cudaconvnet2. https://code.google.com/p/cuda-convnet2/, 2014.\n[13] Alex Krizhevsky, Ilya Sutskever, and Geoffrey E Hinton. Imagenet classification with deep convolutional neural networks. In NIPS, pages 1097–1105, 2012.\n[14] Yann LeCun, Léon Bottou, Yoshua Bengio, and Patrick Haffner. Gradient-based learning applied to document recognition. Proceedings of the IEEE, 86(11):2278–2324, 1998.\n[15] Andrew L Maas, Awni Y Hannun, Daniel Jurafsky, and Andrew Y Ng. First-pass large vocabulary continuous speech recognition using bi-directional recurrent dnns. arXiv preprint arXiv:1408.2873, 2014.\n[16] Michael Mathieu, Mikael Henaff, and Yann LeCun. Fast training of convolutional networks through ffts. arXiv preprint arXiv:1312.5851, 2013.\n[17] Olga Russakovsky, Jia Deng, Hao Su, Jonathan Krause, Sanjeev Satheesh, Sean Ma, Zhiheng Huang, Andrej Karpathy, Aditya Khosla, Michael Bernstein, Alexander C. Berg, and Li FeiFei. Imagenet large scale visual recognition challenge, 2014.\n[18] Pierre Sermanet, David Eigen, Xiang Zhang, Michaël Mathieu, Rob Fergus, and Yann LeCun. Overfeat: Integrated recognition, localization and detection using convolutional networks. arXiv preprint arXiv:1312.6229, 2013.\n[19] Christian Szegedy, Wei Liu, Yangqing Jia, Pierre Sermanet, Scott Reed, Dragomir Anguelov, Dumitru Erhan, Vincent Vanhoucke, and Andrew Rabinovich. Going deeper with convolutions. arXiv preprint arXiv:1409.4842, 2014.\n[20] Guangming Tan, Linchuan Li, Sean Treichler, Everett Phillips, Yungang Bao, and Ninghui Sun. Fast implementation of DGEMM on Fermi GPU. In Supercomputing 2011, SC ’11, pages 35:1–35:11, New York, NY, USA, 2011. ACM.\n[21] Henry S. Warren. Hacker’s Delight. Addison-Wesley Professional, 2002."
+    } ],
+    "references" : [ {
+      "title" : "Unsupervised feature learning and deep learning: A review and new perspectives",
+      "author" : [ "Yoshua Bengio", "Aaron C. Courville", "Pascal Vincent" ],
+      "venue" : "CoRR, abs/1206.5538,",
+      "citeRegEx" : "4",
+      "shortCiteRegEx" : "4",
+      "year" : 2012
+    }, {
+      "title" : "Theano: a cpu and gpu math expression compiler",
+      "author" : [ "James Bergstra", "Olivier Breuleux", "Frédéric Bastien", "Pascal Lamblin", "Razvan Pascanu", "Guillaume Desjardins", "Joseph Turian", "David Warde-Farley", "Yoshua Bengio" ],
+      "venue" : "In SciPy,",
+      "citeRegEx" : "5",
+      "shortCiteRegEx" : "5",
+      "year" : 2010
+    }, {
+      "title" : "High performance convolutional neural networks for document processing",
+      "author" : [ "Kumar Chellapilla", "Sidd Puri", "Patrice Simard" ],
+      "venue" : "In Workshop on Frontiers in Handwriting Recognition,",
+      "citeRegEx" : "6",
+      "shortCiteRegEx" : "6",
+      "year" : 2006
+    }, {
+      "title" : "Deep learning with COTS HPC systems",
+      "author" : [ "Adam Coates", "Brody Huval", "Tao Wang", "David Wu", "Bryan Catanzaro", "Andrew Ng" ],
+      "venue" : "In ICML,",
+      "citeRegEx" : "7",
+      "shortCiteRegEx" : "7",
+      "year" : 2013
+    }, {
+      "title" : "Torch7: A matlab-like environment for machine learning",
+      "author" : [ "Ronan Collobert", "Koray Kavukcuoglu", "Clément Farabet" ],
+      "venue" : "In BigLearn, NIPS Workshop,",
+      "citeRegEx" : "8",
+      "shortCiteRegEx" : "8",
+      "year" : 2011
+    }, {
+      "title" : "Context-dependent pre-trained deep neural networks for large-vocabulary speech recognition. Audio, Speech, and Language Processing",
+      "author" : [ "George E Dahl", "Dong Yu", "Li Deng", "Alex Acero" ],
+      "venue" : "IEEE Transactions on,",
+      "citeRegEx" : "9",
+      "shortCiteRegEx" : "9",
+      "year" : 2012
+    }, {
+      "title" : "Deep neural networks for acoustic modeling in speech recognition: The shared views of four research groups",
+      "author" : [ "Geoffrey Hinton", "Li Deng", "Dong Yu", "George E Dahl", "Abdel-rahman Mohamed", "Navdeep Jaitly", "Andrew Senior", "Vincent Vanhoucke", "Patrick Nguyen", "Tara N Sainath" ],
+      "venue" : "Signal Processing Magazine, IEEE,",
+      "citeRegEx" : "10",
+      "shortCiteRegEx" : "10",
+      "year" : 2012
+    }, {
+      "title" : "Caffe: Convolutional architecture for fast feature embedding",
+      "author" : [ "Yangqing Jia", "Evan Shelhamer", "Jeff Donahue", "Sergey Karayev", "Jonathan Long", "Ross Girshick", "Sergio Guadarrama", "Trevor Darrell" ],
+      "venue" : "arXiv preprint arXiv:1408.5093,",
+      "citeRegEx" : "11",
+      "shortCiteRegEx" : "11",
+      "year" : 2014
+    }, {
+      "title" : "Imagenet classification with deep convolutional neural networks",
+      "author" : [ "Alex Krizhevsky", "Ilya Sutskever", "Geoffrey E Hinton" ],
+      "venue" : "In NIPS,",
+      "citeRegEx" : "13",
+      "shortCiteRegEx" : "13",
+      "year" : 2012
+    }, {
+      "title" : "Gradient-based learning applied to document recognition",
+      "author" : [ "Yann LeCun", "Léon Bottou", "Yoshua Bengio", "Patrick Haffner" ],
+      "venue" : "Proceedings of the IEEE,",
+      "citeRegEx" : "14",
+      "shortCiteRegEx" : "14",
+      "year" : 1998
+    }, {
+      "title" : "First-pass large vocabulary continuous speech recognition using bi-directional recurrent dnns",
+      "author" : [ "Andrew L Maas", "Awni Y Hannun", "Daniel Jurafsky", "Andrew Y Ng" ],
+      "venue" : "arXiv preprint arXiv:1408.2873,",
+      "citeRegEx" : "15",
+      "shortCiteRegEx" : "15",
+      "year" : 2014
+    }, {
+      "title" : "Fast training of convolutional networks through ffts",
+      "author" : [ "Michael Mathieu", "Mikael Henaff", "Yann LeCun" ],
+      "venue" : "arXiv preprint arXiv:1312.5851,",
+      "citeRegEx" : "16",
+      "shortCiteRegEx" : "16",
+      "year" : 2013
+    }, {
+      "title" : "Imagenet large scale visual recognition",
+      "author" : [ "Olga Russakovsky", "Jia Deng", "Hao Su", "Jonathan Krause", "Sanjeev Satheesh", "Sean Ma", "Zhiheng Huang", "Andrej Karpathy", "Aditya Khosla", "Michael Bernstein", "Alexander C. Berg", "Li Fei- Fei" ],
+      "venue" : null,
+      "citeRegEx" : "17",
+      "shortCiteRegEx" : "17",
+      "year" : 2014
+    }, {
+      "title" : "Overfeat: Integrated recognition, localization and detection using convolutional networks",
+      "author" : [ "Pierre Sermanet", "David Eigen", "Xiang Zhang", "Michaël Mathieu", "Rob Fergus", "Yann Le- Cun" ],
+      "venue" : "arXiv preprint arXiv:1312.6229,",
+      "citeRegEx" : "18",
+      "shortCiteRegEx" : "18",
+      "year" : 2013
+    }, {
+      "title" : "Going deeper with convolutions",
+      "author" : [ "Christian Szegedy", "Wei Liu", "Yangqing Jia", "Pierre Sermanet", "Scott Reed", "Dragomir Anguelov", "Dumitru Erhan", "Vincent Vanhoucke", "Andrew Rabinovich" ],
+      "venue" : "arXiv preprint arXiv:1409.4842,",
+      "citeRegEx" : "19",
+      "shortCiteRegEx" : "19",
+      "year" : 2014
+    }, {
+      "title" : "Fast implementation of DGEMM on Fermi GPU",
+      "author" : [ "Guangming Tan", "Linchuan Li", "Sean Treichler", "Everett Phillips", "Yungang Bao", "Ninghui Sun" ],
+      "venue" : "Supercomputing",
+      "citeRegEx" : "20",
+      "shortCiteRegEx" : "20",
+      "year" : 2011
+    }, {
+      "title" : "Hacker’s Delight",
+      "author" : [ "Henry S. Warren" ],
+      "venue" : "Addison-Wesley Professional,",
+      "citeRegEx" : "21",
+      "shortCiteRegEx" : "21",
+      "year" : 2002
+    } ],
+    "referenceMentions" : [ {
+      "referenceID" : 0,
+      "context" : "Deep neural networks have been successful at solving many kinds of tasks [4].",
+      "startOffset" : 73,
+      "endOffset" : 76
+    }, {
+      "referenceID" : 3,
+      "context" : "The efficiency provided by these implementations allows researchers to explore significantly higher capacity networks, training them on larger datasets [7].",
+      "startOffset" : 152,
+      "endOffset" : 155
+    }, {
+      "referenceID" : 12,
+      "context" : "For example, the majority of entries in the 2014 ILSVRC challenge [17] use GPUs to implement deep neural networks, as pioneered by [13], and improved by many others, including [18] [19].",
+      "startOffset" : 66,
+      "endOffset" : 70
+    }, {
+      "referenceID" : 8,
+      "context" : "For example, the majority of entries in the 2014 ILSVRC challenge [17] use GPUs to implement deep neural networks, as pioneered by [13], and improved by many others, including [18] [19].",
+      "startOffset" : 131,
+      "endOffset" : 135
+    }, {
+      "referenceID" : 13,
+      "context" : "For example, the majority of entries in the 2014 ILSVRC challenge [17] use GPUs to implement deep neural networks, as pioneered by [13], and improved by many others, including [18] [19].",
+      "startOffset" : 176,
+      "endOffset" : 180
+    }, {
+      "referenceID" : 14,
+      "context" : "For example, the majority of entries in the 2014 ILSVRC challenge [17] use GPUs to implement deep neural networks, as pioneered by [13], and improved by many others, including [18] [19].",
+      "startOffset" : 181,
+      "endOffset" : 185
+    }, {
+      "referenceID" : 6,
+      "context" : "Deep neural networks for speech recognition have also benefited from parallel implementations on GPUs [10] [9] [15].",
+      "startOffset" : 102,
+      "endOffset" : 106
+    }, {
+      "referenceID" : 5,
+      "context" : "Deep neural networks for speech recognition have also benefited from parallel implementations on GPUs [10] [9] [15].",
+      "startOffset" : 107,
+      "endOffset" : 110
+    }, {
+      "referenceID" : 10,
+      "context" : "Deep neural networks for speech recognition have also benefited from parallel implementations on GPUs [10] [9] [15].",
+      "startOffset" : 111,
+      "endOffset" : 115
+    }, {
+      "referenceID" : 9,
+      "context" : "Convolutional Neural Networks (CNNs) [14] are an important class of deep networks, and have proven successful at many tasks, including image recognition.",
+      "startOffset" : 37,
+      "endOffset" : 41
+    }, {
+      "referenceID" : 4,
+      "context" : "Accordingly, modern deep learning frameworks, such as Torch7 [8], Theano [5], and Caffe [11] feature suites of",
+      "startOffset" : 61,
+      "endOffset" : 64
+    }, {
+      "referenceID" : 1,
+      "context" : "Accordingly, modern deep learning frameworks, such as Torch7 [8], Theano [5], and Caffe [11] feature suites of",
+      "startOffset" : 73,
+      "endOffset" : 76
+    }, {
+      "referenceID" : 7,
+      "context" : "Accordingly, modern deep learning frameworks, such as Torch7 [8], Theano [5], and Caffe [11] feature suites of",
+      "startOffset" : 88,
+      "endOffset" : 92
+    }, {
+      "referenceID" : 2,
+      "context" : "One approach is to lower the convolutions into a matrix multiplication, following [6].",
+      "startOffset" : 82,
+      "endOffset" : 85
+    }, {
+      "referenceID" : 11,
+      "context" : "The FFT can significantly lower the work complexity of the convolutions, and with clever engineering can be used effectively for deep neural networks [16].",
+      "startOffset" : 150,
+      "endOffset" : 154
+    }, {
+      "referenceID" : 13,
+      "context" : "Additionally, the FFT based approach does not perform efficiently when the striding parameters u and v are greater than 1, which is common in many state-of-the art networks, such as the early layers in [18] and [19].",
+      "startOffset" : 202,
+      "endOffset" : 206
+    }, {
+      "referenceID" : 14,
+      "context" : "Additionally, the FFT based approach does not perform efficiently when the striding parameters u and v are greater than 1, which is common in many state-of-the art networks, such as the early layers in [18] and [19].",
+      "startOffset" : 211,
+      "endOffset" : 215
+    }, {
+      "referenceID" : 15,
+      "context" : "The algorithm for this routine is similar to the algorithm described in [20].",
+      "startOffset" : 72,
+      "endOffset" : 76
+    }, {
+      "referenceID" : 16,
+      "context" : "We make use of the algorithm for integer division and modulus presented in [21] to transform these costly operations into integer multiplies and shifts, and thus reduce the indexing overhead required by our approach.",
+      "startOffset" : 75,
+      "endOffset" : 79
+    } ],
+    "year" : 2014,
+    "abstractText" : "We present a library that provides optimized implementations for deep learning primitives. Deep learning workloads are computationally intensive, and optimizing the kernels of deep learning workloads is difficult and time-consuming. As parallel architectures evolve, kernels must be reoptimized for new processors, which makes maintaining codebases difficult over time. Similar issues have long been addressed in the HPC community by libraries such as the Basic Linear Algebra Subroutines (BLAS) [2]. However, there is no analogous library for deep learning. Without such a library, researchers implementing deep learning workloads on parallel processors must create and optimize their own implementations of the main computational kernels, and this work must be repeated as new parallel processors emerge. To address this problem, we have created a library similar in intent to BLAS, with optimized routines for deep learning workloads. Our implementation contains routines for GPUs, and similarly to the BLAS library, could be implemented for other platforms. The library is easy to integrate into existing frameworks, and provides optimized performance and memory usage. For example, integrating cuDNN into Caffe, a popular framework for convolutional networks, improves performance by 36% on a standard model while also reducing memory consumption.",
+    "creator" : "LaTeX with hyperref package"
+  }
+}

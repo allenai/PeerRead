@@ -1,0 +1,651 @@
+{
+  "name" : "1707.07402.pdf",
+  "metadata" : {
+    "source" : "CRF",
+    "title" : "Reinforcement Learning for Bandit Neural Machine Translation with Simulated Human Feedback",
+    "authors" : [ "Khanh Nguyen", "Jordan Boyd-Graber" ],
+    "emails" : [ "kxnguyen@umiacs.umd.edu", "hal@umiacs.umd.edu", "jbg@umiacs.umd.edu" ],
+    "sections" : [ {
+      "heading" : "1 Introduction",
+      "text" : "Bandit structured prediction is the task of learning to solve complex joint prediction problems (like parsing or machine translation) under a very limited feedback model: a system must produce a single structured output (e.g., translation) and then the world reveals a score that measures how good or bad that output is, but provides neither a “correct” output nor feedback on any other possible output (Chang et al., 2015; Sokolov et al., 2015). Because of the extreme sparsity of this feedback, a common experimental setup is that one pre-trains a good-but-not-great “reference” system based on whatever labeled data is available, and then seeks to improve it over time using this bandit feedback.\nA common motivation for this problem setting is cost. In the case of translation, bilingual “experts” can read a source sentence and a possible translation, and can much more quickly provide a rating of that translation than they can produce a full translation on their own. Furthermore, one can often collect even less expensive ratings from “non-experts” who may or may not be bilingual (Hu et al., 2014). Breaking this reliance on expensive data could unlock previously ignored languages and speed development of broad-coverage machine translation systems.\nAll work on bandit structured prediction we know makes an important simplifying assumption: the score provided by the world is exactly the score the system must optimize (§2). In the case of parsing, the score is attachment score; in the case of machine translation, the score is (sentence-level) BLEU. While this simplifying assumption has been incredibly useful in building algorithms, it is highly unrealistic. Any time we want to optimize a system by collecting user feedback, we must take into account:\n1. The metric we care about (e.g., expert ratings) may not correlate perfectly with the measure that the reference system was trained on (e.g., BLEU or log likelihood); 2. Human judgments might be more granular than traditional continuous metrics (e.g., thumbs up vs. thumbs down); 3. Human feedback have high variance (e.g., different raters might give different responses given the same system output); 4. Human feedback might be substantially skewed (e.g., a rater may think all system outputs are poor). Our first contribution is a strategy to simulate expert and non-expert ratings to evaluate the robustness of bandit structured prediction algorithms in general, in a more realistic environment (§4). We ar X iv :1\n70 7.\n07 40\n2v 1\n[ cs\n.C L\n] 2\n4 Ju\nl 2 01\n7\nconstruct a family of perturbations to capture three attributes: granularity, variance, and skew. We apply these perturbations on automatically generated scores to simulate noisy human ratings. To make our simulated ratings as realistic as possible, we study recent human evaluation data (Graham et al., 2017) and fit models to match the noise profiles in actual human ratings (§4.2).\nOur second contribution is a reinforcement learning solution to bandit structured prediction and a study of its robustness to these simulated human ratings (§ 3).1 We combine an encoderdecoder architecture of machine translation (Luong et al., 2015) with the advantage actor-critic algorithm (Mnih et al., 2016), yielding an approach that is simple to implement but works on lowresource bandit machine translation. Even with substantially restricted granularity, with high variance feedback, or with skewed rewards, this combination improves pre-trained models (§6). In particular, under realistic settings of our noise parameters, the algorithm’s online reward and final heldout accuracies do not significantly degrade from a noise-free setting."
+    }, {
+      "heading" : "2 Bandit Machine Translation",
+      "text" : "The bandit structured prediction problem (Chang et al., 2015; Sokolov et al., 2015) is an extension of the contextual bandits problem (Kakade et al., 2008; Langford and Zhang, 2008) to structured prediction. Bandit structured prediction operates over time i = 1 . . .K as:\n1. World reveals context x(i) 2. Algorithm predicts structured output ŷ(i)\n3. World reveals reward R ( ŷ(i),x(i) ) We consider the problem of learning to translate from human ratings in a bandit structured prediction framework. In each round, a translation model receives a source sentence x(i), produces a translation ŷ(i), and receives a rating R ( ŷ(i),x(i) ) from a human that reflects the qual-\nity of the translation. We seek an algorithm that achieves high reward over K rounds (high cumulative reward). The challenge is that even though the model knows how good the translation is, it knows neither where its mistakes are nor what the “correct” translation looks like. It must balance exploration (finding new good predictions)\n1Our code is at https://github.com/ khanhptnk/bandit-nmt (in PyTorch).\nwith exploitation (producing predictions it already knows are good). This is especially difficult in a task like machine translation, where, for a twenty token sentence with a vocabulary size of 50k, there are approximately 1094 possible outputs, of which the algorithm gets to test exactly one.\nDespite these challenges, learning from nonexpert ratings is desirable. In real-world scenarios, non-expert ratings are easy to collect but other stronger forms of feedback are prohibitively expensive. Platforms that offer translations can get quick feedback “for free” from their users to improve their systems (Figure 1). Even in a setting in which annotators are paid, it is much less expensive to ask a bilingual speaker to provide a rating of a proposed translation than it is to pay a professional translator to produce one from scratch."
+    }, {
+      "heading" : "3 Effective Algorithm for Bandit MT",
+      "text" : "This section describes the neural machine translation architecture of our system (§3.1). We formulate bandit neural machine translation as a reinforcement learning problem (§3.2) and discuss why standard actor-critic algorithms struggle with this problem (§3.3). Finally, we describe a more effective training approach based on the advantage actor-critic algorithm (§3.4)."
+    }, {
+      "heading" : "3.1 Neural machine translation",
+      "text" : "Our neural machine translation (NMT) model is a neural encoder-decoder that directly computes the probability of translating a target sentence y = (y1, · · · , ym) from source sentence x:\nPθ(y | x) = m∏ t=1 Pθ(yt | y<t,x) (1)\nwhere Pθ(yt | y<t,x) is the probability of outputting the next word yt at time step t given a translation prefix y<t and a source sentence x.\nWe use an encoder-decoder NMT architecture with global attention (Luong et al., 2015), where both the encoder and decoder are recurrent neural networks (RNN) (see Appendix A for a more detailed description). These models are normally trained by supervised learning, but as reference translations are not available in our setting, we use reinforcement learning methods, which only require numerical feedback to function."
+    }, {
+      "heading" : "3.2 Bandit NMT as Reinforcement Learning",
+      "text" : "NMT generating process can be viewed as a Markov decision process on a continuous state space. The states are the hidden vectors hdect generated by the decoder. The action space is the target language’s vocabulary.\nTo generate a translation from a source sentence x, an NMT model starts at an initial state hdec0 : a representation of x computed by the encoder. At time step t, the model decides the next action to take by defining a stochastic policy Pθ(yt | y<t,x), which is directly parametrized by the parameters θ of the model. This policy takes the current state hdect−1 as input and produces a probability distribution over all actions (target vocabulary words). The next action ŷt is chosen by taking arg max or sampling from this distribution. The model computes the next state hdect by updating the current state hdect−1 by the action taken ŷt.\nThe objective of bandit NMT is to find a policy that maximizes the expected reward of translations sampled from the model’s policy:\nmax θ Lpg(θ) = max θ E x∼Dtr ŷ∼Pθ(·|x)\n[ R(ŷ,x) ] (2)\nwhere Dtr is the training set and R is the reward function (the rater).2 We optimize this objective function with policy gradient methods. For a fixed x, the gradient of the objective in Eq 2 is:\n∇θLpg(θ) = Eŷ∼Pθ(·) [R(ŷ)∇θ logPθ(ŷ)] (3)\n= m∑ t=1 E ŷt∼ Pθ(·|ŷ<t) [ Q(ŷ<t, ŷt)∇θ logPθ(ŷt | ŷ<t) ] where Q(ŷ<t, ŷt) is the expected future reward of ŷt given the current prefix ŷ<t, then continuing sampling from Pθ to complete the translation:\nQ(ŷ<t, ŷt) = Eŷ′∼Pθ(·|x) [ R̃(ŷ′,x) ] (4)\nwith R̃(ŷ′,x) ≡ R(ŷ′,x)1 { ŷ′<t = ŷ<t, ŷ ′ t = ŷt } 2Our raters are stochastic, but for simplicity we denote the reward as a function; it should be expected reward.\n1{·} is the indicator function, which returns 1 if the logic inside the bracket is true and returns 0 otherwise.\nThe gradient in Eq 3 requires rating all possible translations, which is not feasible in bandit NMT. Naı̈ve Monte Carlo reinforcement learning methods such as REINFORCE (Williams, 1992) estimates Q values by sample means but yields very high variance when the action space is large, leading to training instability."
+    }, {
+      "heading" : "3.3 Why are actor-critic algorithms not effective for bandit NMT?",
+      "text" : "Reinforcement learning methods that rely on function approximation are preferred when tackling bandit structured prediction with a large action space because they can capture similarities between structures and generalize to unseen regions of the structure space. The actor-critic algorithm (Konda and Tsitsiklis) uses function approximation to directly model the Q function, called the critic model. In our early attempts on bandit NMT, we adapted the actor-critic algorithm for NMT in Bahdanau et al. (2017), which employs the algorithm in a supervised learning setting. Specifically, while an encoder-decoder critic modelQω as a substitute for the trueQ function in Eq 3 enables taking the full expectation (because the critic model can be queried with any stateaction pair), we are unable to obtain reasonable results with this approach.\nNevertheless, insights into why this approach fails on our problem explains the effectiveness of the approach discussed in the next section. There are two properties in Bahdanau et al. (2017) that our problem lacks but are key elements for a successful actor-critic. The first is access to reference translations: while the critic model is able to observe reference translations during training in their setting, bandit NMT assumes those are never available. The second is per-step rewards: while the reward function in their setting is known and can be exploited to compute immediate rewards after taking each action, in bandit NMT, the actorcritic algorithm struggles with credit assignment because it only receives reward when a translation is completed. Bahdanau et al. (2017) report that the algorithm degrades if rewards are delayed until the end, consistent with our observations.\nWith an enormous action space of bandit NMT, approximating gradients with the Q critic model\ninduces biases and potentially drives the model to wrong optima. Values of rarely taken actions are often overestimated without an explicit constraint between Q values of actions (e.g., a sum-to-one constraint). Bahdanau et al. (2017) add an ad-hoc regularization term to the loss function to mitigate this issue and further stablizes the algorithm with a delay update scheme, but at the same time introduces extra tuning hyper-parameters."
+    }, {
+      "heading" : "3.4 Advantage Actor-Critic for Bandit NMT",
+      "text" : "We follow the approach of advantage actorcritic (Mnih et al., 2016, A2C) and combine it with the neural encoder-decoder architecture. The resulting algorithm—which we call NED-A2C— approximates the gradient in Eq 3 by a single sample ŷ ∼ P (· | x̂) and centers the reward R(ŷ) using the state-specific expected future reward V (ŷ<t) to reduce variance:\n∇θLpg(θ) ≈ m∑ t=1 R̄t(ŷ)∇θ logPθ(ŷt | ŷ<t)\n(5)\nwith R̄t(ŷ) ≡ R(ŷ)− V (ŷ<t) V (ŷ<t) ≡ Eŷ′t∼P (·|ŷ<t) [ Q(ŷ<t, ŷ ′ t) ]\nWe train a separate attention-based encoderdecoder model Vω to estimate V values. This model encodes a source sentence x and decodes a sampled translation ŷ. At time step t, it computes Vω(ŷ<t,x) = w >hcrtt , where h crt t is the current decoder’s hidden vector andw is a learned weight vector. The critic model minimizes the MSE between its estimates and the true values:\nLcrt(ω) = E x∼Dtr ŷ∼Pθ(·|x) [ m∑ t=1 Lt(ŷ,x) ] (6)\nwith Lt(ŷ,x) ≡ [Vω(ŷ<t,x)−R(ŷ,x)] 2 .\nWe use a gradient approximation to update ω for a fixed x and ŷ ∼ P (· | x̂): ∇ωLcrt(ω) ≈ m∑ t=1 [Vω(ŷ<t)−R(ŷ)]∇ωVω(ŷ<t)\n(7) NED-A2C is better suited for problems with a large action space and has other advantages over actor-critic. For large action spaces, approximating gradients using the V critic model induces lower biases than using the Q critic model. As implied by its definition, the V model is robust to\nbiases incurred by rarely taken actions since rewards of those actions are weighted by very small probabilities in the expectation. In addition, the V model has a much smaller number of parameters and thus is more sample-efficient and more stable to train than the Q model. These attractive properties were not studied in A2C’s original paper (Mnih et al., 2016).\nAlgorithm 1 The NED-A2C algorithm for bandit NMT.\n1: for i = 1 · · ·K do 2: receive a source sentence x(i) 3: sample a translation: ŷ(i) ∼ Pθ(· | x(i)) 4: receive reward R(ŷ(i),x(i)) 5: update the NMT model using Eq 5. 6: update the critic model using Eq 7. 7: end for\nAlgorithm 1 summarizes NED-A2C for bandit NMT. For each x, we draw a single sample ŷ from the NMT model, which is used for both estimating gradients of the NMT model and the critic model. We run this algorithm with mini-batches of x and aggregate gradients over all x in a minibatch for each update. Although our focus is on bandit NMT, this algorithm naturally works with any bandit structured prediction problem."
+    }, {
+      "heading" : "4 Modeling Imperfect Ratings",
+      "text" : "Our goal is to establish the feasibility of using real human feedback to optimize a machine translation system, in a setting where one can collect expert feedback as well as a setting in which one only collects non-expert feedback. In all cases, we consider the expert feedback to be the “gold standard” that we wish to optimize. To establish the feasibility of driving learning from human feedback without doing a full, costly user study, we begin with a simulation study. The key aspects (Figure 2) of human feedback we capture are: (a) mismatch between training objective and feedbackmaximizing objective, (b) human ratings typically are binned (§ 4.1), (c) individual human ratings have high variance (§4.2), and (d) non-expert ratings can be skewed with respect to expert ratings (§4.3).\nIn our simulated study, we begin by modeling gold standard human ratings using add-onesmoothed sentence-level BLEU (Chen and Cherry, 2014).3 Our evaluation criteria, therefore, is average sentence-BLEU over the run of our algo-\n3“Smoothing 2” in Chen and Cherry (2014).\nrithm. However, in any realistic scenario, human feedback will vary from its average, and so the reward that our algorithm receives will be a perturbed variant of sentence-BLEU. In particular, if the sentence-BLEU score is s ∈ [0, 1], the algorithm will only observe s′ ∼ pert(s), where pert is a perturbation distribution. Because our reference machine translation system is pre-trained using log-likelihood, there is already an (a) mismatch between training objective and feedback, so we focus on (b-d) below."
+    }, {
+      "heading" : "4.1 Humans Provide Granular Feedback",
+      "text" : "When collecting human feedback, it is often more effective to collect discrete binned scores. A classic example is the Likert scale for human agreement (Likert, 1932) or star ratings for product reviews. Insisting that human judges provide continuous values (or feedback at too fine a granularity) can demotivate raters without improving rating quality (Preston and Colman, 2000).\nTo model granular feedback, we use a simple rounding procedure. Given an integer parameter g for degree of granularity, we define:\npertgran(s; g) = 1\ng round(gs) (8)\nThis perturbation function divides the range of possible outputs into g + 1 bins. For example, for g = 5, we obtain bins [0, 0.1),\n[0.1, 0.3), [0.3, 0.5), [0.5, 0.7), [0.7, 0.9) and [0.9, 1.0]. Since most sentence-BLEU scores are much closer to zero than to one, many of the larger bins are frequently vacant."
+    }, {
+      "heading" : "4.2 Experts Have High Variance",
+      "text" : "Human feedback has high variance around its expected value. A natural goal for a variance model of human annotators is to simulate—as closely as possible—how human raters actually perform. We use human evaluation data recently collected as part of the WMT shared task (Graham et al., 2017). The data consist of 7200 sentences multiply annotated by giving non-expert annotators on Amazon Mechanical Turk a reference sentence and a single system translation, and asking the raters to judge the adequacy of the translation.4\nFrom these data, we treat the average human rating as the ground truth and consider how individual human ratings vary around that mean. To visualize these results with kernel density estimates (standard normal kernels) of the standard deviation. Figure 3 shows the mean rating (x-axis) and the deviation of the human ratings (y-axis) at each mean.5As expected, the standard deviation is small at the extremes and large in the middle (this is a bounded interval), with a fairly large range in the middle: a translation whose average score is 50 can get human evaluation scores anywhere between 20 and 80 with high probability. We use a linear approximation to define our variance-based perturbation function as a Gaussian distribution, which is parameterized by a scale λ that grows or shrinks the variances (when λ = 1 this exactly matches the variance in the plot).\npertvar(s;λ) = Nor ( s, λσ(s)2 ) (9)\nσ(s) = { 0.64s− 0.02 if s < 50 −0.67s+ 67.0 otherwise"
+    }, {
+      "heading" : "4.3 Non-Experts are Skewed from Experts",
+      "text" : "The preceding two noise models assume that the reward closely models the value we want to optimize (has the same mean). This may not be the case with non-expert ratings. Non-expert\n4Typical machine translation evaluations evaluate pairs and ask annotators to choose which is better.\n5A current limitation of this model is that the simulated noise is i.i.d. conditioned on the rating (homoscedastic noise). While this is a stronger and more realistic model than assuming no noise, real noise is likely heteroscedastic: dependent on the input.\n0 20 40 60 80 100 sentence-level avg rating\n0\n20\n40\n60\n80 100\nhu m\nan r\nat in\ng (1 -1 00 ) + - o ne s td de v\nmean mean ± stddev linear fit\n0 20 40 60 80 100 sentence-level avg rating\n0\n20\n40 60 st dd ev o f h um an r at\nin g stddev\nlinear fit left linear fit right\nFigure 3: Average rating (x-axis) versus a kernel density estimate of the variance of human ratings around that mean, with linear fits. Human scores vary more around middling judgments than extreme judgments.\nDe-En Zh-En\nSupervised training 186K 190K Bandit training 167K 165K Development 7.7K 7.9K Test 9.1K 7.4K\nTable 1: Sentence counts in data sets.\nraters are skewed both for reinforcement learning (Thomaz et al., 2006; Thomaz and Breazeal, 2008; Loftin et al., 2014) and recommender systems (Herlocker et al., 2000; Adomavicius and Zhang, 2012), but are typically bimodal: some are harsh (typically provide very low scores, even for “okay” outputs) and some are motivational (providing high scores for “okay” outputs).\nWe can model both harsh and motivations raters with a simple deterministic skew perturbation function, parametrized by a scalar ρ ∈ [0,∞):\npertskew(s; ρ) = sρ (10)\nFor ρ > 1, the rater is harsh; for ρ < 1, the rater is motivational."
+    }, {
+      "heading" : "5 Experimental Setup",
+      "text" : "We choose two language pairs from different language families with different typological properties: German-to-English and (De-En) and Chinese-to-English (Zh-En). We use parallel transcriptions of TED talks for these pairs of languages from the machine translation track of the IWSLT 2014 and 2015 (Cettolo et al., 2014, 2015, 2012). For each language pair, we split its data into four sets for supervised training, bandit training, development and testing (Table 1). For English and German, we tokenize and clean sen-\ntences using Moses (Koehn et al., 2007). For Chinese, we use the Stanford Chinese word segmenter (Chang et al., 2008) to segment sentences and tokenize. We remove all sentences with length greater than 50, resulting in an average sentence length of 18. We use IWSLT 2015 data for supervised training and development, IWSLT 2014 data for bandit training and previous years’ development and evaluation data for testing."
+    }, {
+      "heading" : "5.1 Evaluation Framework",
+      "text" : "For each task, we first use the supervised training set to pre-train a reference NMT model using supervised learning. On the same training set, we also pre-train the critic model with translations sampled from the pre-trained NMT model. Next, we enter a bandit learning mode where our models only observe the source sentences of the bandit training set. Unless specified differently, we train the NMT models with NED-A2C for one pass over the bandit training set. If a perturbation function is applied to Per-Sentence BLEU scores, it is only applied in this stage, not in the pre-training stage.\nWe measure the improvement ∆S of an evaluation metric S due to bandit training: ∆S = SA2C − Sref , where Sref is the metric computed on the reference models and SA2C is the metric computed on models trained with NED-A2C. Our primary interest is Per-Sentence BLEU: average sentence-level BLEU of translations that are sampled and scored during the bandit learning pass. This metric represents average expert ratings, which we want to optimize for in real-world scenarios. We also measure Heldout BLEU: corpuslevel BLEU on an unseen test set, where translations are greedily decoded by the NMT models. This shows how much our method improves translation quality, since corpus-level BLEU correlates better with human judgments than sentence-level BLEU.\nBecause of randomness due to both the random sampling in the model for “exploration” as well as the randomness in the reward function, we repeat each experiment five times and report the mean results with 95% confidence intervals."
+    }, {
+      "heading" : "5.2 Model configuration",
+      "text" : "Both the NMT model and the critic model are encoder-decoder models with global attention (Luong et al., 2015). The encoder and the decoder are unidirectional single-layer LSTMs. They have the same word embedding size and\nLSTM hidden size of 500. The source and target vocabulary sizes are both 50K. We do not use dropout in our experiments. We train our models by the Adam optimizer (Kingma and Ba, 2015) with β1 = 0.9, β2 = 0.999 and a batch size of 64. For Adam’s α hyperparameter, we use 10−3 during pre-training and 10−4 during bandit learning (for both the NMT model and the critic model). During pre-training, starting from the fifth pass, we decay α by a factor of 0.5 when perplexity on the development set increases. The NMT model reaches its highest corpus-level BLEU on the development set after ten passes through the supervised training data, while the critic model’s training error stabilizes after five passes. The training speed is 18s/batch for supervised pre-training and 41s/batch for training with the NED-A2C algorithm."
+    }, {
+      "heading" : "6 Results and Analysis",
+      "text" : "In this section, we describe the results of our experiments, broken into the following questions: how NED-A2C improves reference models (§6.1); the effect the three perturbation functions have on the algorithm (§ 6.2); and whether the algorithm improves a corpus-level metric that corresponds well with human judgments (§6.3)."
+    }, {
+      "heading" : "6.1 Effectiveness of NED-A2C under Un-perturbed Bandit Feedback",
+      "text" : "We evaluate our method in an ideal setting where un-perturbed Per-Sentence BLEU simulates ratings during both training and evaluation (Table 2).\nSingle round of feedback. In this setting, our models only observe each source sentence once and before producing its translation. On both DeEn and Zh-En, NED-A2C improves Per-Sentence BLEU of reference models after only a single pass (+2.82 and +1.08 respectively).\nPoor initialization. Policy gradient algorithms have difficulty improving from poor initializations, especially on problems with a large action space, because they use model-based exploration, which is ineffective when most actions have equal probabilities (Bahdanau et al., 2017; Ranzato et al., 2016). To see whether NED-A2C has this problem, we repeat the experiment with the same setup but with reference models pretrained for only a single pass. Surprisingly, NEDA2C is highly effective at improving these poorly\ntrained models (+7.07 on De-En and +3.60 on ZhEn in Per-Sentence BLEU).\nComparisons with supervised learning. To further demonstrate the effectiveness of NEDA2C, we compare it with training the reference models with supervised learning for a single pass on the bandit training set. Surprisingly, observing ground-truth translations barely improves the models in Per-Sentence BLEU when they are fully trained (less than +0.4 on both tasks). A possible explanation is that the models have already reached full capacity and do not benefit from more examples.6 NED-A2C further enhances the models because it eliminates the mismatch between the supervised training objective and the evaluation objective. On weakly trained reference models, NED-A2C also significantly outperforms supervised learning (∆Per-Sentence BLEU of NEDA2C is over three times as large as those of supervised learning).\nMultiple rounds of feedback. We examine if NED-A2C can improve the models even further with multiple rounds of feedback.7 With supervised learning, the models can memorize the reference translations but, in this case, the models have to be able to exploit and explore effectively. We train the models with NED-A2C for five\n6This result may vary if the domains of the supervised learning set and the bandit training set are dissimilar. Our training data are all TED talks.\n7The ability to receive feedback on the same example multiple times might not fit all use cases though.\npasses and observe a much more significant ∆PerSentence BLEU than training for a single pass in both pairs of language (+6.73 on De-En and +4.56 on Zh-En) (Figure 4)."
+    }, {
+      "heading" : "6.2 Effect of Perturbed Bandit Feedback",
+      "text" : "We apply perturbation functions defined in § 4.1 to Per-Sentence BLEU scores and use the perturbed scores as rewards during bandit training (Figure 5).\nGranular Rewards. We discretize raw PerSentence BLEU scores using pertgran(s; g) (§4.1). We vary g from one to ten (number of bins varies from two to eleven). Compared to continuous rewards, for both pairs of languages, ∆Per-Sentence BLEU is not affected with g at least five (at least six bins). As granularity decreases, ∆PerSentence BLEU monotonically degrades. However, even when g = 1 (scores are either 0 or 1), the models still improve by at least a point.\nHigh-variance Rewards. We simulate noisy rewards using the model of human rating variance pertvar(s;λ) (§ 4.2) with λ ∈ {0.1, 0.2, 0.5, 1, 2, 5}. Our models can withstand an amount of about 20% the variance in our human eval data without dropping in ∆PerSentence BLEU. When the amount of variance attains 100%, matching the amount of variance in the human data, ∆Per-Sentence BLEU go down by about 30% for both pairs of languages. As more variance is injected, the models degrade quickly but still improve from the pre-trained models. Variance is the most detrimental type of perturbation to NED-A2C among the three aspects of human ratings we model.\nSkewed Rewards. We model skewed raters using pertskew(s; ρ) (§ 4.3) with ρ ∈ {0.25, 0.5, 0.67, 1, 1.5, 2, 4}. NED-A2C is robust to skewed scores. ∆Per-Sentence BLEU is at least 90% of unskewed scores for most skew values. Only when the scores are extremely harsh (ρ = 4) does ∆Per-Sentence BLEU degrade significantly (most dramatically by 35% on Zh-En). At that degree of skew, a score of 0.3 is suppressed to be less than 0.08, giving little signal for the models to learn from. On the other spectrum, the models are less sensitive to motivating scores as Per-Sentence BLEU is unaffected on Zh-En and only decreases by 7% on De-En."
+    }, {
+      "heading" : "6.3 Held-out Translation Quality",
+      "text" : "Our method also improves pre-trained models in Heldout BLEU, a metric that correlates with translation quality better than Per-Sentence BLEU (Table 2). When scores are perturbed by our rating model, we observe similar patterns as with PerSentence BLEU: the models are robust to most perturbations except when scores are very coarse, or very harsh, or have very high variance (Figure 5, second row). Supervised learning improves Heldout BLEU better, possibly because maximizing log-likelihood of reference translations correlates more strongly with maximizing Heldout BLEU of predicted translations than maximizing Per-Sentence BLEU of predicted translations."
+    }, {
+      "heading" : "7 Related Work and Discussion",
+      "text" : "Ratings provided by humans can be used as effective learning signals for machines. Reinforcement learning has become the de facto standard for incorporating this feedback across diverse tasks such as robot voice control (Tenorio-Gonzalez et al.,\n2010), myoelectric control (Pilarski et al., 2011), and virtual assistants (Isbell et al., 2001). Recently, this learning framework has been combined with recurrent neural networks to solve machine translation (Bahdanau et al., 2017), dialogue generation (Li et al., 2016), neural architecture search (Zoph and Le, 2017), and device placement (Mirhoseini et al., 2017). Other approaches to more general structured prediction under bandit feedback (Chang et al., 2015; Sokolov et al., 2016a,b) show the broader efficacy of this framework. Ranzato et al. (2016) describe MIXER for training neural encoder-decoder models, which is a reinforcement learning approach closely related to ours but requires a policy-mixing strategy and only uses a linear critic model. Among work on bandit MT, ours is closest to Kreutzer et al. (2017), which also tackle this problem using neural encoder-decoder models, but we (a) take advantage of a state-of-the-art reinforcement learning method; (b) devise a strategy to simulate noisy rewards; and (c) demonstrate the robustness of our method on noisy simulated rewards.\nOur results show that bandit feedback can be an effective feedback mechanism for neural machine translation systems. This is despite that errors in human annotations hurt machine learning models in many NLP tasks (Snow et al., 2008). An obvious question is whether we could extend our framework to model individual annotator preferences (Passonneau and Carpenter, 2014) or learn personalized models (Mirkin et al., 2015; Rabinovich et al., 2017), and handle heteroscedastic noise (Park, 1966; Kersting et al., 2007; Antos\net al., 2010). Another direction is to apply active learning techniques to reduce the sample complexity required to improve the systems or to extend to richer action spaces for problems like simultaneous translation, which requires prediction (Grissom II et al., 2014) and reordering (He et al., 2015) among other strategies to both minimize delay and effectively translate a sentence (He et al., 2016)."
+    }, {
+      "heading" : "Acknowledgements",
+      "text" : "Many thanks to Yvette Graham for her help with the WMT human evaluations data. We thank UMD CLIP lab members for useful discussions that led to the ideas of this paper. We also thank the anonymous reviewers for their thorough and insightful comments. This work was supported by NSF grants IIS-1320538. Boyd-Graber is also partially supported by NSF grants IIS- 1409287, IIS1564275, IIS-IIS-1652666, and NCSE-1422492. Daumé III is also supported by NSF grant IIS1618193, as well as an Amazon Research Award. Any opinions, findings, conclusions, or recommendations expressed here are those of the authors and do not necessarily reflect the view of the sponsor(s)."
+    }, {
+      "heading" : "A Neural MT Architecture",
+      "text" : "Our neural machine translation (NMT) model consists of an encoder and a decoder, each of which is a recurrent neural network (RNN). We closely follow (Luong et al., 2015) for the structure of our model. It directly models the posterior distribution Pθ(y | x) of translating a source sen-\ntence x = (x1, · · · , xn) to a target sentence y = (y1, · · · , ym):\nPθ(y | x) = m∏ t=1 Pθ(yt | y<t,x) (11)\nwhere y<t are all tokens in the target sentence prior to yt.\nEach local disitribution Pθ(yt | y<t,x) is modeled as a multinomial distribution over the target language’s vocabulary. We compute this distribution by applying a linear transformation followed by a softmax function on the decoder’s output vector hdect :\nPθ(yt | y<t,x) = softmax(W s hdect ) (12)\nhdect = tanh(W o[h̃ dec t ; ct]) (13)\nct = attend(h̃ enc 1:n , h̃ dec t ) (14)\nwhere [·; ·] is the concatenation of two vectors, attend(·, ·) is an attention mechanism, h̃enc1:n are all encoder’s hidden vectors and h̃ dec t is the decoder’s hidden vector at time step t. We use the “concat” global attention in (Luong et al., 2015).\nDuring training, the encoder first encodes x to a continuous vector Φ(x), which is used as the initial hidden vector for the decoder. In our paper, Φ(x) simply returns the last hidden vector of the encoder. The decoder performs RNN updates to produce a sequence of hidden vectors:\nh̃ dec 0 = Φ(x) h̃ dec t = fθ ( h̃ dec t−1, [ hdect−1; e(yt) ]) (15) where e(.) is a word embedding lookup function and yt is the ground-truth token at time step t. Feeding the output vector hdect−1 to the next step is known as “input feeding”.\nAt prediction time, the ground-truth token yt in Eq 15 is replaced by the model’s own prediction ŷt:\nŷt = arg max y Pθ(y | ŷ<t,x) (16)\nIn a supervised learning framework, an NMT model is typically trained under the maximum loglikelihood objective:\nmax θ Lsup(θ) = max θ E(x,y)∼Dtr [logPθ (y | x)]\n(17)\nwhere Dtr is the training set. However, this learning framework is not applicable to bandit learning since ground-truth translations are not available."
+    } ],
+    "references" : [ {
+      "title" : "Impact of data characteristics on recommender systems performance",
+      "author" : [ "Gediminas Adomavicius", "Jingjing Zhang." ],
+      "venue" : "ACM Transactions on Management Information Systems (TMIS) 3(1):3.",
+      "citeRegEx" : "Adomavicius and Zhang.,? 2012",
+      "shortCiteRegEx" : "Adomavicius and Zhang.",
+      "year" : 2012
+    }, {
+      "title" : "Active learning in heteroscedastic noise",
+      "author" : [ "András Antos", "Varun Grover", "Csaba Szepesvári." ],
+      "venue" : "Theoretical Computer Science 411(29-30):2712–2728.",
+      "citeRegEx" : "Antos et al\\.,? 2010",
+      "shortCiteRegEx" : "Antos et al\\.",
+      "year" : 2010
+    }, {
+      "title" : "An actor-critic algorithm for sequence prediction",
+      "author" : [ "Dzmitry Bahdanau", "Philemon Brakel", "Kelvin Xu", "Anirudh Goyal", "Ryan Lowe", "Joelle Pineau", "Aaron Courville", "Yoshua Bengio." ],
+      "venue" : "International Conference on Learning Representations (ICLR).",
+      "citeRegEx" : "Bahdanau et al\\.,? 2017",
+      "shortCiteRegEx" : "Bahdanau et al\\.",
+      "year" : 2017
+    }, {
+      "title" : "Wit: Web inventory of transcribed and translated talks",
+      "author" : [ "Mauro Cettolo", "Christian Girardi", "Marcello Federico." ],
+      "venue" : "Conference of the European Association for Machine Translation (EAMT). Trento, Italy.",
+      "citeRegEx" : "Cettolo et al\\.,? 2012",
+      "shortCiteRegEx" : "Cettolo et al\\.",
+      "year" : 2012
+    }, {
+      "title" : "The IWSLT 2015 evaluation campaign",
+      "author" : [ "Mauro Cettolo", "Jan Niehues", "Sebastian Stüker", "Luisa Bentivogli", "Roldano Cattoni", "Marcello Federico." ],
+      "venue" : "International Workshop on Spoken Language Translation (IWSLT).",
+      "citeRegEx" : "Cettolo et al\\.,? 2015",
+      "shortCiteRegEx" : "Cettolo et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "Report on the 11th IWSLT evaluation campaign, IWSLT 2014",
+      "author" : [ "Mauro Cettolo", "Jan Niehues", "Sebastian Stüker", "Luisa Bentivogli", "Marcello Federico." ],
+      "venue" : "International Workshop on Spoken Language Translation (IWSLT).",
+      "citeRegEx" : "Cettolo et al\\.,? 2014",
+      "shortCiteRegEx" : "Cettolo et al\\.",
+      "year" : 2014
+    }, {
+      "title" : "Learning to search better than your teacher",
+      "author" : [ "Kai-Wei Chang", "Akshay Krishnamurthy", "Alekh Agarwal", "Hal Daumé III", "John Langford." ],
+      "venue" : "Proceedings of the International Conference on Machine Learning (ICML).",
+      "citeRegEx" : "Chang et al\\.,? 2015",
+      "shortCiteRegEx" : "Chang et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "Optimizing chinese word segmentation for machine translation performance",
+      "author" : [ "Pi-Chuan Chang", "Michel Galley", "Chris Manning." ],
+      "venue" : "Workshop on Machine Translation.",
+      "citeRegEx" : "Chang et al\\.,? 2008",
+      "shortCiteRegEx" : "Chang et al\\.",
+      "year" : 2008
+    }, {
+      "title" : "A systematic comparison of smoothing techniques for sentencelevel bleu",
+      "author" : [ "Boxing Chen", "Colin Cherry." ],
+      "venue" : "Association for Computational Linguistics (ACL).",
+      "citeRegEx" : "Chen and Cherry.,? 2014",
+      "shortCiteRegEx" : "Chen and Cherry.",
+      "year" : 2014
+    }, {
+      "title" : "Can machine translation systems be evaluated by the crowd alone",
+      "author" : [ "Yvette Graham", "Timothy Baldwin", "Alistair Moffat", "Justin Zobel." ],
+      "venue" : "Natural Language Engineering 23(1):3–30.",
+      "citeRegEx" : "Graham et al\\.,? 2017",
+      "shortCiteRegEx" : "Graham et al\\.",
+      "year" : 2017
+    }, {
+      "title" : "Don’t until the final verb wait: Reinforcement learning for simultaneous machine translation",
+      "author" : [ "Alvin Grissom II", "He He", "Jordan Boyd-Graber", "John Morgan", "Hal Daumé III." ],
+      "venue" : "Empirical Methods in Natural Language Processing (EMNLP).",
+      "citeRegEx" : "II et al\\.,? 2014",
+      "shortCiteRegEx" : "II et al\\.",
+      "year" : 2014
+    }, {
+      "title" : "Interpretese vs",
+      "author" : [ "He He", "Jordan Boyd-Graber", "Hal Daumé III." ],
+      "venue" : "translationese: The uniqueness of human strategies in simultaneous interpretation. In Conference of the North American Chapter of the Association for Computational Linguistics",
+      "citeRegEx" : "He et al\\.,? 2016",
+      "shortCiteRegEx" : "He et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Syntax-based rewriting for simultaneous machine translation",
+      "author" : [ "He He", "Alvin Grissom II", "Jordan Boyd-Graber", "Hal Daumé III." ],
+      "venue" : "Empirical Methods in Natural Language Processing (EMNLP).",
+      "citeRegEx" : "He et al\\.,? 2015",
+      "shortCiteRegEx" : "He et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "Explaining collaborative filtering recommendations",
+      "author" : [ "Jonathan L Herlocker", "Joseph A Konstan", "John Riedl." ],
+      "venue" : "ACM Conference on Computer Supported Cooperative Work.",
+      "citeRegEx" : "Herlocker et al\\.,? 2000",
+      "shortCiteRegEx" : "Herlocker et al\\.",
+      "year" : 2000
+    }, {
+      "title" : "Crowdsourced monolingual translation",
+      "author" : [ "Chang Hu", "Philip Resnik", "Benjamin B Bederson." ],
+      "venue" : "ACM Transactions on Computer-Human Interaction (TOCHI) 21(4):22.",
+      "citeRegEx" : "Hu et al\\.,? 2014",
+      "shortCiteRegEx" : "Hu et al\\.",
+      "year" : 2014
+    }, {
+      "title" : "A social reinforcement learning agent",
+      "author" : [ "Charles Isbell", "Christian R Shelton", "Michael Kearns", "Satinder Singh", "Peter Stone." ],
+      "venue" : "International Conference on Autonomous Agents (AA).",
+      "citeRegEx" : "Isbell et al\\.,? 2001",
+      "shortCiteRegEx" : "Isbell et al\\.",
+      "year" : 2001
+    }, {
+      "title" : "Efficient bandit algorithms for online multiclass prediction",
+      "author" : [ "Sham M Kakade", "Shai Shalev-Shwartz", "Ambuj Tewari." ],
+      "venue" : "International Conference on Machine learning (ICML).",
+      "citeRegEx" : "Kakade et al\\.,? 2008",
+      "shortCiteRegEx" : "Kakade et al\\.",
+      "year" : 2008
+    }, {
+      "title" : "Most likely heteroscedastic gaussian process regression",
+      "author" : [ "Kristian Kersting", "Christian Plagemann", "Patrick Pfaff", "Wolfram Burgard." ],
+      "venue" : "International Conference on Machine Learning (ICML).",
+      "citeRegEx" : "Kersting et al\\.,? 2007",
+      "shortCiteRegEx" : "Kersting et al\\.",
+      "year" : 2007
+    }, {
+      "title" : "Adam: A method for stochastic optimization",
+      "author" : [ "Diederik P. Kingma", "Jimmy Ba." ],
+      "venue" : "International Conference on Learning Representations (ICLR).",
+      "citeRegEx" : "Kingma and Ba.,? 2015",
+      "shortCiteRegEx" : "Kingma and Ba.",
+      "year" : 2015
+    }, {
+      "title" : "Moses: Open source toolkit for statistical machine translation",
+      "author" : [ "Philipp Koehn", "Hieu Hoang", "Alexandra Birch", "Chris Callison-Burch", "Marcello Federico", "Nicola Bertoldi", "Brooke Cowan", "Wade Shen", "Christine Moran", "Richard Zens" ],
+      "venue" : null,
+      "citeRegEx" : "Koehn et al\\.,? \\Q2007\\E",
+      "shortCiteRegEx" : "Koehn et al\\.",
+      "year" : 2007
+    }, {
+      "title" : "Bandit structured prediction for neural sequence-to-sequence learning",
+      "author" : [ "Julia Kreutzer", "Artem Sokolov", "Stefan Riezler." ],
+      "venue" : "Association of Computational Linguistics (ACL).",
+      "citeRegEx" : "Kreutzer et al\\.,? 2017",
+      "shortCiteRegEx" : "Kreutzer et al\\.",
+      "year" : 2017
+    }, {
+      "title" : "The epochgreedy algorithm for multi-armed bandits with side information",
+      "author" : [ "John Langford", "Tong Zhang." ],
+      "venue" : "Advances in Neural Information Processing Systems (NIPS).",
+      "citeRegEx" : "Langford and Zhang.,? 2008",
+      "shortCiteRegEx" : "Langford and Zhang.",
+      "year" : 2008
+    }, {
+      "title" : "Deep reinforcement learning for dialogue generation",
+      "author" : [ "Jiwei Li", "Will Monroe", "Alan Ritter", "Michel Galley", "Jianfeng Gao", "Dan Jurafsky." ],
+      "venue" : "Empirical Methods in Natural Language Processing (EMNLP).",
+      "citeRegEx" : "Li et al\\.,? 2016",
+      "shortCiteRegEx" : "Li et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "A technique for the measurement of attitudes",
+      "author" : [ "Rensis Likert." ],
+      "venue" : "Archives of Psychology 22(140):1–55.",
+      "citeRegEx" : "Likert.,? 1932",
+      "shortCiteRegEx" : "Likert.",
+      "year" : 1932
+    }, {
+      "title" : "A strategy-aware technique for learning behaviors from discrete human feedback",
+      "author" : [ "Robert Loftin", "James MacGlashan", "Michael L Littman", "Matthew E Taylor", "David L Roberts." ],
+      "venue" : "Technical report, North Carolina State University. Dept. of Computer",
+      "citeRegEx" : "Loftin et al\\.,? 2014",
+      "shortCiteRegEx" : "Loftin et al\\.",
+      "year" : 2014
+    }, {
+      "title" : "Effective approaches to attentionbased neural machine translation",
+      "author" : [ "Minh-Thang Luong", "Hieu Pham", "Christopher D Manning." ],
+      "venue" : "Empirical Methods in Natural Language Processing (EMNLP).",
+      "citeRegEx" : "Luong et al\\.,? 2015",
+      "shortCiteRegEx" : "Luong et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "Device placement optimization with reinforcement learning",
+      "author" : [ "Azalia Mirhoseini", "Hieu Pham", "Quoc V Le", "Benoit Steiner", "Rasmus Larsen", "Yuefeng Zhou", "Naveen Kumar", "Mohammad Norouzi", "Samy Bengio", "Jeff Dean." ],
+      "venue" : "International Conference",
+      "citeRegEx" : "Mirhoseini et al\\.,? 2017",
+      "shortCiteRegEx" : "Mirhoseini et al\\.",
+      "year" : 2017
+    }, {
+      "title" : "Motivating personality-aware machine translation",
+      "author" : [ "Shachar Mirkin", "Scott Nowson", "Caroline Brun", "Julien Perez." ],
+      "venue" : "The 2015 Conference on Empirical Methods on Natural Language Processing (EMNLP).",
+      "citeRegEx" : "Mirkin et al\\.,? 2015",
+      "shortCiteRegEx" : "Mirkin et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "Asynchronous methods for deep reinforcement learning",
+      "author" : [ "Volodymyr Mnih", "Adria Puigdomenech Badia", "Mehdi Mirza", "Alex Graves", "Timothy P Lillicrap", "Tim Harley", "David Silver", "Koray Kavukcuoglu." ],
+      "venue" : "International Conference on Ma-",
+      "citeRegEx" : "Mnih et al\\.,? 2016",
+      "shortCiteRegEx" : "Mnih et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Estimation with heteroscedastic error terms",
+      "author" : [ "Rolla E Park." ],
+      "venue" : "Econometrica 34(4):888.",
+      "citeRegEx" : "Park.,? 1966",
+      "shortCiteRegEx" : "Park.",
+      "year" : 1966
+    }, {
+      "title" : "The benefits of a model of annotation",
+      "author" : [ "Rebecca J Passonneau", "Bob Carpenter." ],
+      "venue" : "Transactions of the Association for Computational Linguistics (TACL) 2:311–326.",
+      "citeRegEx" : "Passonneau and Carpenter.,? 2014",
+      "shortCiteRegEx" : "Passonneau and Carpenter.",
+      "year" : 2014
+    }, {
+      "title" : "Online human training of a myoelectric prosthesis controller via actor-critic reinforcement learning",
+      "author" : [ "Patrick M Pilarski", "Michael R Dawson", "Thomas Degris", "Farbod Fahimi", "Jason P Carey", "Richard S Sutton." ],
+      "venue" : "IEEE International Conference on",
+      "citeRegEx" : "Pilarski et al\\.,? 2011",
+      "shortCiteRegEx" : "Pilarski et al\\.",
+      "year" : 2011
+    }, {
+      "title" : "Optimal number of response categories in rating scales: reliability, validity, discriminating power, and respondent preferences",
+      "author" : [ "Carolyn C Preston", "Andrew M Colman." ],
+      "venue" : "Acta Psychologica 104(1):1–",
+      "citeRegEx" : "Preston and Colman.,? 2000",
+      "shortCiteRegEx" : "Preston and Colman.",
+      "year" : 2000
+    }, {
+      "title" : "Personalized machine translation: Preserving original author traits",
+      "author" : [ "Ella Rabinovich", "Shachar Mirkin", "Raj Nath Patel", "Lucia Specia", "Shuly Wintner." ],
+      "venue" : "Association for Computational Linguistics (ACL) .",
+      "citeRegEx" : "Rabinovich et al\\.,? 2017",
+      "shortCiteRegEx" : "Rabinovich et al\\.",
+      "year" : 2017
+    }, {
+      "title" : "Sequence level training with recurrent neural networks. International Conference on Learning Representations (ICLR",
+      "author" : [ "Marc’Aurelio Ranzato", "Sumit Chopra", "Michael Auli", "Wojciech Zaremba" ],
+      "venue" : null,
+      "citeRegEx" : "Ranzato et al\\.,? \\Q2016\\E",
+      "shortCiteRegEx" : "Ranzato et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Cheap and fast—but is it good?: Evaluating non-expert annotations for natural language tasks. In Empirical Methods in Natural Language Processing (EMNLP)",
+      "author" : [ "Rion Snow", "Brendan O’Connor", "Daniel Jurafsky", "Andrew Y Ng" ],
+      "venue" : null,
+      "citeRegEx" : "Snow et al\\.,? \\Q2008\\E",
+      "shortCiteRegEx" : "Snow et al\\.",
+      "year" : 2008
+    }, {
+      "title" : "Learning structured predictors from bandit feedback for interactive NLP",
+      "author" : [ "Artem Sokolov", "Julia Kreutzer", "Christopher Lo", "Stefan Riezler." ],
+      "venue" : "Association for Computational Linguistics (ACL).",
+      "citeRegEx" : "Sokolov et al\\.,? 2016a",
+      "shortCiteRegEx" : "Sokolov et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Stochastic structured prediction under bandit feedback",
+      "author" : [ "Artem Sokolov", "Julia Kreutzer", "Stefan Riezler." ],
+      "venue" : "Advances In Neural Information Processing Systems (NIPS).",
+      "citeRegEx" : "Sokolov et al\\.,? 2016b",
+      "shortCiteRegEx" : "Sokolov et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "A coactive learning view of online structured prediction in statistical machine translation",
+      "author" : [ "Artem Sokolov", "Stefan Riezler", "Shay B Cohen." ],
+      "venue" : "SIGNLL Conference on Computational Natural Language Learning (CoNLL).",
+      "citeRegEx" : "Sokolov et al\\.,? 2015",
+      "shortCiteRegEx" : "Sokolov et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "Dynamic reward shaping: training a robot by voice",
+      "author" : [ "Ana C Tenorio-Gonzalez", "Eduardo F Morales", "Luis Villaseñor-Pineda." ],
+      "venue" : "Ibero-American Conference on Artificial Intelligence. Springer, pages 483–492.",
+      "citeRegEx" : "Tenorio.Gonzalez et al\\.,? 2010",
+      "shortCiteRegEx" : "Tenorio.Gonzalez et al\\.",
+      "year" : 2010
+    }, {
+      "title" : "Teachable robots: Understanding human teaching behavior to build more effective robot learners",
+      "author" : [ "Andrea L Thomaz", "Cynthia Breazeal." ],
+      "venue" : "Artificial Intelligence 172(6-7):716–737.",
+      "citeRegEx" : "Thomaz and Breazeal.,? 2008",
+      "shortCiteRegEx" : "Thomaz and Breazeal.",
+      "year" : 2008
+    }, {
+      "title" : "Reinforcement learning with human teachers: Evidence of feedback and guidance with implications for learning performance. In Association for the Advancement of Artificial Intelligence (AAAI)",
+      "author" : [ "Andrea Lockerd Thomaz", "Cynthia Breazeal" ],
+      "venue" : null,
+      "citeRegEx" : "Thomaz and Breazeal,? \\Q2006\\E",
+      "shortCiteRegEx" : "Thomaz and Breazeal",
+      "year" : 2006
+    }, {
+      "title" : "Simple statistical gradientfollowing algorithms for connectionist reinforcement learning",
+      "author" : [ "Ronald J Williams." ],
+      "venue" : "Machine learning 8(3-4):229–256.",
+      "citeRegEx" : "Williams.,? 1992",
+      "shortCiteRegEx" : "Williams.",
+      "year" : 1992
+    }, {
+      "title" : "Neural architecture search with reinforcement learning",
+      "author" : [ "Barret Zoph", "Quoc V. Le." ],
+      "venue" : "International Conference on Learning Representations (ICLR).",
+      "citeRegEx" : "Zoph and Le.,? 2017",
+      "shortCiteRegEx" : "Zoph and Le.",
+      "year" : 2017
+    } ],
+    "referenceMentions" : [ {
+      "referenceID" : 28,
+      "context" : "Our algorithm combines the advantage actor-critic algorithm (Mnih et al., 2016) with the attention-based neural encoderdecoder architecture (Luong et al.",
+      "startOffset" : 60,
+      "endOffset" : 79
+    }, {
+      "referenceID" : 25,
+      "context" : ", 2016) with the attention-based neural encoderdecoder architecture (Luong et al., 2015).",
+      "startOffset" : 68,
+      "endOffset" : 88
+    }, {
+      "referenceID" : 6,
+      "context" : ", translation) and then the world reveals a score that measures how good or bad that output is, but provides neither a “correct” output nor feedback on any other possible output (Chang et al., 2015; Sokolov et al., 2015).",
+      "startOffset" : 178,
+      "endOffset" : 220
+    }, {
+      "referenceID" : 38,
+      "context" : ", translation) and then the world reveals a score that measures how good or bad that output is, but provides neither a “correct” output nor feedback on any other possible output (Chang et al., 2015; Sokolov et al., 2015).",
+      "startOffset" : 178,
+      "endOffset" : 220
+    }, {
+      "referenceID" : 14,
+      "context" : "Furthermore, one can often collect even less expensive ratings from “non-experts” who may or may not be bilingual (Hu et al., 2014).",
+      "startOffset" : 114,
+      "endOffset" : 131
+    }, {
+      "referenceID" : 9,
+      "context" : "To make our simulated ratings as realistic as possible, we study recent human evaluation data (Graham et al., 2017) and fit models to match the noise profiles in actual human ratings (§4.",
+      "startOffset" : 94,
+      "endOffset" : 115
+    }, {
+      "referenceID" : 25,
+      "context" : "1 We combine an encoderdecoder architecture of machine translation (Luong et al., 2015) with the advantage actor-critic algorithm (Mnih et al.",
+      "startOffset" : 67,
+      "endOffset" : 87
+    }, {
+      "referenceID" : 28,
+      "context" : ", 2015) with the advantage actor-critic algorithm (Mnih et al., 2016), yielding an approach that is simple to implement but works on lowresource bandit machine translation.",
+      "startOffset" : 50,
+      "endOffset" : 69
+    }, {
+      "referenceID" : 6,
+      "context" : "The bandit structured prediction problem (Chang et al., 2015; Sokolov et al., 2015) is an extension of the contextual bandits problem (Kakade et al.",
+      "startOffset" : 41,
+      "endOffset" : 83
+    }, {
+      "referenceID" : 38,
+      "context" : "The bandit structured prediction problem (Chang et al., 2015; Sokolov et al., 2015) is an extension of the contextual bandits problem (Kakade et al.",
+      "startOffset" : 41,
+      "endOffset" : 83
+    }, {
+      "referenceID" : 16,
+      "context" : ", 2015) is an extension of the contextual bandits problem (Kakade et al., 2008; Langford and Zhang, 2008) to structured prediction.",
+      "startOffset" : 58,
+      "endOffset" : 105
+    }, {
+      "referenceID" : 21,
+      "context" : ", 2015) is an extension of the contextual bandits problem (Kakade et al., 2008; Langford and Zhang, 2008) to structured prediction.",
+      "startOffset" : 58,
+      "endOffset" : 105
+    }, {
+      "referenceID" : 25,
+      "context" : "We use an encoder-decoder NMT architecture with global attention (Luong et al., 2015), where both the encoder and decoder are recurrent neural networks (RNN) (see Appendix A for a more detailed description).",
+      "startOffset" : 65,
+      "endOffset" : 85
+    }, {
+      "referenceID" : 42,
+      "context" : "Naı̈ve Monte Carlo reinforcement learning methods such as REINFORCE (Williams, 1992) estimates Q values by sample means but yields very high variance when the action space is large, leading to training instability.",
+      "startOffset" : 68,
+      "endOffset" : 84
+    }, {
+      "referenceID" : 2,
+      "context" : "In our early attempts on bandit NMT, we adapted the actor-critic algorithm for NMT in Bahdanau et al. (2017), which employs the algorithm in a supervised learning setting.",
+      "startOffset" : 86,
+      "endOffset" : 109
+    }, {
+      "referenceID" : 2,
+      "context" : "There are two properties in Bahdanau et al. (2017) that our problem lacks but are key elements for a successful actor-critic.",
+      "startOffset" : 28,
+      "endOffset" : 51
+    }, {
+      "referenceID" : 2,
+      "context" : "There are two properties in Bahdanau et al. (2017) that our problem lacks but are key elements for a successful actor-critic. The first is access to reference translations: while the critic model is able to observe reference translations during training in their setting, bandit NMT assumes those are never available. The second is per-step rewards: while the reward function in their setting is known and can be exploited to compute immediate rewards after taking each action, in bandit NMT, the actorcritic algorithm struggles with credit assignment because it only receives reward when a translation is completed. Bahdanau et al. (2017) report that the algorithm degrades if rewards are delayed until the end, consistent with our observations.",
+      "startOffset" : 28,
+      "endOffset" : 640
+    }, {
+      "referenceID" : 2,
+      "context" : "Bahdanau et al. (2017) add an ad-hoc regularization term to the loss function to mitigate this issue and further stablizes the algorithm with a delay update scheme, but at the same time introduces extra tuning hyper-parameters.",
+      "startOffset" : 0,
+      "endOffset" : 23
+    }, {
+      "referenceID" : 28,
+      "context" : "These attractive properties were not studied in A2C’s original paper (Mnih et al., 2016).",
+      "startOffset" : 69,
+      "endOffset" : 88
+    }, {
+      "referenceID" : 8,
+      "context" : "In our simulated study, we begin by modeling gold standard human ratings using add-onesmoothed sentence-level BLEU (Chen and Cherry, 2014).",
+      "startOffset" : 115,
+      "endOffset" : 138
+    }, {
+      "referenceID" : 8,
+      "context" : "“Smoothing 2” in Chen and Cherry (2014).",
+      "startOffset" : 17,
+      "endOffset" : 40
+    }, {
+      "referenceID" : 23,
+      "context" : "A classic example is the Likert scale for human agreement (Likert, 1932) or star ratings for product reviews.",
+      "startOffset" : 58,
+      "endOffset" : 72
+    }, {
+      "referenceID" : 32,
+      "context" : "Insisting that human judges provide continuous values (or feedback at too fine a granularity) can demotivate raters without improving rating quality (Preston and Colman, 2000).",
+      "startOffset" : 149,
+      "endOffset" : 175
+    }, {
+      "referenceID" : 9,
+      "context" : "We use human evaluation data recently collected as part of the WMT shared task (Graham et al., 2017).",
+      "startOffset" : 79,
+      "endOffset" : 100
+    }, {
+      "referenceID" : 40,
+      "context" : "raters are skewed both for reinforcement learning (Thomaz et al., 2006; Thomaz and Breazeal, 2008; Loftin et al., 2014) and recommender systems (Herlocker et al.",
+      "startOffset" : 50,
+      "endOffset" : 119
+    }, {
+      "referenceID" : 24,
+      "context" : "raters are skewed both for reinforcement learning (Thomaz et al., 2006; Thomaz and Breazeal, 2008; Loftin et al., 2014) and recommender systems (Herlocker et al.",
+      "startOffset" : 50,
+      "endOffset" : 119
+    }, {
+      "referenceID" : 13,
+      "context" : ", 2014) and recommender systems (Herlocker et al., 2000; Adomavicius and Zhang, 2012), but are typically bimodal: some are harsh (typically provide very low scores, even for “okay” outputs) and some are motivational (providing high scores for “okay” outputs).",
+      "startOffset" : 32,
+      "endOffset" : 85
+    }, {
+      "referenceID" : 0,
+      "context" : ", 2014) and recommender systems (Herlocker et al., 2000; Adomavicius and Zhang, 2012), but are typically bimodal: some are harsh (typically provide very low scores, even for “okay” outputs) and some are motivational (providing high scores for “okay” outputs).",
+      "startOffset" : 32,
+      "endOffset" : 85
+    }, {
+      "referenceID" : 19,
+      "context" : "For English and German, we tokenize and clean sentences using Moses (Koehn et al., 2007).",
+      "startOffset" : 68,
+      "endOffset" : 88
+    }, {
+      "referenceID" : 7,
+      "context" : "For Chinese, we use the Stanford Chinese word segmenter (Chang et al., 2008) to segment sentences and tokenize.",
+      "startOffset" : 56,
+      "endOffset" : 76
+    }, {
+      "referenceID" : 25,
+      "context" : "Both the NMT model and the critic model are encoder-decoder models with global attention (Luong et al., 2015).",
+      "startOffset" : 89,
+      "endOffset" : 109
+    }, {
+      "referenceID" : 18,
+      "context" : "We train our models by the Adam optimizer (Kingma and Ba, 2015) with β1 = 0.",
+      "startOffset" : 42,
+      "endOffset" : 63
+    }, {
+      "referenceID" : 2,
+      "context" : "Policy gradient algorithms have difficulty improving from poor initializations, especially on problems with a large action space, because they use model-based exploration, which is ineffective when most actions have equal probabilities (Bahdanau et al., 2017; Ranzato et al., 2016).",
+      "startOffset" : 236,
+      "endOffset" : 281
+    }, {
+      "referenceID" : 34,
+      "context" : "Policy gradient algorithms have difficulty improving from poor initializations, especially on problems with a large action space, because they use model-based exploration, which is ineffective when most actions have equal probabilities (Bahdanau et al., 2017; Ranzato et al., 2016).",
+      "startOffset" : 236,
+      "endOffset" : 281
+    }, {
+      "referenceID" : 31,
+      "context" : "2010), myoelectric control (Pilarski et al., 2011), and virtual assistants (Isbell et al.",
+      "startOffset" : 27,
+      "endOffset" : 50
+    }, {
+      "referenceID" : 15,
+      "context" : ", 2011), and virtual assistants (Isbell et al., 2001).",
+      "startOffset" : 32,
+      "endOffset" : 53
+    }, {
+      "referenceID" : 2,
+      "context" : "Recently, this learning framework has been combined with recurrent neural networks to solve machine translation (Bahdanau et al., 2017), dialogue generation (Li et al.",
+      "startOffset" : 112,
+      "endOffset" : 135
+    }, {
+      "referenceID" : 22,
+      "context" : ", 2017), dialogue generation (Li et al., 2016), neural architecture search (Zoph and Le, 2017), and device placement (Mirhoseini et al.",
+      "startOffset" : 29,
+      "endOffset" : 46
+    }, {
+      "referenceID" : 43,
+      "context" : ", 2016), neural architecture search (Zoph and Le, 2017), and device placement (Mirhoseini et al.",
+      "startOffset" : 36,
+      "endOffset" : 55
+    }, {
+      "referenceID" : 26,
+      "context" : ", 2016), neural architecture search (Zoph and Le, 2017), and device placement (Mirhoseini et al., 2017).",
+      "startOffset" : 78,
+      "endOffset" : 103
+    }, {
+      "referenceID" : 2,
+      "context" : "Recently, this learning framework has been combined with recurrent neural networks to solve machine translation (Bahdanau et al., 2017), dialogue generation (Li et al., 2016), neural architecture search (Zoph and Le, 2017), and device placement (Mirhoseini et al., 2017). Other approaches to more general structured prediction under bandit feedback (Chang et al., 2015; Sokolov et al., 2016a,b) show the broader efficacy of this framework. Ranzato et al. (2016) describe MIXER for training neural encoder-decoder models, which is a reinforcement learning approach closely related to ours but requires a policy-mixing strategy and only uses a linear critic model.",
+      "startOffset" : 113,
+      "endOffset" : 462
+    }, {
+      "referenceID" : 2,
+      "context" : "Recently, this learning framework has been combined with recurrent neural networks to solve machine translation (Bahdanau et al., 2017), dialogue generation (Li et al., 2016), neural architecture search (Zoph and Le, 2017), and device placement (Mirhoseini et al., 2017). Other approaches to more general structured prediction under bandit feedback (Chang et al., 2015; Sokolov et al., 2016a,b) show the broader efficacy of this framework. Ranzato et al. (2016) describe MIXER for training neural encoder-decoder models, which is a reinforcement learning approach closely related to ours but requires a policy-mixing strategy and only uses a linear critic model. Among work on bandit MT, ours is closest to Kreutzer et al. (2017), which also tackle this problem using neural encoder-decoder models, but we (a) take advantage of a state-of-the-art reinforcement learning method; (b) devise a strategy to simulate noisy rewards; and (c) demonstrate the robustness of our method on noisy simulated rewards.",
+      "startOffset" : 113,
+      "endOffset" : 730
+    }, {
+      "referenceID" : 35,
+      "context" : "This is despite that errors in human annotations hurt machine learning models in many NLP tasks (Snow et al., 2008).",
+      "startOffset" : 96,
+      "endOffset" : 115
+    }, {
+      "referenceID" : 30,
+      "context" : "An obvious question is whether we could extend our framework to model individual annotator preferences (Passonneau and Carpenter, 2014) or learn personalized models (Mirkin et al.",
+      "startOffset" : 103,
+      "endOffset" : 135
+    }, {
+      "referenceID" : 27,
+      "context" : "An obvious question is whether we could extend our framework to model individual annotator preferences (Passonneau and Carpenter, 2014) or learn personalized models (Mirkin et al., 2015; Rabinovich et al., 2017), and handle heteroscedastic noise (Park, 1966; Kersting et al.",
+      "startOffset" : 165,
+      "endOffset" : 211
+    }, {
+      "referenceID" : 33,
+      "context" : "An obvious question is whether we could extend our framework to model individual annotator preferences (Passonneau and Carpenter, 2014) or learn personalized models (Mirkin et al., 2015; Rabinovich et al., 2017), and handle heteroscedastic noise (Park, 1966; Kersting et al.",
+      "startOffset" : 165,
+      "endOffset" : 211
+    }, {
+      "referenceID" : 29,
+      "context" : ", 2017), and handle heteroscedastic noise (Park, 1966; Kersting et al., 2007; Antos et al., 2010).",
+      "startOffset" : 42,
+      "endOffset" : 97
+    }, {
+      "referenceID" : 17,
+      "context" : ", 2017), and handle heteroscedastic noise (Park, 1966; Kersting et al., 2007; Antos et al., 2010).",
+      "startOffset" : 42,
+      "endOffset" : 97
+    }, {
+      "referenceID" : 1,
+      "context" : ", 2017), and handle heteroscedastic noise (Park, 1966; Kersting et al., 2007; Antos et al., 2010).",
+      "startOffset" : 42,
+      "endOffset" : 97
+    }, {
+      "referenceID" : 12,
+      "context" : ", 2014) and reordering (He et al., 2015) among other strategies to both minimize delay and effectively translate a sentence (He et al.",
+      "startOffset" : 23,
+      "endOffset" : 40
+    }, {
+      "referenceID" : 11,
+      "context" : ", 2015) among other strategies to both minimize delay and effectively translate a sentence (He et al., 2016).",
+      "startOffset" : 91,
+      "endOffset" : 108
+    }, {
+      "referenceID" : 25,
+      "context" : "We closely follow (Luong et al., 2015) for the structure of our model.",
+      "startOffset" : 18,
+      "endOffset" : 38
+    }, {
+      "referenceID" : 25,
+      "context" : "We use the “concat” global attention in (Luong et al., 2015).",
+      "startOffset" : 40,
+      "endOffset" : 60
+    } ],
+    "year" : 2017,
+    "abstractText" : "Machine translation is a natural candidate problem for reinforcement learning from human feedback: users provide quick, dirty ratings on candidate translations to guide a system to improve. Yet, current neural machine translation training focuses on expensive human-generated reference translations. We describe a reinforcement learning algorithm that improves neural machine translation systems from simulated human feedback. Our algorithm combines the advantage actor-critic algorithm (Mnih et al., 2016) with the attention-based neural encoderdecoder architecture (Luong et al., 2015). This algorithm (a) is well-designed for problems with a large action space and delayed rewards, (b) effectively optimizes traditional corpus-level machine translation metrics, and (c) is robust to skewed, high-variance, granular feedback modeled after actual human behaviors.",
+    "creator" : "LaTeX with hyperref package"
+  }
+}

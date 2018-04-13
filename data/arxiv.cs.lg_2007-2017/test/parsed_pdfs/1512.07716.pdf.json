@@ -1,0 +1,449 @@
+{
+  "name" : "1512.07716.pdf",
+  "metadata" : {
+    "source" : "CRF",
+    "title" : "Fast Parallel SVM using Data Augmentation",
+    "authors" : [ "Hugh Perkins", "Minjie Xu", "Jun Zhu", "Bo Zhang" ],
+    "emails" : [ "hughperkins@gmail.com,", "chokkyvista06@gmail.com,", "dcszj@mail.tsinghua.edu.cn,", "dcszb@mail.tsinghua.edu.cn" ],
+    "sections" : [ {
+      "heading" : "1. INTRODUCTION",
+      "text" : "Support vector machines (SVMs) are among the the most popular and successful paradigms to build classifiers. SVMs have demonstrated tremendous success in many real world applications. However, learning SVMs is a challenging problem. Traditional decomposition methods, like SVMLight [7], LibSVM [1] and SMO [12], have cubic time complexity. The need for developing highly efficient algorithms has increased, due to the fact that large corpora are very easy to obtain, like the various Challenges on image categorization, object detection, document categorization, etc.\nAs the computing resources get cheaper, multi-core and multi-machine computing systems are not rare. For instance, it is not uncommon for a research group to build a computing system with hundreds of CPU cores. To harness the power of large clusters of computers, developing the distributed algorithms for SVMs has received a lot of attention. Representative works include the parallel SVM (PSVM) [2], which performs approximate matrix factorization to reduce memory use and then uses the interior point method to solve the quadratic optimization problem on multiple machines in parallel. The parallel mixture method [4] and the cascade SVM [6] decompose the entire learning problem into multiple smaller QP problems and solve them in parallel.\nRecently, the frequency of CPU cores has reached a point where increasing the frequency further is not cost-effective,\n* denotes equal contribution.\nbecause of the increase in power consumption. Modern hardware contains an increasing number of low-power cores, epitomized by the recent growth of GPGPU hardware. Thus, on future hardware, the fastest algorithm might not be the one that runs fastest in a single thread, but the one which can run effectively on parallel hardware.\nIn this paper, we present a very simple and highly efficient distributed algorithm for learning SVMs. Our algorithm is built on the recent work [13], which shows that the learning problems of SVM can be equivalently formulated as hierarchical Bayesian model, with additional scale variables. Based on the hierarchical formulation, we can develop Monte Carlo methods to infer the parameters (or their posterior distributions). More importantly, the sampling algorithm can be easily parallelized.\nOur work is also inspired by the recent developments on distributed Monte Carlo methods for improving the scalability of probabilistic latent topic models [15, 11].\nOur parallel method is interesting in its own right, because it can be massively and scalably parallelized. In our experiments, we showed scalability up to 500 cores for large datasets. Not only does parallelizing allow one to take advantage of the distributed processing in commodity clusters, but also the large amount of distributed memory, so it is possible to run on huge datasets which is otherwise even impossible to be loaded into memory on single machines.\nIn addition, it is a useful addition to our armory, because it can be used to solve composite models, such as MedLDA [18], without needing to make the mean-field assumption. There are many models, such as [17] for example, that may be able to benefit from fast and accurate parallelization using the parallel sampling or parallel EM SVM formulation.\nWe have extended Polson’s formulations to provide formulations in addition for support vector regression (SVR), non-linear kernelized SVM, and the Crammer and Singer multiclass model.\nWe provide parallel implementations for a linear SVM, a non-linear kernelized SVM, a formulation for SVR, and a parallel solver for the Crammer and Singer multiclass SVM model.\nOutline. Section 2 reviews the formulation of an SVM as a Bayesian inference problem, Section 3 extends the linear sampling SVM to non-linear kernels, to regression, and to the Crammer and Singer multiclass model. Section 4 presents the use of the sampling SVM to implement a parallel, distributed\nar X\niv :1\n51 2.\n07 71\n6v 1\n[ cs\n.L G\n] 2\n4 D\nec 2\n01 5\nSVM. Lastly, Section 5 presents experiments comparing our parallel SVM implementation with recent state of the art SVM solvers.\nWe show that the parallel linear SVM can give excellent performance on very large datasets, where the number of samples is large in comparison to the square of the number of features, and there is parallel hardware available. In these cases, we show that our implementation can give training times faster than other state of the art linear solvers, such as StreamSVM, whilst giving comparable accuracy."
+    }, {
+      "heading" : "2. SVM AS BAYESIAN INFERENCE",
+      "text" : "In this section we present the fundamental theories on which our extensions and distributed algorithms are built."
+    }, {
+      "heading" : "2.1 SVM: the Basics",
+      "text" : "We first focus on standard linear SVMs for binary classification. Let D = {(xd, yd)}Dd=1 be the training data, where yd ∈ {1,−1}. The goal of SVMs is to learn a linear discriminant function\nf(x; w, ν) = w>x + ν.\nFor notation simplicity, we absorb the offset parameter ν into w by introducing an additional feature dimension with fixed unit value. To find the optimal w, the canonical learning problem of SVMs with a tolerance on training errors is formulated as a constrained optimization problem\nmin w,ξ\n1 2 λ‖w‖22 + 2 ∑ d ξd\ns.t. : ∀d, { ydw\n>xd ≥ 1− ξd ξd ≥ 0 ,\nNote that the constant factor 2 in the training error term can be absorbed into λ, yet we leave it for the simplicity of the deduction later. Slack variables removed, the problem is equivalently formulated as an unconstrained form\nmin w\n1 2 λ‖w‖22 + 2 ∑ d max(0, 1− ydw>xd), (1)\nwhich is known as the regularized risk minimization framework. For binary classification, the loss is called hinge loss."
+    }, {
+      "heading" : "2.2 SVM: the MAP estimate",
+      "text" : "Problem (1) can also be viewed as a MAP estimate of a probabilistic model, where the posterior distribution is\np(w|D) ∝ q0(w)q(y|w,X), where q0(w) = N (0, λ−1I) and q(y|w,X) = ∏ d q(yd|w,xd) with\nq(yd|w,xd) = exp(−2 max(0, 1− ydw>xd)). (2)\nNote that we factorize the posterior into q0 and q merely for the simplicity of subsequent denotation and they normally are intrinsically different from the genuine prior and likelihood as can be induced from the probabilistic model (even up to a constant factor). Hence we call q0 and q pseudo-prior and pseudo-likelihood respectively.\nThe benefit of the MAP formulation is that it allows us to take advantage of many existing techniques developed for inference in probabilistic models and hence grants more flexibility for the solution. Specifically, Polson and Scott [13]\nshow that the pseudo-likelihood can be represented as a scale mixture of Gaussians, namely\nLemma 1. Scale mixture for hinge loss\nexp(−2 max(0, 1− ydw>xd))\n= ∫ ∞ 0 1√ 2πγd exp ( − (1 + γd − ydw >xd) 2 2γd ) dγd (3)\nThis directly inspires an augmented representation with γ = (γ1, . . . , γD) such that\np(w,γ|D) ∝ q0(w) ∏ d q(yd, γd|w,xd)\nq(yd|w,xd) = ∫ ∞ 0 q(yd, γd|w,xd)dγd\nq(yd, γd|w,xd) = φ(1− ydw>xd| − γd, γd)\nwhere φ(·|µ, σ2) is the Gaussian density function."
+    }, {
+      "heading" : "2.3 MCMC Sampling for SVM",
+      "text" : "Based on this augmented representation, we are able to design MCMC methods for p(w,γ|D), from which the optimal SVM solution that maximizes p(w|D) is relatively more probable to get sampled.\nSpecifically, we use Gibbs sampling and have the following conditional distributions [13]\np(w|γ,D) =N (µ,Σ) (4) p(γ−1d |w, yd,xd) = IG(|1− ydw >xd|−1, 1), (5)\nwhere Σ = ( λI+ ∑ d 1 γd xdx > d )−1 , µ = Σ (∑ d yd(1+ 1 γd )xd ) (6)\nand IG is the inverse Gaussian distribution."
+    }, {
+      "heading" : "2.4 EM algorithm for SVM",
+      "text" : "The EM algorithm is useful when directly maximizing the posterior p(w|D) is intractable but it’s easy to alternate between the following two steps which converges to a local maximum of the posterior.\nE-step: Q(m)(w) = ∫ log p(w,γ|D)p(γ|D,w(m))dγ (7)\nM-step: w(m+1) = argmax w Q(m)(w) (8)\nOne can prove that the algorithm above monotonically increases the genuine posterior distribution of interest p(w|D) after each iteration, just as traditional EM does likelihood.\nDeduction details omitted to save space, we summarize the results as follows\nE-step (update γ): γ (m) d = |1− ydw (m)>xd| (9) M-step (update w): w(m+1) = µ(m+1)(γ(m)) (10)\nwhere µ is calculated just as Eq. (6). Although normally EM is not guaranteed to obtain the global optimum (even after infinite iterations), for our specific p(w|D) which is concave w.r.t w, global optimum is expected. Furthermore, EM is a deterministic algorithm and enjoys a straightforward stopping criterion when compared with MCMC sampling."
+    }, {
+      "heading" : "3. EXTENSIONS",
+      "text" : "In this section we extend the idea above to SVR, nonlinear kernel SVMs, and the Crammer and Singer multi-class SVM."
+    }, {
+      "heading" : "3.1 Learning Nonlinear Kernel SVMs",
+      "text" : "According to the representer theorem, the solution to problem (1) has the form\nw = ∑ d αdydxd, (11)\nwhich is a linear combination of X. We can naturally extend it to the nonlinear case by using a feature mapping function h and learn the nonlinear SVM by solving\nmin w\n1 2 λ‖w‖22 + 2 ∑ d max(0, 1− ydw>h(xd)), (12)\nwhose solution can be represented accordingly as w = ∑ d αdydh(xd) = Hdiag(y)α, (13)\nwhere H = [h(x1) h(x2) · · · h(xD)]. Substituting Eq. (13) into (12), we get the dual problem\nmin α\n1 2 λα>diag(y)Kdiag(y)α +\n2 ∑ d max(0, 1− ydα>diag(y)K>d ), (14)\nwhere K is the Gram matrix and Kd is the dth row. If the feature map function h is a reproducing kernel, i.e., h(x) = k(·,x), problem (14) becomes a kernel SVM and each entry of K is a dot product, that is\nKij = k(xi,xj) = h(xi) >h(xj).\nThe Gram matrix K is positive definite for any reproducing kernel, e.g. the most commonly used Gaussian kernel\nk(xi,xj) = exp ( − ‖xi − xj‖ 2 2\n2σ2 ) Let ω = diag(y)α, then w = ∑ d ωdh(xd) and the prob-\nlem becomes\nmin ω\n1 2 λω>Kω + 2 ∑ d max(0, 1− ydω>K>d ), (15)\nObserving the similarity between problem (15) and (1), we reformulate it as MAP just as we did (1), with q0(ω) = N (0, (λK)−1) and q(y|ω,X) = ∏ d q(yd|ω,xd), where\nq(yd|ω,xd) = exp(−2 max(0, 1− ydω>K>d )). (16)\nLemma 2. Scale mixture for kernel hinge loss\nexp(−2 max(0, 1− ydω>K>d ))\n= ∫ ∞ 0 1√ 2πγd exp ( − (1 + γd − ydω >K>d ) 2 2γd ) dγd (17)\nConsequently for kernel SVMs, we have\nq(ω|γ,D) =N (µ,Σ) (18) p(γ−1d |w, yd,X) = IG(|`− ydω >K>d |−1, 1), (19)\nwhere Σ = ( λK + ∑ d 1 γd K>d Kd )−1 , µ = Σ (∑ d yd(1 + 1 γd )K>d ) ."
+    }, {
+      "heading" : "3.2 Support Vector Regression",
+      "text" : "For regression, where the response variable y are realvalued, the support vector regression (SVR) problem is defined as minimizing a regularized -insensitive loss [16]\nmin w\n1 2 λ‖w‖22 + 2 ∑ d max(0, |yd −w>xd| − ), (20)\nwhere is the precision parameter∗. Naturally, we obtain the same q0 as SVMs and\nq(yd|w,xd) = exp(−2 max(0, |yd −w>xd| − )), (21)\nand the augmentation is carried out by the following lemma\nLemma 3. Double scale mixture for -insensitive loss\nexp(−2 max(0, |yd −w>xd| − ))\n= ∫ ∞ 0 1√ 2πγd exp ( − (γd + yd −w >xd − )2 2γd ) dγd\n× ∫ ∞ 0 1√ 2πωd exp ( − (ωd − yd + w >xd − )2 2ωd ) dωd (22)\nProof. As ≥ 0, the following equality holds\nmax(0, |yd −w>xd| − )\n= max(0, yd −w>xd − ) + max(0,−yd + w>xd − ). (23)\nTherefore, for each term, we can do similar derivation as in Lemma 1 to get the double scale mixture formulation.\nConsequently for SVR, we have\np(w|γ,ω,D) =N (µ,Σ) (24) p(γ−1d |w,ω, yd,xd) = IG(|yd −w\n>xd − |−1, 1) (25) p(ω−1d |w,γ, yd,xd) = IG(|yd −w >xd + |−1, 1), (26)\nwhere the covariance and mean are now Σ = ( λI + ∑ d ( 1 γd + 1 ωd )xdx > d )−1 , (27)\nµ = Σ (∑\nd\n( yd − λd + yd + ωd )xd ) . (28)"
+    }, {
+      "heading" : "3.3 Learning Multi-class SVM",
+      "text" : "For multi-class classification, we have yd ∈ {1, · · · ,M}. There are various strategies to perform multi-class classification with SVM. Here we consider the approach proposed by Crammer and Singer (2001), where the generalized discriminant function is defined to be\nf(y,x; w) = w>y x (29)\nwhere wy is the sub-vector corresponding to class label y. And the regularized risk minimization problem becomes\nmin w\n1 2 λ‖w‖22 + 2 ∑ d max y (∆d(y)−∆fd(y; w)), (30)\nwhere ∆d(y) is the cost of predicting y for the true label yd and ∆fd(y; w) = f(yd,xd; w) − f(y,xd; w) is the margin, and both ∆d(y) and ∆fd(y; w) equals zero when y = yd.\n∗ is a small positive number, e.g., 1e−3 in our experiments\nThen, the pseudo-prior and pseudo-likelihood is changed accordingly to\nq0(w) = ∏ y q0(wy) = ∏ y N (wy |0, λ−1I) (31)\nq(yd|w,xd) = exp(−2 max y (∆d(y) + w > y xd −w>ydxd)) (32)\nIn order for Lemma 1 to be applicable, we resort to an iterative procedure, which alternately infer weights wy given the other weights w−y, for each class label y.\nThe local conditional distribution is p(wy|D,w−y) ∝ q0(wy) ∏ d ψ(wy; w−y, yd,xd), (33)\nwhere ψ(wy; w−y, yd,xd) ∝ q(yd|w,xd)\n= exp(−2(max(w>y xd + ∆d(y), ζd(y))−w>ydxd)) ∝ {\nexp(−2 max(w>y xd − ρyd, 0)) (y 6= yd) exp(−2 max(0, ρyd −w > y xd)) (y = yd)\n(34)\n= exp(−2 max(0, βyd (ρ y d −w T y xd))) (35)\nwhere ζd(y) = maxy′ 6=y(w > y′xd + ∆d(y ′)) is independent of\nwy, ρ y d = ζd(y)−∆d(y) and β y d =\n{ +1 for y = yd\n−1 for y 6= yd .\nHence we take\nψ(wy; w−y, yd,xd) = exp(−2 max(0, βyd (ρ y d −w T y xd)))\nand through a similar augmentation, we obtain the Gibbs sampling step for each augmented local conditional distribution p(wy,γy|D,w−y)\np(γ−1yd |w, yd,xd) = IG(|ρ y d −w > y xd|−1, 1), (36) p(wy|γy,w−y,D) = N (µy,Σy) (37)\nwhere\nΣy = ( λI + ∑ d 1 γyd xdx > d )−1 , (38)\nµy = Σy (∑\nd\n( ρyd γyd\n+ βyd )xd ) . (39)\nNote that this is actually a hierarchical Gibbs sampling\n1. to sample p(w|D), we carry out Gibbs sampling over p(wy|D,w−y) alternately for y = 1, . . . ,M ;\n2. to sample each p(wy|D,w−y), we use data augmentation to sample over p(wy,γy|D,w−y).\nAccordingly, the EM algorithm for Crammer and Singer multi-class SVMs inherits this 2-layer structure:\n1. to maximize p(w|D), we carry out blockwise coordinate descent to maximize p(wy|D,w−y) alternately;\n2. to maximize each p(wy|D,w−y), we adopt the EM algorithm where\nQ(m)(wy) = ∫ log p(wy ,γy |D,w−y)p(γy |D,w (m) y ,w−y)dγy"
+    }, {
+      "heading" : "4. PARALLEL SVM",
+      "text" : "Below we show how to employ distributed computing into the sampling algorithms above. We focus on the classical linear binary SVMs for the ease of explanation. And exactly the same techniques apply as well to all the extensions we present in section 3, and also their EM algorithms.\nTwo key properties of the sampling process that are in favor of parallel computation are summarized as follows.\n1. The scale variables γ are mutually independent from each other, whose sampling step, therefore, can be easily parallelized to multiple cores and multiple machines.\n2. The training data (xd, yd) contribute to the global variables µ and Σ through a simple summation operator (Eq. (6)). Thus a typical map-reduce architecture is directly applicable, as shown in Figure 1."
+    }, {
+      "heading" : "4.1 The Basic Procedure",
+      "text" : "Let P be the total number of processes and let Dp = {(xpd, y p d)} Dp d=1 be the data assigned to process p. Then each process performs the following computations\n1. draw scale parameters: each p draws γ−1dp (∀1 ≤ d ≤ Dp) according to the distribution in Eq. (5).\n2. compute local statistics: each p computes the following local statistics\nµp = Dp∑ d=1 (1 + 1 γdp )ypdx p d,\nΣp = Dp∑ d=1 1 γdp xpdx p> d . (40)\nSince Σp is symmetric, it suffices to compute only the upper or lower triangle and then submit to the master.\nAfter process p has finished its local computation, it passes the local statistics µp and Σp to the master process, which collects the results and performs the following aggregation operations\n1. compute Σ−1 = λI + ∑ p Σ p.\n2. after Σ−1 is updated, compute µ = Σ( ∑ p µ p).\nIt is worth noting that all the slave processes perform exactly the same set of operations. Assume that we equally partition the large data set and all computing nodes are of the same capacity, then it can be expected that all the nodes have a high probability to finish their local job at roughly the same time. Therefore the latency due to synchronization is typically small. While in contrast, the existing parallel methods for SVMs by solving multiple smaller QP problems can suffer from large synchronization latency since the subQP problems varies a lot."
+    }, {
+      "heading" : "4.2 Notation",
+      "text" : "We will denote the parallel sampling SVM as PEMSVM. PEMSVM has the following options:\n• linear (“LIN”) vs kernelized (“KRN”)\n• EM (“EM”) vs MCMC (“MC”)\n• binary classification (“CLS”) vs multiclass classification (“MLT”) vs support vector regression (“SVR”)\nThese three sets of options are orthogonal, so we can write a set of options for example as ’LIN-EM-CLS’. N is the number of training instances, K is the number of features, M is the number of classes, and P is the number of processes."
+    }, {
+      "heading" : "4.3 Iteration time",
+      "text" : "We looked at the iteration time for different formulations, to give some indication of how well the implementation might scale with N , K, and P .\nWe found that all formulations are highly scalable in P . The LIN formulation is very scalable in N , but finds datasets with high K challenging. The calculations involve dense K by K matrices, even where the original data is sparse. So, dense datasets will run relatively more quickly on our implementation than sparse ones, when comparing with other possible solvers.\nBy contrast, the KRN formulation is highly scalable in K, in fact, the iteration time is independent of K, but the iteration time is cubic withN , which is a significant challenge. To make the KRN formulation really effective, it might be useful to find some way to either reduce the number of features, or use an approximation. For example, PSVM approximates the N by N kernel matrix with an N by sqrt(N) matrix, and gets very good accuracy. Maybe there is a way to do something similar with the sampling kernel SVM formulation?\nAs far as the Crammer and Singer solver, the scalability follows closely the scalability of the associated underlying solver, ie LIN, for the formulations we presented above.\nNext we will present the reasons for the asymptotic iteration times we just talked about.\n4.3.1 EM\nLIN. Looking first at linear EM binary classification, LIN-EMCLS comprises the steps shown in Table 1. Overall:\nO(K2[N/P + log(P ) + log(K)])\nTypically, the N/P term dominates, giving O(NK2/P ), and parallelization is effective.\nWhere K or P are high, then the log(P ) and log(K) terms can dominate. When this is the case, (further) parallelization is no longer effective.\nTherefore, parallelization is most effective for high N and lower K.\nKRN. Next, turning to the kernel formulation for binary classification, KRN-EM-CLS comprises the steps in 2. Overall:\nO(N2[N/P + log(P ) + log(N)])\nTypically, the N/P term dominates, giving O(N3/P ), which shows effective parallelization.\nWhen P or N are high, then the log(P ) and log(N) terms can dominate, and (further) parallelization is no longer effective.\nTherefore, parallelization of the kernel formulation is most effective for high K and low N .\nSVR. As far as SVR, the iteration time is asymptotically identical to CLS. There is a constant factor of 2, but this is absorbed in asymptotic analysis.\nMLT. Looking at the Crammer and Singer solver formulation, the iteration time of MLT is multiplied by a factor of M , when compared to binary classification, CLS.\n4.3.2 MC The paragraphs above discussed the EM formulation. In\nMC, there is an additional stochastic sampling step for both γ and Σ. However, the asymptotic times of the sampling steps are no larger than other terms already considered, and the asymptotic iteration time of MC is identical to that of EM."
+    }, {
+      "heading" : "5. EXPERIMENTS",
+      "text" : "We compare the parallel sampling SVM implementations with state of the art linear solvers."
+    }, {
+      "heading" : "5.1 Summary of results",
+      "text" : "We show that LIN-*-CLS is faster than state of the art linear solvers when N is large relative to K2, and there is parallel hardware available.\nWe show that LIN-*-MLT is highly scalable when N is large relative to K2, and there is parallel hardware available.\nWe show that the algorithms for KRN-*-CLS and LIN-*SVR can give accuracy comparable to existing solvers.\nWe evaluate the performance of a GPU solver for LIN-EMCLS. We show that the learning speed of our formulations can be accelerated by use of a GPU."
+    }, {
+      "heading" : "5.2 Test conditions",
+      "text" : "Tests were run on a cluster of 12-core nodes. The cores were 2.6GHz; and each node had 24GB memory."
+    }, {
+      "heading" : "5.3 Datasets",
+      "text" : "Table 3 shows the datasets used. For some experiments, we created subsets. A K = K0 subset means that we include only features where k <= K0. Similarly a N = N0 subset means that only the first N0 data points from the original training dataset were included."
+    }, {
+      "heading" : "5.4 Solvers",
+      "text" : "Table 4 shows the solvers used, in addition to PEMSVM."
+    }, {
+      "heading" : "5.5 Termination conditions",
+      "text" : "PEMSVM calculates the value of the objective function at each iteration. The algorithm terminates when the iterative change falls to 0.001 ∗ N or below, which we found to be a reasonable stopping condition across many datasets.\nWe used the default termination conditions for other solvers."
+    }, {
+      "heading" : "5.6 I/O",
+      "text" : "By breaking the problem into independent sub-problems, not only can the calculations be parallelized across multiple cores, but the I/O load of reading in the datafile into memory can similarly be parallelized across cores, and across compute nodes. This in itself can lead to speed increases when compared to single-threaded algorithms.\nIn addition, even for large datasets, such as dna, it is possible to hold the dataset entirely in memory, across multiple compute nodes."
+    }, {
+      "heading" : "5.7 Implementation Details",
+      "text" : "5.7.1 MPI implementation MPI was used with C/C++ to parallelize the implementa-\ntion over multiple CPU cores. The cores can be on a single node or multiple nodes. Each MPI process was assigned a partition of the dataset, read the data from the datafile itself, and coordinated with a master process.\nThe MPI implementation was implemented using a sparse representation for xd.\n5.7.2 GPU implementation OpenCL was used with C/C++ to parallelize the calcu-\nlation of ∑ d 1 γd xdx T d over multiple GPU cores. The data was partitioned and each partition was loaded into the local memory of a computer unit. The results written to global memory, then reduced using a second GPU kernel.\nFor multiple GPUs, the dataset was first partitioned, then each partition was handled by a single GPU, in parallel.\nFor datasets that did not fit into the GPU global memory, the dataset was first partitioned into chunks that did, then each chunk was processed sequentially using the above algorithm.\nThe GPU implementation was implemented using a dense representation for xd, for simplicity, though there is no technical reason that a sparse representation couldn’t be used too.\n5.7.3 Treatment of singular γd values For support vectors, the values of γd will go to zero, or\nnearly zero. Polson suggests using Greene’s restricted least squares to separate support vectors from non-SVs. We found that clamping the lambda values to be at least some small value gives similar results, and is simpler.\n5.7.4 Source-code Opensource code for the MPI and GPU implementations\nwill be made available at http://ml.cs.tsinghua.edu.cn/∼jun."
+    }, {
+      "heading" : "5.8 MPI solver for linear classification",
+      "text" : "Table 5 compares our LIN-EM-CLS implementation with other solvers for the dna dataset. For a 2.5 million row subset, our solver was the fastest, when 48 cores were available. Other solvers tested were unavailable to take advantage of the extra cores. Pegasos exceeded available memory (24GB + 30GB swap), and was killed. SDB crashed for unknown reasons.\nFor the full 5 million row subset, our solver is one of the only two that managed to complete. The other solvers exhausted available memory, and were killed. StreamSVM makes good use of available memory, using a blocking procedure, but as a consequence, since it uses only two threads, and runs on a single network node, it is very slow.\nOverall, our solver was the fastest on 2.5 million rows, for equivalent accuracy to other solvers, when 480 cores were available. It was the only solver to complete training on the full 25 million rows within 24 hours, and was over three thousand times faster. This might be explained partially because of the parallelization over multiple CPU cores, partly\nbecause the whole dataset can be loaded into distributed memory simultaneously, obviating any need for further I/O during training."
+    }, {
+      "heading" : "5.9 Scalability of LIN-CLS",
+      "text" : "Figure 2 shows the scalability with number of cores of LIN-EM-CLS, using the DNA dataset. The speed is linear with the number of cores, as far as 480 cores, on this dataset.\nFigure 3 shows the scalability with N . For this graph, all solvers were run single-threaded, including both LIN-CLS and PSVM. We can see that LIN-CLS is linear in N , and scales much better with N than PSVM. PSVM is a dual solver, and scales well with K, but less well with N . Liblinear and Pegasos also scale linearly with N . Note that LINEM-CLS is slower than Liblinear and Pegasos in a singlethreaded scenario, but by taking advantage of additional cores, LIN-EM-CLS can be faster than both Liblinear and Pegasos.\nFigure 4 shows the effect of K on training time, again running each solver single-threaded. LIN-CLS is quadratic\nin K. It scales better with K than PSVM on this dataset. This dataset is quite harsh on PSVM, because it has a very high N . Liblinear and Pegasos are both linear with K."
+    }, {
+      "heading" : "5.10 SVR",
+      "text" : "Table 6 shows the performance of LIN-EM-SVR versus liblinear for the year regression dataset. The data was normalized for mean and variance prior to testing. Epsilon was set to 0.3.\nLIN-EM-SVR trained the fastest, for similar accuracy."
+    }, {
+      "heading" : "5.11 KRN",
+      "text" : "Table 7 shows results for KRN-EM-CLS. Our accuracies are similar to liblinear for this training set. The kernel formulation allows the use of non-linear kernels, and the training time is independent of K.\nA limitation of the KRN formulation is that the training time is cubic in N ."
+    }, {
+      "heading" : "5.12 Performance on Crammer and Singer models",
+      "text" : "Table 8 shows the performance of Crammer and Singer classifiers on the mnist8m dataset. Our implementation of Crammer and Singer is parallelizable across multiple cores. On a cluster today it gives training times comparable to liblinear, and much faster than SVMMulticlass. In the future, the number of cores available will likely increase, possibly exponentially, and our implementation might become increasingly advantageous, when compared to the single-threaded liblinear and SVMMulticlass.\nFor the full mnist8m dataset, only our solver and liblinear were able to complete training. SVMMulticlass used up all available memory (24GB + 30GB swap), and was killed.\nIncreasing the number of cores from 48 to 480 for our implementation gave a 7.6 times increase in speed, showing the scalability of this algorithm."
+    }, {
+      "heading" : "5.13 Convergence",
+      "text" : "Figure 5 shows the convergence of the objective function, for both MC and EM, for the DNA dataset, for LIN-*-CLS. The EM objective function converges within 40-60 iterations here, and this is what we saw in practice across other datasets.\nFor MC, we have two choices:\n• use the best single sample\n• average multiple samples\nGiven that this is high-dimensional space, taking single samples is unlikely to get close to the optimal solution, so we average across multiple samples. Usually, one would want to select a small burnin period of 10-20 iterations.\nThis contrasts with EM, where we use a single sample at each iteration to measure the test accuracy.\nSo, the objective function for MC in these graphs converges more slowly than for EM.\nIn this graphs, we didn’t use a burnin period for MC. Using a burnin period of 10 iterations improves the convergence\ntime. Taking the average across all MC samples from 1 to i gives a relatively smooth change in the objective function over time, which is useful for making a convenient stopping heuristic, and also gives good test accuracy..\nNote that whilst this particular dataset gives a monotonically decreasing objective function for MC, we noticed that in some cases the objective convergence curve does have multiple local minima, so one needs to be a bit careful as to how to construct an appropriate stopping heuristic.\nFigure 6 shows the accuracy, for the same experiment. We can see that whilst EM converged faster in this case to a solution, after 100 iterations, the test accuracy for MC was higher.\nIn practice, we found that for LIN-*-CLS, EM gave good accuracies, and the stopping heuristics are simpler.\nFor the Crammer and Singer implementation, MC converged much faster than EM."
+    }, {
+      "heading" : "5.14 Parallelization using GPU",
+      "text" : "GPU kernels were written to evaluate the Σ component of\nthe algorithm, ie ∑ d 1 γd xdx T d . This is the rate-limiting step\nfor many datasets. For LIN, the execution time is asymptotically O(NK2).\nTable 9 shows the results for evaluating Σ for simulated xd and γd vectors. Using 512 GPU cores was 23 times faster than a single core. Using 2048 GPU cores was about 50 times faster. The CPU core was from an Intel i7-3930K 3.2GHz CPU, and the GPU cores were from nVidia GTX590 GPUs (one GPU contains 512 cores).\nTable 10 shows the performance of LIN-EM-CLS using a GPU implementation on the alpha dataset.\nWe can see that using a single CPU core, liblinear is nearly 3 times faster than LIN-EM-CLS. However, using GPU cores accelerated the learning time For LIN-EM-CLS by 13 times, relative to the single CPU core version.\nNote that for this dataset, the data load time dominates the GPU version. This is the time to load the data from storage into PC main memory. This is limited (i) by the speed of the storage medium and (ii) by the speed of parsing the ASCII data using a single CPU core.\nOne advantage of the MPI implementation over the GPU version is that I/O is parallelized over multiple processors and multiple compute nodes."
+    }, {
+      "heading" : "6. CONCLUSIONS",
+      "text" : "We have presented a simple technique to solve SVM models on parallel hardware, using a sampling SVM. Our implementation of a parallel linear SVM solver is capable of handling very large datasets, and scaled up to at least several hundred cores in our experiments. We have provided an extension to non-linear kernels, an implementation for support vector regression, and a parallel solver for the Crammer and Singer model. It is useful in its own right, and it is a useful addition to our armory, enabling fast and accurate solutions to composite maximum-margin models."
+    }, {
+      "heading" : "7. REFERENCES",
+      "text" : "[1] C.-C. Chang and C.-J. Lin. LIBSVM: A library for\nsupport vector machines. ACM Transactions on Intelligent Systems and Technology, 2:27:1–27:27, 2011.\n[2] E. Y. Chang, K. Zhu, H. Wang, and H. Bai. PSVM: Parallelizing support vector machines on distributed computers. In NIPS, 2007.\n[3] K.-W. Chang and D. Roth. Selective block minimization for faster convergence of limited memory large-scale linear models. In Proceedings of the 17th\nACM SIGKDD international conference on Knowledge discovery and data mining, pages 699–707. ACM, 2011.\n[4] R. Collobert, S. Bengio, and Y. Bengio. A parallel mixture of svms for very large scale problems. Neural Computation, 14(5):1105–1114, 2002.\n[5] R.-E. Fan, K.-W. Chang, C.-J. Hsieh, X.-R. Wang, and C.-J. Lin. LIBLINEAR: A library for large linear classification. Journal of Machine Learning Research, 9:1871–1874, 2008.\n[6] H. P. Graf, E. Cosatto, L. Bottou, I. Durdanovic, and V. Vapnik. Parallel support vector machines: The cascade svm. In NIPS, 2004.\n[7] T. Joachims. Making large-scale SVM learning practical. MIT press, 1999.\n[8] T. Joachims. Training linear svms in linear time. In Proceedings of the 12th ACM SIGKDD international conference on Knowledge discovery and data mining, pages 217–226. ACM, 2006.\n[9] T. Joachims, T. Finley, and C. Yu. Cutting-plane training of structural SVMs. Machine Learning, 77(1):27–59, 2009.\n[10] S. Matsushima, S. Vishwanathan, and A. J. Smola. Linear support vector machines via dual cached loops. In Proceedings of the 18th ACM SIGKDD international conference on Knowledge discovery and data mining, pages 177–185. ACM, 2012.\n[11] D. Newman, A. Asuncion, P. Smyth, and M. Welling. Distributed algorithms for topic models. JMLR, 10:1801–1828, 2009.\n[12] J. Platt et al. Sequential minimal optimization: A fast algorithm for training support vector machines. 1998.\n[13] N. G. Polson and S. L. Scott. Data augmentation for support vector machines. Bayesian Analysis, 6(1):1–24, 2011.\n[14] S. Shalev-Shwartz, Y. Singer, and N. Srebro. Pegasos: Primal estimated sub-gradient solver for svm. In Proceedings of the 24th international conference on Machine learning, pages 807–814. ACM, 2007.\n[15] A. Smola and S. Narayanamurthy. An architecture for parallel topic models. VLDB, 3(1-2):703–710, 2010.\n[16] A. J. Smola and B. Schölkopf. A tutorial on support vector regression. Statistics and Computing, 2003.\n[17] M. Xu, J. Zhu, and B. Zhang. Nonparametric max-margin matrix factorization for. collaborative prediction. In NIPS, 2012.\n[18] J. Zhu, N. Chen, H. Perkins, and B. Zhang. Gibbs max-margin topic models with fast sampling algorithms. In International Conference on Machine Learning (ICML), 2013."
+    } ],
+    "references" : [ {
+      "title" : "LIBSVM: A library for support vector machines",
+      "author" : [ "C.-C. Chang", "C.-J. Lin" ],
+      "venue" : "ACM Transactions on Intelligent Systems and Technology,",
+      "citeRegEx" : "1",
+      "shortCiteRegEx" : "1",
+      "year" : 2011
+    }, {
+      "title" : "PSVM: Parallelizing support vector machines on distributed computers",
+      "author" : [ "E.Y. Chang", "K. Zhu", "H. Wang", "H. Bai" ],
+      "venue" : "In NIPS,",
+      "citeRegEx" : "2",
+      "shortCiteRegEx" : "2",
+      "year" : 2007
+    }, {
+      "title" : "Selective block minimization for faster convergence of limited memory large-scale linear models",
+      "author" : [ "K.-W. Chang", "D. Roth" ],
+      "venue" : "In Proceedings of the 17th  ACM SIGKDD international conference on Knowledge discovery and data mining,",
+      "citeRegEx" : "3",
+      "shortCiteRegEx" : "3",
+      "year" : 2011
+    }, {
+      "title" : "A parallel mixture of svms for very large scale problems",
+      "author" : [ "R. Collobert", "S. Bengio", "Y. Bengio" ],
+      "venue" : "Neural Computation,",
+      "citeRegEx" : "4",
+      "shortCiteRegEx" : "4",
+      "year" : 2002
+    }, {
+      "title" : "LIBLINEAR: A library for large linear classification",
+      "author" : [ "R.-E. Fan", "K.-W. Chang", "C.-J. Hsieh", "X.-R. Wang", "C.-J. Lin" ],
+      "venue" : "Journal of Machine Learning Research,",
+      "citeRegEx" : "5",
+      "shortCiteRegEx" : "5",
+      "year" : 2008
+    }, {
+      "title" : "Parallel support vector machines: The cascade svm",
+      "author" : [ "H.P. Graf", "E. Cosatto", "L. Bottou", "I. Durdanovic", "V. Vapnik" ],
+      "venue" : "In NIPS,",
+      "citeRegEx" : "6",
+      "shortCiteRegEx" : "6",
+      "year" : 2004
+    }, {
+      "title" : "Making large-scale SVM learning practical",
+      "author" : [ "T. Joachims" ],
+      "venue" : "MIT press,",
+      "citeRegEx" : "7",
+      "shortCiteRegEx" : "7",
+      "year" : 1999
+    }, {
+      "title" : "Training linear svms in linear time",
+      "author" : [ "T. Joachims" ],
+      "venue" : "In Proceedings of the 12th ACM SIGKDD international conference on Knowledge discovery and data mining,",
+      "citeRegEx" : "8",
+      "shortCiteRegEx" : "8",
+      "year" : 2006
+    }, {
+      "title" : "Cutting-plane training of structural SVMs",
+      "author" : [ "T. Joachims", "T. Finley", "C. Yu" ],
+      "venue" : "Machine Learning,",
+      "citeRegEx" : "9",
+      "shortCiteRegEx" : "9",
+      "year" : 2009
+    }, {
+      "title" : "Linear support vector machines via dual cached loops",
+      "author" : [ "S. Matsushima", "S. Vishwanathan", "A.J. Smola" ],
+      "venue" : "In Proceedings of the 18th ACM SIGKDD international conference on Knowledge discovery and data mining,",
+      "citeRegEx" : "10",
+      "shortCiteRegEx" : "10",
+      "year" : 2012
+    }, {
+      "title" : "Distributed algorithms for topic models",
+      "author" : [ "D. Newman", "A. Asuncion", "P. Smyth", "M. Welling" ],
+      "venue" : "JMLR, 10:1801–1828,",
+      "citeRegEx" : "11",
+      "shortCiteRegEx" : "11",
+      "year" : 2009
+    }, {
+      "title" : "Sequential minimal optimization: A fast algorithm for training support vector machines",
+      "author" : [ "J. Platt" ],
+      "venue" : null,
+      "citeRegEx" : "12",
+      "shortCiteRegEx" : "12",
+      "year" : 1998
+    }, {
+      "title" : "Data augmentation for support vector machines",
+      "author" : [ "N.G. Polson", "S.L. Scott" ],
+      "venue" : "Bayesian Analysis,",
+      "citeRegEx" : "13",
+      "shortCiteRegEx" : "13",
+      "year" : 2011
+    }, {
+      "title" : "Pegasos: Primal estimated sub-gradient solver for svm",
+      "author" : [ "S. Shalev-Shwartz", "Y. Singer", "N. Srebro" ],
+      "venue" : "In Proceedings of the 24th international conference on Machine learning,",
+      "citeRegEx" : "14",
+      "shortCiteRegEx" : "14",
+      "year" : 2007
+    }, {
+      "title" : "An architecture for parallel topic models",
+      "author" : [ "A. Smola", "S. Narayanamurthy" ],
+      "venue" : null,
+      "citeRegEx" : "15",
+      "shortCiteRegEx" : "15",
+      "year" : 2010
+    }, {
+      "title" : "A tutorial on support vector regression",
+      "author" : [ "A.J. Smola", "B. Schölkopf" ],
+      "venue" : "Statistics and Computing,",
+      "citeRegEx" : "16",
+      "shortCiteRegEx" : "16",
+      "year" : 2003
+    }, {
+      "title" : "Nonparametric max-margin matrix factorization for. collaborative prediction",
+      "author" : [ "M. Xu", "J. Zhu", "B. Zhang" ],
+      "venue" : "In NIPS,",
+      "citeRegEx" : "17",
+      "shortCiteRegEx" : "17",
+      "year" : 2012
+    }, {
+      "title" : "Gibbs max-margin topic models with fast sampling algorithms",
+      "author" : [ "J. Zhu", "N. Chen", "H. Perkins", "B. Zhang" ],
+      "venue" : "In International Conference on Machine Learning (ICML),",
+      "citeRegEx" : "18",
+      "shortCiteRegEx" : "18",
+      "year" : 2013
+    } ],
+    "referenceMentions" : [ {
+      "referenceID" : 6,
+      "context" : "Traditional decomposition methods, like SVMLight [7], LibSVM [1] and SMO [12], have cubic time complexity.",
+      "startOffset" : 49,
+      "endOffset" : 52
+    }, {
+      "referenceID" : 0,
+      "context" : "Traditional decomposition methods, like SVMLight [7], LibSVM [1] and SMO [12], have cubic time complexity.",
+      "startOffset" : 61,
+      "endOffset" : 64
+    }, {
+      "referenceID" : 11,
+      "context" : "Traditional decomposition methods, like SVMLight [7], LibSVM [1] and SMO [12], have cubic time complexity.",
+      "startOffset" : 73,
+      "endOffset" : 77
+    }, {
+      "referenceID" : 1,
+      "context" : "Representative works include the parallel SVM (PSVM) [2], which performs approximate matrix factorization to reduce memory use and then uses the interior point method to solve the quadratic optimization problem on multiple machines in parallel.",
+      "startOffset" : 53,
+      "endOffset" : 56
+    }, {
+      "referenceID" : 3,
+      "context" : "The parallel mixture method [4] and the cascade SVM [6] decompose the entire learning problem into multiple smaller QP problems and solve them in parallel.",
+      "startOffset" : 28,
+      "endOffset" : 31
+    }, {
+      "referenceID" : 5,
+      "context" : "The parallel mixture method [4] and the cascade SVM [6] decompose the entire learning problem into multiple smaller QP problems and solve them in parallel.",
+      "startOffset" : 52,
+      "endOffset" : 55
+    }, {
+      "referenceID" : 12,
+      "context" : "Our algorithm is built on the recent work [13], which shows that the learning problems of SVM can be equivalently formulated as hierarchical Bayesian model, with additional scale variables.",
+      "startOffset" : 42,
+      "endOffset" : 46
+    }, {
+      "referenceID" : 14,
+      "context" : "Our work is also inspired by the recent developments on distributed Monte Carlo methods for improving the scalability of probabilistic latent topic models [15, 11].",
+      "startOffset" : 155,
+      "endOffset" : 163
+    }, {
+      "referenceID" : 10,
+      "context" : "Our work is also inspired by the recent developments on distributed Monte Carlo methods for improving the scalability of probabilistic latent topic models [15, 11].",
+      "startOffset" : 155,
+      "endOffset" : 163
+    }, {
+      "referenceID" : 17,
+      "context" : "In addition, it is a useful addition to our armory, because it can be used to solve composite models, such as MedLDA [18], without needing to make the mean-field assumption.",
+      "startOffset" : 117,
+      "endOffset" : 121
+    }, {
+      "referenceID" : 16,
+      "context" : "There are many models, such as [17] for example, that may be able to benefit from fast and accurate parallelization using the parallel sampling or parallel EM SVM formulation.",
+      "startOffset" : 31,
+      "endOffset" : 35
+    }, {
+      "referenceID" : 12,
+      "context" : "Specifically, Polson and Scott [13] show that the pseudo-likelihood can be represented as a scale mixture of Gaussians, namely",
+      "startOffset" : 31,
+      "endOffset" : 35
+    }, {
+      "referenceID" : 12,
+      "context" : "Specifically, we use Gibbs sampling and have the following conditional distributions [13]",
+      "startOffset" : 85,
+      "endOffset" : 89
+    }, {
+      "referenceID" : 15,
+      "context" : "2 Support Vector Regression For regression, where the response variable y are realvalued, the support vector regression (SVR) problem is defined as minimizing a regularized -insensitive loss [16]",
+      "startOffset" : 191,
+      "endOffset" : 195
+    }, {
+      "referenceID" : 4,
+      "context" : "Name Description LL-Dual[5] Liblinear dual coordinate descent L2-regularization L2-loss biased LL-Primal[5] Liblinear primal coordinate descent L2-regularization L2-loss biased LL-CS[5] Liblinear Crammer and Singer PSVM[2] PSVM, with rank ratio set to 1/ √ N SVMPerf[8] SVMPerf, with defaults SVMMult[9] SVMMulticlass, with defaults Pegasos[14] Pegasos, with defaults SDB[3] Selective Block Minimization, biased StreamSVM[10] StreamSVM, with defaults",
+      "startOffset" : 24,
+      "endOffset" : 27
+    }, {
+      "referenceID" : 4,
+      "context" : "Name Description LL-Dual[5] Liblinear dual coordinate descent L2-regularization L2-loss biased LL-Primal[5] Liblinear primal coordinate descent L2-regularization L2-loss biased LL-CS[5] Liblinear Crammer and Singer PSVM[2] PSVM, with rank ratio set to 1/ √ N SVMPerf[8] SVMPerf, with defaults SVMMult[9] SVMMulticlass, with defaults Pegasos[14] Pegasos, with defaults SDB[3] Selective Block Minimization, biased StreamSVM[10] StreamSVM, with defaults",
+      "startOffset" : 104,
+      "endOffset" : 107
+    }, {
+      "referenceID" : 4,
+      "context" : "Name Description LL-Dual[5] Liblinear dual coordinate descent L2-regularization L2-loss biased LL-Primal[5] Liblinear primal coordinate descent L2-regularization L2-loss biased LL-CS[5] Liblinear Crammer and Singer PSVM[2] PSVM, with rank ratio set to 1/ √ N SVMPerf[8] SVMPerf, with defaults SVMMult[9] SVMMulticlass, with defaults Pegasos[14] Pegasos, with defaults SDB[3] Selective Block Minimization, biased StreamSVM[10] StreamSVM, with defaults",
+      "startOffset" : 182,
+      "endOffset" : 185
+    }, {
+      "referenceID" : 1,
+      "context" : "Name Description LL-Dual[5] Liblinear dual coordinate descent L2-regularization L2-loss biased LL-Primal[5] Liblinear primal coordinate descent L2-regularization L2-loss biased LL-CS[5] Liblinear Crammer and Singer PSVM[2] PSVM, with rank ratio set to 1/ √ N SVMPerf[8] SVMPerf, with defaults SVMMult[9] SVMMulticlass, with defaults Pegasos[14] Pegasos, with defaults SDB[3] Selective Block Minimization, biased StreamSVM[10] StreamSVM, with defaults",
+      "startOffset" : 219,
+      "endOffset" : 222
+    }, {
+      "referenceID" : 7,
+      "context" : "Name Description LL-Dual[5] Liblinear dual coordinate descent L2-regularization L2-loss biased LL-Primal[5] Liblinear primal coordinate descent L2-regularization L2-loss biased LL-CS[5] Liblinear Crammer and Singer PSVM[2] PSVM, with rank ratio set to 1/ √ N SVMPerf[8] SVMPerf, with defaults SVMMult[9] SVMMulticlass, with defaults Pegasos[14] Pegasos, with defaults SDB[3] Selective Block Minimization, biased StreamSVM[10] StreamSVM, with defaults",
+      "startOffset" : 266,
+      "endOffset" : 269
+    }, {
+      "referenceID" : 8,
+      "context" : "Name Description LL-Dual[5] Liblinear dual coordinate descent L2-regularization L2-loss biased LL-Primal[5] Liblinear primal coordinate descent L2-regularization L2-loss biased LL-CS[5] Liblinear Crammer and Singer PSVM[2] PSVM, with rank ratio set to 1/ √ N SVMPerf[8] SVMPerf, with defaults SVMMult[9] SVMMulticlass, with defaults Pegasos[14] Pegasos, with defaults SDB[3] Selective Block Minimization, biased StreamSVM[10] StreamSVM, with defaults",
+      "startOffset" : 300,
+      "endOffset" : 303
+    }, {
+      "referenceID" : 13,
+      "context" : "Name Description LL-Dual[5] Liblinear dual coordinate descent L2-regularization L2-loss biased LL-Primal[5] Liblinear primal coordinate descent L2-regularization L2-loss biased LL-CS[5] Liblinear Crammer and Singer PSVM[2] PSVM, with rank ratio set to 1/ √ N SVMPerf[8] SVMPerf, with defaults SVMMult[9] SVMMulticlass, with defaults Pegasos[14] Pegasos, with defaults SDB[3] Selective Block Minimization, biased StreamSVM[10] StreamSVM, with defaults",
+      "startOffset" : 340,
+      "endOffset" : 344
+    }, {
+      "referenceID" : 2,
+      "context" : "Name Description LL-Dual[5] Liblinear dual coordinate descent L2-regularization L2-loss biased LL-Primal[5] Liblinear primal coordinate descent L2-regularization L2-loss biased LL-CS[5] Liblinear Crammer and Singer PSVM[2] PSVM, with rank ratio set to 1/ √ N SVMPerf[8] SVMPerf, with defaults SVMMult[9] SVMMulticlass, with defaults Pegasos[14] Pegasos, with defaults SDB[3] Selective Block Minimization, biased StreamSVM[10] StreamSVM, with defaults",
+      "startOffset" : 371,
+      "endOffset" : 374
+    }, {
+      "referenceID" : 9,
+      "context" : "Name Description LL-Dual[5] Liblinear dual coordinate descent L2-regularization L2-loss biased LL-Primal[5] Liblinear primal coordinate descent L2-regularization L2-loss biased LL-CS[5] Liblinear Crammer and Singer PSVM[2] PSVM, with rank ratio set to 1/ √ N SVMPerf[8] SVMPerf, with defaults SVMMult[9] SVMMulticlass, with defaults Pegasos[14] Pegasos, with defaults SDB[3] Selective Block Minimization, biased StreamSVM[10] StreamSVM, with defaults",
+      "startOffset" : 421,
+      "endOffset" : 425
+    }, {
+      "referenceID" : 13,
+      "context" : "% Pegasos[14] 1 - Crash SDB[3] 1 1 Crash StreamSVM[10] 2 4e-5 6138s 90.",
+      "startOffset" : 9,
+      "endOffset" : 13
+    }, {
+      "referenceID" : 2,
+      "context" : "% Pegasos[14] 1 - Crash SDB[3] 1 1 Crash StreamSVM[10] 2 4e-5 6138s 90.",
+      "startOffset" : 27,
+      "endOffset" : 30
+    }, {
+      "referenceID" : 9,
+      "context" : "% Pegasos[14] 1 - Crash SDB[3] 1 1 Crash StreamSVM[10] 2 4e-5 6138s 90.",
+      "startOffset" : 50,
+      "endOffset" : 54
+    }, {
+      "referenceID" : 7,
+      "context" : "48 SVMPerf[8] 1 2 641.",
+      "startOffset" : 10,
+      "endOffset" : 13
+    }, {
+      "referenceID" : 4,
+      "context" : "42 LL-Primal[5] 1 4e-6 159.",
+      "startOffset" : 12,
+      "endOffset" : 15
+    }, {
+      "referenceID" : 4,
+      "context" : "31 LL-Dual[5] 1 4e-6 126.",
+      "startOffset" : 10,
+      "endOffset" : 13
+    }, {
+      "referenceID" : 4,
+      "context" : "% LL-Dual[5] 1 4e-6 Crash LL-Primal[5] 1 4e-6 Crash SVMPerf[8] 1 2 Crash StreamSVM[10] 2 4e-5 > 30h StreamSVM[10] 2 1e-5 44h 90.",
+      "startOffset" : 9,
+      "endOffset" : 12
+    }, {
+      "referenceID" : 4,
+      "context" : "% LL-Dual[5] 1 4e-6 Crash LL-Primal[5] 1 4e-6 Crash SVMPerf[8] 1 2 Crash StreamSVM[10] 2 4e-5 > 30h StreamSVM[10] 2 1e-5 44h 90.",
+      "startOffset" : 35,
+      "endOffset" : 38
+    }, {
+      "referenceID" : 7,
+      "context" : "% LL-Dual[5] 1 4e-6 Crash LL-Primal[5] 1 4e-6 Crash SVMPerf[8] 1 2 Crash StreamSVM[10] 2 4e-5 > 30h StreamSVM[10] 2 1e-5 44h 90.",
+      "startOffset" : 59,
+      "endOffset" : 62
+    }, {
+      "referenceID" : 9,
+      "context" : "% LL-Dual[5] 1 4e-6 Crash LL-Primal[5] 1 4e-6 Crash SVMPerf[8] 1 2 Crash StreamSVM[10] 2 4e-5 > 30h StreamSVM[10] 2 1e-5 44h 90.",
+      "startOffset" : 82,
+      "endOffset" : 86
+    }, {
+      "referenceID" : 9,
+      "context" : "% LL-Dual[5] 1 4e-6 Crash LL-Primal[5] 1 4e-6 Crash SVMPerf[8] 1 2 Crash StreamSVM[10] 2 4e-5 > 30h StreamSVM[10] 2 1e-5 44h 90.",
+      "startOffset" : 109,
+      "endOffset" : 113
+    }, {
+      "referenceID" : 4,
+      "context" : "Solver Cores C Train RMS error LL-Primal[5] 1 1 15.",
+      "startOffset" : 40,
+      "endOffset" : 43
+    }, {
+      "referenceID" : 4,
+      "context" : "88 LL-Dual[5] 1 1 114.",
+      "startOffset" : 10,
+      "endOffset" : 13
+    }, {
+      "referenceID" : 4,
+      "context" : "% LL-Dual[5] 1 1000 7.",
+      "startOffset" : 9,
+      "endOffset" : 12
+    }, {
+      "referenceID" : 4,
+      "context" : "2 LL-Primal[5] 1 1000 1.",
+      "startOffset" : 11,
+      "endOffset" : 14
+    }, {
+      "referenceID" : 4,
+      "context" : "% N=200,000 training subset: LL-CS[5] 1 0.",
+      "startOffset" : 34,
+      "endOffset" : 37
+    }, {
+      "referenceID" : 8,
+      "context" : "9 SVMMult[9] 1 800000 518.",
+      "startOffset" : 9,
+      "endOffset" : 12
+    }, {
+      "referenceID" : 8,
+      "context" : "8 Full N=4,000,000 training set: SVMMult[9] 1 80000 Crash LL-CS[5] 1 0.",
+      "startOffset" : 40,
+      "endOffset" : 43
+    }, {
+      "referenceID" : 4,
+      "context" : "8 Full N=4,000,000 training set: SVMMult[9] 1 80000 Crash LL-CS[5] 1 0.",
+      "startOffset" : 63,
+      "endOffset" : 66
+    }, {
+      "referenceID" : 4,
+      "context" : "% load % LL-Dual[5] 1 CPU core 44.",
+      "startOffset" : 16,
+      "endOffset" : 19
+    } ],
+    "year" : 2015,
+    "abstractText" : "As one of the most popular classifiers, linear SVMs still have challenges in dealing with very large-scale problems, even though linear or sub-linear algorithms have been developed recently on single machines. Parallel computing methods have been developed for learning large-scale SVMs. However, existing methods rely on solving local sub-optimization problems. In this paper, we develop a novel parallel algorithm for learning large-scale linear SVM. Our approach is based on a data augmentation equivalent formulation, which casts the problem of learning SVM as a Bayesian inference problem, for which we can develop very efficient parallel sampling methods. We provide empirical results for this parallel sampling SVM, and provide extensions for SVR, nonlinear kernels, and provide a parallel implementation of the Crammer and Singer model. This approach is very promising in its own right, and further is a very useful technique to parallelize a broader family of general maximum-margin models.",
+    "creator" : "TeX"
+  }
+}

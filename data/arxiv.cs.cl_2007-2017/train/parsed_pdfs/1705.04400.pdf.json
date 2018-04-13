@@ -1,0 +1,365 @@
+{
+  "name" : "1705.04400.pdf",
+  "metadata" : {
+    "source" : "META",
+    "title" : "Reducing Bias in Production Speech Models",
+    "authors" : [ "Eric Battenberg", "Rewon Child", "Adam Coates", "Christopher Fougner", "Yashesh Gaur", "Jiaji Huang", "Heewoo Jun", "Ajay Kannan", "Markus Kliegl", "Atul Kumar", "Hairong Liu", "Vinay Rao", "Sanjeev Satheesh", "David Seetapun", "Anuroop Sriram", "Zhenyao Zhu" ],
+    "emails" : [ "SVAIL@BAIDU.COM", "sanjeevsatheesh@baidu.com" ],
+    "sections" : [ {
+      "heading" : "1. Introduction",
+      "text" : "Deep learning has helped speech systems attain very strong results on speech recognition tasks for multiple languages (Xiong et al., 2016; Amodei et al., 2015). One could say therefore that the automatic speech recognition (ASR) task may be considered ‘solved’ for any domain where there is enough training data. However, production requirements such as supporting streaming inference bring in constraints that dramatically degrade the performance of such models – typically because models trained under these constraints are in the underfitting regime and can no longer fit the training data as well. Underfitting is the first symptom of a model with high bias. In this work, we aim to build a deployable model architecture with low bias because 1) It allows us to serve the very best speech models and 2) Identify better architectures to improve generalization performance, by adding more data and parameters.\nTypically, bias is induced by the assumptions made in hand\nContact author: sanjeevsatheesh@baidu.com\nengineered features or workflows, by using surrogate loss functions (or assumptions they make) that are different from the final metric, or maybe even implicit in the layers used in the model. Sometimes, optimization issues may also prevent the model from fitting the training data as well – this effect is difficult to distinguish from underfitting, and we also look at approaches to resolve optimization issues.\nSources of Bias in Production Speech Models\nEnd-to-end models like (Amodei et al., 2015) typically tend to have lower bias because they have fewer hand engineered features, so we start from a similar model as the baseline. The model used in (Amodei et al., 2015) is a recurrent neural network with two 2D-convolutional input layers, followed by multiple bidirectional recurrent layers and one fully connected layer before a softmax layer. The network is trained end-to-end using the Connectionist Temporal Classification (CTC) loss function (Graves et al., 2006), to directly predict sequences of characters from log spectrograms of the audio. The following assumptions are implicit, that contribute to the bias of the model.\n1. Input modeling: Typically, incoming audio is processed using energy normalization, spectrogram featurization, log compression, and finally, feature-wise mean and variance normalization. Figure 1 shows however, that log spectrograms can have a high dynamic range across frequency bands (Fig 1a) or have some bands missing (Fig 1c). We investigate how the PCEN layer (Wang et al., 2016a) can parametrize and learn improved versions of these transformations, which simplifies the task of subsequent 2D convolutional layers.\n2. Architectures for streaming inference: English ASR models greatly benefit from using information from a few time frames into the future (Xiong et al., 2016; Sercu and Goel, 2016; Peddinti et al., 2015). In the baseline model, this is enabled by using bidirectional layers, which are impossible to deploy in a streaming fashion, because the backward looking recurrences can be computed only after the entire input is available. Making the recurrences forward-only immedi-\nar X\niv :1\n70 5.\n04 40\n0v 1\n[ cs\n.C L\n] 1\n1 M\nay 2\n01 7\nately removes this constraint and makes these models deployable, but also make the assumption that no future context is useful. We show the effectiveness of Latency Constrained Bidirectional RNNs (Zhang et al., 2016) in controlling the latency while still being able to include future context.\n3. Target modeling: CTC models that output characters assume conditional independence between predicted characters given the input features - while this approximation makes maximum likelihood training tractable, this induces a bias on English ASR models and imposes a ceiling on performance. While CTC can easily model commonly co-occuring ngrams together, it is impossible to give roughly equal probability to many possible spellings when transcribing unseen words, because the probability mass has to be distributed between multiple time steps, while assuming conditional independence. We show how GramCTC (Liu et al., 2017) finds the label space where this conditional independence is easier to manage.\n4. Optimization issues: Additionally, the CTC loss is notoriously unstable (Sak et al., 2015), despite making sequence labeling tractable, since it is forcing the model to align the input and output sequences, as well as recognize output labels. Making the optimization stable can help learn a better model with the same number of parameters. We show two effective ways of using alignment information to improve the rate of convergence of these models.\nThe rest of the paper is organized as follows: Section 2 introduces related work that address each of the issues outlined above. Sections 3, 4, 5, and 6 investigate solutions for addressing the corresponding issue, and study tradeoffs in their application. In section 7, we present experiments where we show the impact of each component independently, as well as the combination of all of them and discuss the results."
+    }, {
+      "heading" : "2. Related Work",
+      "text" : "The most direct way to remove all bias in the inputmodeling is probably learning a sufficiently expressive model directly from raw waveforms as in (Sainath et al., 2015; Zhu et al., 2016) by parameterizing and learning these transformations. These works suggest that non trivial improvement in accuracy purely from modeling the raw waveform is hard to obtain without a significant increase in the compute and memory requirements. (Wang et al., 2016a) introduced a trainable per-channel energy normalization layer (PCEN) that parametrizes power normalization as well as the compression step, which is typically handled by a static log transform.\nLookahead convolutions have been proposed for streaming inference (Wang et al., 2016b). Latency constrained Bidirectional recurrent layers (LC-BRNN) and Context sensitive chunks (CSC) have been proposed in (Chen and Huo, 2016) for tractable sequence model training but not explored for streaming inference. Time delay neural networks (Peddinti et al., 2015) and Convolutional networks are also options for controlling the amount of future context.\nAlternatives have been proposed to relax the label independence assumption of the CTC loss - Attention models (Bahdanau et al., 2015; Chan et al., 2016), global normalization (Collobert et al., 2016) and segmental RNNs (Lu et al., 2016) and more end-to-end losses like lattice free MMI (Maximum Mutual Information) (Povey et al., 2016) are all promising approaches to address this problem.\nCTC model training has been shown to be made more stable by feeding shorter examples first, like SortaGrad (Amodei et al., 2015) and by warm-starting CTC training from a model pre-trained by Cross-Entropy (CE) loss (using alignment information) (Sak et al., 2015). SortaGrad additionally helps to converge to a better training error."
+    }, {
+      "heading" : "3. Input modeling",
+      "text" : "ASR systems often have a vital front-end that involves power normalization, (mel) spectrogram calculation fol-\nlowed by log compression, mean and variance normalization apart from other operations. In this section, we show that we can better model a wide variety of speech input by replacing this workflow with a trainable frontend.\nWhile spectrograms strike an excellent balance between compute and representational quality, they have a high dynamic range (Figure 1) and are susceptible to channel effects such as room impulse response, Lombard effects and background noises. To alleviate the first issue, they are typically log compressed, and then mean and variance normalized. However, this only moderately helps with all the variations that can arise in the real world as described before, and we expect the network to learn to be robust to these effects by exposing it to such data. By relieving the network of the task of speech and channel normalization, it can devote more of its capacity for the actual speech recognition task. For this, we replaced the traditional log compression and power normalization steps with a trainable per-channel energy normalization (PCEN) front-end (Wang et al., 2016a), which performs\ny(t, f) =\n( x(t, f)\n( +M(t, f))α + δ\n)r − δr, (1)\nwhere x is the input spectrogram, M is the causal energy estimate of the input, and δ, α, r, z are tunable per-channel parameters. The motivation for this is two-fold. It first normalizes the audio using the automatic gain controller (AGC), x/Mα, and further compresses its dynamic range using (· + δ)r − δr. The latter is designed to approximate an optimized spectral subtraction curve (Porter and Boll, 1984) which helps to improve robustness to background noises. Clearly, Figure 1 shows that PCEN effectively normalizes various speaker and channel effects.\nPCEN was originally motivated to improve keyword spotting systems, but our experiments show that it helps with general ASR tasks, yielding a noticeable improvement in error rates over the baseline (Table 3). Our training data set which was curated in-house consists of speech data collected in multiple realistic settings. The PCEN front-end\ngave the most improvement in our far-field validation portion where there was an absolute ∼2 WER reduction. To demonstrate that this was indeed reducing bias, we tried this on WSJ, a much smaller and homogeneous dataset. We observed no improvement on the holdout validation set as shown in Figure 2a as the read speech is extremely uniform and the standard front-end suffices."
+    }, {
+      "heading" : "4. Latency Controlled Recurrent layers",
+      "text" : "Consider a typical use-case for ASR systems under deployment. Audio is typically sent over the network in packets of short durations (e.g., 50-200 ms). Under these streaming conditions, it is imperative to improve accuracy and reduce the latency perceived by end-users. It’s observed that users tend to be most perceptive to the time between when they stop speaking and when the last spoken word presents to them. As a proxy for perceived latency, we measure lastpacket-latency, defined as the time taken to return the transcription to the user after the last audio packet arrived at the server. 1\nTo tackle the bias induced by using purely forward only recurrences in deployed models, we examine several structures, including look-ahead convolutions (Wang et al., 2016b) (LA-Conv) and latency-controlled bidirectional RNNs (in our case, LC-BGRU as our recurrent layers employ GRU (D. Bahdanau and Bengio, 2014) cells) (Chen and Huo, 2016; Zhang et al., 2016), which are illustrated in Figure 3.\n1Real-time-factor (RTF) has also been commonly used to measure the speed of an ASR system, but it is in most cases only loosely correlated with latency. While a RTF < 1 is necessary for a streaming system, it’s far from sufficient. As one example RTF does not consider the non-uniformity in processing time caused by (stacked) convolutions in neural networks.\n• An LA-Conv layer learns a linear weighted combination (convolution) of activations in the future ([t+1, t+C]) to compute activations for each neuron t, with a context size C, as shown in Figure 3 (e). The LA-Conv is placed above all recurrent layers.\n• In a LC-BGRU layer, an utterance is uniformly divided into several overlapping chunks, each of which can be treated as an independent utterance and computed with bidirectional recurrences. More formally, let L be the length of an utterance X . xi represents the ith frame of X . X is divided into overlapping chunks that are each of a fixed context size cW . In our experiments, the forward recurrences process X sequentially as x1,...,xL. Backward recurrences start processing the first chunk x1,...,xcW , then move ahead by chunk/step-size cS to independently process xcS ,...,xcW+cS , and so on. In relation to the first chunk x1,...,xcW , we refer to xcS ,...,xcW as the lookahead. Hidden-states hb of the backward recurrences are reset between each chunk, and consequently hb1 ,...,hbcS produced from each chunk are used in calculating the final output of the LC-BGRU layer. Figure [3] illustrates this operation and compares it with other methods which are proposed for similar purposes. The forward-looking and backwardlooking units in this LC-BGRU layer receive the same affine transformations of inputs. We found that this helps reduce computation and save parameters, without affecting the accuracy adversely. The outputs are then concatenated across features at each timestep before being fed into the next layer."
+    }, {
+      "heading" : "4.1. Accuracy and Serving Latency",
+      "text" : "We compare the Character Error Rate (CER) and lastpacket-latency of using LA-Conv and LC-BGRU, along with those of forward-GRU and Bidrectional GRU for ref-\nerences. Context size is fixed as 30 time steps for both LA-Conv and LC-BGRU, and lookahead timestep ranges from 5 to 25 every 5 steps for LC-BGRU. For latency experiments, we fix the packet size at 100 ms, and send one packet every 100 ms from the client. We send 10 simultaneous streams to simulate a system under moderate load. As shown in Figure 4a, while LA-Conv reduces almost half of the gap between forward GRU and bidirectional GRU, a model with three LC-BGRUs with lookahead of 25 each (yellow line) performs as well as bidirectional GRU (green line). The accuracy improves, but the serving latency increases exponentially as we stack LC-BGRU layers, because this increases the effective context much like in convolutional layers. Taking both accuracy and serving-latency into consideration, our final models use 1 LC-BGRU layer, with a lookahead of 20 timesteps (400ms) and step-size of 10 timesteps (200ms). 2"
+    }, {
+      "heading" : "4.2. Loading BGRU as LC-BGRU",
+      "text" : "Since Bidrectional GRUs (BGRU) can be considered as an extreme case of LC-BGRUs with infinite context (as long as the utterance length), it is interesting to know whether we could load a trained bidirectional GRU model as an LC-BGRU, so that we don’t have to train LC-BGRUs from scratch. However, we found that loading a model with 3 stacked bidirectional GRUs as stacked LC-BGRUs resulted in significant degradation in performance compared to both the bidirectional baseline and a model trained with stacked LC-BGRUs across a large set of chunk sizes and lookaheads.\nWe can improve the performance of the model, if we instead chop up the input at each layer to a fixed size cW , such that it is smaller than the effective context. We run an LC-BGRU layer on an input of length cW , then stride the input by cS , discard the last (cW - cS) outputs, and re-run the layer over the strided input. Between each iteration the forward recurrent states are copied over, but the backward recurrent states are reset each time. The effect of using vari-\n21 timestep corresponds to 10ms of the raw-input spectrogram, and then striding in the convolution layers makes that 20ms\nous cW and cS is shown in Figure 5. This approach is much more successful in that with cW >= 300 timesteps and cS >= 150 timesteps, we are able to obtain nearly identical error rates to the Bidirectional GRU. With this selection of cW and cS , the network does twice as much computation as would otherwise be needed, and it also has latencies that are unacceptable for streaming applications. However, it does have the advantage of running bi-directional recurrent layers over arbitrarily long utterances in a production environment at close to no loss in accuracy."
+    }, {
+      "heading" : "5. Loss function",
+      "text" : "The conditional independence assumption made by CTC forces the model to learn unimodal distributions over predicted label sequences. GramCTC (Liu et al., 2017) attempts to find a transformation of the output space where the conditional independence assumption made by CTC is less harmful. Specifically, GramCTC attempts to predict word-pieces, whereas traditional CTC based end-toend models aim to predict characters.\nGramCTC learns to align and decompose target sequences into word-pieces, or n-grams. N-Grams allow us to address the peculiarities of English spelling and pronunciation, where word-pieces have a consistent pronunciation, but characters don’t. For example, when the model is unsure how to spell a sound, it can choose to distribute probability mass roughly equally between all valid spellings of the sound, and let the language model decide the most appropriate way to spell the word. This is often the safest solution, since language models are typically trained on significantly larger datasets and see even the rarest words. GramCTC is a drop-in replacement for the CTC loss function, with the only requirement being a pre-specified set\nof n-grams G. In our experiments, we include all unigrams and high-frequency bi-grams and tri-grams, which composes a set of 1200 n-grams."
+    }, {
+      "heading" : "5.1. Forward-backward Process of GramCTC",
+      "text" : "The training process of GramCTC is very similar to CTC. The main difference is that multiple consecutive characters may form a valid gram. Thus, the total number of states in the forward-backward process is much larger, as well as the transition between these states.\nFigure 6 illustrates partially the dynamic programming process for the target sequence ‘CAT’. Here we suppose G contains all possible uni-grams and bi-grams. Thus, for each character in ‘CAT’, there are three possible states associated with it: 1) the current character, 2) the bi-gram ending in current character, and 3) the blank after current character. There is also one blank at beginning. In total we have 10 states."
+    }, {
+      "heading" : "5.2. GramCTC vs CTC",
+      "text" : "GramCTC effectively reduces the learning burden of ASR network in two ways: 1) it decomposes sentences into pronunciation-meaningful n-grams, and 2) it effectively reduces the number of output time steps. Both aspects simplify the rules the network needs to learn, thus reducing the required network capacity of the ASR task. Table 1 compares the performances between CTC and GramCTC using the same network. There are some interesting distinctions. First, the CERs of GramCTC are similar or even worse than CTC; however, the WERs of GramCTC are always significantly better than CTC. This is probably because GramCTC predicts in chunks of characters and the characters in the same chunk are dependent, thus more robust. Secondly, we also observe the performance on the dev set is relatively worse than that on the train holdout. Our dev dataset is not drawn from the same distribution of the training data - this exhibits the potential for GramCTC to overfit even a large dataset.\nTable 2 compares the training efficiency and the performance of trained model with GramCTC on two time resolutions, 2 and 4. By striding over the input at a faster rate in the early layers, we effectively reduce the time steps of later layers, and reduce the training time in half. From stride 2 to stride 4, the performance also improves a lot probably because larger n-grams align with larger segments of utterance, and thus need lower time resolution."
+    }, {
+      "heading" : "6. Optimization Tricks",
+      "text" : "Removing optimization issues have been a reliable way of improving performance in deep neural networks (Ioffe and Szegedy, 2015; He et al., 2016). Several optimization tricks have been proposed especially for training recurrent networks - we tried using LayerNorm (Ba et al., 2016), Recurrent batch norm (Cooijmans et al., 2016) and NormProp (Arpit et al., 2016) without much success. Additionally, we take care special care to optimize layers properly, and also employ SortaGrad (Amodei et al., 2015).\n(Sak et al., 2015) suggests that CTC training could be suffering from optimization issues and could be made more stable by providing alignment information during training. In this section we study how alignment information can be used effectively."
+    }, {
+      "heading" : "6.1. Pre-training vs Joint-training",
+      "text" : "Using alignment information for training CTC models appears counter intuitive since CTC marginalizes over all alignments during training. However, the CTC loss is hard to optimize because it simultaneously estimates network parameters and alignments. To simplify the problem, one may propose an Expectation-Maximization (EM) like approach, where the E-step computes the expected loglikelihood by marginalizing over the posterior of alignments, and the M-step refines the model parameters by\nmaximizing the expected log-likelihood. However, it is infeasible to compute the posterior for all the alignments, and we approximate it by taking only the most probable alignment. One step of EM can be considered as the pre-training approach of using alignment information - we start training a model with the most likely alignment (which simplifies to training with a Cross-Entropy (CE) loss for a few epochs, followed by training with the CTC loss.\nAnother way of using the alignment information is train a single model simultaneously using a weighted combination of the CTC loss and the CE loss.\nFigure 7c shows the training curves of the same model architecture with pure CTC training, pre-training and joint training with alignment information from different source models. In the case of pre-training we stop providing alignment information at the 6-th epoch, corresponding to the shift in the training curve. Note that the final training losses of both pre-trained and joint-trained models are all lower than the pure CTC trained model, showing the effectiveness of this optimization trick. Additionally, joint-training and pre-training are on par in terms of training, so we prefer joint-training to avoid multi phase training. The corresponding CER on dev set is presented in figure 7d."
+    }, {
+      "heading" : "6.2. Source of alignments",
+      "text" : "It is important for us to understand how accurate the alignment information needs to be, since different models have differing alignments according to the architecture and training methods.\nWe estimate alignments from three “reference” models (models with forward only GRU, LC-BGRU and bidirectional GRU layers, all trained with several epochs of CTC minimization), and present the cross correlation between the alignments produced by these models in Fig. 7a. The location of the peak implies the amount of delays between\ntwo alignments. It is evident that alignments by a forward (and LC-BGRU) model are 5 (4) time-steps later than those by a bidirectional model, an observation that is consistent with (Schuster and Paliwal, 1997). Therefore, it seems important to pre-train a model with properly adjusted alignments, e.g., alignments from a bidirectional model are supposed to be delayed for 5 steps to be used in the pre-training of a forward model. However, we found that for models trained on large datasets, this delay has little impact on the final result (figure 7b). To push this series of experiments to the extreme, we tried pre-training a model with random alignments. Random alignments do not work, but we found that most likely alignment as predict by any ctc model was sufficient to achieve improved optimization."
+    }, {
+      "heading" : "7. Experiments",
+      "text" : ""
+    }, {
+      "heading" : "7.1. Setup",
+      "text" : "In all experiments, the dataset is 10,000 hours of labeled speech from a wide variety of sources. The dataset is expanded by noise augmentation – in every epoch, 40% of the utterances are randomly selected and background noise is added. For robustness to reverberant noise encountered in far-field recognition, we adopt room impulse response (RIR) augmentation as in (Ko et al., 2017), in which case, we randomly sample a subset of the data and convolve each instance with a random RIR signal. 3\nThe model specification and training procedure are the same as in (Amodei et al., 2015). The baseline model is a deep recurrent neural network with two 2D convolutional input layers, followed by 3 forward Gated Recurrent layers (D. Bahdanau and Bengio, 2014), 2560 cells each, a look-ahead convolution layer and one fully connected layer before a softmax layer. The network is trained end-to-end to predict characters using the CTC loss. The configurations of the 2D convolution layers (filters, filter dimensions, channels, stride) are (32, 41x11, 1, 2x2) and (32, 21x11, 32, 2x1). Striding in both time and frequency domains helps us reduce computation in the convolution layers. In the convolution and fully-connected layers, we apply batch-normalization before applying nonlinearities (ReLU). We use sequence-wise batch-normalization in the recurrent layers (Amodei et al., 2015), effectively acting on the affine transformations of the inputs fed into them. Figure 8 shows the baseline model on the left.\nFor the baseline model, log spectrogram features are extracted, in 161 bins with a hop size of 10ms and window\n3We collect RIRs by emitting a signal from a speaker and capturing the signal, as well as the reverberations from the room, using an linear array of 8 microphones. The speaker is placed in a variety of configurations, ranging from 1 to 3 meters distance and 60 to 120 degrees inclination with respect to the array, for 20 different rooms.\nsize of 20ms, and are normalized so that each input feature has zero mean and unit variance. The optimization method we use is stochastic gradient descent with Nesterov momentum. Hyperparameters (batch-size = 512, learning-rate 7 × 10−4, momentum 0.99) are kept the same across different experiments.\nTable 3 shows the result of the proposed solutions in earlier sections. We report the results on a sample of the train set as well as a development set. The error rates on the train set are useful to identify over-fitting scenarios, especially since the development set is significantly different from our training distribution as their sources are different.\nIn Table 3, both character and word error rates (CER/WER) are produced using a greedy max decoding of the output softmax matrix, i.e., taking the most likely symbol at each time step and then removing blanks and repeated characters. However, when a language model is adopted as in the “Dev LM” results, we use a beam search over the combined CTC and LM scores."
+    }, {
+      "heading" : "7.2. Results of Individual Changes",
+      "text" : "In the first half of Table 3, we show the impact of each of the changes applied individually. All of the techniques proposed help fit the training data better, measured by CER on the train set. Several observations stand out.\n1. Replacing CTC loss with GramCTC loss achieves a lower WER, while CERs are similar on the train set. This indicates that the loss promotes the model to learn the spelling of words, but completely mispredicts words when they are not known. This effect results in diminished improvements when the language model is applied.\n2. Applying farfield augmentation on the same sized model results in a worse training error as expected. It shows a marginal improvement on the dev set, even though our dev set has a heavy representation of farfield audio.\n3. The single biggest improvement on the dev set is the addition of the LC-BGRU which closes the gap to bidirectional models by 50%.\n4. Joint (and pre) training with alignment information improves CER on the train set by 25%, highlighting optimization issues in training CTC models from scratch. However, these models get less of an improvement from language model decoding, indicating their softmax outputs could be overconfident, therefore less amenable to correction by the language model. This phenomenon is observed in all models employing CE training as well as our Bidirectional target model (the model that provides the targets used for CE training)."
+    }, {
+      "heading" : "7.3. Results of Incremental Changes",
+      "text" : "While we designed the solutions to address distinct issues in the model, we should not expect every individual improvement to be beneficial when used in combination. As an example, we see in the section on optimization that models with bidirectional layers gain very little by using alignment information - clearly, bidirectional layers by themselves address a part of the difficulty in optimizing CTC\nmodels. Therefore, addressing the absence of bidirectional layers will also address optimization difficulties and they may not stack up.\nWe see in the second half of Table 3 that improvements indeed do not stack up. There are 3 interesting models to discuss.\n1. The model mix of joint training with 3 increasingly difficult losses (CE, CTC, and GramCTC, Mix-1) achieves the best results on the train set far surpassing the other model mixes, and even nearly matching the performance of models with bidirectional layers on the train set. This model has the smallest gain on the dev set amongst all the mix-models, and puts it in the overfitting regime. We know that there exists a model that can generalize better than this one, while achieving the same error rates on the train set: the bidirectional baseline. Additionally, this model receives a weak improvement from the language model, which agrees with what we observed with GramCTC and CE training in 7.2.\n2. The model mix of PCEN, LC-BGRU and IR augmentation (Mix-2) performs worse on the train set – additional data augmentation with IR impulses makes the training data harder to fit as we have seen earlier, but PCEN and LC-BGRU is not sufficient to address this difficulty. However, the model does attain better generalization and performs better on the dev set, and ac-\ntually surpasses our bidirectional target when using a language model.\n3. Mix-3 adds CE joint training which helps to address optimization issues and leads to lower error rates on both the train and dev sets. However, the improvement in dev WER disappears when using a language model, again highlighting the language model integration issues when using CE training.\nFinally in Table 4, we compare Mix-3 against the baseline model, and its equivalent with twice as many parameters in every layer, on various categories of speech data. Clearly, Mix-3 is significantly better for “farfield” and “Names” speech data, two notably difficult categories for ASR. ASR tasks run into a generalization issue for “Names” categories because they are often required words that is not present in the acoustic training data. Similarly far field audio is hard to obtain and the models are forced to generalize out of the training data, in this case by making use of augmentation. At the same time, the serving latency of Mix-3 is only slightly higher than baseline model, still good for deployment."
+    }, {
+      "heading" : "8. Conclusion",
+      "text" : "In this work, we identify multiple sources of bias in endto-end speech systems which tend to encourage very large neural network structure, thus make deployment impractical. Multiple methods are proposed to address these issues, which enable us to build a model that performs significantly better on our target dev set, while still being good for streaming inference.\nWhile the addition of cross entropy alignment training and the GramCTC loss allow models to fit the training and validation data better with respect to the WER of a greedy max decoding, they see much less of a benefit from language\nmodeling integration. Using an LC-BRGU layer in place of lookahead convolutions conveys benefits across the board as does use of a PCEN layer at the front end. Finally, generalization to unseen data is improved by the addition of farfield augmentation."
+    }, {
+      "heading" : "9. Acknowledgements",
+      "text" : "We are indebted to the Baidu Speech Technology Group for all the IR convolutions, and the Quality Assurance team for helping us identify and understand useful metrics (like first, last and 98% packet latency). We are also grateful to the systems team at SVAIL, for their help in developing the training platform and infrastructure."
+    } ],
+    "references" : [ {
+      "title" : "Achieving human parity in conversational speech recognition",
+      "author" : [ "Wayne Xiong", "Jasha Droppo", "Xuedong Huang", "Frank Seide", "Mike Seltzer", "Andreas Stolcke", "Dong Yu", "Geoffrey Zweig" ],
+      "venue" : "arXiv preprint arXiv:1610.05256,",
+      "citeRegEx" : "Xiong et al\\.,? \\Q2016\\E",
+      "shortCiteRegEx" : "Xiong et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Trainable frontend for robust and far-field keyword spotting",
+      "author" : [ "Yuxuan Wang", "Pascal Getreuer", "Thad Hughes", "Richard F Lyon", "Rif A Saurous" ],
+      "venue" : "arXiv preprint arXiv:1607.05666,",
+      "citeRegEx" : "Wang et al\\.,? \\Q2016\\E",
+      "shortCiteRegEx" : "Wang et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Dense prediction on sequences with time-dilated convolutions for speech recognition",
+      "author" : [ "Tom Sercu", "Vaibhava Goel" ],
+      "venue" : "arXiv preprint arXiv:1611.09288,",
+      "citeRegEx" : "Sercu and Goel.,? \\Q2016\\E",
+      "shortCiteRegEx" : "Sercu and Goel.",
+      "year" : 2016
+    }, {
+      "title" : "A time delay neural network architecture for efficient modeling of long temporal contexts",
+      "author" : [ "Vijayaditya Peddinti", "Daniel Povey", "Sanjeev Khudanpur" ],
+      "venue" : "In INTERSPEECH,",
+      "citeRegEx" : "Peddinti et al\\.,? \\Q2015\\E",
+      "shortCiteRegEx" : "Peddinti et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "Highway long short-term memory rnns for distant speech recognition",
+      "author" : [ "Yu Zhang", "Guoguo Chen", "Dong Yu", "Kaisheng Yao", "Sanjeev Khudanpur", "James R. Glass" ],
+      "venue" : null,
+      "citeRegEx" : "Zhang et al\\.,? \\Q2016\\E",
+      "shortCiteRegEx" : "Zhang et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Gram-ctc: Automatic unit selection and target decomposition for sequence labelling",
+      "author" : [ "Hairong Liu", "Zhenyao Zhu", "Xiangang Li", "Sanjeev Satheesh" ],
+      "venue" : "arXiv preprint arXiv:1703.00096,",
+      "citeRegEx" : "Liu et al\\.,? \\Q2017\\E",
+      "shortCiteRegEx" : "Liu et al\\.",
+      "year" : 2017
+    }, {
+      "title" : "Fast and accurate recurrent neural network acoustic models for speech recognition",
+      "author" : [ "Hasim Sak", "Andrew Senior", "Kanishka Rao", "Francoise Beaufays" ],
+      "venue" : null,
+      "citeRegEx" : "Sak et al\\.,? \\Q2015\\E",
+      "shortCiteRegEx" : "Sak et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "Learning the speech frontend with raw waveform cldnns",
+      "author" : [ "Tara N. Sainath", "Ron J. Weiss", "Andrew W. Senior", "Kevin W. Wilson", "Oriol Vinyals" ],
+      "venue" : "In INTERSPEECH,",
+      "citeRegEx" : "Sainath et al\\.,? \\Q2015\\E",
+      "shortCiteRegEx" : "Sainath et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "Learning multiscale features directly from waveforms",
+      "author" : [ "Zhenyao Zhu", "Jesse Engel", "Awni Y. Hannun" ],
+      "venue" : "In INTERSPEECH,",
+      "citeRegEx" : "Zhu et al\\.,? \\Q2016\\E",
+      "shortCiteRegEx" : "Zhu et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Lookahead convlution layer for unidirectional recurrent neural networks. 2016b. http://www.cs.cmu.edu/ dyogatam/papers/wang+etal.iclrworkshop2016.pdf",
+      "author" : [ "Chong Wang", "Dani Yogatama", "Adam Coates", "Tony Han", "Awni Hannun", "Bo Xiao" ],
+      "venue" : null,
+      "citeRegEx" : "Wang et al\\.,? \\Q2016\\E",
+      "shortCiteRegEx" : "Wang et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Training deep bidirectional lstm acoustic model for lvcsr by a context-sensitivechunk bptt approach",
+      "author" : [ "Kai Chen", "Qiang Huo" ],
+      "venue" : "IEEE/ACM Transactions on Audio, Speech, and Language Processing,",
+      "citeRegEx" : "Chen and Huo.,? \\Q2016\\E",
+      "shortCiteRegEx" : "Chen and Huo.",
+      "year" : 2016
+    }, {
+      "title" : "Neural machine translation by jointly learning to align and translate",
+      "author" : [ "Dzmitry Bahdanau", "Kyunghyun Cho", "Yoshua Bengio" ],
+      "venue" : "In ICLR,",
+      "citeRegEx" : "Bahdanau et al\\.,? \\Q2015\\E",
+      "shortCiteRegEx" : "Bahdanau et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "Listen, attend and spell: A neural network for large vocabulary conversational speech recognition",
+      "author" : [ "William Chan", "Navdeep Jaitly", "Quoc Le", "Oriol Vinyals" ],
+      "venue" : "IEEE International Conference on Acoustics, Speech and Signal Processing (ICASSP),",
+      "citeRegEx" : "Chan et al\\.,? \\Q2016\\E",
+      "shortCiteRegEx" : "Chan et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Wav2letter: an end-to-end convnet-based speech recognition system",
+      "author" : [ "Ronan Collobert", "Christian Puhrsch", "Gabriel Synnaeve" ],
+      "venue" : "arXiv preprint arXiv:1609.03193,",
+      "citeRegEx" : "Collobert et al\\.,? \\Q2016\\E",
+      "shortCiteRegEx" : "Collobert et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Segmental recurrent neural networks for end-to-end speech recognition",
+      "author" : [ "Liang Lu", "Lingpeng Kong", "Chris Dyer", "Noah A. Smith", "Steve Renals" ],
+      "venue" : null,
+      "citeRegEx" : "Lu et al\\.,? \\Q2016\\E",
+      "shortCiteRegEx" : "Lu et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Purely sequence-trained neural networks for asr based on lattice-free mmi",
+      "author" : [ "Daniel Povey", "Vijayaditya Peddinti", "Daniel Galvez", "Pegah Ghahremani", "Vimal Manohar", "Xingyu Na", "Yiming Wang", "Sanjeev Khudanpur" ],
+      "venue" : null,
+      "citeRegEx" : "Povey et al\\.,? \\Q2016\\E",
+      "shortCiteRegEx" : "Povey et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Optimal estimators for spectral restoration of noisy speech",
+      "author" : [ "J. Porter", "S. Boll" ],
+      "venue" : "In Acoustics, Speech, and Signal Processing, IEEE International Conference on ICASSP ’84.,",
+      "citeRegEx" : "Porter and Boll.,? \\Q1984\\E",
+      "shortCiteRegEx" : "Porter and Boll.",
+      "year" : 1984
+    }, {
+      "title" : "Neural machine translation by jointly learning to align and translate",
+      "author" : [ "K. Cho D. Bahdanau", "Y. Bengio" ],
+      "venue" : null,
+      "citeRegEx" : "Bahdanau and Bengio.,? \\Q2014\\E",
+      "shortCiteRegEx" : "Bahdanau and Bengio.",
+      "year" : 2014
+    }, {
+      "title" : "Batch normalization: Accelerating deep network training by reducing internal covariate shift",
+      "author" : [ "Sergey Ioffe", "Christian Szegedy" ],
+      "venue" : null,
+      "citeRegEx" : "Ioffe and Szegedy.,? \\Q2015\\E",
+      "shortCiteRegEx" : "Ioffe and Szegedy.",
+      "year" : 2015
+    }, {
+      "title" : "Deep residual learning for image recognition",
+      "author" : [ "Kaiming He", "Xiangyu Zhang", "Shaoqing Ren", "Jian Sun" ],
+      "venue" : null,
+      "citeRegEx" : "He et al\\.,? \\Q2016\\E",
+      "shortCiteRegEx" : "He et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Recurrent batch normalization",
+      "author" : [ "Tim Cooijmans", "Nicolas Ballas", "César Laurent", "Aaron C. Courville" ],
+      "venue" : "CoRR, abs/1603.09025,",
+      "citeRegEx" : "Cooijmans et al\\.,? \\Q2016\\E",
+      "shortCiteRegEx" : "Cooijmans et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Bidirectional recurrent neural networks",
+      "author" : [ "Mike Schuster", "Kuldip K Paliwal" ],
+      "venue" : "IEEE Transactions on Signal Processing,",
+      "citeRegEx" : "Schuster and Paliwal.,? \\Q1997\\E",
+      "shortCiteRegEx" : "Schuster and Paliwal.",
+      "year" : 1997
+    }, {
+      "title" : "A study on data augmentation of reverberant speech for robust speech recognition",
+      "author" : [ "Tom Ko", "Vijayaditya Peddinti", "Daniel Povey", "Michael Seltzer", "Sanjeev Khudanpur" ],
+      "venue" : null,
+      "citeRegEx" : "Ko et al\\.,? \\Q2017\\E",
+      "shortCiteRegEx" : "Ko et al\\.",
+      "year" : 2017
+    } ],
+    "referenceMentions" : [ {
+      "referenceID" : 0,
+      "context" : "Deep learning has helped speech systems attain very strong results on speech recognition tasks for multiple languages (Xiong et al., 2016; Amodei et al., 2015).",
+      "startOffset" : 118,
+      "endOffset" : 159
+    }, {
+      "referenceID" : 0,
+      "context" : "Architectures for streaming inference: English ASR models greatly benefit from using information from a few time frames into the future (Xiong et al., 2016; Sercu and Goel, 2016; Peddinti et al., 2015).",
+      "startOffset" : 136,
+      "endOffset" : 201
+    }, {
+      "referenceID" : 2,
+      "context" : "Architectures for streaming inference: English ASR models greatly benefit from using information from a few time frames into the future (Xiong et al., 2016; Sercu and Goel, 2016; Peddinti et al., 2015).",
+      "startOffset" : 136,
+      "endOffset" : 201
+    }, {
+      "referenceID" : 3,
+      "context" : "Architectures for streaming inference: English ASR models greatly benefit from using information from a few time frames into the future (Xiong et al., 2016; Sercu and Goel, 2016; Peddinti et al., 2015).",
+      "startOffset" : 136,
+      "endOffset" : 201
+    }, {
+      "referenceID" : 4,
+      "context" : "We show the effectiveness of Latency Constrained Bidirectional RNNs (Zhang et al., 2016) in controlling the latency while still being able to include future context.",
+      "startOffset" : 68,
+      "endOffset" : 88
+    }, {
+      "referenceID" : 5,
+      "context" : "We show how GramCTC (Liu et al., 2017) finds the label space where this conditional independence is easier to manage.",
+      "startOffset" : 20,
+      "endOffset" : 38
+    }, {
+      "referenceID" : 6,
+      "context" : "Optimization issues: Additionally, the CTC loss is notoriously unstable (Sak et al., 2015), despite making sequence labeling tractable, since it is forcing the model to align the input and output sequences, as well as recognize output labels.",
+      "startOffset" : 72,
+      "endOffset" : 90
+    }, {
+      "referenceID" : 7,
+      "context" : "The most direct way to remove all bias in the inputmodeling is probably learning a sufficiently expressive model directly from raw waveforms as in (Sainath et al., 2015; Zhu et al., 2016) by parameterizing and learning these transformations.",
+      "startOffset" : 147,
+      "endOffset" : 187
+    }, {
+      "referenceID" : 8,
+      "context" : "The most direct way to remove all bias in the inputmodeling is probably learning a sufficiently expressive model directly from raw waveforms as in (Sainath et al., 2015; Zhu et al., 2016) by parameterizing and learning these transformations.",
+      "startOffset" : 147,
+      "endOffset" : 187
+    }, {
+      "referenceID" : 10,
+      "context" : "Latency constrained Bidirectional recurrent layers (LC-BRNN) and Context sensitive chunks (CSC) have been proposed in (Chen and Huo, 2016) for tractable sequence model training but not explored for streaming inference.",
+      "startOffset" : 118,
+      "endOffset" : 138
+    }, {
+      "referenceID" : 3,
+      "context" : "Time delay neural networks (Peddinti et al., 2015) and Convolutional networks are also options for controlling the amount of future context.",
+      "startOffset" : 27,
+      "endOffset" : 50
+    }, {
+      "referenceID" : 11,
+      "context" : "Alternatives have been proposed to relax the label independence assumption of the CTC loss - Attention models (Bahdanau et al., 2015; Chan et al., 2016), global normalization (Collobert et al.",
+      "startOffset" : 110,
+      "endOffset" : 152
+    }, {
+      "referenceID" : 12,
+      "context" : "Alternatives have been proposed to relax the label independence assumption of the CTC loss - Attention models (Bahdanau et al., 2015; Chan et al., 2016), global normalization (Collobert et al.",
+      "startOffset" : 110,
+      "endOffset" : 152
+    }, {
+      "referenceID" : 13,
+      "context" : ", 2016), global normalization (Collobert et al., 2016) and segmental RNNs (Lu et al.",
+      "startOffset" : 30,
+      "endOffset" : 54
+    }, {
+      "referenceID" : 14,
+      "context" : ", 2016) and segmental RNNs (Lu et al., 2016) and more end-to-end losses like lattice free MMI (Maximum Mutual Information) (Povey et al.",
+      "startOffset" : 27,
+      "endOffset" : 44
+    }, {
+      "referenceID" : 15,
+      "context" : ", 2016) and more end-to-end losses like lattice free MMI (Maximum Mutual Information) (Povey et al., 2016) are all promising approaches to address this problem.",
+      "startOffset" : 86,
+      "endOffset" : 106
+    }, {
+      "referenceID" : 6,
+      "context" : ", 2015) and by warm-starting CTC training from a model pre-trained by Cross-Entropy (CE) loss (using alignment information) (Sak et al., 2015).",
+      "startOffset" : 124,
+      "endOffset" : 142
+    }, {
+      "referenceID" : 16,
+      "context" : "The latter is designed to approximate an optimized spectral subtraction curve (Porter and Boll, 1984) which helps to improve robustness to background noises.",
+      "startOffset" : 78,
+      "endOffset" : 101
+    }, {
+      "referenceID" : 10,
+      "context" : "Bahdanau and Bengio, 2014) cells) (Chen and Huo, 2016; Zhang et al., 2016), which are illustrated in Figure 3.",
+      "startOffset" : 34,
+      "endOffset" : 74
+    }, {
+      "referenceID" : 4,
+      "context" : "Bahdanau and Bengio, 2014) cells) (Chen and Huo, 2016; Zhang et al., 2016), which are illustrated in Figure 3.",
+      "startOffset" : 34,
+      "endOffset" : 74
+    }, {
+      "referenceID" : 5,
+      "context" : "GramCTC (Liu et al., 2017) attempts to find a transformation of the output space where the conditional independence assumption made by CTC is less harmful.",
+      "startOffset" : 8,
+      "endOffset" : 26
+    }, {
+      "referenceID" : 18,
+      "context" : "Removing optimization issues have been a reliable way of improving performance in deep neural networks (Ioffe and Szegedy, 2015; He et al., 2016).",
+      "startOffset" : 103,
+      "endOffset" : 145
+    }, {
+      "referenceID" : 19,
+      "context" : "Removing optimization issues have been a reliable way of improving performance in deep neural networks (Ioffe and Szegedy, 2015; He et al., 2016).",
+      "startOffset" : 103,
+      "endOffset" : 145
+    }, {
+      "referenceID" : 20,
+      "context" : ", 2016), Recurrent batch norm (Cooijmans et al., 2016) and NormProp (Arpit et al.",
+      "startOffset" : 30,
+      "endOffset" : 54
+    }, {
+      "referenceID" : 6,
+      "context" : "(Sak et al., 2015) suggests that CTC training could be suffering from optimization issues and could be made more stable by providing alignment information during training.",
+      "startOffset" : 0,
+      "endOffset" : 18
+    }, {
+      "referenceID" : 21,
+      "context" : "It is evident that alignments by a forward (and LC-BGRU) model are 5 (4) time-steps later than those by a bidirectional model, an observation that is consistent with (Schuster and Paliwal, 1997).",
+      "startOffset" : 166,
+      "endOffset" : 194
+    }, {
+      "referenceID" : 22,
+      "context" : "For robustness to reverberant noise encountered in far-field recognition, we adopt room impulse response (RIR) augmentation as in (Ko et al., 2017), in which case, we randomly sample a subset of the data and convolve each instance with a random RIR signal.",
+      "startOffset" : 130,
+      "endOffset" : 147
+    } ],
+    "year" : 2017,
+    "abstractText" : "Replacing hand-engineered pipelines with endto-end deep learning systems has enabled strong results in applications like speech and object recognition. However, the causality and latency constraints of production systems put end-to-end speech models back into the underfitting regime and expose biases in the model that we show cannot be overcome by “scaling up”, i.e., training bigger models on more data. In this work we systematically identify and address sources of bias, reducing error rates by up to 20% while remaining practical for deployment. We achieve this by utilizing improved neural architectures for streaming inference, solving optimization issues, and employing strategies that increase audio and label modelling versatility.",
+    "creator" : "LaTeX with hyperref package"
+  }
+}

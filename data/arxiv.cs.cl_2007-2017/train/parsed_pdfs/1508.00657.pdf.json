@@ -1,0 +1,909 @@
+{
+  "name" : "1508.00657.pdf",
+  "metadata" : {
+    "source" : "CRF",
+    "title" : "Improved Transition-Based Parsing by Modeling Characters instead of Words with LSTMs",
+    "authors" : [ "Miguel Ballesteros", "Chris Dyer", "Noah A. Smith" ],
+    "emails" : [ "chris@marianaslabs.com,", "miguel.ballesteros@upf.edu,", "nasmith@cs.washington.edu" ],
+    "sections" : [ {
+      "heading" : "1 Introduction",
+      "text" : "At the heart of natural language parsing is the challenge of representing the “state” of an algorithm— what parts of a parse have been built and what parts of the input string are not yet accounted for—as it incrementally constructs a parse. Traditional approaches rely on independence assumptions, decomposition of scoring functions, and/or greedy approximations to keep this space manageable. Recently, continuous-state parsers have been proposed, in which the state is embedded as a vector (Titov and Henderson, 2007; Stenetorp, 2013; Chen and Manning, 2014; Dyer et al., 2015; Zhou et al., 2015; Weiss et al., 2015). Dyer et al. reported state-of-the-art performance on English and Chinese benchmarks using a transitionbased parser whose continuous-state embeddings were constructed using LSTM recurrent neural networks (RNNs) and estimated using backpropagation.\nSince morphology provides strong clues for parsing morphologically rich languages (Balles-\nteros, 2013), our primary extension takes the idea of continuous-state parsing a step farther to be include sensitive to word forms (in past work, continuous-state parsers consistently made use of vector embeddings of words that were independent of the form of the word). When estimated from distributional statistics, such vectors tend to learn a certain amount of syntactic and semantic information, leading (in a parser) to statistical sharing across “nearby” elements of the lexicon. However, these embeddings are oblivious to morphology; morphological variants will only be embedded close together if they are observed in similar contexts with sufficient frequency. Rich inflective morphology implies a greater diversity of surface forms, resulting in sparse data and poor estimates. Our solution to this problem is to reparameterize word embeddings using the same RNN machinery used in the parser: a word’s vector is calculated based on the sequence of orthographic symbols representing it (§3).\nAlthough this model is provided no supervision in the form of explicit morphological annotation, we find that it gives a large performance increase when parsing morphologically rich languages in the SPMRL datasets (Seddah et al., 2013; Seddah and Tsarfaty, 2014), especially in agglutinative languages and the ones that present extensive case systems. Further, this modification does not harm parser performance for other languages, and even improves when parsing without POS tags. Interestingly, we find that character-based word embeddings in some cases obviate explicit POS information. Taken together, these findings suggest that such representations are able to capture important morphosyntactic information from word strings. Runtime is minimally impacted, and the parser is quite fast.\nFinally, since the Dyer et al. (2015) parser used only a simple arc-standard parsing algorithm, it could not produce nonprojective trees. We present\nar X\niv :1\n50 8.\n00 65\n7v 1\n[ cs\n.C L\n] 4\nA ug\n2 01\n5\na parallel improvement to the parser by including a SWAP operation (Nivre, 2009) (§2.4), enabling the parser to produce nonprojective dependencies which are often found in morphologically rich languages."
+    }, {
+      "heading" : "2 Dependency Parser",
+      "text" : "We begin by reviewing the parsing approach of Dyer et al. (2015) on which our work is based.\nLike most transition-based parsers, Dyer et al.’s parser can be understood as the sequential manipulation of three data structures: a buffer B initialized with the sequence of words to be parsed, a stack S containing partially-built parses, and a list A of actions previously taken by the parser. In particular the parser implements the arc-standard parsing algorithm (Nivre, 2004).\nAt each time step t, a transition action is applied that alters these data structures by pushing or popping words from the stack and the buffer; the operations are listed in Figure 1.\nAlong with the discrete transitions above, the parser calculates a vector representation of the states of B, S, and A; at time step t these are denoted by bt, st, and at, respectively. The total parser state at t is given by\npt = max {0,W[st;bt;at] + d} (1)\nwhere the matrix W and the vector d are learned parameters. This continuous-state representation pt is used to decide which operation to apply next, updating B, S, and A (Figure 1).\nWe elaborate on the design of bt, st, and at using RNNs in §2.1, on the representation of partial parses in S in §2.2, and on the parser’s decision mechanism in §2.3. We discuss the inclusion of SWAP in §2.4."
+    }, {
+      "heading" : "2.1 Stack LSTMs",
+      "text" : "RNNs are functions that read a sequence of vectors incrementally; at time step t the vector xt is read in and the hidden state ht computed using xt and the previous hidden state ht−1. In principle, this allows retaining information from time steps in the distant past, but the nonlinear “squashing” functions applied in the calcluation of each ht result in a decay of the error signal used in training with backpropagation. LSTMs are a variant of RNNs designed to cope with this “vanishing gradient” problem using an extra memory “cell” (Hochreiter and Schmidhuber, 1997; Graves, 2013).\nPast work explains the computation within an LSTM through the metaphors of deciding how much of the current input to pass into memory (it) or forget (ft). We refer interested readers to the original papers and present only the recursive equations updating the memory cell ct and hidden state ht given xt, the previous hidden state ht−1, and the memory cell ct−1:\nit = σ(Wixxt +Wihht−1 +Wicct−1 + bi)\nft = 1− it ct = ft ct−1+\nit tanh(Wcxxt +Wchht−1 + bc) ot = σ(Woxxt +Wohht−1 +Wocct + bo)\nht = ot tanh(ct),\nwhere σ is the component-wise logistic sigmoid function and is the component-wise (Hadamard) product. Parameters are all represented using W and b. This formulation differs slightly from the classic LSTM formulation in that it makes use of “peephole connections” (Gers et al., 2002) and defines the forget gate so that it sums with the input gate to 1 (Greff et al., 2015). To improve the representational capacity of LSTMs (and RNNs generally), they can be stacked in “layers.” In these architectures, the input LSTM at higher layers at time t is the value of ht computed by the lower layer (and xt is the input at the lowest layer).\nThe stack LSTM augments the left-to-right sequential model of the conventional LSTM with a stack pointer. As in the LSTM, new inputs are added in the right-most position, but the stack pointer indicates which LSTM cell provides ct−1 and ht−1 for the computation of the next iterate. Further, the stack LSTM provides a pop operation that moves the stack pointer to the previous element. Hence each of the parser data structures (B, S, and A) is implemented with its own stack LSTM, each with its own parameters. The values of bt, st, and at are the ht vectors from their respective stack LSTMs."
+    }, {
+      "heading" : "2.2 Composition Functions",
+      "text" : "Whenever a REDUCE operation is selected, two tree fragments are popped off of S and combined to form a new tree fragment, which is then popped back onto S (see Figure 1). This tree must be embedded as an input vector xt.\nTo do this, Dyer et al. (2015) use a recursive neural network gr (for relation r) that composes\nthe representations of the two subtrees popped from S (we denote these by u and v), resulting in a new vector gr(u,v) or gr(v,u), depending on the direction of attachment. The resulting vector embeds the tree fragment in the same space as the words and other tree fragments. This kind of composition was thoroughly explored in prior work (Socher et al., 2011; Socher et al., 2013b; Hermann and Blunsom, 2013; Socher et al., 2013a); for details, see Dyer et al. (2015)."
+    }, {
+      "heading" : "2.3 Predicting Parser Decisions",
+      "text" : "The parser uses a probabilistic model of parser decisions at each time step t. Letting A(S,B) denote the set of allowed transitions given the stack S and buffer S (i.e., those where preconditions are met; see Figure 1), the probability of action z ∈ A(S,B) defined using a log-linear distribution:\np(z | pt) = exp\n( g>z pt + qz )∑ z′∈A(S,B) exp ( g>z′pt + qz′\n) (2) (where gz and qz are parameters associated with each action type z).\nParsing proceeds by always choosing the most probable action from A(S,B). The probabilistic definition allows parameter estimation for all of the parameters (W∗, b∗ in all three stack LSTMs, as well as W, d, g∗, and q∗) by maximizing the conditional likelihood of each correct parser decisions given the state."
+    }, {
+      "heading" : "2.4 Adding the SWAP Operation",
+      "text" : "Dyer et al. (2015)’s parser implemented the most basic version of the arc-standard algorithm, which is capable of producing only projective parse trees. In order to deal with nonprojective trees, we also add the SWAP operation which allows nonprojective trees to be produced.\nThe SWAP operation, first introduced by Nivre (2009) can produce nonprojective trees with a\ntransition-based parser. In Dyer et al. (2015)’s parser, besides the oracle transitions, the inclusion of the SWAP operation requires breaking the linearity of the stack by removing tokens that are not at the top of the stack, however this is easily handled with the stack LSTM. Figure 1 shows how the parser is capable of moving words from the stack (S) to the buffer (B), breaking the linear order of words. Since a node that is swapped may have already been assigned as the head of a dependent, the buffer (B) can now also contain tree fragments."
+    }, {
+      "heading" : "3 Word Representations",
+      "text" : "The main contribution of this paper is to change the word representations. In this section, we present the standard word embeddings as in Dyer et al. (2015), and the improvements we made generating word embeddings that are geared towards morphology based on orthographic strings."
+    }, {
+      "heading" : "3.1 Baseline: Standard Word Embeddings",
+      "text" : "Dyer et al.’s parser generates word representations to represent each input token, by concatenating two vectors: a vector representation for each word type (w); and a representation (t) of the POS tag of the token (if it is used), provided as auxiliary input to the parser.1 A linear map (V) is applied to the resulting vector and passed through a component-wise ReLU:\nx = max {0,V[w; t] + b}\nFor out-of-vocabulary words, the parser uses an “UNK” token that is handled as a separate word during parsing time. This mapping can be shown schematically as in Figure 2.\n1Dyer et al. (2015), included a third input representation learned from a neural language model (w̃LM). We do not include these pretrained representations in our experiments, focusing instead on character-based representations."
+    }, {
+      "heading" : "3.2 Character-based Embeddings of Words",
+      "text" : "Our main modification is an alternative to the continuous-space vector embeddings representing. Following (Ling et al., 2015), we compute character-based representations which are calculated as continuous-space vector embeddings representing the words based on bidirectional LSTMs (Graves and Schmidhuber, 2005). When the parser initiates the learning process and populates the buffer with all the words from the sentence, it reads the words character by character from left to right and computes a continuous-space vector embedding the character sequence, which is the h vector of the LSTM; we denote it by → w. The same process is applied in reverse, computing a similar continuous-space vector embedding starting from the last character and finishing at the first one ( ← w); again each character is represented with an LSTM cell. After that, we concatenate these vectors and a (learned) representation of their tag to produce the representation w. As in §3.1, a linear map (V) is applied and passed through a component-wise ReLU.\nx = max { 0,V[ → w; ← w; t] + b } This process is shown schematically in Figure 3.\nNote that under this representation, out-ofvocabulary words are treated as bidirectional LSTM encodings and thus they will be “close” to other words that the parser has seen during training, ideally close to their more frequent morphological relatives. We conjecture that this will give a clear advantage over a single “UNK” token for all the words that the parser does not see during training, as done by Dyer et al. (2015) and other parsers without additional resources. In §4 we confirm this hypothesis."
+    }, {
+      "heading" : "4 Experiments",
+      "text" : "We applied our parsing model and several variations of it to several parsing tasks and report results below."
+    }, {
+      "heading" : "4.1 Data",
+      "text" : "In order to find out whether the character-based representations are capable of learning the morphology of words, we applied the parser on morphologically rich languages. To put our results in context with the most recent neural network transition-based parsers, we run the parser in the same setup as Chen and Manning (2014) and Dyer et al. (2015), which means that we also run experiments for English and Chinese.\nWe applied our model to the the treebanks of the SPMRL Shared Task (Seddah et al., 2013; Seddah and Tsarfaty, 2014): Arabic (Maamouri et al., 2004), Basque (Aduriz et al., 2003), French (Abeillé et al., 2003), German (Seeker and Kuhn, 2012), Hebrew (Sima’an et al., 2001), Hungarian (Vincze et al., 2010), Korean (Choi, 2013), Polish (Świdziński and Woliński, 2010) and Swedish (Nivre et al., 2006b). For all the corpora of the SPMRL Shared Task we used predicted POS tags as provided by the shared task organizers.2 We also ran the experiment with the Turkish dependency treebank3 (Oflazer et al., 2003) of\n2The POS tags were calculated with MarMot tagger (Müller et al., 2013) by the best performing system of the SPMRL Shared Task (Björkelund et al., 2013). Arabic: 97.38. Basque: 97.02. French: 97.61. German: 98.10. Hebrew: 97.09. Hungarian: 98.72. Korean: 94.03. Polish: 98.12. Swedish: 97.27.\n3Since the Turkish dependency treebank does not have development set, we extracted the last 150 sentences from the 4996 sentences of the training set as a development set.\nthe CoNLL-X Shared Task (Buchholz and Marsi, 2006) and we use gold POS tags when used as it is common with the CoNLL-X data sets. Turkish is an agglutinative language.\nFor English, we used the Stanford Dependency (SD) treebank4 (Marneffe et al., 2006).5 For Chinese, we use the Penn Chinese Treebank 5.1 (CTB5) following Zhang and Clark (2008b),6 with gold POS tags."
+    }, {
+      "heading" : "4.2 Experimental Configurations",
+      "text" : "In order to isolate the improvements provided by the LSTM encodings of characters, we run the parser in the following configurations:\n• The parser by just using words, as in §3.1. [Words]\n• The parser using character-based representations of words with bidirectional LSTMs, as in §3.2. [Char-based]\n• The parser with words and POS tags, as in §3.1. [Words + POS]\n• The parser using character-based representations of words with bidirectional LSTMs plus POS tags, as in §3.2. [Char-based + POS]\nNone of the experimental configurations include pretrained word-embeddings or any additional data resources. All experiments include SWAP transition, meaning that nonprojective trees could be produced in any language.\nDimensionality. The full version of our parsing model sets dimensionalities as follows. LSTM hidden states are of size 100, and we use two layers of LSTMs for each stack. Embeddings of the parser actions used in the composition functions have 20 dimensions, and the output embedding size is 20 dimensions. The learned word representations embeddings have 32 dimensions when used, while the character-based representations have 100 dimensions, when used. Part of speech embeddings have 12 dimensions, when used. These dimensions were chosen after running several tests with different values, but a more careful selection of these values would probably further improve results.\n4Training: 02–21. Development: 22. Test: 23. 5The POS tags are predicted by using the Stanford Tagger (Toutanova et al., 2003) with an accuracy of 97.3%. 6Training: 001–815, 1001–1136. Development: 886– 931, 1148–1151. Test: 816–885, 1137–1147."
+    }, {
+      "heading" : "4.3 Training Process",
+      "text" : "Parameters are initialized randomly (refer to Dyer et al. (2015) for specifics) and optimized using stochastic gradient descent (without minibatches) using derivatives of the negative log likelihood of the sequence of parsing actions computed using backpropagation. Training is stopped when the learned model’s UAS stops improving on the development set, and this model is used to parse the test set. No pretraining of any parameters is done."
+    }, {
+      "heading" : "4.4 Results and Discussion",
+      "text" : "Tables 1 and 2 show the results of the parsers for the development sets and the final test sets, respectively. The results of Chinese, English and Turkish7 are calculated excluding punctuation symbols, as is the common practice in those treebanks; while the results in the rest are calculated including punctuation symbols for evaluation. The left hand side of the tables shows the results for the model that only use words forms ([Words] and [Char-based]), the parser is run simply by using the words that it can find in the training sets. The right hand of the table shows the results when we include the POS tags in the model ([Words + POS] and [Char-based + POS]).\nThe first conclusion to extract from the set of experiments is that the model really improves for Basque, Hungarian, Korean, Polish, and Turkish.\nBasque, Hungarian, Turkish, and Korean are agglutinative languages, and in these four languages [Char-based + POS] is superior than [Words + POS]. For Arabic there is a slight improvement as well. In fact, in Arabic, Basque, Korean, and Turkish [Char-based] is better than [Char-based + POS] and [Words + POS]. For the rest, we believe that the character-based representations helped a lot when the POS tags were not present since both POS tags and character-based representations approximate the same kind of information, but once the POS tags are included the character-based representations become less effective.\nIt is also worth noting that the character-based representations are always useful when the POS tags are not present ([Words] vs. [Char-based]), which means that the character-based representations are capable of learning similar information as the POS tags.\n7In the CoNLL-X Shared Task, they used eval.pl which calculates scores without punctuation symbols, while in the SPMRL Shared task used eval07.pl which includes punctuation for evaluation.\nIt is common practice to encode morphological information in the POS tags; for instance, the English treebank includes tense and number (NNS: singular noun or VBD: verbs in past tense) and even if our character-based representations are capable of encoding the same kind of information, the POS tags suffice for high accuracy. However, in morphologically rich languages, the POS tags do not seem to be enough.\nSwedish, English, and French use suffixes for the verb tenses and number,8 while Hebrew\n8Tense and number features provide little improvement in\npresents more prepositional particles rather than grammatical case. Tsarfaty (2006) and Cohen and Smith (2007) claimed that for Semitic languages, such as Hebrew, determining the correct morphological segmentation is dependent on syntactic context; our character-based representations are capturing the same kind of information and learning it from syntactic context. Chinese morphology is mainly represented by syllables that can even stand alone as different words, nonetheless the character-based representations are still\na transition-based parser, compared with other features such as case, when the POS tags are included (Ballesteros, 2013).\nuseful for Chinese. Finally, on average the parser is always better with character-based representations, regardless of whether POS tags are included; the best model for UAS is [Char-based], while the best model for LAS is [Char-based + POS]. We conclude that character-based representations have a positive role to play in statistical parsers."
+    }, {
+      "heading" : "4.4.1 Learned Word Representations",
+      "text" : "Figure 4 visualizes a sample of the characterbased bidimensional LSTMs’s learned representations [Char-based]. Clear clusters of past tense verbs, gerunds, and other syntactic classes are visible. The colors in the figure represent the most common POS tag for each word."
+    }, {
+      "heading" : "4.4.2 Out-of-Vocabulary Words",
+      "text" : "The character-based representation for words is notably beneficial for out-of-vocabulary (OOV) words. We tested this specifically by testing the [Char-based] and [Char-based + POS] models where unknown words are replaced by the string “UNK.” during parsing time, instead of having the corresponding character-based representation. Under these conditions, we see large performance\ndrops in languages with high OOV rates: Korean drops 15.5 LAS (6,708 OOVs out of 25,265 tokens in the development set); Hungarian drops 5.5 LAS (5,955 OOVs out of 29,970 tokens). Others show a much smaller drop: French (1,252 OOVs out of 38,603 tokens) drops 0.8 LAS. Table 3 shows all the results.\nInterestingly, this artificially impoverished model is still consistently better than [Words] for all languages (e.g., for Korean, by 4 LAS). This implies that not all of the improvement is due to OOV words; statistical sharing across orthographically close words is beneficial, as well.\nIncluding POS tags, [Char-based + POS] is also better for most languages but, as expected, the improvements are not that high. The highest one is Hungarian with 5.14 LAS points of improvement (71.02 vs 76.16) in the development set. Basque drops 3.49 LAS points (2,541 OOVs out of 13,840 tokens). In other languages, such as French, there is just a small variance (+/-0.02 LAS points)."
+    }, {
+      "heading" : "4.4.3 Computational Requirements",
+      "text" : "The character-based representations make the parser slower, since they require composing the character-based bidimensional LSTMs for each word of the input sentence; however, at test time these results could be cached. On average, [Words] parses a sentence in 44 ms, while [Charbased] needs 130 ms.9 Training time is affected by the same constant, needing some hours to have a competitive model. In terms of memory, [Words] requires on average 300 MB of main memory for both training and parsing, while [Char-based] requires 450 MB."
+    }, {
+      "heading" : "4.4.4 Comparison with State-of-the-Art",
+      "text" : "Table 4 shows a comparison with the state-ofthe-art parsers. We include greedy transitionbased parsers that, like ours, do not apply a beam search (Zhang and Clark, 2008b) or a dynamic oracle (Goldberg and Nivre, 2013). For all the SPMRL languages we show the results of Ballesteros (2013), who reported results after carrying out a careful automatic morphological feature selection experiment. For Turkish, we show the results of Nivre et al. (2006a) which also carried out a careful manual morphological feature selection. Compared to them, our parser performs competitively for all languages being better in most\n9We are using a machine with 32 Intel(R) Xeon(R) CPU E5-2650 at 2.00GHz; the parser runs on a single core.\nof them. Since those systems relied on morphological features, we believe that this comparison shows even more that the character-based representations are geared towards morphology. Again, it is worth emphasazing that our parser does not use explicit morphological features at all.\nWe also show the best results ever reported in these data sets. For the SPMRL data sets, the best performing system of the shared task is either (Björkelund et al., 2013) or (Björkelund et al., 2014), which are consistently better than our system for all languages. Note that the comparison is harsh to our system, which does not use unlabeled data or explicit morphological features nor any combination of different parsers. For Turkish, we report the results of Koo et al. (2010), which only reported unlabeled attachment scores. For English, we report (Weiss et al., 2015) and for Chi-\nnese, we report (Dyer et al., 2015) which is [Words + POS] but with pretrained word embeddings."
+    }, {
+      "heading" : "5 Related Work",
+      "text" : "Character-based representations have been explored in other NLP tasks; for instance, dos Santos and Zadrozny (2014) and dos Santos and Guimarães (2015) learned character level neural representations for POS tagging and named entity recognition, getting a high error reduction in both tasks. Their approach is similar to ours. Many approaches have used character-based models as additional features to improve existing models. For instance, Chrupała (2014) tried charater-based recurrent neural networks to normalize tweets.\nAlso, Botha and Blunsom (2014) show that stems, prefixes and suffixes can be used to learn useful word representations. Our approach is\nlearning similar representations, by using the bidirectional LSTMs. Similarly, Chen et al. (2015) proposes joint learning of character and word embeddings for Chinese, claiming that characters contain rich internal information.\nGoldberg and Tsarfaty (2008) and Goldberg and Elhadad (2011) presented methods for joint segmentation and phrase-structure parsing, by segmenting the words in useful morphologically oriented units.\nZhang et al. (2013) presented efforts on phrasestructure Chinese parsing with characters showing that Chinese can be parsed at the character level, and that Chinese word segmentation is useful for predicting the correct POS tags (Zhang and Clark, 2008a).\nBohnet et al. (2013) presented an arc-standard transition-based parser that performs competitively for joint morphological tagging and dependency parsing for richly inflected languages, such as Czech, Finnish, German, Hungarian, and Russian.\nTo the best of our knowledge, nobody has tried to incorporate character-based embeddings to boost transition-based dependency parsers as we do in this paper."
+    }, {
+      "heading" : "6 Conclusion",
+      "text" : "We have presented several interesting findings. First, we add new evidence that character-based representations are useful for NLP tasks. In this paper, we demonstrate that they are useful for transition-based dependency parsing, since they are capable of capturing morphological information crucial for analyzing syntax.\nThe improvements provided by the characterbased representations using bidirectional LSTMs are strong for agglutinative languages, such as Basque, Hungarian, Korean, and Turkish, since the inclusion of POS tags is not sufficient. This outcome is important, since annotating morphological information for a treebank is expensive; our model suggests that only dependency annotations are necessary and morphological features can be learned from strings.\nThe character-based representations are also a way of overcoming the out-of-vocabulary problem; without any additional resources, they enable the parser to substantially improve the performance when OOV rates are high. We expect that, in conjunction with a pretraing regime, or in\nconjunction with distributional word embeddings, further improvements could be realized."
+    }, {
+      "heading" : "Acknowledgments",
+      "text" : "MB was supported by the European Commission under the contract numbers FP7-ICT610411 (project MULTISENSOR) and H2020RIA-645012 (project KRISTINA). This research was supported by the U.S. Army Research Laboratory and the U.S. Army Research Office under contract/grant number W911NF-10-1-0533 and NSF IIS-1054319. This work was completed while NS was at CMU. Thanks to Joakim Nivre, Bernd Bohnet, Fei Liu and Swabha Swayamdipta for useful comments."
+    } ],
+    "references" : [ {
+      "title" : "Building a treebank for french",
+      "author" : [ "Anne Abeillé", "Lionel Clément", "François Toussenel." ],
+      "venue" : "Anne Abeillé, editor, Treebanks. Kluwer, Dordrecht.",
+      "citeRegEx" : "Abeillé et al\\.,? 2003",
+      "shortCiteRegEx" : "Abeillé et al\\.",
+      "year" : 2003
+    }, {
+      "title" : "Construction of a Basque dependency treebank",
+      "author" : [ "I. Aduriz", "M.J. Aranzabe", "J.M. Arriola", "A. Atutxa", "A. Dı́az de Ilarraza", "A. Garmendia", "M. Oronoz" ],
+      "venue" : null,
+      "citeRegEx" : "Aduriz et al\\.,? \\Q2003\\E",
+      "shortCiteRegEx" : "Aduriz et al\\.",
+      "year" : 2003
+    }, {
+      "title" : "Effective Morphological Feature Selection with MaltOptimizer at the SPMRL 2013 Shared Task",
+      "author" : [ "Miguel Ballesteros." ],
+      "venue" : "Proc. of SPMRL-EMNLP.",
+      "citeRegEx" : "Ballesteros.,? 2013",
+      "shortCiteRegEx" : "Ballesteros.",
+      "year" : 2013
+    }, {
+      "title" : "Re)ranking Meets Morphosyntax: State-of-the-art Results from the SPMRL 2013 Shared Task",
+      "author" : [ "Anders Björkelund", "Ozlem Cetinoglu", "Richárd Farkas", "Thomas Mueller", "Wolfgang Seeker." ],
+      "venue" : "SPMRL-EMNLP.",
+      "citeRegEx" : "Björkelund et al\\.,? 2013",
+      "shortCiteRegEx" : "Björkelund et al\\.",
+      "year" : 2013
+    }, {
+      "title" : "Introducing the IMS-Wrocław-Szeged-CIS entry at the SPMRL 2014 Shared Task: Reranking and Morpho-syntax",
+      "author" : [ "Anders Björkelund", "Özlem Çetinoğlu", "Agnieszka Faleńska", "Richárd Farkas", "Thomas Mueller", "Wolfgang Seeker", "Zsolt Szántó" ],
+      "venue" : null,
+      "citeRegEx" : "Björkelund et al\\.,? \\Q2014\\E",
+      "shortCiteRegEx" : "Björkelund et al\\.",
+      "year" : 2014
+    }, {
+      "title" : "Joint morphological and syntactic analysis for richly inflected languages",
+      "author" : [ "Bernd Bohnet", "Joakim Nivre", "Igor Boguslavsky", "Richard Farkas", "Filip Ginter", "Jan Hajia." ],
+      "venue" : "TACL, 1.",
+      "citeRegEx" : "Bohnet et al\\.,? 2013",
+      "shortCiteRegEx" : "Bohnet et al\\.",
+      "year" : 2013
+    }, {
+      "title" : "Compositional Morphology for Word Representations and Language Modelling",
+      "author" : [ "Jan A. Botha", "Phil Blunsom." ],
+      "venue" : "ICML.",
+      "citeRegEx" : "Botha and Blunsom.,? 2014",
+      "shortCiteRegEx" : "Botha and Blunsom.",
+      "year" : 2014
+    }, {
+      "title" : "CoNLLX shared task on multilingual dependency parsing",
+      "author" : [ "Sabine Buchholz", "Erwin Marsi." ],
+      "venue" : "Proceedings of the 10th Conference on Computational Natural Language Learning (CoNLL), pages 149–164.",
+      "citeRegEx" : "Buchholz and Marsi.,? 2006",
+      "shortCiteRegEx" : "Buchholz and Marsi.",
+      "year" : 2006
+    }, {
+      "title" : "A fast and accurate dependency parser using neural networks",
+      "author" : [ "Danqi Chen", "Christopher D. Manning." ],
+      "venue" : "Proc. EMNLP.",
+      "citeRegEx" : "Chen and Manning.,? 2014",
+      "shortCiteRegEx" : "Chen and Manning.",
+      "year" : 2014
+    }, {
+      "title" : "Joint learning of character and word embeddings",
+      "author" : [ "Xinxiong Chen", "Lei Xu", "Zhiyuan Liu", "Maosong Sun", "Huanbo Luan." ],
+      "venue" : "Proc. IJCAI.",
+      "citeRegEx" : "Chen et al\\.,? 2015",
+      "shortCiteRegEx" : "Chen et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "Preparing Korean Data for the Shared Task on Parsing Morphologically Rich Languages",
+      "author" : [ "Jinho D. Choi." ],
+      "venue" : "ArXiv e-prints, September.",
+      "citeRegEx" : "Choi.,? 2013",
+      "shortCiteRegEx" : "Choi.",
+      "year" : 2013
+    }, {
+      "title" : "Normalizing tweets with edit scripts and recurrent neural embeddings",
+      "author" : [ "Grzegorz Chrupała." ],
+      "venue" : "Proceedings of ACL.",
+      "citeRegEx" : "Chrupała.,? 2014",
+      "shortCiteRegEx" : "Chrupała.",
+      "year" : 2014
+    }, {
+      "title" : "Joint morphological and syntactic disambiguation",
+      "author" : [ "Shay B. Cohen", "Noah A. Smith." ],
+      "venue" : "Proc. EMNLP-CoNLL.",
+      "citeRegEx" : "Cohen and Smith.,? 2007",
+      "shortCiteRegEx" : "Cohen and Smith.",
+      "year" : 2007
+    }, {
+      "title" : "Boosting named entity recognition with neural character embeddings",
+      "author" : [ "Cicero Nogueira dos Santos", "Victor Guimarães." ],
+      "venue" : "Arxiv.",
+      "citeRegEx" : "Santos and Guimarães.,? 2015",
+      "shortCiteRegEx" : "Santos and Guimarães.",
+      "year" : 2015
+    }, {
+      "title" : "Learning character-level representations for part-ofspeech tagging",
+      "author" : [ "Cicero dos Santos", "Bianca Zadrozny." ],
+      "venue" : "Proceedings of the 31st International Conference on Machine Learning (ICML-14), pages 1818–1826.",
+      "citeRegEx" : "Santos and Zadrozny.,? 2014",
+      "shortCiteRegEx" : "Santos and Zadrozny.",
+      "year" : 2014
+    }, {
+      "title" : "Transitionbased dependency parsing with stack long shortterm memory",
+      "author" : [ "Chris Dyer", "Miguel Ballesteros", "Wang Ling", "Austin Matthews", "Noah A. Smith." ],
+      "venue" : "Proceedings of ACL.",
+      "citeRegEx" : "Dyer et al\\.,? 2015",
+      "shortCiteRegEx" : "Dyer et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "Learning precise timing with LSTM recurrent networks",
+      "author" : [ "Felix A. Gers", "Nicol N. Schraudolph", "Jürgen Schmidhuber." ],
+      "venue" : "JMLR, pages 115–143.",
+      "citeRegEx" : "Gers et al\\.,? 2002",
+      "shortCiteRegEx" : "Gers et al\\.",
+      "year" : 2002
+    }, {
+      "title" : "Joint hebrew segmentation and parsing using a pcfg-la lattice parser",
+      "author" : [ "Yoav Goldberg", "Michael Elhadad." ],
+      "venue" : "Proceedings of the 49th Annual Meeting of the Association for Computational Linguistics: Human Language Technologies: short papers-",
+      "citeRegEx" : "Goldberg and Elhadad.,? 2011",
+      "shortCiteRegEx" : "Goldberg and Elhadad.",
+      "year" : 2011
+    }, {
+      "title" : "Training deterministic parsers with non-deterministic oracles",
+      "author" : [ "Yoav Goldberg", "Joakim Nivre." ],
+      "venue" : "Transactions of the association for Computational Linguistics, 1:403–414.",
+      "citeRegEx" : "Goldberg and Nivre.,? 2013",
+      "shortCiteRegEx" : "Goldberg and Nivre.",
+      "year" : 2013
+    }, {
+      "title" : "A single generative model for joint morphological segmentation and syntactic parsing",
+      "author" : [ "Yoav Goldberg", "Reut Tsarfaty." ],
+      "venue" : "ACL, pages 371–379.",
+      "citeRegEx" : "Goldberg and Tsarfaty.,? 2008",
+      "shortCiteRegEx" : "Goldberg and Tsarfaty.",
+      "year" : 2008
+    }, {
+      "title" : "Framewise phoneme classification with bidirectional lstm and other neural network architectures",
+      "author" : [ "Alex Graves", "Jrgen Schmidhuber." ],
+      "venue" : "Neural Networks, 18(5-6).",
+      "citeRegEx" : "Graves and Schmidhuber.,? 2005",
+      "shortCiteRegEx" : "Graves and Schmidhuber.",
+      "year" : 2005
+    }, {
+      "title" : "Generating sequences with recurrent neural networks",
+      "author" : [ "Alex Graves." ],
+      "venue" : "CoRR, abs/1308.0850.",
+      "citeRegEx" : "Graves.,? 2013",
+      "shortCiteRegEx" : "Graves.",
+      "year" : 2013
+    }, {
+      "title" : "LSTM: A search space odyssey",
+      "author" : [ "Klaus Greff", "Rupesh Kumar Srivastava", "Jan Koutnı́k", "Bas R. Steunebrink", "Jürgen Schmidhuber" ],
+      "venue" : null,
+      "citeRegEx" : "Greff et al\\.,? \\Q2015\\E",
+      "shortCiteRegEx" : "Greff et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "The role of syntax in vector space models of compositional semantics",
+      "author" : [ "Karl Moritz Hermann", "Phil Blunsom." ],
+      "venue" : "Proc. ACL.",
+      "citeRegEx" : "Hermann and Blunsom.,? 2013",
+      "shortCiteRegEx" : "Hermann and Blunsom.",
+      "year" : 2013
+    }, {
+      "title" : "Long short-term memory",
+      "author" : [ "Sepp Hochreiter", "Jürgen Schmidhuber." ],
+      "venue" : "Neural Computation, 9(8):1735–1780.",
+      "citeRegEx" : "Hochreiter and Schmidhuber.,? 1997",
+      "shortCiteRegEx" : "Hochreiter and Schmidhuber.",
+      "year" : 1997
+    }, {
+      "title" : "Dual decomposition for parsing with non-projective head automata",
+      "author" : [ "Terry Koo", "Alexander M. Rush", "Michael Collins", "Tommi Jaakkola", "David Sontag." ],
+      "venue" : "Proceedings of EMNLP.",
+      "citeRegEx" : "Koo et al\\.,? 2010",
+      "shortCiteRegEx" : "Koo et al\\.",
+      "year" : 2010
+    }, {
+      "title" : "Finding function in form: Compositional character models for open vocabulary word representation",
+      "author" : [ "Wang Ling", "Tiago Luı́s", "Luı́s Marujo", "Ramón Fernandez Astudillo", "Silvio Amir", "Chris Dyer", "Alan W Black", "Isabel Trancoso" ],
+      "venue" : "In Proc. EMNLP",
+      "citeRegEx" : "Ling et al\\.,? \\Q2015\\E",
+      "shortCiteRegEx" : "Ling et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "The Penn Arabic Treebank: Building a Large-Scale Annotated Arabic Corpus",
+      "author" : [ "Mohamed Maamouri", "Ann Bies", "Tim Buckwalter", "Wigdan Mekki." ],
+      "venue" : "NEMLAR Conference on Arabic Language Resources and Tools.",
+      "citeRegEx" : "Maamouri et al\\.,? 2004",
+      "shortCiteRegEx" : "Maamouri et al\\.",
+      "year" : 2004
+    }, {
+      "title" : "Generating typed dependency parses from phrase structure parses",
+      "author" : [ "Marie-Catherine De Marneffe", "Bill Maccartney", "Christopher D. Manning." ],
+      "venue" : "Proc. LREC.",
+      "citeRegEx" : "Marneffe et al\\.,? 2006",
+      "shortCiteRegEx" : "Marneffe et al\\.",
+      "year" : 2006
+    }, {
+      "title" : "Efficient higher-order crfs for morphological tagging",
+      "author" : [ "Thomas Müller", "Helmut Schmid", "Hinrich Schütze." ],
+      "venue" : "Proc. EMNLP.",
+      "citeRegEx" : "Müller et al\\.,? 2013",
+      "shortCiteRegEx" : "Müller et al\\.",
+      "year" : 2013
+    }, {
+      "title" : "Labeled pseudo-projective dependency parsing with support vector machines",
+      "author" : [ "Joakim Nivre", "Johan Hall", "Jens Nilsson", "Gülsen Eryiğit", "Svetoslav Marinov." ],
+      "venue" : "Proceedings of the 10th Conference on Computational Natural Language Learning",
+      "citeRegEx" : "Nivre et al\\.,? 2006a",
+      "shortCiteRegEx" : "Nivre et al\\.",
+      "year" : 2006
+    }, {
+      "title" : "Talbanken05: A Swedish treebank with phrase structure and dependency annotation",
+      "author" : [ "Joakim Nivre", "Jens Nilsson", "Johan Hall." ],
+      "venue" : "Proceedings of LREC, pages 1392–1395, Genoa, Italy.",
+      "citeRegEx" : "Nivre et al\\.,? 2006b",
+      "shortCiteRegEx" : "Nivre et al\\.",
+      "year" : 2006
+    }, {
+      "title" : "Incrementality in deterministic dependency parsing",
+      "author" : [ "Joakim Nivre." ],
+      "venue" : "Proceedings of the Workshop on Incremental Parsing: Bringing Engineering and Cognition Together.",
+      "citeRegEx" : "Nivre.,? 2004",
+      "shortCiteRegEx" : "Nivre.",
+      "year" : 2004
+    }, {
+      "title" : "Non-projective dependency parsing in expected linear time",
+      "author" : [ "Joakim Nivre." ],
+      "venue" : "Proceedings of the Joint Conference of the 47th Annual Meeting of the ACL and the 4th International Joint Conference on Natural Language Processing of the AFNLP: Vol-",
+      "citeRegEx" : "Nivre.,? 2009",
+      "shortCiteRegEx" : "Nivre.",
+      "year" : 2009
+    }, {
+      "title" : "Building a turkish treebank",
+      "author" : [ "Kemal Oflazer", "Bilge Say", "Dilek Zeynep Hakkani-Tür", "Gökhan Tür." ],
+      "venue" : "Treebanks, pages 261–277. Springer.",
+      "citeRegEx" : "Oflazer et al\\.,? 2003",
+      "shortCiteRegEx" : "Oflazer et al\\.",
+      "year" : 2003
+    }, {
+      "title" : "Introducing the spmrl 2014 shared task on parsing morphologically-rich languages",
+      "author" : [ "Djamé Seddah", "Reut Tsarfaty." ],
+      "venue" : "SPMRL-SANCL 2014.",
+      "citeRegEx" : "Seddah and Tsarfaty.,? 2014",
+      "shortCiteRegEx" : "Seddah and Tsarfaty.",
+      "year" : 2014
+    }, {
+      "title" : "Overview of the SPMRL 2013 shared task: cross-framework evaluation of parsing mor",
+      "author" : [ "Djamé Seddah", "Reut Tsarfaty", "Sandra Kübler", "Marie Candito", "Jinho Choi", "Richárd Farkas", "Jennifer Foster", "Iakes Goenaga", "Koldo Gojenola", "Yoav Goldberg" ],
+      "venue" : null,
+      "citeRegEx" : "Seddah et al\\.,? \\Q2013\\E",
+      "shortCiteRegEx" : "Seddah et al\\.",
+      "year" : 2013
+    }, {
+      "title" : "Making Ellipses Explicit in Dependency Conversion for a German Treebank",
+      "author" : [ "Wolfgang Seeker", "Jonas Kuhn." ],
+      "venue" : "Proceedings of the 8th International Conference on Language Resources and Evaluation, pages 3132–3139, Istanbul, Turkey. Euro-",
+      "citeRegEx" : "Seeker and Kuhn.,? 2012",
+      "shortCiteRegEx" : "Seeker and Kuhn.",
+      "year" : 2012
+    }, {
+      "title" : "Building a Tree-Bank for Modern Hebrew Text",
+      "author" : [ "Khalil Sima’an", "Alon Itai", "Yoad Winter", "Alon Altman", "Noa Nativ" ],
+      "venue" : "In Traitement Automatique des Langues",
+      "citeRegEx" : "Sima.an et al\\.,? \\Q2001\\E",
+      "shortCiteRegEx" : "Sima.an et al\\.",
+      "year" : 2001
+    }, {
+      "title" : "Dynamic pooling and unfolding recursive autoencoders for paraphrase detection",
+      "author" : [ "Richard Socher", "Eric H. Huang", "Jeffrey Pennington", "Andrew Y. Ng", "Christopher D. Manning." ],
+      "venue" : "Proc. NIPS.",
+      "citeRegEx" : "Socher et al\\.,? 2011",
+      "shortCiteRegEx" : "Socher et al\\.",
+      "year" : 2011
+    }, {
+      "title" : "Grounded compositional semantics for finding and describing images with sentences",
+      "author" : [ "Richard Socher", "Andrej Karpathy", "Quoc V. Le", "Christopher D. Manning", "Andrew Y. Ng." ],
+      "venue" : "TACL.",
+      "citeRegEx" : "Socher et al\\.,? 2013a",
+      "shortCiteRegEx" : "Socher et al\\.",
+      "year" : 2013
+    }, {
+      "title" : "Recursive deep models for semantic compositionality over a sentiment treebank",
+      "author" : [ "Richard Socher", "Alex Perelygin", "Jean Y. Wu", "Jason Chuang", "Christopher D. Manning", "Andrew Y. Ng", "Christopher Potts." ],
+      "venue" : "Proc. EMNLP.",
+      "citeRegEx" : "Socher et al\\.,? 2013b",
+      "shortCiteRegEx" : "Socher et al\\.",
+      "year" : 2013
+    }, {
+      "title" : "Transition-based dependency parsing using recursive neural networks",
+      "author" : [ "Pontus Stenetorp." ],
+      "venue" : "Proc. NIPS Deep Learning Workshop.",
+      "citeRegEx" : "Stenetorp.,? 2013",
+      "shortCiteRegEx" : "Stenetorp.",
+      "year" : 2013
+    }, {
+      "title" : "Towards a bank of constituent parse trees for Polish",
+      "author" : [ "Marek Świdziński", "Marcin Woliński." ],
+      "venue" : "Text, Speech and Dialogue: 13th International Conference (TSD), Lecture Notes in Artificial Intelligence, pages 197—204, Brno, Czech Republic.",
+      "citeRegEx" : "Świdziński and Woliński.,? 2010",
+      "shortCiteRegEx" : "Świdziński and Woliński.",
+      "year" : 2010
+    }, {
+      "title" : "A latent variable model for generative dependency parsing",
+      "author" : [ "Ivan. Titov", "James. Henderson." ],
+      "venue" : "Proceedings of IWPT.",
+      "citeRegEx" : "Titov and Henderson.,? 2007",
+      "shortCiteRegEx" : "Titov and Henderson.",
+      "year" : 2007
+    }, {
+      "title" : "Feature-rich part-ofspeech tagging with a cyclic dependency network",
+      "author" : [ "Kristina Toutanova", "Dan Klein", "Christopher D. Manning", "Yoram Singer." ],
+      "venue" : "Proc. NAACL.",
+      "citeRegEx" : "Toutanova et al\\.,? 2003",
+      "shortCiteRegEx" : "Toutanova et al\\.",
+      "year" : 2003
+    }, {
+      "title" : "Integrated morphological and syntactic disambiguation for modern hebrew",
+      "author" : [ "Reut Tsarfaty." ],
+      "venue" : "Proceedings of the 21st International Conference on computational Linguistics and 44th Annual Meeting of the Association for Computational Linguistics:",
+      "citeRegEx" : "Tsarfaty.,? 2006",
+      "shortCiteRegEx" : "Tsarfaty.",
+      "year" : 2006
+    }, {
+      "title" : "Hungarian dependency treebank",
+      "author" : [ "Veronika Vincze", "Dóra Szauter", "Attila Almási", "György Móra", "Zoltán Alexin", "János Csirik." ],
+      "venue" : "LREC.",
+      "citeRegEx" : "Vincze et al\\.,? 2010",
+      "shortCiteRegEx" : "Vincze et al\\.",
+      "year" : 2010
+    }, {
+      "title" : "Structured training for neural network transition-based parsing",
+      "author" : [ "David Weiss", "Christopher Alberti", "Michael Collins", "Slav Petrov." ],
+      "venue" : "Proc. ACL.",
+      "citeRegEx" : "Weiss et al\\.,? 2015",
+      "shortCiteRegEx" : "Weiss et al\\.",
+      "year" : 2015
+    }, {
+      "title" : "Joint word segmentation and pos tagging using a single perceptron",
+      "author" : [ "Yue Zhang", "Stephen Clark." ],
+      "venue" : "ACL, pages 888–896.",
+      "citeRegEx" : "Zhang and Clark.,? 2008a",
+      "shortCiteRegEx" : "Zhang and Clark.",
+      "year" : 2008
+    }, {
+      "title" : "A tale of two parsers: Investigating and combining graph-based and transition-based dependency parsing",
+      "author" : [ "Yue Zhang", "Stephen Clark." ],
+      "venue" : "Proc. EMNLP.",
+      "citeRegEx" : "Zhang and Clark.,? 2008b",
+      "shortCiteRegEx" : "Zhang and Clark.",
+      "year" : 2008
+    }, {
+      "title" : "Chinese parsing exploiting characters",
+      "author" : [ "Meishan Zhang", "Yue Zhang", "Wanxiang Che", "Ting Liu." ],
+      "venue" : "ACL (1), pages 125–134.",
+      "citeRegEx" : "Zhang et al\\.,? 2013",
+      "shortCiteRegEx" : "Zhang et al\\.",
+      "year" : 2013
+    }, {
+      "title" : "A Neural Probabilistic StructuredPrediction Model for Transition-Based Dependency Parsing",
+      "author" : [ "Hao Zhou", "Yue Zhang", "Shujian Huang", "Jiajun Chen." ],
+      "venue" : "ACL.",
+      "citeRegEx" : "Zhou et al\\.,? 2015",
+      "shortCiteRegEx" : "Zhou et al\\.",
+      "year" : 2015
+    } ],
+    "referenceMentions" : [ {
+      "referenceID" : 44,
+      "context" : "Recently, continuous-state parsers have been proposed, in which the state is embedded as a vector (Titov and Henderson, 2007; Stenetorp, 2013; Chen and Manning, 2014; Dyer et al., 2015; Zhou et al., 2015; Weiss et al., 2015).",
+      "startOffset" : 98,
+      "endOffset" : 224
+    }, {
+      "referenceID" : 42,
+      "context" : "Recently, continuous-state parsers have been proposed, in which the state is embedded as a vector (Titov and Henderson, 2007; Stenetorp, 2013; Chen and Manning, 2014; Dyer et al., 2015; Zhou et al., 2015; Weiss et al., 2015).",
+      "startOffset" : 98,
+      "endOffset" : 224
+    }, {
+      "referenceID" : 8,
+      "context" : "Recently, continuous-state parsers have been proposed, in which the state is embedded as a vector (Titov and Henderson, 2007; Stenetorp, 2013; Chen and Manning, 2014; Dyer et al., 2015; Zhou et al., 2015; Weiss et al., 2015).",
+      "startOffset" : 98,
+      "endOffset" : 224
+    }, {
+      "referenceID" : 15,
+      "context" : "Recently, continuous-state parsers have been proposed, in which the state is embedded as a vector (Titov and Henderson, 2007; Stenetorp, 2013; Chen and Manning, 2014; Dyer et al., 2015; Zhou et al., 2015; Weiss et al., 2015).",
+      "startOffset" : 98,
+      "endOffset" : 224
+    }, {
+      "referenceID" : 52,
+      "context" : "Recently, continuous-state parsers have been proposed, in which the state is embedded as a vector (Titov and Henderson, 2007; Stenetorp, 2013; Chen and Manning, 2014; Dyer et al., 2015; Zhou et al., 2015; Weiss et al., 2015).",
+      "startOffset" : 98,
+      "endOffset" : 224
+    }, {
+      "referenceID" : 48,
+      "context" : "Recently, continuous-state parsers have been proposed, in which the state is embedded as a vector (Titov and Henderson, 2007; Stenetorp, 2013; Chen and Manning, 2014; Dyer et al., 2015; Zhou et al., 2015; Weiss et al., 2015).",
+      "startOffset" : 98,
+      "endOffset" : 224
+    }, {
+      "referenceID" : 2,
+      "context" : "Since morphology provides strong clues for parsing morphologically rich languages (Ballesteros, 2013), our primary extension takes the idea of continuous-state parsing a step farther to be include sensitive to word forms (in past work, continuous-state parsers consistently made use of vector embeddings of words that were independent of the form of the word).",
+      "startOffset" : 82,
+      "endOffset" : 101
+    }, {
+      "referenceID" : 36,
+      "context" : "Although this model is provided no supervision in the form of explicit morphological annotation, we find that it gives a large performance increase when parsing morphologically rich languages in the SPMRL datasets (Seddah et al., 2013; Seddah and Tsarfaty, 2014), especially in agglutinative languages and the ones that present extensive case systems.",
+      "startOffset" : 214,
+      "endOffset" : 262
+    }, {
+      "referenceID" : 35,
+      "context" : "Although this model is provided no supervision in the form of explicit morphological annotation, we find that it gives a large performance increase when parsing morphologically rich languages in the SPMRL datasets (Seddah et al., 2013; Seddah and Tsarfaty, 2014), especially in agglutinative languages and the ones that present extensive case systems.",
+      "startOffset" : 214,
+      "endOffset" : 262
+    }, {
+      "referenceID" : 15,
+      "context" : "Finally, since the Dyer et al. (2015) parser used only a simple arc-standard parsing algorithm, it could not produce nonprojective trees.",
+      "startOffset" : 19,
+      "endOffset" : 38
+    }, {
+      "referenceID" : 33,
+      "context" : "a parallel improvement to the parser by including a SWAP operation (Nivre, 2009) (§2.",
+      "startOffset" : 67,
+      "endOffset" : 80
+    }, {
+      "referenceID" : 15,
+      "context" : "We begin by reviewing the parsing approach of Dyer et al. (2015) on which our work is based.",
+      "startOffset" : 46,
+      "endOffset" : 65
+    }, {
+      "referenceID" : 32,
+      "context" : "In particular the parser implements the arc-standard parsing algorithm (Nivre, 2004).",
+      "startOffset" : 71,
+      "endOffset" : 84
+    }, {
+      "referenceID" : 24,
+      "context" : "LSTMs are a variant of RNNs designed to cope with this “vanishing gradient” problem using an extra memory “cell” (Hochreiter and Schmidhuber, 1997; Graves, 2013).",
+      "startOffset" : 113,
+      "endOffset" : 161
+    }, {
+      "referenceID" : 21,
+      "context" : "LSTMs are a variant of RNNs designed to cope with this “vanishing gradient” problem using an extra memory “cell” (Hochreiter and Schmidhuber, 1997; Graves, 2013).",
+      "startOffset" : 113,
+      "endOffset" : 161
+    }, {
+      "referenceID" : 16,
+      "context" : "This formulation differs slightly from the classic LSTM formulation in that it makes use of “peephole connections” (Gers et al., 2002) and defines the forget gate so that it sums with the input gate to 1 (Greff et al.",
+      "startOffset" : 115,
+      "endOffset" : 134
+    }, {
+      "referenceID" : 22,
+      "context" : ", 2002) and defines the forget gate so that it sums with the input gate to 1 (Greff et al., 2015).",
+      "startOffset" : 77,
+      "endOffset" : 97
+    }, {
+      "referenceID" : 15,
+      "context" : "To do this, Dyer et al. (2015) use a recursive neural network gr (for relation r) that composes",
+      "startOffset" : 12,
+      "endOffset" : 31
+    }, {
+      "referenceID" : 15,
+      "context" : "Dyer et al. (2015) used the SHIFT and REDUCE operations in their continuous-state parser; we add SWAP.",
+      "startOffset" : 0,
+      "endOffset" : 19
+    }, {
+      "referenceID" : 39,
+      "context" : "This kind of composition was thoroughly explored in prior work (Socher et al., 2011; Socher et al., 2013b; Hermann and Blunsom, 2013; Socher et al., 2013a); for details, see Dyer et al.",
+      "startOffset" : 63,
+      "endOffset" : 155
+    }, {
+      "referenceID" : 41,
+      "context" : "This kind of composition was thoroughly explored in prior work (Socher et al., 2011; Socher et al., 2013b; Hermann and Blunsom, 2013; Socher et al., 2013a); for details, see Dyer et al.",
+      "startOffset" : 63,
+      "endOffset" : 155
+    }, {
+      "referenceID" : 23,
+      "context" : "This kind of composition was thoroughly explored in prior work (Socher et al., 2011; Socher et al., 2013b; Hermann and Blunsom, 2013; Socher et al., 2013a); for details, see Dyer et al.",
+      "startOffset" : 63,
+      "endOffset" : 155
+    }, {
+      "referenceID" : 40,
+      "context" : "This kind of composition was thoroughly explored in prior work (Socher et al., 2011; Socher et al., 2013b; Hermann and Blunsom, 2013; Socher et al., 2013a); for details, see Dyer et al.",
+      "startOffset" : 63,
+      "endOffset" : 155
+    }, {
+      "referenceID" : 15,
+      "context" : ", 2013a); for details, see Dyer et al. (2015).",
+      "startOffset" : 27,
+      "endOffset" : 46
+    }, {
+      "referenceID" : 15,
+      "context" : "In this section, we present the standard word embeddings as in Dyer et al. (2015), and the improvements we made generating word embeddings that are geared towards morphology based on orthographic strings.",
+      "startOffset" : 63,
+      "endOffset" : 82
+    }, {
+      "referenceID" : 26,
+      "context" : "Following (Ling et al., 2015), we compute character-based representations which are calculated as continuous-space vector embeddings representing the words based on bidirectional LSTMs (Graves and Schmidhuber, 2005).",
+      "startOffset" : 10,
+      "endOffset" : 29
+    }, {
+      "referenceID" : 20,
+      "context" : ", 2015), we compute character-based representations which are calculated as continuous-space vector embeddings representing the words based on bidirectional LSTMs (Graves and Schmidhuber, 2005).",
+      "startOffset" : 163,
+      "endOffset" : 193
+    }, {
+      "referenceID" : 15,
+      "context" : "We conjecture that this will give a clear advantage over a single “UNK” token for all the words that the parser does not see during training, as done by Dyer et al. (2015) and other parsers without additional resources.",
+      "startOffset" : 153,
+      "endOffset" : 172
+    }, {
+      "referenceID" : 8,
+      "context" : "To put our results in context with the most recent neural network transition-based parsers, we run the parser in the same setup as Chen and Manning (2014) and Dyer et al.",
+      "startOffset" : 131,
+      "endOffset" : 155
+    }, {
+      "referenceID" : 8,
+      "context" : "To put our results in context with the most recent neural network transition-based parsers, we run the parser in the same setup as Chen and Manning (2014) and Dyer et al. (2015), which means that we also run experiments for English and Chinese.",
+      "startOffset" : 131,
+      "endOffset" : 178
+    }, {
+      "referenceID" : 36,
+      "context" : "SPMRL Shared Task (Seddah et al., 2013; Seddah and Tsarfaty, 2014): Arabic (Maamouri et al.",
+      "startOffset" : 18,
+      "endOffset" : 66
+    }, {
+      "referenceID" : 35,
+      "context" : "SPMRL Shared Task (Seddah et al., 2013; Seddah and Tsarfaty, 2014): Arabic (Maamouri et al.",
+      "startOffset" : 18,
+      "endOffset" : 66
+    }, {
+      "referenceID" : 27,
+      "context" : ", 2013; Seddah and Tsarfaty, 2014): Arabic (Maamouri et al., 2004), Basque (Aduriz et al.",
+      "startOffset" : 43,
+      "endOffset" : 66
+    }, {
+      "referenceID" : 1,
+      "context" : ", 2004), Basque (Aduriz et al., 2003), French (Abeillé et al.",
+      "startOffset" : 16,
+      "endOffset" : 37
+    }, {
+      "referenceID" : 0,
+      "context" : ", 2003), French (Abeillé et al., 2003), German (Seeker and Kuhn, 2012), Hebrew (Sima’an et al.",
+      "startOffset" : 16,
+      "endOffset" : 38
+    }, {
+      "referenceID" : 37,
+      "context" : ", 2003), German (Seeker and Kuhn, 2012), Hebrew (Sima’an et al.",
+      "startOffset" : 16,
+      "endOffset" : 39
+    }, {
+      "referenceID" : 38,
+      "context" : ", 2003), German (Seeker and Kuhn, 2012), Hebrew (Sima’an et al., 2001), Hungarian (Vincze et al.",
+      "startOffset" : 48,
+      "endOffset" : 70
+    }, {
+      "referenceID" : 47,
+      "context" : ", 2001), Hungarian (Vincze et al., 2010), Korean (Choi, 2013), Polish (Świdziński and Woliński, 2010) and Swedish (Nivre et al.",
+      "startOffset" : 19,
+      "endOffset" : 40
+    }, {
+      "referenceID" : 10,
+      "context" : ", 2010), Korean (Choi, 2013), Polish (Świdziński and Woliński, 2010) and Swedish (Nivre et al.",
+      "startOffset" : 16,
+      "endOffset" : 28
+    }, {
+      "referenceID" : 43,
+      "context" : ", 2010), Korean (Choi, 2013), Polish (Świdziński and Woliński, 2010) and Swedish (Nivre et al.",
+      "startOffset" : 37,
+      "endOffset" : 68
+    }, {
+      "referenceID" : 31,
+      "context" : ", 2010), Korean (Choi, 2013), Polish (Świdziński and Woliński, 2010) and Swedish (Nivre et al., 2006b).",
+      "startOffset" : 81,
+      "endOffset" : 102
+    }, {
+      "referenceID" : 34,
+      "context" : "2 We also ran the experiment with the Turkish dependency treebank3 (Oflazer et al., 2003) of",
+      "startOffset" : 67,
+      "endOffset" : 89
+    }, {
+      "referenceID" : 29,
+      "context" : "The POS tags were calculated with MarMot tagger (Müller et al., 2013) by the best performing system of the SPMRL Shared Task (Björkelund et al.",
+      "startOffset" : 48,
+      "endOffset" : 69
+    }, {
+      "referenceID" : 3,
+      "context" : ", 2013) by the best performing system of the SPMRL Shared Task (Björkelund et al., 2013).",
+      "startOffset" : 63,
+      "endOffset" : 88
+    }, {
+      "referenceID" : 7,
+      "context" : "the CoNLL-X Shared Task (Buchholz and Marsi, 2006) and we use gold POS tags when used as it is common with the CoNLL-X data sets.",
+      "startOffset" : 24,
+      "endOffset" : 50
+    }, {
+      "referenceID" : 28,
+      "context" : "For English, we used the Stanford Dependency (SD) treebank4 (Marneffe et al., 2006).",
+      "startOffset" : 60,
+      "endOffset" : 83
+    }, {
+      "referenceID" : 7,
+      "context" : "the CoNLL-X Shared Task (Buchholz and Marsi, 2006) and we use gold POS tags when used as it is common with the CoNLL-X data sets. Turkish is an agglutinative language. For English, we used the Stanford Dependency (SD) treebank4 (Marneffe et al., 2006).5 For Chinese, we use the Penn Chinese Treebank 5.1 (CTB5) following Zhang and Clark (2008b),6 with gold POS tags.",
+      "startOffset" : 25,
+      "endOffset" : 345
+    }, {
+      "referenceID" : 45,
+      "context" : "The POS tags are predicted by using the Stanford Tagger (Toutanova et al., 2003) with an accuracy of 97.",
+      "startOffset" : 56,
+      "endOffset" : 80
+    }, {
+      "referenceID" : 15,
+      "context" : "Parameters are initialized randomly (refer to Dyer et al. (2015) for specifics) and optimized using stochastic gradient descent (without minibatches) using derivatives of the negative log likelihood of the sequence of parsing actions computed using backpropagation.",
+      "startOffset" : 46,
+      "endOffset" : 65
+    }, {
+      "referenceID" : 45,
+      "context" : "Tsarfaty (2006) and Cohen and Smith (2007) claimed that for Semitic languages, such as Hebrew, determining the correct morphological segmentation is dependent on syntactic context; our character-based representations are capturing the same kind of information and learning it from syntactic context.",
+      "startOffset" : 0,
+      "endOffset" : 16
+    }, {
+      "referenceID" : 12,
+      "context" : "Tsarfaty (2006) and Cohen and Smith (2007) claimed that for Semitic languages, such as Hebrew, determining the correct morphological segmentation is dependent on syntactic context; our character-based representations are capturing the same kind of information and learning it from syntactic context.",
+      "startOffset" : 20,
+      "endOffset" : 43
+    }, {
+      "referenceID" : 2,
+      "context" : "a transition-based parser, compared with other features such as case, when the POS tags are included (Ballesteros, 2013).",
+      "startOffset" : 101,
+      "endOffset" : 120
+    }, {
+      "referenceID" : 50,
+      "context" : "We include greedy transitionbased parsers that, like ours, do not apply a beam search (Zhang and Clark, 2008b) or a dynamic oracle (Goldberg and Nivre, 2013).",
+      "startOffset" : 86,
+      "endOffset" : 110
+    }, {
+      "referenceID" : 18,
+      "context" : "We include greedy transitionbased parsers that, like ours, do not apply a beam search (Zhang and Clark, 2008b) or a dynamic oracle (Goldberg and Nivre, 2013).",
+      "startOffset" : 131,
+      "endOffset" : 157
+    }, {
+      "referenceID" : 2,
+      "context" : "For all the SPMRL languages we show the results of Ballesteros (2013), who reported results after carrying out a careful automatic morphological feature selection experiment.",
+      "startOffset" : 51,
+      "endOffset" : 70
+    }, {
+      "referenceID" : 2,
+      "context" : "For all the SPMRL languages we show the results of Ballesteros (2013), who reported results after carrying out a careful automatic morphological feature selection experiment. For Turkish, we show the results of Nivre et al. (2006a) which also carried out a careful manual morphological feature selection.",
+      "startOffset" : 51,
+      "endOffset" : 232
+    }, {
+      "referenceID" : 2,
+      "context" : "90 (Ballesteros, 2013) 88.",
+      "startOffset" : 3,
+      "endOffset" : 22
+    }, {
+      "referenceID" : 3,
+      "context" : "21 (Björkelund et al., 2013) Basque 85.",
+      "startOffset" : 3,
+      "endOffset" : 28
+    }, {
+      "referenceID" : 2,
+      "context" : "58 (Ballesteros, 2013) 89.",
+      "startOffset" : 3,
+      "endOffset" : 22
+    }, {
+      "referenceID" : 4,
+      "context" : "70 (Björkelund et al., 2014) French 86.",
+      "startOffset" : 3,
+      "endOffset" : 28
+    }, {
+      "referenceID" : 2,
+      "context" : "98 (Ballesteros, 2013) 89.",
+      "startOffset" : 3,
+      "endOffset" : 22
+    }, {
+      "referenceID" : 4,
+      "context" : "66 (Björkelund et al., 2014) German 87.",
+      "startOffset" : 3,
+      "endOffset" : 28
+    }, {
+      "referenceID" : 2,
+      "context" : "75 (Ballesteros, 2013) 91.",
+      "startOffset" : 3,
+      "endOffset" : 22
+    }, {
+      "referenceID" : 3,
+      "context" : "65 (Björkelund et al., 2013) Hebrew 80.",
+      "startOffset" : 3,
+      "endOffset" : 28
+    }, {
+      "referenceID" : 2,
+      "context" : "01 (Ballesteros, 2013) 87.",
+      "startOffset" : 3,
+      "endOffset" : 22
+    }, {
+      "referenceID" : 4,
+      "context" : "65 (Björkelund et al., 2014) Hungarian 80.",
+      "startOffset" : 3,
+      "endOffset" : 28
+    }, {
+      "referenceID" : 2,
+      "context" : "63 (Ballesteros, 2013) 89.",
+      "startOffset" : 3,
+      "endOffset" : 22
+    }, {
+      "referenceID" : 3,
+      "context" : "13 (Björkelund et al., 2013) Korean 88.",
+      "startOffset" : 3,
+      "endOffset" : 28
+    }, {
+      "referenceID" : 2,
+      "context" : "06 (Ballesteros, 2013) 89.",
+      "startOffset" : 3,
+      "endOffset" : 22
+    }, {
+      "referenceID" : 4,
+      "context" : "27 (Björkelund et al., 2014) Polish 87.",
+      "startOffset" : 3,
+      "endOffset" : 28
+    }, {
+      "referenceID" : 2,
+      "context" : "89 (Ballesteros, 2013) 91.",
+      "startOffset" : 3,
+      "endOffset" : 22
+    }, {
+      "referenceID" : 3,
+      "context" : "07 (Björkelund et al., 2013) Swedish 83.",
+      "startOffset" : 3,
+      "endOffset" : 28
+    }, {
+      "referenceID" : 2,
+      "context" : "82 (Ballesteros, 2013) 88.",
+      "startOffset" : 3,
+      "endOffset" : 22
+    }, {
+      "referenceID" : 4,
+      "context" : "75 (Björkelund et al., 2014) Turkish 76.",
+      "startOffset" : 3,
+      "endOffset" : 28
+    }, {
+      "referenceID" : 30,
+      "context" : "68 (Nivre et al., 2006a) 77.",
+      "startOffset" : 3,
+      "endOffset" : 24
+    }, {
+      "referenceID" : 25,
+      "context" : "55 n/a (Koo et al., 2010) Chinese 85.",
+      "startOffset" : 7,
+      "endOffset" : 25
+    }, {
+      "referenceID" : 15,
+      "context" : "70 (Dyer et al., 2015) 87.",
+      "startOffset" : 3,
+      "endOffset" : 22
+    }, {
+      "referenceID" : 15,
+      "context" : "70 (Dyer et al., 2015) English 92.",
+      "startOffset" : 3,
+      "endOffset" : 22
+    }, {
+      "referenceID" : 15,
+      "context" : "90 (Dyer et al., 2015) 94.",
+      "startOffset" : 3,
+      "endOffset" : 22
+    }, {
+      "referenceID" : 48,
+      "context" : "19 (Weiss et al., 2015)",
+      "startOffset" : 3,
+      "endOffset" : 23
+    }, {
+      "referenceID" : 3,
+      "context" : "For the SPMRL data sets, the best performing system of the shared task is either (Björkelund et al., 2013) or (Björkelund et al.",
+      "startOffset" : 81,
+      "endOffset" : 106
+    }, {
+      "referenceID" : 4,
+      "context" : ", 2013) or (Björkelund et al., 2014), which are consistently better than our system for all languages.",
+      "startOffset" : 11,
+      "endOffset" : 36
+    }, {
+      "referenceID" : 48,
+      "context" : "For English, we report (Weiss et al., 2015) and for Chinese, we report (Dyer et al.",
+      "startOffset" : 23,
+      "endOffset" : 43
+    }, {
+      "referenceID" : 15,
+      "context" : ", 2015) and for Chinese, we report (Dyer et al., 2015) which is [Words + POS] but with pretrained word embeddings.",
+      "startOffset" : 35,
+      "endOffset" : 54
+    }, {
+      "referenceID" : 3,
+      "context" : "For the SPMRL data sets, the best performing system of the shared task is either (Björkelund et al., 2013) or (Björkelund et al., 2014), which are consistently better than our system for all languages. Note that the comparison is harsh to our system, which does not use unlabeled data or explicit morphological features nor any combination of different parsers. For Turkish, we report the results of Koo et al. (2010), which only reported unlabeled attachment scores.",
+      "startOffset" : 82,
+      "endOffset" : 418
+    }, {
+      "referenceID" : 12,
+      "context" : "Character-based representations have been explored in other NLP tasks; for instance, dos Santos and Zadrozny (2014) and dos Santos and Guimarães (2015) learned character level neural representations for POS tagging and named entity recognition, getting a high error reduction in both tasks.",
+      "startOffset" : 89,
+      "endOffset" : 116
+    }, {
+      "referenceID" : 12,
+      "context" : "Character-based representations have been explored in other NLP tasks; for instance, dos Santos and Zadrozny (2014) and dos Santos and Guimarães (2015) learned character level neural representations for POS tagging and named entity recognition, getting a high error reduction in both tasks.",
+      "startOffset" : 124,
+      "endOffset" : 152
+    }, {
+      "referenceID" : 11,
+      "context" : "For instance, Chrupała (2014) tried charater-based recurrent neural networks to normalize tweets.",
+      "startOffset" : 14,
+      "endOffset" : 30
+    }, {
+      "referenceID" : 6,
+      "context" : "Also, Botha and Blunsom (2014) show that stems, prefixes and suffixes can be used to learn useful word representations.",
+      "startOffset" : 6,
+      "endOffset" : 31
+    }, {
+      "referenceID" : 9,
+      "context" : "Similarly, Chen et al. (2015) proposes joint learning of character and word embeddings for Chinese, claiming that characters contain rich internal information.",
+      "startOffset" : 11,
+      "endOffset" : 30
+    }, {
+      "referenceID" : 17,
+      "context" : "Goldberg and Tsarfaty (2008) and Goldberg and Elhadad (2011) presented methods for joint segmentation and phrase-structure parsing, by segmenting the words in useful morphologically oriented units.",
+      "startOffset" : 33,
+      "endOffset" : 61
+    }, {
+      "referenceID" : 49,
+      "context" : "(2013) presented efforts on phrasestructure Chinese parsing with characters showing that Chinese can be parsed at the character level, and that Chinese word segmentation is useful for predicting the correct POS tags (Zhang and Clark, 2008a).",
+      "startOffset" : 216,
+      "endOffset" : 240
+    } ],
+    "year" : 2017,
+    "abstractText" : "We present extensions to a continuousstate dependency parsing method that makes it applicable to morphologically rich languages. Starting with a highperformance transition-based parser that uses long short-term memory (LSTM) recurrent neural networks to learn representations of the parser state, we replace lookup based word representations with representations constructed based on the orthographic representations of the words, also using LSTMs. This allows statistical sharing across word forms that are similar on the surface. Experiments for morphologically rich languages show that the parsing model benefits from incorporating the character-based encodings of words.",
+    "creator" : "TeX"
+  }
+}

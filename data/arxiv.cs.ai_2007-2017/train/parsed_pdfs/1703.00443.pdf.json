@@ -1,0 +1,228 @@
+{
+  "name" : "1703.00443.pdf",
+  "metadata" : {
+    "source" : "META",
+    "title" : "OptNet: Differentiable Optimization as a Layer in Neural Networks",
+    "authors" : [ "Brandon Amos", "J. Zico Kolter" ],
+    "emails" : [ "<bamos@cs.cmu.edu>,", "<zkolter@cs.cmu.edu>." ],
+    "sections" : [ {
+      "heading" : "1. Introduction",
+      "text" : "In this paper, we lay the foundation and provide algorithms for treating constrained, exact optimization as itself a layer within a deep learning architecture. Unlike traditional feedforward networks, where the output of each layer is a relatively simple (though non-linear) function of the previous layer, our optimization framework allows for individual layers to capture much richer behavior, expressing complex operations that in total can reduce the overall depth\n1School of Computer Science, Carnegie Mellon University. Pittsburgh, PA, USA. Correspondence to: Brandon Amos <bamos@cs.cmu.edu>, J. Zico Kolter <zkolter@cs.cmu.edu>.\nUnder review by the International Conference on Machine Learning (ICML) 2017.\nof the network while preserving richness of representation. Specifically, we build a framework where the output of the i + 1th layer in a network is the solution to a constrained optimization problem based upon previous layers. This framework naturally encompasses a wide variety of inference problems expressed within a neural network, allowing for the potential of much richer end-to-end training for complex tasks that require such inference procedures.\nConcretely, in this paper we specifically consider the task of solving small quadratic programs as individual layers. That is, we consider layers of the form\nzi+1 = argmin z\n1 2 zTQ(zi)z + p(zi) T z\nsubject to A(zi)z = b(zi)\nG(zi)z ≤ h(zi)\n(1)\nwhere z is the optimization variable, Q(zi), p(zi), A(zi), b(zi), G(zi), and h(zi) are parameters of the optimization problem. As the notation suggests, these parameters can depend in any differentiable way on the previous layer zi, and which can eventually be optimized just like any other weights in a neural network.\nTo implement layers of this form, we present two chief innovations. First, we show that it is possible backpropagate the relevant gradient information through the argmin operator for a strictly convex quadratic program. By taking matrix differentials of the KKT conditions of the optimization problem at its solution, we derive backpropagation rules that allow us to compute all the relevant derivatives with respect to all the relevant parameters and through the layer.\nSecond, in order to the make the approach actually practical for large networks, we develop a custom solver which can simultaneously solve multiple small QPs in batch form. We do so by developing a custom interior point primal dual method tailored specifically to dense batch operations on a GPU. Unlike virtually all existing related work that we are aware of, our architecture does not simply unroll an optimization procedure like gradient descent as a computation graph, but instead computes the gradients analytically at the solution to the optimization problem, which can then be computed much more efficiently and exactly. In total, the solver can solve batches of quadratic programs over 100 times faster than existing highly tuned quadratic pro-\nar X\niv :1\n70 3.\n00 44\n3v 1\n[ cs\n.L G\n] 1\nM ar\n2 01\n7\ngramming solvers such as Gurobi and CPLEX. One crucial algorithmic insight in the solver is that by using a specific factorization of the interior point primal-dual update, we can obtain a backward pass over the optimization layer virtually “for free” (i.e., requiring no additional factorization once the optimization problem itself has been solved). Together, these innovations make it practical to include parameterized optimization problems directly within the architecture of existing deep networks.\nWe begin by highlighting background and related work, and then present our optimization layer itself. Using matrix differentials we derive rules for computing all the necessary backpropagation updates. We then detail our specific solver for these quadratic programs, based upon a state-ofthe-art primal-dual interior point architecture, and highlight the novel elements as they apply to our formulation, such as the aforementioned fact that we can compute backpropagation at very little additional cost. We then provide experimental results that demonstrate the capabilities of the architecture, highlighting potential tasks that these architectures can solve, and illustrating improvements upon existing approaches."
+    }, {
+      "heading" : "2. Background and related work",
+      "text" : "General optimization and quadratic programming Optimization plays a key role in modeling complex phenomena and providing concrete decision making processes in complex environments. For example, many control tasks are naturally represented as the solution to optimization problems such as those that occur in model prediction control frameworks (Morari & Lee, 1999); problems in rigid body dynamics like predicting contact forces are expressed and solved with quadratic programming (Lötstedt, 1984); and numerous statistical and mathematical formalisms are easily described via the solution to optimization problems (Boyd & Vandenberghe, 2004). Our work is a step towards learning optimization problems behind real-world processes from data that can be learned end-to-end rather than requiring human specification and intervention.\nOptimization within deep architectures In addition to its general prominence, optimization is playing an increasingly important role in deep architectures. For instance, recent work on structured prediction (Belanger & McCallum, 2016; Amos et al., 2016) has used optimization within energy-based neural network models, and (Metz et al., 2016) used unrolled optimization within a network to stabilize the convergence of generative adversarial networks (Goodfellow et al., 2014).\nThese architectures typically introduce an optimization procedure such as gradient descent into the inference procedure. The optimization procedure is unrolled automati-\ncally or manually (Domke, 2012) to obtain derivatives during training that incorporate the effects of these in-the-loop optimization procedures. However, unrolling the computation of a method like gradient descent typically requires a substantially larger network, and adds substantially to the computation complexity of the network. Crucially, in this paper, we do not unroll a optimization procedure but instead solve (constrained) optimization problems exactly (to numerical precision) using an interior point methods (Wright, 1997), and then analytically derive expressions for the gradients using the matrix differential of the KKT conditions.\nStructured prediction and MAP inference Our work also draws some connection to MAP-inference-based learning and approximate inference. There are two broad classes of learning approaches in structured prediction: methods that use probabilistic inference techniques (typically exploiting the fact that the gradient of the log likelihood is given by the actual feature expectations minus their expectation under the learned model (Koller & Friedman, 2009, Ch 20)), and methods that rely solely upon MAP inference (such as max-margin structured prediction (Taskar et al., 2005; Tsochantaridis et al., 2005)). MAP inference in particular also has close connections to optimization, as various convex relaxations of the general MAP inference problem often perform well in practice or in theory. The proposed methods can be viewed as an extreme case of this second class of algorithm, where inference is based solely upon a convex optimization problem that may not have any probabilistic semantics at all.\nArgmin differentiation Most closely related to our own work, there have been several recent papers that propose some form of differentiation through argmin operators. In the case of (Gould et al., 2016), the authors describe general techniques for differentiation through optimization problems, but only describe the case of exact equality constraints rather than both equality and inequality constraints (in the case inequality constraints, they add these via a barrier function). Other work (Johnson et al., 2016; Amos et al., 2016) (the later with some inequality constraints) uses argmin differentiation within the context of a specific optimization problem, but doesn’t consider a particularly general setting; similarly, the older work of (Mairal et al., 2012) considered argmin differentiation for a LASSO problem, deriving specific rules for this case, and presenting an efficient algorithm based upon our ability to solve the LASSO problem efficiently. However, to the best of our knowledge none of these approaches consider how to handle and differentiate through general types of exact inequality and equality constraints, nor have they developed methods to make these approaches practical within the context of existing architectures."
+    }, {
+      "heading" : "3. OptNet: solving optimization within a neural network",
+      "text" : "In the most general form, an OptNet layer is an optimization problem of the form\nzi+1 = argmin z fθ(z, zi)\nsubject to gφ(z, zi) ≤ 0 hϕ(z, zi) = 0 (2)\nwhere zi and zi+1 are the previous and current layer, z is the optimization variable, and θ, φ, and ϕ are parameters. Although most of the techniques we present here can easily be extend to the case of any convex optimization problem, the remainder of this paper will focus on the special case, mentioned in the introduction, where (2) is a convex quadratic program. More general convex optimization problems can be solved, for instance, using sequential quadratic programming that makes a relatively small number of calls to our QP optimizer within an inner loop over the larger optimization procedure."
+    }, {
+      "heading" : "3.1. QP layers and backpropagation",
+      "text" : "To formally define our layer, we slightly simplify the previous notation, and consider the convex quadratic program\nminimize z\n1 2 zTQz + pT z\nsubject to Az = b, Gz ≤ h (3)\nwhere z ∈ Rn is our optimization variable,Q ∈ Rn×n 0 (a positive semidefinite matrix), p ∈ Rn, A ∈ Rm×n, b ∈ Rm, G ∈ Rp×n and h ∈ Rp are problem data. As is well-known, these problems can be solved in polynomial time using a variety of methods; if one desires exact (to numerical precision) solutions to these problems, then primal-dual interior point methods, as we will use in a later section, are the current state of the art in solution methods.\nIn the neural network setting, the optimal solution (or more generally, a subset of the optimal solution) of this optimization problems becomes the output of our layer, denoted zi+1, and any of the problem data Q, p,A, b,G, h can depend on the value of the previous layer zi. The forward pass in our OptNet architecture thus involves simply setting up and finding the solution to the above optimization problems.\nTraining deep architectures, however, requires that we not just have a forward pass in our network but also a backward pass. This requires that we compute the derivative of the solution to the QP with respect to its input parameters. Although the previous papers mentioned above have considered similar argmin differentiation techniques (Gould et al., 2016), to the best of our knowledge this is the first case of a general formulation for argmin differentiation in the\npresence of exact equality and inequality constraints. To obtain these derivatives, we we differentiate the KKT conditions (sufficient and necessary condition for optimality) of (3) at a solution to the problem, using techniques from matrix differential calculus (Magnus & Neudecker, 1988). Our analysis here can be extended to more general convex optimization problems.\nThe Lagrangian of (3) is given by\nL(z, ν, λ) = 1\n2 zTQz + pT z + νT (Az − b) + λT (Gz − h)\n(4) where ν are the dual variables on the equality constraints and λ ≥ 0 are the dual variables on the inequality constraints. The KKT conditions for stationarity, primal feasibility, and complementary slackness are\nQz? + p+AT ν? +GTλ? = 0\nAz? − b = 0 D(λ?)(Gz? − h) = 0,\n(5)\nwhereD(·) creates a diagonal matrix from a vector. Taking the differentials of these conditions gives the equations\ndQz? +Qdz + dp+ dAT ν?+\nAT dν + dGTλ? +GT dλ = 0\ndAz? +Adz − db = 0 D(Gz? − h)dλ+D(λ?)(dGz? +Gdz − dh) = 0\n(6)\nor written more compactly in matrix form Q GT ATD(λ?)G D(Gz? − h) 0 A 0 0 dzdλ dν  = −dQz? − dp− dGTλ? − dAT ν?−D(λ?)dGz? +D(λ?)dh\n−dAz? + db\n . (7)\nUsing these equations, we can form the Jacobians of z? (or λ? and ν?, though we don’t consider this case here), with respect to any of the data parameters. For example, if we wished to compute the Jacobian ∂z ?\n∂b ∈ R n×m, we would\nsimply substitute db = I (and set all other differential terms in the right hand side to zero), solve the equation, and the resulting value of dz would be the desired Jacobian.\nIn the backpropagation algorithm, however, we never want to explicitly form the actual Jacobian matrices, but rather want to form the left matrix-vector product with some previous backward pass vector ∂`∂z? ∈ R n, i.e., ∂`∂z? ∂z?\n∂b . We can do this efficiently by noting the solution for the (dz, dλ, dν) involves multiplying the inverse of the lefthand-side matrix in (7) by some right hand side. Thus, if multiply the backward pass vector by the transpose of the\ndifferential matrixdzdλ dν  = Q GTD(λ?) ATG D(Gz? − h) 0 A 0 0 −1 ( ∂`∂z? )T0 0  (8) then the relevant gradients with respect to all the QP parameters can be given by\n∂` ∂p = dz\n∂` ∂b = −dν\n∂` ∂p = dz\n∂` ∂b = −dν\n∂` ∂h = −D(λ?)dλ\n∂` ∂Q = 1 2 (dxx T + xdTx )\n∂` ∂A = dνx T + νdTx ∂` ∂G = D(λ?)(dλx T + λdTx )\n(9)\nwhere as in standard backpropagation, all these terms are at most the size of the parameter matrices. As we will see in the next section, the solution to an interior point method in fact already provides a factorization we can use to compute these gradient efficiently."
+    }, {
+      "heading" : "3.2. An efficient batched QP solver",
+      "text" : "Deep networks are typically trained in mini-batches to take advantage of efficient data-parallel GPU operations. Without mini-batching on the GPU, many modern deep learning architectures become intractable for all practical purposes. However, today’s state-of-the-art QP solvers like Gurobi and CPLEX do not have the capability of solving multiple optimization problems on the GPU in parallel across the entire minibatch. This makes larger OptNet layers become quickly intractable compared to a fully-connected layer with the same number of parameters.\nTo overcome this performance bottleneck in our quadratic program layers, we have implemented a GPU-based primal-dual interior point method (PDIPM) based on (Mattingley & Boyd, 2012) that solves a batch of quadratic programs, and which provides the necessary gradients needed to train these in an end-to-end fashion. Our performance experiments in Section 4.1 shows that our solver is significantly faster than the standard non-batch solvers Gurobi and CPLEX.\nFollowing the method of (Mattingley & Boyd, 2012), our solver introduces slack variables on the inequality constraints and iteratively minimizes the residuals from the KKT conditions over the primal and dual variables. Each iteration computes the affine scaling directions by solving\nK  ∆zaff ∆saff\n∆λaff ∆νaff\n =  −(AT ν +GTλ+Qz + p)\n−Sλ −(Gz + s− h) −(Az − b)\n (10)\nwhere\nK =  Q 0 GT AT\n0 D(λ) D(s) 0 G I 0 0 A 0 0 0  , then centering-plus-corrector directions by solving\nK  ∆zcc ∆scc\n∆λcc ∆νcc\n =  0 σµ1−D(∆saff)∆λaff\n0 0  , (11) where α is the largest step size that maintains dual feasibility and σ > 0. Each variable v is updated with ∆v = ∆vaff + ∆vcc using an appropriate step size.\nWe solve these iterations for every example in our minibatch by solving a symmetrized version of these linear systems with\nKsym =  Q 0 GT AT\n0 D(λ/s) I 0 G I 0 0 A 0 0 0  , (12) whereD(λ/s) is the only portion ofKsym that changes between iterations. We analytically decompose these systems into smaller symmetric systems and pre-factorize portions of them that don’t change (i.e. that don’t involve D(λ/s) between iterations.\nWe have implemented a batched version of this method with the PyTorch library1 and have released it as an open source library at https://github.com/locuslab/ qpth. It uses a custom CUBLAS extension that provide an interface to solve multiple matrix factorizations and solves in parallel, and which provides the necessary backpropagation gradients for their use in an end-to-end learning system."
+    }, {
+      "heading" : "3.2.1. EFFICIENTLY COMPUTING GRADIENTS",
+      "text" : "A key point of the particular form of primal-dual interior point method that we employ is that it is possible to compute the backward pass gradients “for free” after solving the original QP, without an additional matrix factorization or solve. Specifically, at each iteration in the primal-dual interior point, we are computing an LU decomposition of the matrixKsym.2 This matrix is essentially a symmetrized\n1https://pytorch.org 2We actually perform an LU decomposition of a certain subset of the matrix formed by eliminating variables to create only a p × p matrix (the number of inequality constraints) that needs to be factor during each iteration of the primal-dual algorithm, and one m × m and one n × n matrix once at the start of the primal-dual algorithm, though we omit the detail here. We also\nversion of the matrix needed for computing the backpropagated gradients, and we can similarly compute the dz,λ,ν terms by solving the linear system\nKsym  dz ds d̃λ dν  =  ( − ∂`∂zi+1 )T 0 0 0  , (13) where d̃λ = D(λ?)dλ for dλ as defined in (8). Thus, all the backward pass gradients can be computed using the factored KKT matrix at the solution. Crucially, because the bottleneck of solving this linear system is computing the factorization of the KKT matrix (cubic time as opposed to the quadratic time for solving via backsubstitution once the factorization is computed), the additional time requirements for computing all the necessary gradients in the backward pass is virtually nonexistent compared with the time of computing the solution. To the best of our knowledge, this is the first time that this fact has been exploited in the context of learning end-to-end systems."
+    }, {
+      "heading" : "3.3. Limitation of the method",
+      "text" : "Although, as we will show shortly, the OptNet layer has several strong points, we also want to highlight the potential drawbacks of this approach. First, although, without an efficient batch solver, integrating an OptNet layer into existing deep learning architectures is potentially practical, we do note that solving optimization problems exactly as we do here has has cubic complexity in the number of variables and/or constraints. This contrasts with the quadratic complexity of standard feedforward layers. This means that we are ultimately limited to settings where the number of hidden variables in an OptNet layer is not too large (less than 1000 dimensions seems to be the limits of what we currently find to the be practical, and substantially less if one wants real-time results for an architecture).\nSecondly, there are many improvements to the OptNet layers that are still possible. Our QP solver, for instance, uses fully dense matrix operations, which makes the solves very efficient for GPU solutions, and which also makes sense for our general setting where the coefficients of the quadratic problem can be learned. However, for setting many realworld optimization problems (and hence for architectures that wish to more closely mimic some real-world optimization problem), there is often substantial structure (e.g., sparsity), in the data matrices that can be exploited for efficiency. There is of course no prohibition of incorporating sparse matrix methods into the fast custom solver, but\nuse an LU decomposition as this routine is provided in batch form by CUBLAS, but could potentially use a (faster) Cholesky factorization if and when the appropriate functionality is added to CUBLAS).\ndoing so would require substantial added complexity, especially regarding efforts like finding minimum fill orderings for different sparsity patterns of the KKT systems.\nLastly, we note that while the OptNet layers can be trained just as any neural network layer, since they are a new creation and since they have manifolds in the parameter space which have no effect on the resulting solution (e.g., scaling the rows of a constraint matrix and its right hand side does not change the optimization problem), there is admittedly more tuning required to get these to work. This situation is common when developing new neural network architectures, and our hope is that techniques for overcoming some of the challenges in learning these layers will be developed in future work."
+    }, {
+      "heading" : "4. Experimental results",
+      "text" : "In this section, we present several experimental results that highlight the capabilities of the OptNet layer. Specifically we look at 1) computational efficiency over exiting solvers; 2) the ability to improve upon existing convex problems such as those used in signal denoising; 3) integrating the architecture into an generic deep learning architectures; and 3) performance of our approach on a problem that is very challenging for current approaches. performance of our approach can sometimes vastly improve upon existing deep architectures architectures. In particular, we want to emphasize the results of our system on learning the game of (4x4) Sudoku, a well-known logical puzzle; to the best of our knowledge, ours in the first type of end-to-end differentiable architecture that can learn problems such as this one based solely upon examples with no a priori knowledge of the rules of Sudoku. The code and data for our experiments are open sourced at https://github.com/locuslab/optnet."
+    }, {
+      "heading" : "4.1. Batch QP solver performance",
+      "text" : "Our first experiment illustrates why standard baseline QP solvers like CPLEX and Gurobi without batch support are too computationally expensive for OptNet layers to be tractable. We run our solver on an unloaded Titan X GPU and Gurobi on an unloaded quad-core Intel Core i7-5960X CPU @ 3.00GHz. We set up the same random QP of the form (1) across all three frameworks and vary the number\nof variable, constraints, and batch size.3\nFigure 1 shows the means and standard deviations of running each trial 10 times, showing that our solver outperforms Gurobi, itself a highly tuned solver, in all batched instances. For the minibatch size of 128, we solve all problems in an average of 0.18 seconds, whereas Gurobi tasks an average of 4.7 seconds. In the context of training a deep architecture this type of speed difference for a single minibatch can make the difference between a practical and a completely unusable solution."
+    }, {
+      "heading" : "4.2. Total variation denoising",
+      "text" : "Our next experiment studies how we can use the OptNet architecture to improve upon signal processing techniques that currently use convex optimization as a basis. Specifically, our goal in this case is to denoise a noisy 1D signal given training data consistency of noisy and clean signals generated from the same distribution. Such problems are often addressed by convex optimization procedures, and (1D) total variation denoising is a particularly common and simple approach. Specifically, the total variation denoising approach attempts to smooth some noisy observed signal y by solving the optimization problem\nargmin z\n1 2 ||y − z||+ λ||Dz||1 (14)\nwhere D in the first order differencing operation. Penalizing the `1 norm of the signal difference encourages this difference to be sparse, i.e., the number of changepoints of the signal is small, and we end up approximating y by a (roughly) piecewise constant function.\nTo test this approach and competing ones on a denoising\n3Experimental details: we sample entries of a matrix U from a random uniform distribution and set Q = UTU +10−3I , sample G with random normal entries, and set h by selecting generating some z0 random normal and s0 random uniform and setting h = Gz0 + s0 (we didn’t include equality constraints just for simplicity, and since the number of inequality constraints in the primary driver of complexity for the iterations in a primal-dual interior point method). The choice of h guarantees the problem is feasible.\ntask, we generate piecewise constant signals (which are the desired outputs of the learning algorithm) and corrupt them with independent Gaussian noise (which form the inputs to the learning algorithm). The summary training and testing performance of the four approaches we describe are shown in Table 1."
+    }, {
+      "heading" : "4.2.1. BASELINE: TOTAL VARIATION DENOISING",
+      "text" : "To establish a baseline for denoising performance with total variation, we run the above optimization problem varying values of λ between 0 and 100. The procedure performs best with a choice of λ ≈ 13, and achieves a minimum test MSE on our task of about 16.5 (the units here are unimportant, the only relevant quantity is the relative performances of the different algorithms)."
+    }, {
+      "heading" : "4.2.2. BASELINE: LEARNING WITH A FULLY-CONNECTED NEURAL NETWORK",
+      "text" : "An alternative approach to denoising is by learning from data. A function fθ(x) parameterized by θ can be used to predict the original signal. The optimal θ can be learned by using the mean squared error between the true and predicted signals. Denoising is typically a difficult function to learn and Figure 2 shows that a fully connected neural network perform substantially worse on this denoising task than the convex optimization problem."
+    }, {
+      "heading" : "4.2.3. LEARNING THE DIFFERENCING OPERATOR WITH OPTNET",
+      "text" : "Between the feedforward neural network approach and the convex total variation optimization, we could instead use a generic OptNet layers that effectively allowed us to solve (14) using any denoising matrix, which we randomly initialize. While the accuracy here is substantially lower than even the fully connected case, this is largely the result of learning an over-regularized solution to D. This is indeed a point that should be addressed in future work (we refer back to our comments in the previous section on the po-\ntential challenges of training these layers), but the point we want to highlight here is that the OptNet layer seems to be learning something very interpretable and understandable. Specifically, Figure 3 shows the D matrix of our solution before and after learning (we permute the rows to make them ordered by the magnitude of where the largeabsolute-value entries occurs). What is interesting in this picture is that the learned D matrix typically captures exactly the same intuition as the D matrix used by total variation denoising: a mainly sparse matrix with a few entries of alternating sign next to each other. This implies that for the data set we have, total variation denoising is indeed the “right” way to think about denoising the resulting signal, but if some other noise process were to generate the data, then we can learn that process instead. We can then attain lower actual error for the method (in this case similar though slightly higher than the TV solution), by fixing the learned sparsity of the D matrix and then fine tuning."
+    }, {
+      "heading" : "4.2.4. FINE-TUNING AND IMPROVING THE TOTAL VARIATION SOLUTION",
+      "text" : "To finally highlight the ability of the OptNet methods to improve upon the results of a convex program, specifically tailoring to the data. Here, we use the same OptNet architecture as in the previous subsection, but initialize D to be the differencing matrix as in the total variation solution. As shown in Figure 4, the procedure is able to improve both the training and testing MSE over the TV solution, specifically improving upon test MSE by 12%."
+    }, {
+      "heading" : "4.3. MNIST",
+      "text" : "In this section we consider the integration of OptNet layers into a traditional fully connected network for the MNIST problem. The results here show only very marginal im-\nprovement if any over a fully connected layer (MNIST, after all, is very fairly well-solved by a fully connected network, let alone a convolution network). But our main point of this comparison is simply to illustrate that we can include these layers within existing network architectures and efficiently propagate the gradients through the layer. Specifically we use a FC600-FC10-FC10-SoftMax fully connected network and compare to a FC600-FC10Optnet10-SoftMax network, where the numbers after each layer indicate the layer size, and the OptNet network in this case includes only inequality constraints. As shown in Figure 5, the results are similar for both networks with slightly lower error and less variance in the OptNet network."
+    }, {
+      "heading" : "4.4. Sudoku",
+      "text" : "Finally, we present the main illustrative example of the representational power of our approach, the task of learning the game of Sudoku. Sudoku is a popular logical puzzle, where a (typically 9x9) grid of points must be arranged given some initial point, so that each row, each column, and each 3x3 grid of points must contain one of each num-\nber 1 through 9. We consider the slightly simpler case of 4x4 Sudoku puzzles, with number in 1 through 4, as shown in Figure 4.3.\nSudoku is fundamentally a constraint satisfaction problem, and is trivial for computers to solve when told the rules of the game. However, if we do not know the rules of the game, but are only presented with examples of unsolved and the corresponding solved puzzle, this is a challenging task. We consider this to be an interesting benchmark task for algorithms that seek to capture complex strict relationships between all input and output variables. The input to the algorithm consists of a 4x4 grid (really a 4x4x4 tensor with a one-hot encoding for known entries an all zeros for unknown entries), and the desired output is a 4x4x4 tensor of the one-hot encoding of the solution.\nThis is a problem where traditional neural networks fail completely: as a baseline we implemented a multilayer feedforward network to attempt to solve Sudoku problems (specifically, we report results for a FC100-FC100-F100FC100-Softmax network, though we tried other architectures as well), and found them completely unable to achieve an error rate lower than 99% on at test set of 1000 examples, where error here is interpreted as whether or not the puzzle is solved correctly if assign cell to whichever index is largest in the predicted encoding). This performance is shown in Figure 7, showing that the network is able to decrease the loss function (squared error) somewhat, but produces no boost in correctly solved puzzles.\nWe contrast this with the performance of the OptNet network. Here were learn a completely generic QP in socalled “standard form” with only positivity inequality constraints but an arbitrary constraint matrix Ax = b, a small Q = 0.1I to make sure the problem is strictly feasible, and with the linear term p simply being the input one-hot encoding of the Sudoku problem. We know that Sudoku can be approximated well with a linear program (indeed, integer programming is a typical solution method for such problems), but the model here is told nothing about the rules of Sudoku. Despite this, as shown in Figure 8 after just three epochs, the algorithm has effectively learned the game, and can get virtually zero test error with just minor noise in the learning process. This represents a substantial advance over the fully connected layers, and we believe highlights the ability of the OptNet layers to learn com-\nplex phenomena that currently elude neural networks. We know of no other machine learning algorithm that can learn a game like this solely from data."
+    }, {
+      "heading" : "5. Conclusion",
+      "text" : "We have presented OptNet, a neural network architecture where we use optimization problems as a single layer in the network. We have derived the algorithmic formulation for differentiating through these layers, allowing for backpropagating in end-to-end architectures. We have also developed an efficient batch solver for these optimizations based upon a primal-dual interior point method, and developed a method for attaining the necessary gradient information “for free” from this approach. Our experiments highlight the potential power of these networks, showing that they can solve problems where existing networks are very poorly suited, such as learning Sudoku problems purely from data. There are many future directions of research for these approaches, but we feel that they add another important primitive to the toolbox of neural network practitioners."
+    } ],
+    "references" : [ {
+      "title" : "Input convex neural networks",
+      "author" : [ "Amos", "Brandon", "Xu", "Lei", "Kolter", "J Zico" ],
+      "venue" : "arXiv preprint arXiv:1609.07152,",
+      "citeRegEx" : "Amos et al\\.,? \\Q2016\\E",
+      "shortCiteRegEx" : "Amos et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Structured prediction energy networks",
+      "author" : [ "Belanger", "David", "McCallum", "Andrew" ],
+      "venue" : "In Proceedings of the International Conference on Machine Learning,",
+      "citeRegEx" : "Belanger et al\\.,? \\Q2016\\E",
+      "shortCiteRegEx" : "Belanger et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Generic methods for optimization-based modeling",
+      "author" : [ "Domke", "Justin" ],
+      "venue" : "In AISTATS,",
+      "citeRegEx" : "Domke and Justin.,? \\Q2012\\E",
+      "shortCiteRegEx" : "Domke and Justin.",
+      "year" : 2012
+    }, {
+      "title" : "Generative adversarial nets",
+      "author" : [ "Goodfellow", "Ian", "Pouget-Abadie", "Jean", "Mirza", "Mehdi", "Xu", "Bing", "Warde-Farley", "David", "Ozair", "Sherjil", "Courville", "Aaron", "Bengio", "Yoshua" ],
+      "venue" : "In Advances in Neural Information Processing Systems,",
+      "citeRegEx" : "Goodfellow et al\\.,? \\Q2014\\E",
+      "shortCiteRegEx" : "Goodfellow et al\\.",
+      "year" : 2014
+    }, {
+      "title" : "On differentiating parameterized argmin and argmax problems with application to bi-level optimization",
+      "author" : [ "Gould", "Stephen", "Fernando", "Basura", "Cherian", "Anoop", "Anderson", "Peter", "Santa Cruz", "Rodrigo", "Guo", "Edison" ],
+      "venue" : "arXiv preprint arXiv:1607.05447,",
+      "citeRegEx" : "Gould et al\\.,? \\Q2016\\E",
+      "shortCiteRegEx" : "Gould et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Composing graphical models with neural networks for structured representations and fast inference",
+      "author" : [ "Johnson", "Matthew", "Duvenaud", "David K", "Wiltschko", "Alex", "Adams", "Ryan P", "Datta", "Sandeep R" ],
+      "venue" : "In Advances in Neural Information Processing Systems,",
+      "citeRegEx" : "Johnson et al\\.,? \\Q2016\\E",
+      "shortCiteRegEx" : "Johnson et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Probabilistic graphical models: principles and techniques",
+      "author" : [ "Koller", "Daphne", "Friedman", "Nir" ],
+      "venue" : "MIT press,",
+      "citeRegEx" : "Koller et al\\.,? \\Q2009\\E",
+      "shortCiteRegEx" : "Koller et al\\.",
+      "year" : 2009
+    }, {
+      "title" : "Numerical simulation of time-dependent contact and friction problems in rigid body mechanics",
+      "author" : [ "Lötstedt", "Per" ],
+      "venue" : "SIAM journal on scientific and statistical computing,",
+      "citeRegEx" : "Lötstedt and Per.,? \\Q1984\\E",
+      "shortCiteRegEx" : "Lötstedt and Per.",
+      "year" : 1984
+    }, {
+      "title" : "Matrix differential calculus",
+      "author" : [ "X Magnus", "Neudecker", "Heinz" ],
+      "venue" : "New York,",
+      "citeRegEx" : "Magnus et al\\.,? \\Q1988\\E",
+      "shortCiteRegEx" : "Magnus et al\\.",
+      "year" : 1988
+    }, {
+      "title" : "Task-driven dictionary learning",
+      "author" : [ "Mairal", "Julien", "Bach", "Francis", "Ponce", "Jean" ],
+      "venue" : "IEEE Transactions on Pattern Analysis and Machine Intelligence,",
+      "citeRegEx" : "Mairal et al\\.,? \\Q2012\\E",
+      "shortCiteRegEx" : "Mairal et al\\.",
+      "year" : 2012
+    }, {
+      "title" : "Cvxgen: A code generator for embedded convex optimization",
+      "author" : [ "Mattingley", "Jacob", "Boyd", "Stephen" ],
+      "venue" : "Optimization and Engineering,",
+      "citeRegEx" : "Mattingley et al\\.,? \\Q2012\\E",
+      "shortCiteRegEx" : "Mattingley et al\\.",
+      "year" : 2012
+    }, {
+      "title" : "Unrolled generative adversarial networks",
+      "author" : [ "Metz", "Luke", "Poole", "Ben", "Pfau", "David", "Sohl-Dickstein", "Jascha" ],
+      "venue" : "arXiv preprint arXiv:1611.02163,",
+      "citeRegEx" : "Metz et al\\.,? \\Q2016\\E",
+      "shortCiteRegEx" : "Metz et al\\.",
+      "year" : 2016
+    }, {
+      "title" : "Model predictive control: past, present and future",
+      "author" : [ "Morari", "Manfred", "Lee", "Jay H" ],
+      "venue" : "Computers & Chemical Engineering,",
+      "citeRegEx" : "Morari et al\\.,? \\Q1999\\E",
+      "shortCiteRegEx" : "Morari et al\\.",
+      "year" : 1999
+    }, {
+      "title" : "Learning structured prediction models: A large margin approach",
+      "author" : [ "Taskar", "Ben", "Chatalbashev", "Vassil", "Koller", "Daphne", "Guestrin", "Carlos" ],
+      "venue" : "In Proceedings of the 22nd International Conference on Machine Learning,",
+      "citeRegEx" : "Taskar et al\\.,? \\Q2005\\E",
+      "shortCiteRegEx" : "Taskar et al\\.",
+      "year" : 2005
+    }, {
+      "title" : "Large margin methods for structured and interdependent output variables",
+      "author" : [ "Tsochantaridis", "Ioannis", "Joachims", "Thorsten", "Hofmann", "Thomas", "Altun", "Yasemin" ],
+      "venue" : "Journal of Machine Learning Research,",
+      "citeRegEx" : "Tsochantaridis et al\\.,? \\Q2005\\E",
+      "shortCiteRegEx" : "Tsochantaridis et al\\.",
+      "year" : 2005
+    }, {
+      "title" : "Primal-dual interior-point methods",
+      "author" : [ "Wright", "Stephen J" ],
+      "venue" : null,
+      "citeRegEx" : "Wright and J.,? \\Q1997\\E",
+      "shortCiteRegEx" : "Wright and J.",
+      "year" : 1997
+    } ],
+    "referenceMentions" : [ {
+      "referenceID" : 0,
+      "context" : "For instance, recent work on structured prediction (Belanger & McCallum, 2016; Amos et al., 2016) has used optimization within energy-based neural network models, and (Metz et al.",
+      "startOffset" : 51,
+      "endOffset" : 97
+    }, {
+      "referenceID" : 11,
+      "context" : ", 2016) has used optimization within energy-based neural network models, and (Metz et al., 2016) used unrolled optimization within a network to stabilize the convergence of generative adversarial networks (Goodfellow et al.",
+      "startOffset" : 77,
+      "endOffset" : 96
+    }, {
+      "referenceID" : 3,
+      "context" : ", 2016) used unrolled optimization within a network to stabilize the convergence of generative adversarial networks (Goodfellow et al., 2014).",
+      "startOffset" : 116,
+      "endOffset" : 141
+    }, {
+      "referenceID" : 13,
+      "context" : "There are two broad classes of learning approaches in structured prediction: methods that use probabilistic inference techniques (typically exploiting the fact that the gradient of the log likelihood is given by the actual feature expectations minus their expectation under the learned model (Koller & Friedman, 2009, Ch 20)), and methods that rely solely upon MAP inference (such as max-margin structured prediction (Taskar et al., 2005; Tsochantaridis et al., 2005)).",
+      "startOffset" : 417,
+      "endOffset" : 467
+    }, {
+      "referenceID" : 14,
+      "context" : "There are two broad classes of learning approaches in structured prediction: methods that use probabilistic inference techniques (typically exploiting the fact that the gradient of the log likelihood is given by the actual feature expectations minus their expectation under the learned model (Koller & Friedman, 2009, Ch 20)), and methods that rely solely upon MAP inference (such as max-margin structured prediction (Taskar et al., 2005; Tsochantaridis et al., 2005)).",
+      "startOffset" : 417,
+      "endOffset" : 467
+    }, {
+      "referenceID" : 4,
+      "context" : "In the case of (Gould et al., 2016), the authors describe general techniques for differentiation through optimization problems, but only describe the case of exact equality constraints rather than both equality and inequality constraints (in the case inequality constraints, they add these via a barrier function).",
+      "startOffset" : 15,
+      "endOffset" : 35
+    }, {
+      "referenceID" : 5,
+      "context" : "Other work (Johnson et al., 2016; Amos et al., 2016) (the later with some inequality constraints) uses argmin differentiation within the context of a specific optimization problem, but doesn’t consider a particularly general setting; similarly, the older work of (Mairal et al.",
+      "startOffset" : 11,
+      "endOffset" : 52
+    }, {
+      "referenceID" : 0,
+      "context" : "Other work (Johnson et al., 2016; Amos et al., 2016) (the later with some inequality constraints) uses argmin differentiation within the context of a specific optimization problem, but doesn’t consider a particularly general setting; similarly, the older work of (Mairal et al.",
+      "startOffset" : 11,
+      "endOffset" : 52
+    }, {
+      "referenceID" : 9,
+      "context" : ", 2016) (the later with some inequality constraints) uses argmin differentiation within the context of a specific optimization problem, but doesn’t consider a particularly general setting; similarly, the older work of (Mairal et al., 2012) considered argmin differentiation for a LASSO problem, deriving specific rules for this case, and presenting an efficient algorithm based upon our ability to solve the LASSO problem efficiently.",
+      "startOffset" : 218,
+      "endOffset" : 239
+    }, {
+      "referenceID" : 4,
+      "context" : "Although the previous papers mentioned above have considered similar argmin differentiation techniques (Gould et al., 2016), to the best of our knowledge this is the first case of a general formulation for argmin differentiation in the presence of exact equality and inequality constraints.",
+      "startOffset" : 103,
+      "endOffset" : 123
+    } ],
+    "year" : 2017,
+    "abstractText" : "This paper presents OptNet, a network architecture that integrates optimization problems (here, specifically in the form of quadratic programs) as individual layers in larger end-to-end trainable deep networks. These layers allow complex dependencies between the hidden states to be captured that traditional convolutional and fully-connected layers are not able to capture. In this paper, we develop the foundations for such an architecture: we derive the equations to perform exact differentiation through these layers and with respect to layer parameters; we develop a highly efficient solver for these layers that exploits fast GPU-based batch solves within a primal-dual interior point method, and which provides backpropagation gradients with virtually no additional cost on top of the solve; and we highlight the application of these approaches in several problems. In one particularly standout example, we show that the method is capable of learning to play Sudoku given just input and output games, with no a priori information about the rules of the game; this task is virtually impossible for other neural network architectures that we have experimented with, and highlights the representation capabilities of our approach.",
+    "creator" : "LaTeX with hyperref package"
+  }
+}

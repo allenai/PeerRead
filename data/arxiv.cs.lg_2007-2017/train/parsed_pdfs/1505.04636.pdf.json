@@ -1,0 +1,625 @@
+{
+  "name" : "1505.04636.pdf",
+  "metadata" : {
+    "source" : "CRF",
+    "title" : "Graph Partitioning via Parallel Submodular Approximation to Accelerate Distributed Machine Learning",
+    "authors" : [ "Mu Li", "Dave G. Andersen", "Alexander J. Smola" ],
+    "emails" : [ "muli@cs.cmu.edu", "dga@cs.cmu.edu", "alex@smola.org" ],
+    "sections" : [ {
+      "heading" : null,
+      "text" : "In this paper, we formulate data placement as a graph partitioning problem. We propose a distributed partitioning algorithm. We give both theoretical guarantees and a highly efficient implementation. We also provide a highly efficient implementation of the algorithm and demonstrate its promising results on both text datasets and social networks. We show that the proposed algorithm leads to 1.6x speedup of a state-of-the-start distributed machine learning system by eliminating 90% of the network communication."
+    }, {
+      "heading" : "1. INTRODUCTION",
+      "text" : "The importance of large-scale machine learning continues to grow in concert with the big data boom, the advances in learning techniques, and the deployment of systems that enable wider applications. As the amount of data scales up, the need to harness increasingly large clusters of machines significantly increases. In this paper, we address a question that is fundamental for applying today’s loosely-coupled “scaleout” cluster computing techniques to important classes of machine learning applications:\nHow to spread data and model parameters across a cluster of machines for efficient processing?\nOne big challenge for large-scale data processing problems is to distribute the data over processing nodes to fit the computation and storage capacity of each node. For instance, for very large scale graph factorization [2], one needs to partition a natural graph in a way such that the memory, which is required for storing local state of the partition and caching the adjacent variables, is bounded within the capacity of each machine. Similar constraints apply to\nPermission to make digital or hard copies of all or part of this work for personal or classroom use is granted without fee provided that copies are not made or distributed for profit or commercial advantage and that copies bear this notice and the full citation on the first page. To copy otherwise, to republish, to post on servers or to redistribute to lists, requires prior specific permission and/or a fee. Copyright 20XX ACM X-XXXXX-XX-X/XX/XX ...$15.00.\nGraphLab [20, 12], where vertex-specific updates are carried out while keeping other variables synchronized between machines. Likewise, in distributed inference for graphical models with latent variables [1, 26], the distributed state variables must be synchronized efficiently between machines. Furthermore, general purposed distributed machine learning framework such as the parameter server [18, 8] face similar issues when it comes to data and parameter layout.\nShared parameters are synchronized via the communication network. The sheer number of parameters and the iterative nature of machine learning algorithms often produce huge amounts of network traffic. Figure 1 shows that, if we randomly assign data (documents) to machines in a text classification application, the total amount of network traffic is 100 times larger than the size of training data. Specifically, almost 4 TB parameters are communicated for 300 GB training data. Given that the network bandwidth is typically much smaller than the local memory bandwidth, this traffic volume can potentially become a performance bottleneck.\nThere are three key challenges in achieving scalability for large-scale data processing problems:\nLimited computation (CPU) per machine: therefore we need a well-balanced task distribution over machines.\nar X\niv :1\n50 5.\n04 63\n6v 1\n[ cs\n.D C\n] 1\n8 M\nay 2\n01 5\nLimited memory (RAM) per machine: the amount of storage per machine available for processing and caching model variables is often constrained to a small fraction of the total model.\nLimited network bandwidth: the network bandwidth is typically 100 times worse than the local memory bandwidth. Thus we need to reduce the amount of communication between machines.\nOne key observation is the sparsity pattern in large scale datasets: most documents contain only a small fraction of distinct words, and most people have only a few friends in a social graph. Such nonuniformity and sparsity is both a boon and a challenge for the problem of dataset partitioning. Due to its practical importance, even though the dataset partitioning problems are often NP hard [28], it is still worth seeking practical solutions that outperform random partitioning, which typically leads to poor performance.\nOur contributions: In this paper, we formulate the task of data and parameter placement as a graph partitioning problem. We propose Parsa, a PARallel Submodular Approximation algorithm for solving this problem, and we analyze its theoretical guarantees. A straightforward implementation of the algorithm has running time in the order of O(k|E|2), where k is the number of partitions and |E| is the number of edges in the graph. Using an efficient vertex selection data structure, we provide an efficient implementation with time complexity O(k|E|). We also discuss the techniques including sampling, initialization and parallelization to improve the partitioning quality and efficiency.\nExperiments on text datasets and social networks of various scales show that, on both partition quality and time efficiency, Parsa outperforms state-of-the-art methods, including METIS [16], PaToH [6] and Zoltan [9]. Parsa can also significantly accelerate the parameter server, a stateof-the-art general purpose distributed machine learning, on data of hundreds GBs size and with billions parameters."
+    }, {
+      "heading" : "2. GRAPH PARTITIONING",
+      "text" : "In this section, we first introduce the inference problem and the model of dependencies in distributed inference. Then we provide the formulation of the data partitioning problem in distributed inference. We also present a brief overview of related work in the end."
+    }, {
+      "heading" : "2.1 Inference in Machine Learning",
+      "text" : "In machine learning, many inference problems have graphstructured dependencies. For instance, in risk minimization [14], we strive to solve\nminimize w R[w] := m∑ i=1 l(xi, yi, w) + Ω[w], (1)\nwhere l(xi, yi, w) is a loss function measuring the model fitting error in the data (xi, yi), and Ω[w] is a regularizer on the model parameter w. The data and parameters are often correlated only via the nonzero terms in xi, which exhibit sparsity patterns in many applications. For example, in email spam filtering, elements of xi’ correspond to words and attributes in emails, while in computational advertising, they correspond to words in ads and user behavior patterns.\nFor undirected graphical models [4, 17], the joint distribution of the random variables in logscale can be written as\na summation of potential of all the cliques in the graph, and each clique potential ψC(wC) only depends on the subset of variables wC in the clique C.\nThe learning and inference problems in undirected graphical models are often formulated as an optimization problem in the following form:\nminimize w R[w] := ∑ C∈C ψC(wC), (2)\nwhere local variables interact through the model parameters wC of the cliques.\nSimilar problems occur in the context of inference on natural graphs [3, 12, 2], where we have sets of interacting parameters represented by vertices on the graph, and manipulating a vertex affects all of its neighbors computationally."
+    }, {
+      "heading" : "2.2 Bipartite Graphs",
+      "text" : "The dependencies in the inference problems above can be modeled by a bipartite graph G(U, V,E) with vertex sets U and V and edge set E. We denote the edge between two node u ∈ U and v ∈ V by (u, v) ∈ E. Figure 2 illustrates the case of risk minimization (1), where U consists of the samples {(xi, yi)}mi=1 and V consists of the parameters in w. There is an edge ((xi, yi), wj) if and only if the j-th element of xi is non-zero. Therefore, {wj : ((xi, yi), wj) ∈ E} is the working set of elements of w for evaluating the loss function l(xi, yi, w) on the sample (xi, yi).\nWe can construct such bipartite graph G(U ′, V, E′) to encode the dependencies in undirected graphical models and natural graphs with node set V and edge set E. One construction is to define U ′ = V , and add an edge (u, v) to the edge set E′ if they are connected in the original graph. An alternative construction is to define the node set U ′ to be C, the set of all cliques of the original graph, and add an edge (C, v) to the edge set E′ if node v belongs to the clique C in the original graph.\nThroughout the discussion, we refer to U as the set of data (examples) nodes and V as the set of parameters (results) nodes."
+    }, {
+      "heading" : "2.3 Distributed Inference",
+      "text" : "The challenge for large scale inference is that the size of the optimization problem in (2) is too large, and even the model w may be too large to be stored on a single machine. One solution is to divide exploit the additive form of R[w] to decompose the optimization into smaller problems, and then employ multiple machines to solve these sub-problems while keeping the solutions (parameters) consistent.\nThere exist several frameworks to simplify the developing of efficient distributed algorithms, such as Hadoop [11] and its in-memory variant Spark [34] to execute MapReduce programs, and Graphlab for distributed graph com-\npush pull\nserver nodes:\nworker nodes:\ndata\nscheduler\nFigure 3: Simplified parameter server architecture.\nmachine 0 machine 1 machine 2\nV:\nU:\nFigure 4: Each machine contains a server and a worker, holding a part of U and V , respectively. The inter-machine dependencies (edges) are highlighted and the communication costs for these three machines are 2, 3, and 3, respectively. Moving the 3rd vertex in V to either machine 0 or 1 reduces cost.\nputation [21]. In this paper, we focus on the parameter server framework [18], a high-performance general-purpose distributed machine learning framework.\nIn the parameter server framework, computational nodes are divided into server nodes and worker nodes, which are shown in Figure 3. The globally shared parameters w are partitioned and stored in the server nodes. Each worker node solves a sub-problem and communicates with the server nodes in two ways: to push local results such as gradients or parameter updates to the servers, and to pull recent parameter (changes) from the servers. Both push and pull are executed asynchronously."
+    }, {
+      "heading" : "2.4 Multiple Objectives of Partitioning",
+      "text" : "In distributed inference, we divide the problem in (2) by partition the cost function R[w] as well as the associated dependency graph into k blocks. Without loss of generality we consider a parameter server with k server nodes and k worker nodes, and each machine has exactly one server and one worker (otherwise we can aggregate multiple nodes in the same machines without affecting the following analysis). For the bipartite dependency graph G(U, V,E), we partition the parameter set V into k parts and assign each part to a server node, and we partition the data set U into k parts and assign them to individual worker nodes. Figure 4 illustrates an example for k = 3. More specifically, we want to divide both U and V into k non-overlapping parts\nU = k⋃ i=1 Ui and V = k⋃ i=1 Vi, (3)\nand assign the part Ui and Vi to the worker node and server node on machine i respectively.\nThere are three goals when implementing the graph partitioning: Balancing the computational load. We want to ensure that each machine has approximately the same computational load. Assume that each example ui incurs roughly the same workload, then one of the objective to keep maxi |Ui| small:\nminimize max i |Ui| (4)\nSatisfying the memory constraint. Inference algorithms frequently access the parameters (at random). Workers keep these parameters in memory to improve performance, yet RAM is limited. Denote by N (ui) the neighbor set of ui\nN (ui) = {vj : (ui, vj) ∈ E} . (5) Then ⋃ u∈Ui N (u) is the working set of the parameters worker i needed. For simplicity we assume that each parameter vj has the same storage cost. Our goal to limit the worker’s memory footprint is given by\nminimize max i |N (Ui)| where N (Ui) := ⋃ u∈Ui N (u) (6)\nMinimizing the communication cost. The total communication cost per worker i is |N (Ui)|, which is already minimized using our previous goal (6). To further reduce this cost, we can assign server i to the same machine with worker i, so that any communication uses memory rather than network. This reduces the inter-machine communication cost to |N (Ui)| − |N (Ui)\\Vi|. Figure 4 shows an example. Further note that if vj is not needed by worker i, then server i should never maintain vj . In other words, we have Vi ⊆ N (Ui) and the cost simplifies to |N (Ui)| − |Vi|.\nOn the other hand, ∑ j 6=i |Vi ∩N (Uj)| is the communication cost of server i because other workers must request parameters from server i. Therefore, the goal to minimize the maximal communication cost of a machine is\nminimize max i |N (Ui)| − |Vi|+ ∑ j 6=i |Vi ∩N (Uj)|. (7)"
+    }, {
+      "heading" : "2.5 Related Work",
+      "text" : "Graph partitioning has attracted much interest in scientific computing [16, 6, 9], scaling out large-scale computations [12, 35, 33, 5, 13, 31], graph databases [25, 32, 7], search and social network analysis [24, 31, 2], and streaming processing [28, 27, 22, 30].\nMost previous work, such as METIS [16], is concerned with edge cuts. Only a few of them solve the vertex cut problem, which is closely related to this paper, to directly minimize the network traffic. PaToH [6] and Zoltan [9] used multilevel partitioning algorithms related to METIS, while PowerGraph [12] adopted a greedy algorithm. Very recently [5] studied the relation between edge cut and vertex cut.\nDifferent to these works, we propose a new algorithm based on submodular approximation to solve the vertex-cut partitioning problem. We give theoretical analysis of the partition quality, and describe an efficient distributed implementation. We show that the proposed algorithm outperforms the state of the art on several large scale real datasets in both in terms of quality and speed.\nAlgorithm 1 Partition U via submodular approximation\nInput: Graph G, #partitions k, maximal #iterations n, residue θ, and improvement α Output: Partitions of U = ⋃k i=1 Ui\n1: for i = 1, . . . , k do 2: Ui ← ∅ 3: define gi(T ) := f(T ∪ Ui)− α|T ∪ Ui| 4: end for 5: for t = 1, ..., n do 6: if |U | ≤ kθ then break 7: find i← argminj |Uj | 8: draw R ⊆ U by choosing u ∈ U with probability n|U|k 9: if |R| > 2n/k then next\n10: solve T ∗ = argminT⊆R gi(T ) 11: if gi(T\n∗) ≤ 0 then Ui ← Ui ∪ T ∗ and U ← U \\ T ∗ 12: end for 13: if |U | > kθ then return fail 14: evenly assign the remainder U to Ui"
+    }, {
+      "heading" : "3. ALGORITHM",
+      "text" : "In this section, we present our algorithm Parsa for solving the partitioning problem with multiple objectives in (4), (6) and (7).\nNote that (6) is equal to a k-way graph partition problem on vertex set U with vertex-cut as the merit. This problem is NP-Complete [6]. Furthermore, (7) is more complex because of the involvement of V . Rather than solving all these objectives together, Parsa decomposes this problem into two tasks: partition the data U by solving (4) and (6), and given the partition of U partition the parameters V by solving (7). Intuitively, we first assigns data workers to balance the CPU load and minimize the memory footprint, and then distribute the parameters over servers to minimize inter-machine communication."
+    }, {
+      "heading" : "3.1 Partitioning U over Worker Nodes",
+      "text" : "Note that f(U) := |N (U)| is a set function in the variable U . It is a submodular function similar to convex and concave functions in real variables. Although the problem in (4) is NP-Complete, there exist several algorithms to solve it approximately by exploiting the submodularity [29]. In our algorithm, we modified [29] to solve (4) and (6). The key difference is that we build up the sets Ui incrementally, which is important for both partition quality and computational efficiency at a later stage.\nAs shown in Algorithm 1, the algorithm proceeds as follows: in each round we pick the smallest partition Ui and find the best set of elements to add to it. To do so, we first draw a small subset of candidates R and select the best subset using a minimum-increment weight via minT⊆R f(Ui ∪ T ) − α|Ui ∪ T |. If the optimal solution T ∗ satisfies f(Ui ∪ T ∗) < α|Ui ∪ T ∗|, i.e., the cost for increasing Ui is not too large, we assign T ∗ to partition Ui.\nBefore showing the implementation details in Section 4, we first analyze the partitioning quality of Algorithm 1.\nProposition 1 Assume that there exists some partitioning U∗i that satisfies maxi f(U ∗ i ) ≤ B. Let k > θ = √ n/ logn, c = (32π)− 1 2 , α = BK/ √ n logn and τ = n 3\nc log 1\n1−p . Then Algorithm 1 will succeed with probability at least p and it will generate a feasible solution with partitioning cost at most\nAlgorithm 2 Partition V for given {Ui}ki=1 Input: The neighbor sets {N (Ui)}ki=1 Output: Partitions V = ⋃k i=1 Vi\n1: for i = 1, . . . k do 2: Vi ← ∅ 3: costi ← |N (Ui)| 4: end for 5: for all j ∈ V do 6: ξ ← argmini:uij 6=0 costi 7: Vξ ← Vξ ∪ {j} 8: costξ ← costξ − 1 + ∑ i6=ξ uij 9: end for\nmaxi f(Ui) ≤ 4B √ n/ logn.\nProof. The proof is near-identical as [29]. Note that we overload the meaning of U as it refers to the remaining variables in the algorithm.\nFor a given iteration, without loss of generality we assume that U∗1 maximizes |U∗j ∩ U | for all j. Denote this by υ = |U∗1 ∩U |. Since T ∗ is the optimal solution at the current iteration we have gi(T\n∗) ≤ gi(U∗1 ∩U) = f((U∗1 ∩U)∪Ui)− α |(U∗1 ∩ U) ∪ Ui|. Further note that by monotonicity and submodularity f((U∗1 ∩U)∪Ui) ≤ f(U∗1 ∩U)+f(Ui). Moreover, U ∩ Ui = ∅ holds since U contains only the leftovers. Consequently |(U∗1 ∩ U) ∪ Ui| = |U∗1 ∩ U |+ |Ui|. Finally, the algorithm only increases the size of Ui whenever the cost is balanced. Hence f(Ui)− α|Ui| < 0. Combining this yields\ngi(T ∗) ≤ gi(U∗1 ∩ U) ≤ f(U∗1 ∩ U)− α|U∗1 ∩ U | ≤ B − αυ\nUsing the results from the proof of [29, Theorem 5.4] we know that υ ≥ B\nα and therefore gi(T ∗) happens with probability at least c\nn2 . Hence the probability of removing at least\none vertex from U within an iteration is greater than c n2 .\nChernoff bounds show that after τ = −n2/c log(1 − δ) iterations the algorithm will terminate with probability at least p since the residual U is small, i.e., |U | ≤ kθ.\nThe algorithm will never select a Ui for augmentation unless |Ui| ≤ n/k (there would always be a smaller set). Moreover, the maximum increment at any given time is 2n/k. Hence |Ui| ≤ 3n/k and therefore f(Ui) ≤ 3nα/k.\nFinally, the contribution of the unassigned residual U is at most θB since each Ui is incremented by at most θ elements and since f(u) ≤ B for all u ∈ U . In summary, this yields f(Ui) ≤ 3nα/k +Bθ = 4B √ n/ logn."
+    }, {
+      "heading" : "3.2 Partitioning V over Server Nodes",
+      "text" : "Next, given the partition of U , we find an assignment of parameters in V to servers. We reformulate (7) as a convex integer programming problem with totally unimodular constraints [15], which is then solved using a sequential optimization algorithm performing a sweep through the variables.\nWe define index variables vij ∈ {0, 1}, j = 1, . . . , k to indicate which server node maintains a particular parameter vi. They need to satisfy ∑k j=1 vij = 1. Moreover, denote by uij ∈ {0, 1} variables that record whether j ∈ N (Ui). Then\nAlgorithm 3 Partitioning U efficiently\nInput: Graph G(U, V,E), #partitions k, and initial neighbor sets {Si}ki=1 Output: Partitioned U = ⋃k i=1 Ui and updated neighbor\nsets which are equal to {Si ∪N (Ui)}ki=1 1: for i = 1, . . . , k do 2: Ui ← ∅ 3: for all u ∈ U do Ai(u) = | N (u) \\ Si | 4: end for 5: while |U | > 0 do 6: pick partition i← arg minj |Sj | 7: pick the lowest-cost vertex u∗ ← Ai.min 8: assign u∗ to partition i: Ui ← Ui ∪ {u∗} 9: remove u∗ from U : U ← U \\ {u∗}\n10: for j = 1, . . . , k do remove u∗ from Aj 11: for v ∈ N (u∗) \\ Si do 12: Si ← Si ∪ {v} 13: for u ∈ N (v) ∩ U do Ai(u)← Ai(u)− 1 14: end for 15: end while\nwe can rewrite (7) as a convex integer program:\nminimize v max i |N (Ui)|+ ∑ j vij −1 + ∑ l 6=i ulj  (8a) subject to\n∑ j vij = 1 and vij ∈ {0, 1} and vij ≤ uij (8b)\nHere we exploited the fact that ∑ j vijulj = |Vi ∩ N (Ul)|\nand that ∑k j=1 vij = |Vi|. These constraints are totally unimodular, since they satisfy the conditions of [15]. As a consequence every vertex solution is integral and we may relax the condition vij ∈ {0, 1} to vij ∈ [0, 1] to obtain a convex optimization problem.\nAlgorithm 2 performs a single sweep over (8) to find a locally optimal assignment of one variable at a time. We found that it is sufficient for a near-optimal solution. Repeated sweeps over the assignment space are straightforward and will improve the objective until convergence to optimality in a finite number of steps: due to convexity all local optima are global. Further note that we need not store the full neighbor sets in memory. Instead, we can perform the assignment in a streaming fashion."
+    }, {
+      "heading" : "4. EFFICIENT IMPLEMENTATION",
+      "text" : "The time complexity of Algorithm 2 is O(k(|U | + |V |)), however, it could be O(k|U |6) for Algorithm 1, which is infeasible in practice. We now discuss how to implement Algorithm 1 efficiently. We first present how to find the optimal T ∗ and sample R. Then we address the parallel implementation with the parameter server, and finally describe neighbor set initialization to improve the partition quality."
+    }, {
+      "heading" : "4.1 Finding T ∗ efficiently",
+      "text" : "The most expensive operation in the inner loop of Algorithm 1 is step 10, determining which vertices, T ∗, to add to a partition. Submodular minimization problems incur O(n6) time [23]. Given the fact that this step is invoked frequently and the problem is large, this strategy is impractical. A key approximation Parsa made is to add only a single ver-\ntex at a time instead of a set of vertices: Given a vertex set R and partition i, it finds vertex u∗ that minimizes\nu∗ = argmin u∈R gi(u) := |N ({u} ∪ Ui)| − α|{u} ∪ Ui| (9)\nAn additional advantage of this approximation is that we are now solving exactly the CPU load balancing problem (4). Since we only assign one vertex at a time to the smallest partition, we obtain perfect balancing.\nEven though this approximation improves the performance, a naive way to calculate (9) is to compute all gi(u) to find u∗ with the minimal value for each iteration. If the size of R is a constant fraction of the entire graph, this leads to an undesirable time complexity of O(|U ||E|). This remains impractical for graphs with billions of vertices and edges.\nWe accelerate computation as follows: we store all vertex costs to avoid re-computing them, and we create a data structure to locate the lowest-cost vertex efficiently.\nStoring vertex costs. If we subtract the constant |N (Ui)|+ α(|Ui|+ 1) from gi(u), we obtain the vertex cost\ncosti(u) := |N (Ui ∪ {u})| − |N (Ui)|. (10)\nThis is the number of new vertices that would be added to the neighbor set of partition i due top adding vertex u to i.\nWhen adding u to a partition i, only the costs of a few vertices will be changed. Denote by\n∆i := {v ∈ N (u) : v /∈ N (Ui)}\nthe set of new vertices will be added into the neighbor set of Ui when assigning u to partition i. Only vertices in U connected to vertices in ∆i will have their costs affected, and these costs will only be reduced and never increased. Due to the sparsity of the graph, this is often a small subset of the total vertices. Hence the overhead of updating the vertex costs is much smaller than re-computing them repeatedly.\nFast vertex cost lookup. We build an efficient data structure to store the vertex costs, which is illustrated at Figure 5. For each partition i, we use an array Ai to store the j-th vertex cost, costi(uj), in the j-th entry, denoted by Ai(uj). We then impose a doubly-linked list on top of this array in an increasing order to rapidly locate the lowest-cost vertex. When a vertex cost is modified (always reduced), we update the doubly-linked list to preserve the order.\nNote that most large-scale graphs have a power-law degree distribution. Therefore a large portion of vertex costs will be small integers, which are always less equal that their degrees. We store a small array of “head” pointers to the locations in the list where the cost jumps to 0, 1, 2, . . . θ. The pointers accelerate locating elements in the list when updating. In practice, we found θ = 1000 covers over 99% of vertex costs.\nThe algorithm is illustrated in Algorithm 3. The inputs are a bipartite graph G = (U, V,E), the number of partitions k, together with k sets Si ⊆ V , which is the union neighbor set of vertices have been assigned to partition i before. The outputs are the k partitions U = ⋃ i Ui and updated Si with the neighbor set of Ui included. Here we assume R = U , the sampling strategy of R will be addressed in next section.\nRuntime. The initial Ai(u) can be computed in O(|E|) time and then be ordered in O(|U |) by counting sort, as they are integers, upper bounded by the maximal vertex degree. The most expensive part of Algorithm 3 is updating Ai in step 13. This is are evaluated at most k|E| times because, for each partition, a vertex v ∈ V together with its neighbors is accessed at most once.\nFor most cases, the time complexity of updating the doublylinked lists isO(1). The cost to access the j-th vertex isO(1) due to the sequential storing on an array. Finding a vertex with the minimal value or removing a vertex from the list is also in O(1) time because of the doubly links. Keeping the list ordered after decreasing a vertex cost by 1 is O(1) in most cases (O(|U |) for the worst case), as discussed above, by using the cached head pointers.\nThe average time complexity of Algorithm 3 is thenO(k|E|), much faster than the naive implementation and orders of magnitude better than Algorithm 1."
+    }, {
+      "heading" : "4.2 Division into Subgraphs",
+      "text" : "One goal of the sampling strategy used in Algorithm 1 is to keep the partitions of U balanced, because the vertices assigned to a partition at a time is being limited. The additional constraint |T | = 1 introduced in the previous section ensures that only a single vertex is assigned each time, which addresses balancing. Consequently we would like to sample as many vertices as possible to enlarge the search range of the optimal u∗ to partition quality. Sampling remains appealing since it is a trade-off between computation efficiency and partition quality.\nParsa first randomly divides U into b blocks. It next constructs the corresponding b subgraphs by adding the neighbor vertices from V and the corresponding edges, and then partitions these subgraphs sequentially by Algorithm 3. In other words, denote by {Gj}bj=1 the b subgraphs, and {Si}ki=1 the initialized neighbor sets, for instances Si = ∅ for all i; at iteration j = 1, . . . , b, we sequentially feed Gj and Si’s\ninto Algorithm 3 to obtain the partitions ⋃k i=1 Ui,j of Gj and updated Si’s, which contain the previous partition information. Then we union the results on each subgraph to the final partitions of U by Ui = ⋃b j=1 Ui,j for i = 1, . . . , k.\nCompared to the scheme described in Section 3.1 which samples a new subgraph (R) for each single vertex assignment, Parsa fixes those subgraphs at the beginning. This sampling strategy has several advantages. First, it partitions a subgraph by directly using Algorithm 3, which takes advantage of the head pointers and linked list to improve the efficiency. Next, it is convenient to place both the initialization of neighbor sets and parallelization which will be introduced soon on subgraph granularity. Finally, this strategy is I/O efficient, because we must only keep the current subgraph in memory. As a result, it is possible to partition graphs of sizes much larger than physical memory.\nThe number of subgraphs b is a trade-off between partition quality and computational efficiency. In the extreme case of b = 1, the vertex assigned to a partition is the optimal one\nfrom all unassigned vertices. It is, however, the most time consuming. In contrast, though the time complexity reduces toO(|E|) when letting b = |U |, we only get random partition results. Therefore, a well-chosen size b not only removes the graph size constraint but also balances time and quality."
+    }, {
+      "heading" : "4.3 Parallelize with the Parameter Server",
+      "text" : "Although Parsa can partition very large graphs with a single process by taking advantage of sampling, parallelization is desirable because of the reduction of both CPU and I/O times on each machine. Parsa parallelizes the partitioning by processing different subgraphs in parallel (on different nodes) by using the shared neighbor sets.\nTo implement the algorithm using the parameter server, we need the following three groups of nodes:\nThe scheduler issues partitioning tasks to workers and monitors their progress.\nServer nodes maintain the global shared neighbor sets. They process push and pull requests by workers.\nWorker nodes partition subgraphs in parallel. Every time a worker first reads a subgraph from the (distributed) file system. It then pulls the newest neighbor sets associated with this subgraph from the servers. Then, it partitions this subgraph using Algorithm 3 and finally pushes the modified neighbor sets to the servers."
+    }, {
+      "heading" : "4.4 Initializing the Neighbor Sets",
+      "text" : "The neighbor sets play a similar role as cluster centers on clustering methods, both of which affect the assignment of vertices. Well-initialized neighbor sets potentially improve the partition results. Initialization by empty sets, which prefers assigning vertices with small degrees first, however, often helps little, or even degrades, the resulting assignment. Parsa uses several initialization strategies to improve the results:\nIndividual initialization. Given a graph that has been divided into b subgraphs, we can runs a+ b iterations where the results for the first a iterations are used for initialization. In other words, before processing the (j + 1)-th subgraph, j ≤ a + 1, we reset the neighbor set by Si = N (Ui,j), where {Ui,j}ki=1 are the partitions of j-th subgraph. The old results are dropped because otherwise a vertex u will be assigned to its old partition i again as Si contains the neighbors of u and the cost |N (u) \\ Si| will then be 0.\nGlobal initialization. In parallel partitioning, before starting all workers, we first sample a small part from the graph and then let one worker partition this small subgraph. Then we can use the resulting neighbor sets as an initialization to all workers.\nIncremental partitioning. In this setting, data arrives in an incremental way and we want to partition the new data efficiently. Since we already have the partitioning results on the old data, we can use these results as initialization of the neighbor sets."
+    }, {
+      "heading" : "4.5 Puting it all together",
+      "text" : "Algorithm 4 shows Parsa, which partitions U into k parts in parallel. Then we can assign V using Algorithm 2 if\nAlgorithm 4 Parsa: parallel submodular approximation\nInput: Graph G, initial neighbor sets {Si}ki=1, #partitions k, max delay τ , initialization from a, #subgraphs b.\nOutput: partitions U = ⋃k i=1 Ui Scheduler:\n1: divide G into b subgraphs 2: ask all workers to partition with (a, τ, true) 3: ask all workers to partition with (b, τ, false)\nServer:\n1: start with a part of {Si}ki=1 2: if receiving a pull request then 3: reply with the requested neighbor set {Si}ki=1 4: end if 5: if receiving a push request containing {Snewi }ki=1 then 6: if initializing then 7: Si ← Snewi for i = 1, . . . , k 8: else 9: Si ← Si ∪ Snewi for i = 1, . . . , k\n10: end if 11: end if\nWorker:\n1: receive hyper-parameters (T, τ, initializing) 2: for t = 1, . . . , T do 3: load a subgraph G(U, V,E) 4: wait until all pushes before time t− τ finished 5: pull the part of neighbor sets, {Si}ki=1, that contained in V from the servers 6: get partitions {Unewi }ki=1 and updated neighbor sets {Snewi }ki=1 using Algorithm 3 7: if initializing = false and t > 1 then 8: Snewi ← Snewi \\ Si for all i = 1, . . . , k 9: end if\n10: push {Snewi }ki=1 to servers 11: if not initializing then Ui ← Ui ∪ Unewi for all i 12: end for\nnecessary. The initial neighbor sets can be obtained from global initialization or incremental partitioning discussed in the previous section. There are several details worth noting: First, while communication in the parameter server is asynchronous, Parsa imposes a maximal allowed delay τ to control the data consistency. Second, the worker might only push the changes of the neighbor sets to the servers to save the communication traffic. Finally, a worker may start a separate data pre-fetching thread to run steps 3, 4 and 5 to improve the efficiency."
+    }, {
+      "heading" : "5. EXPERIMENTS",
+      "text" : "We chose 7 datasets of varying type and scale, as summarized in Table 1. The first three are text datasets1; livejournal and orkut are social networks2; and the last two are click-through rate datasets from a large Internet company. The numbers of vertices and edges range from 104 to 1010."
+    }, {
+      "heading" : "5.1 Setup",
+      "text" : "We implemented Parsa in the parameter server [18]; the source is available at https://github.com/mli/parsa. We\n1 http://www.csie.ntu.edu.tw/~cjlin/libsvmtools/datasets/ 2 http://snap.stanford.edu/data/\ncompared Parsa with popular vertex-cut graph partition toolboxes Zoltan3 and PaToH4, which can also take bipartite graphs as inputs. We also used the well-known graph partition package METIS5 and the greedy algorithm adopted by Powergraph6, though these handle only normal graphs. All algorithms are implemented in C/C++.\nWe report both runtime and partition results. The default measurement of the latter is the maximal individual traffic volume. We counted the improvement against random partition by (random− proposed)/proposed× 100%, where 100% improvement means that traffic or memory footprint are 50% of that achieved by random partitioning.\nThe default number of partitions was set to 16. As Parsa is a randomized algorithm, we recorded the average results over 10 trials. Single thread experiments used a desktop with an Intel i7 3.4GHz CPU, while the parallel experiments used a university cluster with 16 machines, each with an Intel Xeon 2.4GHz CPU and 1 Gigabit Ethernet."
+    }, {
+      "heading" : "5.2 Comparison to other Methods",
+      "text" : "Table 2 shows the comparison results on different datasets. We recorded the CPU time on running each algorithm except for loading the data, because its performance varies for different data formats each algorithm used. The improvements are measured on maximal individual memory footprint and traffic volume, together with total traffic volume, which is the objective for both PaToH and Zoltan. Since neither METIS nor PowerGraph handle general sparse matrices, only results on social networks are reported. The number of partitions is 16, and the parameters of Parsa are fixed by a = b = 16. See Figure 6 for improvements on maximal individual traffic volume and runtimes.\nAs can be seen, Parsa is not only 20x faster than PaToH and Zoltan, but also produces more stable partition results, especially on reducing the memory footprint. METIS outperforms Parsa on one of the two social networks but consumes twice as much CPU time. PowerGraph is the fastest but suffers the cost of worse partition quality. Under both measurements on maximal individual traffic volume and total traffic volume, Parsa produces similar results.\nAs the number of partitions increases, the recursive-bisectionbased algorithms (METIS, PaToH, and Zoltan) retain their runtimes, but their partition quality degrades, as shown in Figure 7. In contrast, Parsa and Powergraph compute kpartitions directly. Their runtimes increase linearly with k, but their partition quality actually improves.\n5.3 Number of subgraphs and initialization 3 http://www.cs.sandia.gov/Zoltan/ 4 http://bmi.osu.edu/~umit/software.html 5 http://glaros.dtc.umn.edu/gkhome/metis/metis/overview 6 http://graphlab.org/downloads/\nWe examine two important optimizations in Parsa: the size of subgraph and the neighbor set initialization. We first consider the single thread case, which starts with empty neighbor sets. We divide the data into different numbers of subgraphs b and also varying the number of subgraphs a used for initialization. The results on representative text dataset CTRa and social network live-journal are shown in Figure 8.\nThe x-axis plots a/b× 100%, which is the percent of data used for constructing the initialization. It is clear that using\nmore data for initialization improves partition quality. Although the improvement is not significant for the single subgraph case (b = 1) because partitioning the same subgraph several times changes the results little, there is a stable 20% improvement over no initialization when at least 100% data are used for b > 1.\nWithout initialization, using small subgraphs has a positive effect on partition results for live-journal, but not for CTRa. The reason, as mentioned in Section 4.2, is that Parsa prefers to assign vertices with small degrees first when starting with empty neighbor sets. Those vertices offer lit-\ntle or no benefit for the subsequent assignment. Live-journal has many more sparse vertices than CTRa due to the power law distribution, and partitioning small subgraphs reduces the number of sparse vertices entering partitions too early.\nInitialization solves the previous problem by dropping early partition results and resetting corresponding neighbor sets. With a > 1\n2 b in Figure 8, small subgraphs improve the par-\ntition results on both CTRa and live-journal. This occurs since when using the same percentage of data for initialization, neighbor sets with small b are reset more often.\nFigure 8 also shows the runtime. Splitting into more blocks (larger b) narrows the search range for adding vertices, which reduces the cost of operating the doubly-linked list, boosting speed. The runtime increases linearly as we use and discard more samples for initialization, but the partition quality benefits of doing so appear worthwhile up to performing two passes (100% samples).\nNext we consider the parallel case with non-empty starting neighbor sets. We use 4 workers to partition a subset of CTRb containing 1 billion of edges and use one worker to partition an even smaller subgraph to obtain the starting\nneighbor sets. The results of varying the size of the this subgraph are shown in Figure 9.\nAs can be seen, the partition quality is significantly improved even when only 0.1% data are used for the global initialization. In addition, although this initialization takes extra time, the total running time is minimized when we used initialization. A good initialization of the neighbor sets reduces the cost of operating the doubly linked lists, saving time."
+    }, {
+      "heading" : "5.4 Scalability",
+      "text" : "We test the scalability of Parsa on CTRb with 10 billion edges by increasing the number of machines. We run 4 workers and 4 servers at each machine with infinite maximum delay. The results are shown in Figure 1. As can be seen, the speedup is linear with the number of machines and close to the ideal case. In particular, we obtained a 13.7x speedup by increasing the number of machines from 1 to 16.\nThe main reason that Parsa scales well is due to the eventual consistency model (τ = ∞). In this model, there is no global barrier between workers, and each worker even does\nnot wait the previous results pushed successfully. Therefore, workers fully utilize the computational resource and network bandwidth, and waste no time on waiting the data synchronization.\nThis consistency model, however, potentially leads to inconsistency of the neighbor sets between workers. However, we found that Parsa is robust to this kind of inconsistency. In our experiment, increasing the number of machines from 1 to 16 (4 to 64 in terms of workers) only decreases the quality of the partition result at most by 5%. We believe the reason is twofold. First, the starting neighbor sets obtained on a small subgraph let all workers have a consistent initialization, which may contain the membership of most head (large degree) vertices in V . Second, the modifications of the neighbor sets each worker contributed after partitioning a subgraph therefore are mainly about tail (small degree) vertices in V . Due to the extreme sparsity of the\ntail vertices, the conflicts among workers could be small and therefore affect the results little."
+    }, {
+      "heading" : "5.5 Accelerating Distributed Inference",
+      "text" : "Finally we examine how much Parsa can accelerate distributed machine learning applications by better data and parameter placement. We consider `1-regularized logistic regression, which is one of the most widely used machine learning algorithm for large scale text datasets. We choose a state-of-the-art distributed inference algorithm, DBPG [19], to solve this application. It is based on the block proximal gradient method using several techniques to improve efficiency: it supports a maximal τ -delay consistency model similar to Parsa, and uses several user-defined filters, such as key caching, value compression, and an algorithm-specific KKT filter, to further reduce communication cost. This algorithm has been implemented in the parameter server [18], and is well optimized. It can use 1,000 machines to train `1- regularized logistic regression on 500 terabytes data within a hour [19].\nWe run DBPG on CTRb using 16 machines as the baseline. We enabled all optimization options described in [19]. Then we partition CTRb into 16 parts by Parsa and run DBPG again. The runtime is shown in Table 3. By random partitioning, DBPG stops after passing the data 45 times and uses 1.43 hours. On the other hand, Parsa uses 4 minutes to partition the data and then accelerates DBPG to 0.84 hour. As a result, Parsa can reduce the total time from 1.43 hours to 0.91 hourx, a 1.6x speedup.\nThe reason Parsa accelerates DBPG is shown clearly in Table 3. By random partition, only 6% of network traffic between servers and workers happens locally. Even though the prior work reported very low communication cost for DBPG [19], we observe that a significant amount of time was spent on data synchronization. The reason is twofold. First, [19] pre-processed the data to remove tail features (tail vertices in V ) before training. But we fed the raw data into the algorithm and let the `1-regularizer do the feature selection automatically, which often yields a better machine learning model but induces more network traffic. Second, the network bandwidth of the university cluster we used is 20 times less than the industrial data-center used by [19]. Therefore, the communication cost can not be ignored in our experiment. However, after the partitioning, the inter-machine communication is decreased from 4.2TB to 0.3TB. Furthermore, the ratio of inner-machine traffic increases from 6% to 92%. In total, inter-machine communication is decreased by more than 90%, which significantly speeds inference."
+    }, {
+      "heading" : "6. CONCLUSION",
+      "text" : "This paper presented a new parallel vertex-cut graph partition algorithm, Parsa, to solve the data and parameter placement problem. Our contributions are the following:\n• We give theoretical analysis and approximation guarantees for both decomposition stages of what is generally an NP hard problem.\n• We show that the algorithm can be implemented very efficiently by judicious use of a doubly-linked list in O(k|E|) time.\n• We provide technologies such as sampling, initialization, and parallelizaiton, to improve the speed and partition quality.\n• Experiments show that Parsa works well in practice, beating (or matching) all competing algorithms in both memory footprint and communication cost while also offering very fast runtime.\n• We used Parsa to accelerate a stat-of-the-art distributed solver for `1-regularized logistic regression implemented in parameter server. We observed a 1.6x speedup on 16 machines with a dataset containing 10 billion nonzero entries.\nIn summary, Parsa is a fast, relatively simple, highly scalable and well performing algorithm.\nAcknowledgments: We thank Stefanie Jegelka and Christos Faloutsos for inspiring discussions."
+    }, {
+      "heading" : "7. REFERENCES",
+      "text" : "[1] A. Ahmed, M. Aly, J. Gonzalez, S. Narayanamurthy,\nand A. J. Smola. Scalable inference in latent variable models. In WSDM, 2012.\n[2] A. Ahmed, N. Shervashidze, S. Narayanamurthy, V. Josifovski, and A. J. Smola. Distributed large-scale natural graph factorization. In WWW, 2013.\n[3] R. Andersen, D. Gleich, and V. Mirrokni. Overlapping clusters for distributed computation. In WSDM, 2012.\n[4] J. Besag. Spatial interaction and the statistical analysis of lattice systems (with discussion). JRSS Series B, 36(2):192–236, 1974.\n[5] F. Bourse, M. Lelarge, and M. Vojnovic. Balanced graph edge partition. In KDD, 2014.\n[6] U. Catalyurek and C. Aykanat. Hypergraph partitioning based decomposition for parallel sparse-matrix vector multiplication. IEEE TPDS, 10(7):673–693, 1999.\n[7] M. Curtiss, I. Becker, T. Bosman, S. Doroshenko, L. Grijincu, T. Jackson, S. Kunnatur, S. Lassen, P. Pronin, S. Sankar. Unicorn: A system for searching the social graph. VLDB, 6(11):1150–1161, 2013.\n[8] J. Dean, G. Corrado, R. Monga, K. Chen, M. Devin, Q. Le, M. Mao, M. Ranzato, A. Senior, P. Tucker, K. Yang, and A. Ng. Large scale distributed deep networks. In NIPS, 2012.\n[9] K. Devine, E. Boman, R. Heaphy, R. Bisseling, and U. Catalyurek. Parallel hypergraph partitioning for scientific computing. In Parallel and Distributed Processing Symposium, pages 10–pp. IEEE, 2006.\n[10] M. Faloutsos, P. Faloutsos, and C. Faloutsos. On power-law relationships of the internet topology. In SIGCOMM, pages 251–262, 1999.\n[11] Apache hadoop, 2009, http://hadoop.apache.org/.\n[12] J. E. Gonzalez, Y. Low, H. Gu, D. Bickson, and C. Guestrin. Powergraph: Distributed graph-parallel computation on natural graphs. In OSDI, 2012.\n[13] J. E. Gonzalez, R. S. Xin, A. Dave, D. Crankshaw, M. J. Franklin, and I. Stoica. GraphX: Graph processing in a distributed dataflow framework. In OSDI, 2014.\n[14] T. Hastie, R. Tibshirani, and J. Friedman. The Elements of Statistical Learning. Springer, 2009.\n[15] I. Heller and C. Tompkins. An extension of a theorem of Dantzig’s. In Linear Inequalities and Related Systems, volume 38, AMS, 1956.\n[16] G. Karypis and V. Kumar. Multilevel k-way partitioning scheme for irregular graphs. J. Parallel Distrib. Comput., 48(1), 1998.\n[17] F. Kschischang, B. J. Frey, and H. Loeliger. Factor graphs and the sum-product algorithm. IEEE ToIT, 47(2):498–519, 2001.\n[18] M. Li, D. G. Andersen, J. Park, A. J. Smola, A. Amhed, V. Josifovski, J. Long, E. Shekita, and B. Y. Su. Scaling distributed machine learning with the parameter server. In OSDI, 2014.\n[19] M. Li, D. G. Andersen, A. J. Smola, and K. Yu. Communication efficient distributed machine learning with the parameter server. In NIPS, 2014.\n[20] Y. Low, J. Gonzalez, A. Kyrola, D. Bickson, C. Guestrin, and J. M. Hellerstein. GraphLab: A new parallel framework for machine learning. In Conference on Uncertainty in Artificial Intelligence, 2010.\n[21] Y. Low, J. Gonzalez, A. Kyrola, D. Bickson, C. Guestrin, and J. M. Hellerstein. Distributed graphlab: A framework for machine learning and data mining in the cloud. In PVLDB, 2012.\n[22] J. Nishimura and J. Ugander. Restreaming graph partitioning: Simple versatile algorithms for advanced balancing. In KDD, ACM, 2013.\n[23] J. Orlin. A faster strongly polynomial time algorithm for submodular function minimization. Mathematical Programming, 118(2):237–251, 2009.\n[24] J. M. Pujol, V. Erramilli, G. Siganos, X. Yang, N. Laoutaris, P. Chhabra, and P. Rodriguez. The little engine (s) that could: scaling online social networks. ACM SIGCOMM, 41(4):375–386, 2011.\n[25] B. Shao, H. Wang, and Y. Li. Trinity: A distributed graph engine on a memory cloud. In ACM SIGMOD, pages 505–516. ACM, 2013.\n[26] A. J. Smola and S. Narayanamurthy. An architecture for parallel topic models. In VLDB, 2010.\n[27] I. Stanton. Streaming balanced graph partitioning for random graphs. CoRR, abs/1212.1121, 2012.\n[28] I. Stanton and G. Kliot. Streaming graph partitioning for large distributed graphs. In KDD, 2012.\n[29] Z. Svitkina and L. Fleischer. Submodular approximation: Sampling-based algorithms and lower bounds. SIAM Computing, 40(6):1715–1737, 2011.\n[30] C. Tsourakakis, C. Gkantsidis, B. Radunovic, and M. Vojnovic. Fennel: Streaming graph partitioning for\nmassive scale graphs. In WSDM, pg. 333–342, 2014.\n[31] J. Ugander and L. Backstrom. Balanced label propagation for partitioning massive graphs. In WSDM, pages 507–516. ACM, 2013.\n[32] V. Venkataramani, Z. Amsden, N. Bronson, G. Cabrera III, P. Chakka, P. Dimov, H. Ding, J. Ferris, A. Giardullo, J. Hoon. Tao: how Facebook serves the social graph. In ACM SIGMOD, pages 791–792. ACM, 2012.\n[33] S. Yang, X. Yan, B. Zong, and A. Khan. Towards effective partition management for large graphs. In ACM SIGMOD, pages 517–528, 2012.\n[34] M. Zaharia, M. Chowdhury, T. Das, A. Dave, J. Ma, M. Mccauley, M. J. Franklin, S. Shenker, and I. Stoica. Fast and interactive analytics over Hadoop data with Spark. USENIX ;login:, 37(4):45–51, August 2012.\n[35] J. Zhou, N. Bruno, and W. Lin. Advanced partitioning techniques for massively distributed computation. In ACM SIGMOD, pages 13–24, 2012."
+    } ],
+    "references" : [ {
+      "title" : "Scalable inference in latent variable models",
+      "author" : [ "A. Ahmed", "M. Aly", "J. Gonzalez", "S. Narayanamurthy", "A.J. Smola" ],
+      "venue" : "In WSDM,",
+      "citeRegEx" : "1",
+      "shortCiteRegEx" : "1",
+      "year" : 2012
+    }, {
+      "title" : "Distributed large-scale natural graph factorization",
+      "author" : [ "A. Ahmed", "N. Shervashidze", "S. Narayanamurthy", "V. Josifovski", "A.J. Smola" ],
+      "venue" : "In WWW,",
+      "citeRegEx" : "2",
+      "shortCiteRegEx" : "2",
+      "year" : 2013
+    }, {
+      "title" : "Overlapping clusters for distributed computation",
+      "author" : [ "R. Andersen", "D. Gleich", "V. Mirrokni" ],
+      "venue" : "In WSDM,",
+      "citeRegEx" : "3",
+      "shortCiteRegEx" : "3",
+      "year" : 2012
+    }, {
+      "title" : "Spatial interaction and the statistical analysis of lattice systems (with discussion)",
+      "author" : [ "J. Besag" ],
+      "venue" : "JRSS Series B,",
+      "citeRegEx" : "4",
+      "shortCiteRegEx" : "4",
+      "year" : 1974
+    }, {
+      "title" : "Balanced graph edge partition",
+      "author" : [ "F. Bourse", "M. Lelarge", "M. Vojnovic" ],
+      "venue" : "In KDD,",
+      "citeRegEx" : "5",
+      "shortCiteRegEx" : "5",
+      "year" : 2014
+    }, {
+      "title" : "Hypergraph partitioning based decomposition for parallel sparse-matrix vector multiplication",
+      "author" : [ "U. Catalyurek", "C. Aykanat" ],
+      "venue" : "IEEE TPDS,",
+      "citeRegEx" : "6",
+      "shortCiteRegEx" : "6",
+      "year" : 1999
+    }, {
+      "title" : "Unicorn: A system for searching the social",
+      "author" : [ "M. Curtiss", "I. Becker", "T. Bosman", "S. Doroshenko", "L. Grijincu", "T. Jackson", "S. Kunnatur", "S. Lassen", "P. Pronin", "S. Sankar" ],
+      "venue" : null,
+      "citeRegEx" : "7",
+      "shortCiteRegEx" : "7",
+      "year" : 2013
+    }, {
+      "title" : "Large scale distributed deep networks",
+      "author" : [ "J. Dean", "G. Corrado", "R. Monga", "K. Chen", "M. Devin", "Q. Le", "M. Mao", "M. Ranzato", "A. Senior", "P. Tucker", "K. Yang", "A. Ng" ],
+      "venue" : "In NIPS,",
+      "citeRegEx" : "8",
+      "shortCiteRegEx" : "8",
+      "year" : 2012
+    }, {
+      "title" : "Parallel hypergraph partitioning for scientific computing",
+      "author" : [ "K. Devine", "E. Boman", "R. Heaphy", "R. Bisseling", "U. Catalyurek" ],
+      "venue" : "In Parallel and Distributed Processing Symposium, pages 10–pp. IEEE,",
+      "citeRegEx" : "9",
+      "shortCiteRegEx" : "9",
+      "year" : 2006
+    }, {
+      "title" : "On power-law relationships of the internet topology",
+      "author" : [ "M. Faloutsos", "P. Faloutsos", "C. Faloutsos" ],
+      "venue" : "In SIGCOMM,",
+      "citeRegEx" : "10",
+      "shortCiteRegEx" : "10",
+      "year" : 1999
+    }, {
+      "title" : "Powergraph: Distributed graph-parallel computation on natural graphs",
+      "author" : [ "J.E. Gonzalez", "Y. Low", "H. Gu", "D. Bickson", "C. Guestrin" ],
+      "venue" : "In OSDI,",
+      "citeRegEx" : "12",
+      "shortCiteRegEx" : "12",
+      "year" : 2012
+    }, {
+      "title" : "GraphX: Graph processing in a distributed dataflow framework",
+      "author" : [ "J.E. Gonzalez", "R.S. Xin", "A. Dave", "D. Crankshaw", "M.J. Franklin", "I. Stoica" ],
+      "venue" : "In OSDI,",
+      "citeRegEx" : "13",
+      "shortCiteRegEx" : "13",
+      "year" : 2014
+    }, {
+      "title" : "The Elements of Statistical Learning",
+      "author" : [ "T. Hastie", "R. Tibshirani", "J. Friedman" ],
+      "venue" : null,
+      "citeRegEx" : "14",
+      "shortCiteRegEx" : "14",
+      "year" : 2009
+    }, {
+      "title" : "An extension of a theorem of Dantzig’s",
+      "author" : [ "I. Heller", "C. Tompkins" ],
+      "venue" : "In Linear Inequalities and Related Systems,",
+      "citeRegEx" : "15",
+      "shortCiteRegEx" : "15",
+      "year" : 1956
+    }, {
+      "title" : "Multilevel k-way partitioning scheme for irregular graphs",
+      "author" : [ "G. Karypis", "V. Kumar" ],
+      "venue" : "J. Parallel Distrib. Comput.,",
+      "citeRegEx" : "16",
+      "shortCiteRegEx" : "16",
+      "year" : 1998
+    }, {
+      "title" : "Factor graphs and the sum-product algorithm",
+      "author" : [ "F. Kschischang", "B.J. Frey", "H. Loeliger" ],
+      "venue" : "IEEE ToIT,",
+      "citeRegEx" : "17",
+      "shortCiteRegEx" : "17",
+      "year" : 2001
+    }, {
+      "title" : "Scaling distributed machine learning with the parameter server",
+      "author" : [ "M. Li", "D.G. Andersen", "J. Park", "A.J. Smola", "A. Amhed", "V. Josifovski", "J. Long", "E. Shekita", "B.Y. Su" ],
+      "venue" : "In OSDI,",
+      "citeRegEx" : "18",
+      "shortCiteRegEx" : "18",
+      "year" : 2014
+    }, {
+      "title" : "Communication efficient distributed machine learning with the parameter server",
+      "author" : [ "M. Li", "D.G. Andersen", "A.J. Smola", "K. Yu" ],
+      "venue" : "In NIPS,",
+      "citeRegEx" : "19",
+      "shortCiteRegEx" : "19",
+      "year" : 2014
+    }, {
+      "title" : "GraphLab: A new parallel framework for machine learning",
+      "author" : [ "Y. Low", "J. Gonzalez", "A. Kyrola", "D. Bickson", "C. Guestrin", "J.M. Hellerstein" ],
+      "venue" : "In Conference on Uncertainty in Artificial Intelligence,",
+      "citeRegEx" : "20",
+      "shortCiteRegEx" : "20",
+      "year" : 2010
+    }, {
+      "title" : "Distributed graphlab: A framework for machine learning and data mining in the cloud",
+      "author" : [ "Y. Low", "J. Gonzalez", "A. Kyrola", "D. Bickson", "C. Guestrin", "J.M. Hellerstein" ],
+      "venue" : "In PVLDB,",
+      "citeRegEx" : "21",
+      "shortCiteRegEx" : "21",
+      "year" : 2012
+    }, {
+      "title" : "Restreaming graph partitioning: Simple versatile algorithms for advanced balancing",
+      "author" : [ "J. Nishimura", "J. Ugander" ],
+      "venue" : "In KDD,",
+      "citeRegEx" : "22",
+      "shortCiteRegEx" : "22",
+      "year" : 2013
+    }, {
+      "title" : "A faster strongly polynomial time algorithm for submodular function minimization",
+      "author" : [ "J. Orlin" ],
+      "venue" : "Mathematical Programming,",
+      "citeRegEx" : "23",
+      "shortCiteRegEx" : "23",
+      "year" : 2009
+    }, {
+      "title" : "The little engine (s) that could: scaling online social networks",
+      "author" : [ "J.M. Pujol", "V. Erramilli", "G. Siganos", "X. Yang", "N. Laoutaris", "P. Chhabra", "P. Rodriguez" ],
+      "venue" : "ACM SIGCOMM,",
+      "citeRegEx" : "24",
+      "shortCiteRegEx" : "24",
+      "year" : 2011
+    }, {
+      "title" : "Trinity: A distributed graph engine on a memory cloud",
+      "author" : [ "B. Shao", "H. Wang", "Y. Li" ],
+      "venue" : "In ACM SIGMOD,",
+      "citeRegEx" : "25",
+      "shortCiteRegEx" : "25",
+      "year" : 2013
+    }, {
+      "title" : "An architecture for parallel topic models",
+      "author" : [ "A.J. Smola", "S. Narayanamurthy" ],
+      "venue" : "In VLDB,",
+      "citeRegEx" : "26",
+      "shortCiteRegEx" : "26",
+      "year" : 2010
+    }, {
+      "title" : "Streaming balanced graph partitioning for random graphs",
+      "author" : [ "I. Stanton" ],
+      "venue" : "CoRR, abs/1212.1121,",
+      "citeRegEx" : "27",
+      "shortCiteRegEx" : "27",
+      "year" : 2012
+    }, {
+      "title" : "Streaming graph partitioning for large distributed graphs",
+      "author" : [ "I. Stanton", "G. Kliot" ],
+      "venue" : "In KDD,",
+      "citeRegEx" : "28",
+      "shortCiteRegEx" : "28",
+      "year" : 2012
+    }, {
+      "title" : "Submodular approximation: Sampling-based algorithms and lower bounds",
+      "author" : [ "Z. Svitkina", "L. Fleischer" ],
+      "venue" : "SIAM Computing,",
+      "citeRegEx" : "29",
+      "shortCiteRegEx" : "29",
+      "year" : 2011
+    }, {
+      "title" : "Fennel: Streaming graph partitioning for  massive scale graphs",
+      "author" : [ "C. Tsourakakis", "C. Gkantsidis", "B. Radunovic", "M. Vojnovic" ],
+      "venue" : "In WSDM, pg",
+      "citeRegEx" : "30",
+      "shortCiteRegEx" : "30",
+      "year" : 2014
+    }, {
+      "title" : "Balanced label propagation for partitioning massive graphs",
+      "author" : [ "J. Ugander", "L. Backstrom" ],
+      "venue" : "In WSDM,",
+      "citeRegEx" : "31",
+      "shortCiteRegEx" : "31",
+      "year" : 2013
+    }, {
+      "title" : "Tao: how Facebook serves the social graph",
+      "author" : [ "V. Venkataramani", "Z. Amsden", "N. Bronson", "G. Cabrera III", "P. Chakka", "P. Dimov", "H. Ding", "J. Ferris", "A. Giardullo", "J. Hoon" ],
+      "venue" : "In ACM SIGMOD,",
+      "citeRegEx" : "32",
+      "shortCiteRegEx" : "32",
+      "year" : 2012
+    }, {
+      "title" : "Towards effective partition management for large graphs",
+      "author" : [ "S. Yang", "X. Yan", "B. Zong", "A. Khan" ],
+      "venue" : "In ACM SIGMOD,",
+      "citeRegEx" : "33",
+      "shortCiteRegEx" : "33",
+      "year" : 2012
+    }, {
+      "title" : "Fast and interactive analytics over Hadoop data with Spark",
+      "author" : [ "M. Zaharia", "M. Chowdhury", "T. Das", "A. Dave", "J. Ma", "M. Mccauley", "M.J. Franklin", "S. Shenker", "I. Stoica" ],
+      "venue" : null,
+      "citeRegEx" : "34",
+      "shortCiteRegEx" : "34",
+      "year" : 2012
+    }, {
+      "title" : "Advanced partitioning techniques for massively distributed computation",
+      "author" : [ "J. Zhou", "N. Bruno", "W. Lin" ],
+      "venue" : "In ACM SIGMOD,",
+      "citeRegEx" : "35",
+      "shortCiteRegEx" : "35",
+      "year" : 2012
+    } ],
+    "referenceMentions" : [ {
+      "referenceID" : 1,
+      "context" : "For instance, for very large scale graph factorization [2], one needs to partition a natural graph in a way such that the memory, which is required for storing local state of the partition and caching the adjacent variables, is bounded within the capacity of each machine.",
+      "startOffset" : 55,
+      "endOffset" : 58
+    }, {
+      "referenceID" : 18,
+      "context" : "GraphLab [20, 12], where vertex-specific updates are carried out while keeping other variables synchronized between machines.",
+      "startOffset" : 9,
+      "endOffset" : 17
+    }, {
+      "referenceID" : 10,
+      "context" : "GraphLab [20, 12], where vertex-specific updates are carried out while keeping other variables synchronized between machines.",
+      "startOffset" : 9,
+      "endOffset" : 17
+    }, {
+      "referenceID" : 0,
+      "context" : "Likewise, in distributed inference for graphical models with latent variables [1, 26], the distributed state variables must be synchronized efficiently between machines.",
+      "startOffset" : 78,
+      "endOffset" : 85
+    }, {
+      "referenceID" : 24,
+      "context" : "Likewise, in distributed inference for graphical models with latent variables [1, 26], the distributed state variables must be synchronized efficiently between machines.",
+      "startOffset" : 78,
+      "endOffset" : 85
+    }, {
+      "referenceID" : 16,
+      "context" : "Furthermore, general purposed distributed machine learning framework such as the parameter server [18, 8] face similar issues when it comes to data and parameter layout.",
+      "startOffset" : 98,
+      "endOffset" : 105
+    }, {
+      "referenceID" : 7,
+      "context" : "Furthermore, general purposed distributed machine learning framework such as the parameter server [18, 8] face similar issues when it comes to data and parameter layout.",
+      "startOffset" : 98,
+      "endOffset" : 105
+    }, {
+      "referenceID" : 26,
+      "context" : "Due to its practical importance, even though the dataset partitioning problems are often NP hard [28], it is still worth seeking practical solutions that outperform random partitioning, which typically leads to poor performance.",
+      "startOffset" : 97,
+      "endOffset" : 101
+    }, {
+      "referenceID" : 14,
+      "context" : "Experiments on text datasets and social networks of various scales show that, on both partition quality and time efficiency, Parsa outperforms state-of-the-art methods, including METIS [16], PaToH [6] and Zoltan [9].",
+      "startOffset" : 185,
+      "endOffset" : 189
+    }, {
+      "referenceID" : 5,
+      "context" : "Experiments on text datasets and social networks of various scales show that, on both partition quality and time efficiency, Parsa outperforms state-of-the-art methods, including METIS [16], PaToH [6] and Zoltan [9].",
+      "startOffset" : 197,
+      "endOffset" : 200
+    }, {
+      "referenceID" : 8,
+      "context" : "Experiments on text datasets and social networks of various scales show that, on both partition quality and time efficiency, Parsa outperforms state-of-the-art methods, including METIS [16], PaToH [6] and Zoltan [9].",
+      "startOffset" : 212,
+      "endOffset" : 215
+    }, {
+      "referenceID" : 12,
+      "context" : "For instance, in risk minimization [14], we strive to solve",
+      "startOffset" : 35,
+      "endOffset" : 39
+    }, {
+      "referenceID" : 3,
+      "context" : "For undirected graphical models [4, 17], the joint distribution of the random variables in logscale can be written as x1 = (.",
+      "startOffset" : 32,
+      "endOffset" : 39
+    }, {
+      "referenceID" : 15,
+      "context" : "For undirected graphical models [4, 17], the joint distribution of the random variables in logscale can be written as x1 = (.",
+      "startOffset" : 32,
+      "endOffset" : 39
+    }, {
+      "referenceID" : 2,
+      "context" : "Similar problems occur in the context of inference on natural graphs [3, 12, 2], where we have sets of interacting parameters represented by vertices on the graph, and manipulating a vertex affects all of its neighbors computationally.",
+      "startOffset" : 69,
+      "endOffset" : 79
+    }, {
+      "referenceID" : 10,
+      "context" : "Similar problems occur in the context of inference on natural graphs [3, 12, 2], where we have sets of interacting parameters represented by vertices on the graph, and manipulating a vertex affects all of its neighbors computationally.",
+      "startOffset" : 69,
+      "endOffset" : 79
+    }, {
+      "referenceID" : 1,
+      "context" : "Similar problems occur in the context of inference on natural graphs [3, 12, 2], where we have sets of interacting parameters represented by vertices on the graph, and manipulating a vertex affects all of its neighbors computationally.",
+      "startOffset" : 69,
+      "endOffset" : 79
+    }, {
+      "referenceID" : 32,
+      "context" : "There exist several frameworks to simplify the developing of efficient distributed algorithms, such as Hadoop [11] and its in-memory variant Spark [34] to execute MapReduce programs, and Graphlab for distributed graph com-",
+      "startOffset" : 147,
+      "endOffset" : 151
+    }, {
+      "referenceID" : 19,
+      "context" : "putation [21].",
+      "startOffset" : 9,
+      "endOffset" : 13
+    }, {
+      "referenceID" : 16,
+      "context" : "In this paper, we focus on the parameter server framework [18], a high-performance general-purpose distributed machine learning framework.",
+      "startOffset" : 58,
+      "endOffset" : 62
+    }, {
+      "referenceID" : 14,
+      "context" : "Graph partitioning has attracted much interest in scientific computing [16, 6, 9], scaling out large-scale computations [12, 35, 33, 5, 13, 31], graph databases [25, 32, 7], search and social network analysis [24, 31, 2], and streaming processing [28, 27, 22, 30].",
+      "startOffset" : 71,
+      "endOffset" : 81
+    }, {
+      "referenceID" : 5,
+      "context" : "Graph partitioning has attracted much interest in scientific computing [16, 6, 9], scaling out large-scale computations [12, 35, 33, 5, 13, 31], graph databases [25, 32, 7], search and social network analysis [24, 31, 2], and streaming processing [28, 27, 22, 30].",
+      "startOffset" : 71,
+      "endOffset" : 81
+    }, {
+      "referenceID" : 8,
+      "context" : "Graph partitioning has attracted much interest in scientific computing [16, 6, 9], scaling out large-scale computations [12, 35, 33, 5, 13, 31], graph databases [25, 32, 7], search and social network analysis [24, 31, 2], and streaming processing [28, 27, 22, 30].",
+      "startOffset" : 71,
+      "endOffset" : 81
+    }, {
+      "referenceID" : 10,
+      "context" : "Graph partitioning has attracted much interest in scientific computing [16, 6, 9], scaling out large-scale computations [12, 35, 33, 5, 13, 31], graph databases [25, 32, 7], search and social network analysis [24, 31, 2], and streaming processing [28, 27, 22, 30].",
+      "startOffset" : 120,
+      "endOffset" : 143
+    }, {
+      "referenceID" : 33,
+      "context" : "Graph partitioning has attracted much interest in scientific computing [16, 6, 9], scaling out large-scale computations [12, 35, 33, 5, 13, 31], graph databases [25, 32, 7], search and social network analysis [24, 31, 2], and streaming processing [28, 27, 22, 30].",
+      "startOffset" : 120,
+      "endOffset" : 143
+    }, {
+      "referenceID" : 31,
+      "context" : "Graph partitioning has attracted much interest in scientific computing [16, 6, 9], scaling out large-scale computations [12, 35, 33, 5, 13, 31], graph databases [25, 32, 7], search and social network analysis [24, 31, 2], and streaming processing [28, 27, 22, 30].",
+      "startOffset" : 120,
+      "endOffset" : 143
+    }, {
+      "referenceID" : 4,
+      "context" : "Graph partitioning has attracted much interest in scientific computing [16, 6, 9], scaling out large-scale computations [12, 35, 33, 5, 13, 31], graph databases [25, 32, 7], search and social network analysis [24, 31, 2], and streaming processing [28, 27, 22, 30].",
+      "startOffset" : 120,
+      "endOffset" : 143
+    }, {
+      "referenceID" : 11,
+      "context" : "Graph partitioning has attracted much interest in scientific computing [16, 6, 9], scaling out large-scale computations [12, 35, 33, 5, 13, 31], graph databases [25, 32, 7], search and social network analysis [24, 31, 2], and streaming processing [28, 27, 22, 30].",
+      "startOffset" : 120,
+      "endOffset" : 143
+    }, {
+      "referenceID" : 29,
+      "context" : "Graph partitioning has attracted much interest in scientific computing [16, 6, 9], scaling out large-scale computations [12, 35, 33, 5, 13, 31], graph databases [25, 32, 7], search and social network analysis [24, 31, 2], and streaming processing [28, 27, 22, 30].",
+      "startOffset" : 120,
+      "endOffset" : 143
+    }, {
+      "referenceID" : 23,
+      "context" : "Graph partitioning has attracted much interest in scientific computing [16, 6, 9], scaling out large-scale computations [12, 35, 33, 5, 13, 31], graph databases [25, 32, 7], search and social network analysis [24, 31, 2], and streaming processing [28, 27, 22, 30].",
+      "startOffset" : 161,
+      "endOffset" : 172
+    }, {
+      "referenceID" : 30,
+      "context" : "Graph partitioning has attracted much interest in scientific computing [16, 6, 9], scaling out large-scale computations [12, 35, 33, 5, 13, 31], graph databases [25, 32, 7], search and social network analysis [24, 31, 2], and streaming processing [28, 27, 22, 30].",
+      "startOffset" : 161,
+      "endOffset" : 172
+    }, {
+      "referenceID" : 6,
+      "context" : "Graph partitioning has attracted much interest in scientific computing [16, 6, 9], scaling out large-scale computations [12, 35, 33, 5, 13, 31], graph databases [25, 32, 7], search and social network analysis [24, 31, 2], and streaming processing [28, 27, 22, 30].",
+      "startOffset" : 161,
+      "endOffset" : 172
+    }, {
+      "referenceID" : 22,
+      "context" : "Graph partitioning has attracted much interest in scientific computing [16, 6, 9], scaling out large-scale computations [12, 35, 33, 5, 13, 31], graph databases [25, 32, 7], search and social network analysis [24, 31, 2], and streaming processing [28, 27, 22, 30].",
+      "startOffset" : 209,
+      "endOffset" : 220
+    }, {
+      "referenceID" : 29,
+      "context" : "Graph partitioning has attracted much interest in scientific computing [16, 6, 9], scaling out large-scale computations [12, 35, 33, 5, 13, 31], graph databases [25, 32, 7], search and social network analysis [24, 31, 2], and streaming processing [28, 27, 22, 30].",
+      "startOffset" : 209,
+      "endOffset" : 220
+    }, {
+      "referenceID" : 1,
+      "context" : "Graph partitioning has attracted much interest in scientific computing [16, 6, 9], scaling out large-scale computations [12, 35, 33, 5, 13, 31], graph databases [25, 32, 7], search and social network analysis [24, 31, 2], and streaming processing [28, 27, 22, 30].",
+      "startOffset" : 209,
+      "endOffset" : 220
+    }, {
+      "referenceID" : 26,
+      "context" : "Graph partitioning has attracted much interest in scientific computing [16, 6, 9], scaling out large-scale computations [12, 35, 33, 5, 13, 31], graph databases [25, 32, 7], search and social network analysis [24, 31, 2], and streaming processing [28, 27, 22, 30].",
+      "startOffset" : 247,
+      "endOffset" : 263
+    }, {
+      "referenceID" : 25,
+      "context" : "Graph partitioning has attracted much interest in scientific computing [16, 6, 9], scaling out large-scale computations [12, 35, 33, 5, 13, 31], graph databases [25, 32, 7], search and social network analysis [24, 31, 2], and streaming processing [28, 27, 22, 30].",
+      "startOffset" : 247,
+      "endOffset" : 263
+    }, {
+      "referenceID" : 20,
+      "context" : "Graph partitioning has attracted much interest in scientific computing [16, 6, 9], scaling out large-scale computations [12, 35, 33, 5, 13, 31], graph databases [25, 32, 7], search and social network analysis [24, 31, 2], and streaming processing [28, 27, 22, 30].",
+      "startOffset" : 247,
+      "endOffset" : 263
+    }, {
+      "referenceID" : 28,
+      "context" : "Graph partitioning has attracted much interest in scientific computing [16, 6, 9], scaling out large-scale computations [12, 35, 33, 5, 13, 31], graph databases [25, 32, 7], search and social network analysis [24, 31, 2], and streaming processing [28, 27, 22, 30].",
+      "startOffset" : 247,
+      "endOffset" : 263
+    }, {
+      "referenceID" : 14,
+      "context" : "Most previous work, such as METIS [16], is concerned with edge cuts.",
+      "startOffset" : 34,
+      "endOffset" : 38
+    }, {
+      "referenceID" : 5,
+      "context" : "PaToH [6] and Zoltan [9] used multilevel partitioning algorithms related to METIS, while PowerGraph [12] adopted a greedy algorithm.",
+      "startOffset" : 6,
+      "endOffset" : 9
+    }, {
+      "referenceID" : 8,
+      "context" : "PaToH [6] and Zoltan [9] used multilevel partitioning algorithms related to METIS, while PowerGraph [12] adopted a greedy algorithm.",
+      "startOffset" : 21,
+      "endOffset" : 24
+    }, {
+      "referenceID" : 10,
+      "context" : "PaToH [6] and Zoltan [9] used multilevel partitioning algorithms related to METIS, while PowerGraph [12] adopted a greedy algorithm.",
+      "startOffset" : 100,
+      "endOffset" : 104
+    }, {
+      "referenceID" : 4,
+      "context" : "Very recently [5] studied the relation between edge cut and vertex cut.",
+      "startOffset" : 14,
+      "endOffset" : 17
+    }, {
+      "referenceID" : 5,
+      "context" : "This problem is NP-Complete [6].",
+      "startOffset" : 28,
+      "endOffset" : 31
+    }, {
+      "referenceID" : 27,
+      "context" : "Although the problem in (4) is NP-Complete, there exist several algorithms to solve it approximately by exploiting the submodularity [29].",
+      "startOffset" : 133,
+      "endOffset" : 137
+    }, {
+      "referenceID" : 27,
+      "context" : "In our algorithm, we modified [29] to solve (4) and (6).",
+      "startOffset" : 30,
+      "endOffset" : 34
+    }, {
+      "referenceID" : 27,
+      "context" : "The proof is near-identical as [29].",
+      "startOffset" : 31,
+      "endOffset" : 35
+    }, {
+      "referenceID" : 13,
+      "context" : "We reformulate (7) as a convex integer programming problem with totally unimodular constraints [15], which is then solved using a sequential optimization algorithm performing a sweep through the variables.",
+      "startOffset" : 95,
+      "endOffset" : 99
+    }, {
+      "referenceID" : 13,
+      "context" : "modular, since they satisfy the conditions of [15].",
+      "startOffset" : 46,
+      "endOffset" : 50
+    }, {
+      "referenceID" : 0,
+      "context" : "As a consequence every vertex solution is integral and we may relax the condition vij ∈ {0, 1} to vij ∈ [0, 1] to obtain a convex optimization problem.",
+      "startOffset" : 104,
+      "endOffset" : 110
+    }, {
+      "referenceID" : 21,
+      "context" : "Submodular minimization problems incur O(n) time [23].",
+      "startOffset" : 49,
+      "endOffset" : 53
+    }, {
+      "referenceID" : 16,
+      "context" : "We implemented Parsa in the parameter server [18]; the source is available at https://github.",
+      "startOffset" : 45,
+      "endOffset" : 49
+    }, {
+      "referenceID" : 17,
+      "context" : "We choose a state-of-the-art distributed inference algorithm, DBPG [19], to solve this application.",
+      "startOffset" : 67,
+      "endOffset" : 71
+    }, {
+      "referenceID" : 16,
+      "context" : "This algorithm has been implemented in the parameter server [18], and is well optimized.",
+      "startOffset" : 60,
+      "endOffset" : 64
+    }, {
+      "referenceID" : 17,
+      "context" : "It can use 1,000 machines to train `1regularized logistic regression on 500 terabytes data within a hour [19].",
+      "startOffset" : 105,
+      "endOffset" : 109
+    }, {
+      "referenceID" : 17,
+      "context" : "We enabled all optimization options described in [19].",
+      "startOffset" : 49,
+      "endOffset" : 53
+    }, {
+      "referenceID" : 17,
+      "context" : "Even though the prior work reported very low communication cost for DBPG [19], we observe that a significant amount of time was spent on data synchronization.",
+      "startOffset" : 73,
+      "endOffset" : 77
+    }, {
+      "referenceID" : 17,
+      "context" : "First, [19] pre-processed the data to remove tail features (tail vertices in V ) before training.",
+      "startOffset" : 7,
+      "endOffset" : 11
+    }, {
+      "referenceID" : 17,
+      "context" : "Second, the network bandwidth of the university cluster we used is 20 times less than the industrial data-center used by [19].",
+      "startOffset" : 121,
+      "endOffset" : 125
+    } ],
+    "year" : 2015,
+    "abstractText" : "Distributed computing excels at processing large scale data, but the communication cost for synchronizing the shared parameters may slow down the overall performance. Fortunately, the interactions between parameter and data in many problems are sparse, which admits efficient partition in order to reduce the communication overhead. In this paper, we formulate data placement as a graph partitioning problem. We propose a distributed partitioning algorithm. We give both theoretical guarantees and a highly efficient implementation. We also provide a highly efficient implementation of the algorithm and demonstrate its promising results on both text datasets and social networks. We show that the proposed algorithm leads to 1.6x speedup of a state-of-the-start distributed machine learning system by eliminating 90% of the network communication.",
+    "creator" : "LaTeX with hyperref package"
+  }
+}

@@ -1,10 +1,6 @@
 # PeerReaD
 Data and code for ["A Dataset of Peer Reviews (PeerRead): Collection, Insights and NLP Applications"](http://arxiv.org) by Dongyeop Kang, Waleed Ammar, Bhavana Dalvi, Madeleine van Zuylen, Sebastian Kohlmeier, Eduard Hovy and Roy Schwartz, NAACL 2018
 
-
-# v2 update (around May 2018)
-* Version 2 will include ACL_2017 (license opens), ICLR_2018, NIPS 2017
-
 # TODOs
 ### Structure for PeerRead dataset
 * Add a script for downloading the nips papers 2013-2017 (PDFs and reviews), splitting them similarly to the paper, as described [here](./data/nips_2013-2016/README.md)

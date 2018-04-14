@@ -2,11 +2,12 @@
 
 from __future__ import print_function
 import sys
+import os
 import re
 import urllib3
 import certifi
 
-from Paper import *
+from models.Paper import *
 
 
 def main(args):
@@ -21,6 +22,10 @@ def main(args):
 
     year = args[1]
     out_dir = args[2]
+    
+    if not os.path.isdir(out_dir):
+        os.mkdir(out_dir)
+    
     number = str(int(year)-1987)
     http = urllib3.PoolManager(cert_reqs='CERT_REQUIRED', ca_certs=certifi.where())
 
@@ -63,12 +68,11 @@ def handle_paper(l, out_dir, http, year, no_pdf):
     for author_str in authors_strs:
         match2 = re.search('a [^>]+>([^<]+)</a', author_str)
         if match2 is None:
-            print("Bad author string", author_str, "#", match.group(3)[1:-1], "#", l)
-            return None
-        authors.append(match2.group(1))
+            print("No authors found for", title)
+        else:
+            authors.append(match2.group(1))
 
     title = match.group(2)
-
     data = handle_url2(match.group(1), out_dir, http, year, no_pdf)
 
     if data is None:
@@ -125,7 +129,14 @@ def handle_url2(url, out_dir, http, year, no_pdf):
 
     if abstract is None:
         print("Some fields missing in paper page:",url,"Other:",pdf_url, reviews_url, publication_type)
-        return None
+        abstract = ""
+        
+        if reviews_url is None:
+            reviews_url = ""
+            
+        if publication_type is None:
+            publication_type = ""
+#        return None
 
     # print("PDF url:",pdf_url,"Review URL:",reviews_url,"type:",publication_type,"abstract:",abstract)
 

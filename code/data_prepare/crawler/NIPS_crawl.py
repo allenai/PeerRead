@@ -142,7 +142,7 @@ def handle_url2(url, out_dir, http, year, no_pdf):
 
     reviews, id = handle_url3(http, reviews_url, year)
 
-    if no_pdf is None:
+    if no_pdf is None and pdf_url is not None:
         pdf_url = "https://papers.nips.cc"+pdf_url
 
         pdf_data = get_url(http, pdf_url)

@@ -1,16 +1,7 @@
 # PeerReaD
 Data and code for ["A Dataset of Peer Reviews (PeerRead): Collection, Insights and NLP Applications"](http://arxiv.org) by Dongyeop Kang, Waleed Ammar, Bhavana Dalvi, Madeleine van Zuylen, Sebastian Kohlmeier, Eduard Hovy and Roy Schwartz, NAACL 2018
 
-
-# v2 update (around May 2018)
-* Version 2 will include ACL_2017 (license opens), ICLR_2018, NIPS 2017
-
-# TODOs
 ### Structure for PeerRead dataset
-* Add a script for downloading the nips papers 2013-2017 (PDFs and reviews), splitting them similarly to the paper, as described [here](./data/nips_2013-2016/README.md)
-* [Done] Copy arxiv papers from each split in the old repo to one or more subdirectories in `data/arxiv.cs.ai_2007-2017/{train|dev|test}`.
-* Add Madeleine's annotations to ICLR 2017 reviews.
-* Move code from the old repo to new repo (see agreed upon structure below).
 
 ```
 README.md
@@ -30,14 +21,7 @@ code/aspect_predict # codes for aspect score prediction
 misc/
 ```
 
-Each section should have a license file, e.g., `data/conll_2016/LICENSE.md`
-Each of the splits in a data section should have the following structure for all papers, e.g., for the `data/conll_2016/train` split:
-```
-data/conll_2016/train/pdfs/$paper_id.pdf
-data/conll_2016/train/parsed_pdfs/$paper_id.pdf.json
-data/conll_2016/train/reviews/$paper_id.json
-```
-
+Each section has a license file, e.g., `data/conll_2016/LICENSE.md`
 
 ### How-to-run two NLP tasks: acceptance classification and aspect prediction
 Please take a look at code/README.md for detailed instructions.
@@ -45,7 +29,7 @@ Please take a look at code/README.md for detailed instructions.
 
 ### Setup Configuration
 
-Running the following script will download the dataset and resolve all dependencies:
+To install dependencies, run:
 ```
   ./setup.sh
 ```

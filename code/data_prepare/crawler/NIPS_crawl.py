@@ -63,6 +63,7 @@ def handle_paper(l, out_dir, http, year, no_pdf):
         return None
 
     authors_strs = match.group(3)[1:-1].split(">, <")
+    title = match.group(2)
 
     authors = []
     for author_str in authors_strs:
@@ -72,7 +73,6 @@ def handle_paper(l, out_dir, http, year, no_pdf):
         else:
             authors.append(match2.group(1))
 
-    title = match.group(2)
     data = handle_url2(match.group(1), out_dir, http, year, no_pdf)
 
     if data is None:
@@ -242,10 +242,14 @@ def handle_url3(http, reviews_url, year):
 
 
 def get_url(http, url):
-    response = http.request('GET', url)
+    try:
+        response = http.request('GET', url)
 
-    if response.status != 200:
-        print("Problem, couldn't download", url,"(status is "+str(response.status)+")")
+        if response.status != 200:
+            print("Problem, couldn't download", url,"(status is "+str(response.status)+")")
+            return None
+    except urllib3.exceptions.MaxRetryError:
+        print("Max retries exceeded with url", url)
         return None
 
     return response.data

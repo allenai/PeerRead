@@ -1,3 +1,4 @@
+#!/bin/bash
 
 # download glove file
 W2V_DIR=./data/word2vec/

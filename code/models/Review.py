@@ -76,7 +76,7 @@ class Review:
   def to_json_object(self):
     data = dict()
 
-    data["comments"] = self.get_comments()
+    data["comments"] = self.get_comments().decode('cp1252', errors='ignore').encode('utf-8')
 
     if self.RECOMMENDATION is not None:
       data["RECOMMENDATION"] = self.get_recommendation()

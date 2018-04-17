@@ -191,8 +191,9 @@ def main(args, lower=True, max_vocab_size = False, encoder='bowtfidf'):
 
   # 2) sentence encoder features
   elif encoder in ['w2v', 'w2vtfidf']:
-    from sent2vec import MeanEmbeddingVectorizer,TFIDFEmbeddingVectorizer,w2v
+    from sent2vec import MeanEmbeddingVectorizer,TFIDFEmbeddingVectorizer,import_embeddings
     if is_train:
+      w2v = import_embeddings()
       vect = MeanEmbeddingVectorizer(w2v) if encoder=='w2v' else TFIDFEmbeddingVectorizer(w2v)
       for f in range(vect.dim):
         #fid = get_feature_id()

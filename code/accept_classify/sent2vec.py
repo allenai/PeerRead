@@ -8,14 +8,13 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from collections import defaultdict
 import dill
 
-def import_embeddings(filename="./data/word2vec/glove.840B.300d.txt", binary=False):
+def import_embeddings(filename="../../data/word2vec/glove.840B.300d.w2v.txt", binary=False):
   """
     Loading pre-trained word embeddings
     For speed-up, you can convert the text file to binary and turn on the switch "binary=True"
   """
-	return gensim.models.KeyedVectors.load_word2vec_format(filename, binary=binary)
-
-w2v = import_embeddings()
+  w2v = gensim.models.KeyedVectors.load_word2vec_format(filename, binary=binary)
+  return w2v
 
 class MeanEmbeddingVectorizer(object):
   """

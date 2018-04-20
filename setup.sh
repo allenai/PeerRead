@@ -6,7 +6,7 @@ echo 'Installing Python Dependencies..'
 pip install -r requirements.txt
 
 # download nltk data
-echo -e "import nltk\nnltk.download('punkt')" | python
+echo -e "import nltk\nnltk.download('punkt')\nnltk.download('stopwords')" | python
 
 # download glove file
 echo 'Downloading word2vec (i.e. Glove) embeddings..'

@@ -4,7 +4,8 @@ Data and code for ["A Dataset of Peer Reviews (PeerRead): Collection, Insights a
 ## The PeerRead dataset
 PearRead is a dataset of scientific peer reviews available to help researchers study this important artifact.
 The dataset consists of over 14K paper drafts and the corresponding accept/reject decisions in top-tier venues including ACL, NIPS and ICLR, as well as over 10K textual peer reviews written by experts for a subset of the papers.
-We structured the dataset into subsections each corresponding to a venue or an arxiv category, e.g., [./data/acl_2017](./data/acl_2017) and [./data/arxiv.cs.cl_2007-2017](./data/arxiv.cs.cl_2007-2017). Each subsection is further split into the train/dev/test splits (same splits used in the paper). Due to licensing constraints, we provide instructions for downloading the data instead of including it in this repository, e.g., [./data/nips_2013-2017/README.md](./data/nips_2013-2017/README.md).
+
+We structured the dataset into sections each corresponding to a venue or an arxiv category, e.g., [./data/acl_2017](./data/acl_2017) and [./data/arxiv.cs.cl_2007-2017](./data/arxiv.cs.cl_2007-2017). Each section is further split into the train/dev/test splits (same splits used in the paper). Due to licensing constraints, we provide instructions for downloading the data for some sections instead of including it in this repository, e.g., [./data/nips_2013-2017/README.md](./data/nips_2013-2017/README.md).
 
 ## Models
 In order to experiment with (and hopefully improve) our models for aspect prediction and for predicting whether a paper will be accepted, see [./code/README.md](./code/README.md).

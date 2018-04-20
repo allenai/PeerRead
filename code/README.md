@@ -5,20 +5,18 @@
 
 #### (1) Acceptance Classification
 
-To train and test our acceptance classification, please use the following command:
+To train and test our acceptance classification on the ICLR 2017 section, please use the following command, starting with `./code` as your working directory:
 ```shell
   cd ./accept_classify/
   ./run_featurize_classify.sh
 ```
 
-The script "run_featurize_classify.sh" runs feature extraction using "featurize.py" and classification using "classificy.py". The former part takes ~35 minutes and the later takes ~5 seconds on ICLR_2017 dataset.
+The script `run_featurize_classify.sh` first calls `featurize.py` to generate features (~35 minutes on ICLR_2017 dataset) then calls `classificy.py` to train and evaluate the classifier (~5 seconds on ICLR_2017 dataset).
 
-Here is brief description of each code.
- - "featurize.py" creates (hand-authored and lexical) features for baselines classifiers and save to under dataset folder in each split. This code loads review/paper text and outputs feature vectors in ./{train,dev,test}/dataset/. You should specify type of lexical encoder (e.g., w2v, bow, None) and whether to use hand-authored features or not.
- - "classifiy.py" trains linear classifier using CV and find the best model on dev set. This code loads the featurized vectors from the previous step and outputs accuracies on train/dev/test set.
- - "sent2vec.py" contains different embedding vectorizers and embedding loader.
-
-
+Here is brief description of the different scripts involved.
+ - `featurize.py` creates (hand-authored and lexical) features for baselines classifiers and save to under dataset folder in each split. This code loads review/paper text and outputs feature vectors in `./{train,dev,test}/dataset/`. You should specify type of lexical encoder (e.g., w2v, bow, None) and whether to use hand-authored features or not.
+ - `classifiy.py` trains linear classifier using cross-validation and finds the best model on dev set. This code loads the featurized vectors from the previous step and outputs accuracies on train/dev/test splits.
+ - `sent2vec.py` contains different embedding vectorizers and embedding loader.
 
 #### (2) Aspect Prediction
 

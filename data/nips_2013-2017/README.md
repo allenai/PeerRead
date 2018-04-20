@@ -2,7 +2,6 @@ Papers and reviews in this section can be obtained from the NIPS website by runn
 
 ```shell
 #!/usr/bin/env bash
-
 cd code
 python ./data_prepare/crawler/NIPS_crawl.py $year $output_directory (no_pdf)
 ```
@@ -12,6 +11,7 @@ For example, to download and process the years 2013-2017, run the following (af
 
 ```shell
 #!/usr/bin/env bash
+cd code
 for year in {2013..2017}; do
     python ./data_prepare/crawler/NIPS_crawl.py $year ../data/nips_2013-2017/$year
     mkdir -p data/nips_2013-2017/$year/parsed_pdfs/

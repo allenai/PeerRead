@@ -2,11 +2,12 @@
 
 from __future__ import print_function
 import sys
+import os
 import re
 import urllib3
 import certifi
 
-from Paper import *
+from models.Paper import *
 
 
 def main(args):
@@ -21,6 +22,10 @@ def main(args):
 
     year = args[1]
     out_dir = args[2]
+    
+    if not os.path.isdir(out_dir):
+        os.mkdir(out_dir)
+    
     number = str(int(year)-1987)
     http = urllib3.PoolManager(cert_reqs='CERT_REQUIRED', ca_certs=certifi.where())
 
@@ -58,16 +63,15 @@ def handle_paper(l, out_dir, http, year, no_pdf):
         return None
 
     authors_strs = match.group(3)[1:-1].split(">, <")
+    title = match.group(2)
 
     authors = []
     for author_str in authors_strs:
         match2 = re.search('a [^>]+>([^<]+)</a', author_str)
         if match2 is None:
-            print("Bad author string", author_str, "#", match.group(3)[1:-1], "#", l)
-            return None
-        authors.append(match2.group(1))
-
-    title = match.group(2)
+            print("No authors found for", title)
+        else:
+            authors.append(match2.group(1))
 
     data = handle_url2(match.group(1), out_dir, http, year, no_pdf)
 
@@ -125,13 +129,20 @@ def handle_url2(url, out_dir, http, year, no_pdf):
 
     if abstract is None:
         print("Some fields missing in paper page:",url,"Other:",pdf_url, reviews_url, publication_type)
-        return None
+        abstract = ""
+        
+        if reviews_url is None:
+            reviews_url = ""
+            
+        if publication_type is None:
+            publication_type = ""
+#        return None
 
     # print("PDF url:",pdf_url,"Review URL:",reviews_url,"type:",publication_type,"abstract:",abstract)
 
     reviews, id = handle_url3(http, reviews_url, year)
 
-    if no_pdf is None:
+    if no_pdf is None and pdf_url is not None:
         pdf_url = "https://papers.nips.cc"+pdf_url
 
         pdf_data = get_url(http, pdf_url)
@@ -231,10 +242,14 @@ def handle_url3(http, reviews_url, year):
 
 
 def get_url(http, url):
-    response = http.request('GET', url)
+    try:
+        response = http.request('GET', url)
 
-    if response.status != 200:
-        print("Problem, couldn't download", url,"(status is "+str(response.status)+")")
+        if response.status != 200:
+            print("Problem, couldn't download", url,"(status is "+str(response.status)+")")
+            return None
+    except urllib3.exceptions.MaxRetryError:
+        print("Max retries exceeded with url", url)
         return None
 
     return response.data

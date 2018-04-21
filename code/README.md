@@ -8,40 +8,14 @@
 To train and test our acceptance classification, please use the following command:
 ```shell
   cd ./accept_classify/
-  DATADIR=../../data/iclr_2017
-  DATASETS=("train" "dev" "test")
-  FEATDIR=dataset
-  MAX_VOCAB=False
-  ENCODER=w2v
-  HAND=True
-
-  for DATASET in "${DATASETS[@]}"
-  do
-    echo "Extracting feautures..." DATASET=$DATASET ENCODER=$ENCODER ALL_VOCAB=$MAX_VOCAB HAND_FEATURE=$HAND
-    rm -rf $DATADIR/$DATASET/$FEATDIR
-    python featurize.py \
-      $DATADIR/$DATASET/reviews/ \
-      $DATADIR/$DATASET/parsed_pdfs/ \
-      $DATADIR/$DATASET/$FEATDIR \
-      $DATADIR/train/$FEATDIR/features_${MAX_VOCAB}_${ENCODER}_${HAND}.dat \
-      $DATADIR/train/$FEATDIR/vect_${MAX_VOCAB}_${ENCODER}_${HAND}.pkl \
-      $MAX_VOCAB $ENCODER $HAND
-    echo
-  done
-
-  echo "Classifying..." $DATASET $ENCODER $MAX_VOCAB $HAND
-  python classify.py \
-    $DATADIR/train/$FEATDIR/features.svmlite_${MAX_VOCAB}_${ENCODER}_${HAND}.txt \
-    $DATADIR/dev/$FEATDIR/features.svmlite_${MAX_VOCAB}_${ENCODER}_${HAND}.txt \
-    $DATADIR/test/$FEATDIR/features.svmlite_${MAX_VOCAB}_${ENCODER}_${HAND}.txt \
-    $DATADIR/train/$FEATDIR/best_classifer_${MAX_VOCAB}_${ENCODER}_${HAND}.pkl \
-    $DATADIR/train/$FEATDIR/features_${MAX_VOCAB}_${ENCODER}_${HAND}.dat
-
+  ./run_featurize_classify.sh
 ```
 
+The script "run_featurize_classify.sh" runs feature extraction using "featurize.py" and classification using "classificy.py". The former part takes ~35 minutes and the later takes ~5 seconds on ICLR_2017 dataset.
+
 Here is brief description of each code.
- - "featurize.py" creates (hand-authored and lexical) features for baselines classifiers and save to under dataset folder in each split.
- - "classifiy.py" trains linear classifier using CV and find the best model on dev set.
+ - "featurize.py" creates (hand-authored and lexical) features for baselines classifiers and save to under dataset folder in each split. This code loads review/paper text and outputs feature vectors in ./{train,dev,test}/dataset/. You should specify type of lexical encoder (e.g., w2v, bow, None) and whether to use hand-authored features or not.
+ - "classifiy.py" trains linear classifier using CV and find the best model on dev set. This code loads the featurized vectors from the previous step and outputs accuracies on train/dev/test set.
  - "sent2vec.py" contains different embedding vectorizers and embedding loader.
 
 
@@ -51,8 +25,8 @@ Here is brief description of each code.
 To train and test our aspect predictor, please use the following command:
 
 ```shell
- cd ./accept_classify/
- python predict.py "../../data/iclr_2017" {"all","review","paper"} {"dan","rnn","cnn"} {0,1,2,3,4,5,6,7,8}
+  cd ./accept_classify/
+  python predict.py "../../data/iclr_2017" {"all","review","paper"} {"dan","rnn","cnn"} {0,1,2,3,4,5,6,7,8}
 ```
 
 

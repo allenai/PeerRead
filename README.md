@@ -1,5 +1,5 @@
 # PeerRead
-Data and code for ["A Dataset of Peer Reviews (PeerRead): Collection, Insights and NLP Applications"](http://arxiv.org) by Dongyeop Kang, Waleed Ammar, Bhavana Dalvi, Madeleine van Zuylen, Sebastian Kohlmeier, Eduard Hovy and Roy Schwartz, NAACL 2018
+Data and code for ["A Dataset of Peer Reviews (PeerRead): Collection, Insights and NLP Applications"](https://arxiv.org/abs/1804.09635) by Dongyeop Kang, Waleed Ammar, Bhavana Dalvi, Madeleine van Zuylen, Sebastian Kohlmeier, Eduard Hovy and Roy Schwartz, NAACL 2018
 
 ## The PeerRead dataset
 PearRead is a dataset of scientific peer reviews available to help researchers study this important artifact.

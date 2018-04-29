@@ -13,6 +13,21 @@ In order to experiment with (and hopefully improve) our models for aspect predic
 ## Setup Configuration
 Run `./setup.sh` at the root of this repository to install dependencies and download some of the larger data files not included in this repo.
 
+
+## Citation
+    
+    @inproceedings{kang18naacl,
+      title = {A Dataset of Peer Reviews (PeerRead): Collection, Insights and NLP Applications},
+      author = {Dongyeop Kang and Waleed Ammar and Bhavana Dalvi and Madeleine van Zuylen and Sebastian Kohlmeier and Eduard Hovy and Roy Schwartz},
+      booktitle = {Meeting of the North American Chapter of the Association for Computational Linguistics (NAACL)},
+      address = {New Orleans, USA},
+      month = {June},
+      url = {https://arxiv.org/abs/1804.09635},
+      year = {2018}
+    }
+
+    
+
 ## Acknowledgement
  - We use some of the code in [CanaanShen](https://github.com/CanaanShen/DataProcessor/tree/master/src/Crawler) for web crawling.
  - We use some of the code in [jiegzhan](https://github.com/jiegzhan/multi-class-text-classification-cnn-rnn) for our aspect prediction experiments.

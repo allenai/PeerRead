@@ -1,6 +1,7 @@
 """
  some utility functions for loading data
 """
+from __future__ import print_function
 
 import os,re,sys,json,logging,itertools,gensim,pprint,functools, random
 import numpy as np

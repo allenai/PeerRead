@@ -1,3 +1,4 @@
+from __future__ import print_function
 
 class Review:
 
@@ -68,7 +69,7 @@ class Review:
     other_keys = Review.get_json_string(json_object, "OTHER_KEYS", missing_fields)
 
     if print_missing_fields and len(missing_fields):
-      print("The following fields are missing in json input file:",missing_fields)
+      print(("The following fields are missing in json input file:",missing_fields))
     return Review(recommendation, comments, replicability, presentation_format, clarity, meaningful_comparison, \
             substance, reviewer_confidence, soundness_correctness, appropriateness, impact, originality, \
             other_keys, is_meta_review, title, date, recommendation_unofficial, is_annotated )

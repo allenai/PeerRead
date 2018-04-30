@@ -1,14 +1,18 @@
 # encoding=utf8
-import sys
-reload(sys)
-sys.setdefaultencoding('utf8')
+from __future__ import absolute_import
 
-import sys,io
-import json, glob
-from Review import Review
-from Paper import Paper
-from ScienceParse import ScienceParse
-from sklearn.feature_extraction.text import TfidfVectorizer
+import io
+import json
+import sys
+
+from .ScienceParse import ScienceParse
+
+try:
+    reload(sys)
+    sys.setdefaultencoding('utf8')
+except NameError:
+    pass  # Python 3 already defaults to utf8 encoding
+
 
 class ScienceParseReader:
   """

@@ -1,6 +1,7 @@
 """
 contains different embedding vectorizers and embedding loader
 """
+from __future__ import print_function
 
 import numpy as np
 import gensim
@@ -26,7 +27,7 @@ class MeanEmbeddingVectorizer(object):
     # if a text is empty we should return a vector of zeros
     # with the same dimensionality as all the other vectors
     self.dim = len(word2vec['a'])
-    print 'Dimension: ',self.dim
+    print('Dimension: ',self.dim)
 
   def fit(self, X, y=None):
     return self

@@ -20,7 +20,7 @@ for year in {2013..2017}; do
 done
 ```
 
-In order to also parse the PDF files, run the following code:
+In order to also parse the PDF files into plain text, run the following code:
 
 ```shell
 #!/usr/bin/env bash

@@ -4,7 +4,7 @@
 DATADIR=../../data/iclr_2017
 DATASETS=("train" "dev" "test")
 FEATDIR=dataset
-MAX_VOCAB=False
+MAX_VOCAB=30000 #False
 ENCODER=w2v
 HAND=True
 

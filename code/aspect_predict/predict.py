@@ -76,12 +76,12 @@ def prepare_data(
     aspects = ['RECOMMENDATION', 'SUBSTANCE', 'APPROPRIATENESS','MEANINGFUL_COMPARISON','SOUNDNESS_CORRECTNESS','ORIGINALITY','CLARITY','IMPACT', 'REVIEWER_CONFIDENCE' ]
     review_dir_postfix = ''
   else:
-    print 'wrong dataset:',data_dir
+    print('wrong dataset:',data_dir)
     sys.exit(1)
 
 
   # Loading datasets
-  print 'Reading datasets..'
+  print('Reading datasets..')
   datasets = ['train','dev','test']
   paper_content_all = []
   review_content_all = []
@@ -117,18 +117,18 @@ def prepare_data(
       d['reviews'] = reviews
       data[dataset].append(d)
 
-  print 'Total number of papers %d' %(np.sum([len(d) for _,d in data.items()]))
-  print 'Total number of reviews %d' %(np.sum([len(r['reviews']) for _,d in data.items() for r in d ]))
+  print('Total number of papers %d' %(np.sum([len(d) for _,d in data.items()])))
+  print('Total number of reviews %d' %(np.sum([len(r['reviews']) for _,d in data.items() for r in d ])))
 
   # Loading VOCAB
-  print 'Building vocab...'
+  print('Building vocab...')
   words =  []
   for _,d in data.items():
     for p in d:
       words += p['paper_content'].split(' ')
       for r in p['reviews_content']:
         words += r.split(' ')
-  print "Total words in corpus",len(words)
+  print("Total words in corpus",len(words))
 
   vocab = OrderedDict()
   word_counter = Counter(words)
@@ -144,10 +144,10 @@ def prepare_data(
     for w,id in vocab.items():
       fout.write('%s\t%s\n'%(w,id))
   vocab_inv = {int(i):v for v,i in vocab.items()}
-  print "Total vocab of size",len(vocab)
+  print("Total vocab of size",len(vocab))
 
   # Loading DATA
-  print 'Reading reviews from...'
+  print('Reading reviews from...')
   data_padded = []
   for dataset in datasets:
 
@@ -192,7 +192,7 @@ def prepare_data(
       inds = np.where(np.isnan(y))
       y[inds] = np.take(col_mean, inds[1])
 
-    print 'Total %s dataset: %d/%d'%(dataset,len(x_paper),len(x_review)),x_paper.shape,x_review.shape, y.shape
+    print('Total %s dataset: %d/%d'%(dataset,len(x_paper),len(x_review)),x_paper.shape,x_review.shape, y.shape)
     data_padded.append((x_paper,x_review))
     data_padded.append(y)
 
@@ -260,7 +260,7 @@ def main(args):
   # choose only given aspect as label among different aspects
   if label >=0:
     aspects = [aspects[label]]
-    print 'Labels:',aspects
+    print('Labels:',aspects)
 
 
   # extract only data of interest
@@ -281,10 +281,10 @@ def main(args):
     evaluate_major_aspect = evaluate(y_aspect, [major_aspect] * len(y_aspect))
     evaluate_mean.append(evaluate_mean_aspect)
     evaluate_major.append(evaluate_major_aspect)
-  print 'Majority (Test)'
+  print('Majority (Test)')
   for mean, major,a in zip(evaluate_mean, evaluate_major, aspects):
-    print '\t%15s\t%.4f\t%.4f'%(a,mean, major)
-  print '\t%15s\t%.4f\t%.4f'%('TOTAL',np.average(evaluate_mean), np.average(evaluate_major))
+    print('\t%15s\t%.4f\t%.4f'%(a,mean, major))
+  print('\t%15s\t%.4f\t%.4f'%('TOTAL',np.average(evaluate_mean), np.average(evaluate_major)))
 
   # choose train text
   if train_text == 'paper':
@@ -300,11 +300,11 @@ def main(args):
     x_dev = np.concatenate(x_dev,axis=1)
     x_test = np.concatenate(x_test,axis=1)
   else:
-    print 'Wrong'; sys.exit(1)
+    print('Wrong'; sys.exit(1))
   max_len = x_train.shape[1]
 
-  print 'x_train: {}, x_dev: {}, x_test: {}'.format(len(x_train), len(x_dev), len(x_test))
-  print 'y_train: {}, y_dev: {}, y_test: {}'.format(len(y_train), len(y_dev), len(y_test))
+  print('x_train: {}, x_dev: {}, x_test: {}'.format(len(x_train), len(x_dev), len(x_test)))
+  print('y_train: {}, y_dev: {}, y_test: {}'.format(len(y_train), len(y_dev), len(y_test)))
 
   timestamp = str(int(time.time()))
   trained_dir = './trained_results/' + timestamp + '/'
@@ -366,7 +366,7 @@ def main(args):
       train_losses.append(train_loss)
 
       if current_step % config.print_per_batch==0:
-        print '[%d/%d] %.4f'%(epoch,current_step, np.average(train_losses))
+        print('[%d/%d] %.4f'%(epoch,current_step, np.average(train_losses)))
 
       # evaluateuate the model with x_dev and y_dev
       if current_step % config.save_per_batch == 0:
@@ -393,7 +393,7 @@ def main(args):
         #for a,r in zip(aspects, dev_aspect):
         #  print '\t%20s\t%.4f'%(a,r)
         #print '\t%20s\t%.4f'%('TOTAL',np.average(dev_aspect))
-        print '[%d] dev loss: %.6f, acc: %.6f'%(current_step,np.average(dev_losses), np.average(dev_aspect))
+        print('[%d] dev loss: %.6f, acc: %.6f'%(current_step,np.average(dev_losses), np.average(dev_aspect)))
 
         # test
         test_batches = batch_iter(list(zip(x_test, y_test)), config.batch_size, shuffle=False)
@@ -416,17 +416,17 @@ def main(args):
           ys = aspect_all_ys[aid]
           ys_ = aspect_all_ys_[aid]
           test_aspect.append(evaluate(ys, ys_) )
-        print '[%d] test loss: %.4f'%(current_step,np.average(test_aspect))
+        print('[%d] test loss: %.4f'%(current_step,np.average(test_aspect)))
 
 
         if np.average(dev_losses) <= best_loss:
           best_loss, best_at_step = np.average(dev_losses), current_step
           path = saver.save(sess, checkpoint_prefix, global_step=current_step)
-          print 'Best loss %.2f at step %d'%(best_loss , best_at_step)
+          print('Best loss %.2f at step %d'%(best_loss , best_at_step))
     #print 'Epoch done'
-  print 'Training is complete, testing the best model on x_test and y_test'
+  print('Training is complete, testing the best model on x_test and y_test')
 
-  print 'Best epoch', best_at_step
+  print('Best epoch', best_at_step)
   saver.restore(sess, checkpoint_prefix + '-' + str(best_at_step))
 
   test_batches = batch_iter(list(zip(x_test, y_test)), config.batch_size, shuffle=False)
@@ -450,8 +450,8 @@ def main(args):
     ys_ = aspect_all_ys_[aid]
     evaluate_aspect.append(evaluate(ys, ys_) )
   for a,r in zip(aspects, evaluate_aspect):
-    print '\t%20s\t%.4f'%(a,r)
-  print '\t%20s\t%.4f'%('TOTAL',np.average(evaluate_aspect))
+    print('\t%20s\t%.4f'%(a,r))
+  print('\t%20s\t%.4f'%('TOTAL',np.average(evaluate_aspect)))
 
 
 

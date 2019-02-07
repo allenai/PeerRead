@@ -1,14 +1,16 @@
 # encoding=utf8
 import sys
-reload(sys)
-sys.setdefaultencoding('utf8')
+import io
+import json
+import glob
 
-import sys,io
-import json, glob
-from Review import Review
-from Paper import Paper
-from ScienceParse import ScienceParse
+if sys.version_info[0]<3:
+  reload(sys)
+  sys.setdefaultencoding('utf8')
 from sklearn.feature_extraction.text import TfidfVectorizer
+from .Review import Review
+from .Paper import Paper
+from .ScienceParse import ScienceParse
 
 class ScienceParseReader:
   """

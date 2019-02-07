@@ -3,7 +3,8 @@ create (hand-authored and lexical) features for baselines classifiers and save t
 """
 
 import sys,os,random,json,glob,operator,re
-import cPickle as pkl
+# import cPickle as pkl
+import pickle as pkl
 from collections import Counter
 from sklearn.feature_extraction.text import TfidfVectorizer,CountVectorizer
 from itertools import dropwhile
@@ -98,10 +99,10 @@ def main(args, lower=True, max_vocab_size = False, encoder='bowtfidf'):
     is_train = False
     idToFeature = read_features(feature_output_file)
     if encoder:
-      print 'Loading vector file from...',vect_file
+      print('Loading vector file from...',vect_file)
       vect = load_vect(vect_file)
   else:
-    print 'Loading vector file from scratch..'
+    print('Loading vector file from scratch..')
     idToFeature = dict()
 
   outLabelsFile = open(out_dir + '/labels_%s_%s_%s.tsv'%(str(max_vocab_size), str(encoder),str(hand)), 'w')
@@ -114,7 +115,7 @@ def main(args, lower=True, max_vocab_size = False, encoder='bowtfidf'):
   ################################
   # read reviews
   ################################
-  print 'Reading reviews from...',paper_json_dir
+  print('Reading reviews from...',paper_json_dir)
   paper_content_corpus = [] #""
   paper_json_filenames = sorted(glob.glob('{}/*.json'.format(paper_json_dir)))
   papers = []
@@ -124,7 +125,7 @@ def main(args, lower=True, max_vocab_size = False, encoder='bowtfidf'):
     paper_content_corpus.append(paper.SCIENCEPARSE.get_paper_content())
     papers.append(paper)
   random.shuffle(papers)
-  print 'Total number of reviews',len(papers)
+  print('Total number of reviews',len(papers))
 
 
   def get_feature_id(feature):
@@ -150,7 +151,7 @@ def main(args, lower=True, max_vocab_size = False, encoder='bowtfidf'):
     pkl.dump(paper_content_corpus_words, open(outCorpusFilename, 'wb'))
   else:
     paper_content_corpus_words = pkl.load(open(outCorpusFilename,'rb'))
-  print 'Total words in corpus',len(paper_content_corpus_words)
+  print('Total words in corpus',len(paper_content_corpus_words))
 
 
 
@@ -159,10 +160,10 @@ def main(args, lower=True, max_vocab_size = False, encoder='bowtfidf'):
   ################################
   # Encoding
   ################################
-  print 'Encoding..',encoder
+  print('Encoding..',encoder)
   # 1) tf-idf features on title/author_names/domains
   if not encoder:
-    print 'No encoder',encoder
+    print('No encoder',encoder)
   elif encoder in ['bow', 'bowtfidf']:
     word_counter = Counter(paper_content_corpus_words)
     # vocab limit by frequency
@@ -180,7 +181,7 @@ def main(args, lower=True, max_vocab_size = False, encoder='bowtfidf'):
             vocabulary[w] = fid
     print("Got vocab of size",len(vocabulary))
     if is_train:
-      print 'Saving vectorized',vect_file
+      print('Saving vectorized',vect_file)
       if encoder == 'bow':
         vect = CountVectorizer( max_df=0.5, analyzer='word', stop_words='english', vocabulary=vocabulary)
       else:
@@ -192,18 +193,26 @@ def main(args, lower=True, max_vocab_size = False, encoder='bowtfidf'):
   # 2) sentence encoder features
   elif encoder in ['w2v', 'w2vtfidf']:
     from sent2vec import MeanEmbeddingVectorizer,TFIDFEmbeddingVectorizer,import_embeddings
+
+    # vocab limit by frequency
+    word_counter = False
+    if max_vocab_size:
+      word_counter = Counter(paper_content_corpus_words)
+      word_counter = dict(word_counter.most_common()[:max_vocab_size])
+
     if is_train:
       w2v = import_embeddings()
-      vect = MeanEmbeddingVectorizer(w2v) if encoder=='w2v' else TFIDFEmbeddingVectorizer(w2v)
+      vect = MeanEmbeddingVectorizer(w2v,word_counter) if encoder=='w2v' else TFIDFEmbeddingVectorizer(w2v,word_counter)
       for f in range(vect.dim):
         #fid = get_feature_id()
         addFeatureToDict('%s%d'%(encoder,f))
-      print 'Saving vectorized',vect_file
+      print('Saving vectorized',vect_file)
+
       if encoder == 'w2vtfidf':
         vect.fit([p for p in paper_content_corpus])
       save_vect(vect, vect_file)
   else:
-    print 'Wrong type of encoder',encoder
+    print('Wrong type of encoder',encoder)
     sys.exit(1)
 
 
@@ -220,7 +229,7 @@ def main(args, lower=True, max_vocab_size = False, encoder='bowtfidf'):
     all_titles_features = vect.transform(all_titles)
 
   if is_train:
-    print 'saving features to file',feature_output_file
+    print('saving features to file',feature_output_file)
     if hand:
       addFeatureToDict("get_most_recent_reference_year")
       addFeatureToDict("get_num_references")
@@ -273,7 +282,7 @@ def main(args, lower=True, max_vocab_size = False, encoder='bowtfidf'):
         for word_id in range(vect.dim):
           outSvmLiteFile.write(str(word_id)+":"+ str(title_tfidf[word_id])+" ")
       else:
-        print 'wrong ecndoer', encoder
+        print('wrong ecndoer', encoder)
         sys.exit(1)
 
     if hand:
@@ -359,9 +368,9 @@ def main(args, lower=True, max_vocab_size = False, encoder='bowtfidf'):
   outLabelsFile.close()
   outIDFile.close()
   outSvmLiteFile.close()
-  print 'saved',outLabelsFile.name
-  print 'saved',outIDFile.name
-  print 'saved',outSvmLiteFile.name
+  print('saved',outLabelsFile.name)
+  print('saved',outIDFile.name)
+  print('saved',outSvmLiteFile.name)
 
 
 if __name__ == "__main__":

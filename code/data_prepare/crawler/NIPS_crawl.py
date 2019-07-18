@@ -37,7 +37,7 @@ def main(args):
     if data is None:
         return -2
 
-    lines = str(data).split("\n")
+    lines = str(data).split(r"\n")
 
     print("Got",len(lines),"lines")
 
@@ -95,7 +95,7 @@ def handle_url2(url, out_dir, http, year, no_pdf):
     if lines is None:
         return None
 
-    lines = str(lines).split("\n")
+    lines = str(lines).split(r"\n")
 
     publication_type = None
     abstract = None
